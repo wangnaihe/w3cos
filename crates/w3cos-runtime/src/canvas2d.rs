@@ -19,7 +19,7 @@
 //! let pixels = ctx.get_image_data(0, 0, 800, 600);
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -42,6 +42,19 @@ impl CanvasSnapshot {
 
 thread_local! {
     static SURFACES: RefCell<HashMap<usize, CanvasSnapshot>> = RefCell::new(HashMap::new());
+    static PAINT_CLIENT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Paint-node index of the canvas currently being drawn.
+///
+/// CPU and GPU renderers do not thread the client index into `render_node`,
+/// so the paint loop records it here for the canvas snapshot lookup.
+pub(crate) fn set_paint_client(index: usize) {
+    PAINT_CLIENT.with(|cell| cell.set(index));
+}
+
+pub(crate) fn paint_client() -> usize {
+    PAINT_CLIENT.with(Cell::get)
 }
 
 /// Publish the latest pixels for a retained canvas display client.

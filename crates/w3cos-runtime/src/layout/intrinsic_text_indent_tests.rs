@@ -23,7 +23,7 @@ fn paragraph(content: &str, indent: f32) -> Component {
         w3cos_std::Style {
             display: WDisplay::Inline,
             text_indent: WDim::Px(indent),
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-text-line-width".into(),
                 "1".into(),
             )])),

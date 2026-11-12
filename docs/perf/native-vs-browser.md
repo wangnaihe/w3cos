@@ -34,6 +34,179 @@ built for the table below.
 Chromium is the host Google Chrome in headless mode, sandbox left on,
 viewport 1024×768, DPR 1.
 
+## macOS host: Apple M5 (`eedbb9f`)
+
+This section is a different host. Do not compare its numbers with the Linux
+tables below.
+
+| | |
+| --- | --- |
+| Host | macOS, Apple M5, 10 cores, 32 GB |
+| Chromium | Google Chrome 155.0.8059.80, headless, `--disable-gpu` kept for parity |
+| Native raster | tiny-skia (`cpu-render`), same as Linux |
+| rustc | 1.94.0 |
+| RSS / CPU | `ps -o rss,time` over the process tree (no `/proc`); the native side reports `getrusage` + `proc_pidinfo` |
+
+Run with `W3COS_CHROME` unset (the runner picks the app bundle on Darwin):
+
+```sh
+python3 tools/perf-native-browser/run.py --runs 5 --jobs 10 \
+  --workloads startup,dom-list,layout,layout-css,frames,compute,memory,css-list,flex-list,events,table-repaint,styled-scroll,text-layout,md-long-history,dom-ops,css-ops,animation,event-flood
+```
+
+Only the Playwright-launched browser (`--headless`, not `--type=`) and its
+children are counted, so a desktop Chrome the user has open is excluded.
+
+### New workloads
+
+| Workload | What it does |
+| --- | --- |
+| `md-stream-append` / `md-stream-rerender` | AI chat UI. 200 prior markdown messages (headings, lists, tables, inline code, 50-line fenced code with highlight spans, links, quotes) rendered by a vendored plain-JS markdown-to-DOM renderer, then a 5000-token reply (2–8 chars each) streamed into the tail message with `scrollTop = scrollHeight` after every chunk. Append strategy extends the tail text node; rerender rebuilds the open block. Reports per-chunk p50/p95/max. |
+| `md-long-history` | 2000 messages, then 2000 scroll jumps with `offsetTop` probes. |
+| `dom-ops` | insertBefore/removeChild/replaceChildren churn, keyed shuffle of 1000, innerHTML parse, deep cloneNode, querySelector/All, classList, attributes, DocumentFragment. |
+| `css-ops` | 300 extra rules (descendant/class/attribute/`:nth-child`), 2000 nodes, class toggle restyle, getComputedStyle, CSS variables, media queries. |
+| `animation` | 500 nodes: paused `@keyframes` driven by negative `animation-delay`, transitions, rAF JS animation, Web Animations `currentTime`. |
+| `event-flood` | 10k listeners, 50-deep bubbling, delegation, 100k dispatches, add/remove churn, pointermove/scroll floods. |
+
+Checksums are structural (DOM shape, text, counts, explicit px sizes), so they
+do not depend on which sans-serif face each engine resolves.
+
+### Five-run table
+
+Median (min–max). Times in ms, RSS in MB. Verdict per profile
+(size/speed/max): win means the native max is below the Chromium min and the
+checksums match; `mismatch` means the checksums differ, so the row does not count.
+
+| workload | metric | size | speed | max | Chromium | verdict |
+|---|---|---:|---:|---:|---:|---|
+| startup | cold_start_ms | 222 (218–1.85e+03) | 202 (196–1.92e+03) | 195 (192–764) | 411 (389–966) | overlap/overlap/overlap |
+| startup | native_first_raster_ms | 208 (205–862) | 189 (185–195) | 186 (183–194) | n/a |  |
+| startup | cpu_ms | 215 (212–676) | 195 (189–198) | 189 (185–196) | 100 (90–130) | loss/loss/loss |
+| startup | peak_rss | 810 (810–811) | 813 (812–814) | 810 (810–811) | 941 (934–946) | win/win/win |
+| startup | steady_rss | 814 (813–815) | 817 (816–819) | 814 (813–815) | 941 (934–946) | win/win/win |
+| dom-list | wall_ms | 1.93 (1.85–2.43) | 0.972 (0.915–2.44) | 0.579 (0.547–1.17) | 2.9 (2.7–3.1) | win/win/win |
+| dom-list | create_ms | 0.308 (0.285–0.367) | 0.165 (0.158–0.388) | 0.098 (0.0894–0.116) | 0.3 (0.3–0.4) | overlap/overlap/win |
+| dom-list | update_ms | 1.6 (1.55–2.01) | 0.807 (0.758–2.05) | 0.486 (0.441–1.06) | 2.5 (2.5–2.7) | win/win/win |
+| dom-list | cpu_ms | 36.1 (34.6–44.6) | 20.1 (18.8–35.5) | 11.8 (11.2–15.9) | 130 (110–140) | win/win/win |
+| dom-list | peak_rss | 8.8 (8.66–19.6) | 11.5 (8.38–15.1) | 9.34 (8.31–10.8) | 952 (949–953) | win/win/win |
+| dom-list | steady_rss | 19.9 (19.8–19.9) | 22.2 (22.2–22.3) | 19.5 (19.4–19.5) | 952 (949–953) | win/win/win |
+| dom-list | checksum | 62890 | 62890 | 62890 | 62890 |  |
+| layout | wall_ms | 1.07 (0.985–1.22) | 0.641 (0.59–0.937) | 0.543 (0.514–0.63) | 4.4 (4.2–4.8) | win/win/win |
+| layout | cpu_ms | 64.3 (55–75.7) | 39 (29–46.9) | 23.4 (19.5–24.7) | 130 (120–150) | win/win/win |
+| layout | peak_rss | 22.5 (22.4–23.9) | 9.2 (8.42–11.9) | 11.1 (9.05–13.3) | 998 (991–1.01e+03) | win/win/win |
+| layout | steady_rss | 26.3 (26.2–26.3) | 28.7 (28.6–28.8) | 26.2 (26–26.2) | 998 (991–1.01e+03) | win/win/win |
+| layout | checksum | 20016 | 20016 | 20016 | 20016 |  |
+| layout-css | wall_ms | 1.71 (1.33–3.44) | 0.965 (0.706–1.11) | 0.936 (0.525–1.08) | 0.5 (0.4–0.5) | loss/loss/loss |
+| layout-css | cpu_ms | 297 (289–346) | 247 (238–258) | 242 (233–259) | 120 (70–140) | loss/loss/loss |
+| layout-css | peak_rss | 811 (811–813) | 814 (812–817) | 812 (810–813) | 942 (939–950) | win/win/win |
+| layout-css | steady_rss | 812 (812–814) | 815 (814–818) | 813 (811–814) | 942 (939–947) | win/win/win |
+| layout-css | checksum | 7680 | 7680 | 7680 | 7680 |  |
+| frames | frame_work_p50_ms | 0.423 (0.376–0.813) | 0.314 (0.257–0.708) | 0.232 (0.188–0.498) | 0.2 (0.2–0.2) | loss/loss/overlap |
+| frames | frame_work_p95_ms | 0.952 (0.444–1.39) | 0.734 (0.518–2.51) | 0.569 (0.333–1.99) | 0.21 (0.205–0.305) | loss/loss/loss |
+| frames | native_pipeline_p50_ms | 12.7 (9.66–15.6) | 7.6 (6.8–20.6) | 6.94 (5.39–12.5) | n/a |  |
+| frames | browser_raf_gap_p50_ms | n/a | n/a | n/a | 16.7 (16.7–16.7) |  |
+| frames | cpu_ms | 564 (491–607) | 420 (385–522) | 411 (338–458) | 160 (100–200) | loss/loss/loss |
+| frames | peak_rss | 820 (820–821) | 823 (822–824) | 820 (819–822) | 950 (946–957) | win/win/win |
+| frames | steady_rss | 820 (820–821) | 823 (822–824) | 820 (819–822) | 950 (946–958) | win/win/win |
+| frames | checksum | 11000 | 11000 | 11000 | 11000 |  |
+| compute | wall_ms | 1.5 (1.38–6.86) | 1.72 (1.28–1.86) | 1.69 (1.51–2.35) | 1.2 (1.2–1.2) | loss/loss/loss |
+| compute | cpu_ms | 21.8 (20.5–22.5) | 17.9 (17–21.6) | 15.7 (14.9–16.3) | 100 (80–150) | win/win/win |
+| compute | peak_rss | 12 (11.7–13) | 11.6 (8.58–13) | 11.1 (9.14–15.8) | 944 (935–949) | win/win/win |
+| compute | steady_rss | 16.6 (16.5–16.6) | 18.4 (18.4–18.5) | 16 (16–16.1) | 944 (935–949) | win/win/win |
+| compute | checksum | -362648 | -362648 | -362648 | -362648 |  |
+| memory | wall_ms | 2.75 (2.5–6.56) | 2.68 (1.7–3.54) | 1.57 (1.02–2.28) | 12.6 (11.3–13.5) | win/win/win |
+| memory | cpu_ms | 16.7 (14.4–20.9) | 10.8 (8.81–12.1) | 7.26 (5.86–9.37) | 100 (80–150) | win/win/win |
+| memory | peak_rss | 12.2 (11.5–14.6) | 11.8 (9.34–18.7) | 11.9 (11.1–13.9) | 959 (957–970) | win/win/win |
+| memory | steady_rss | 18.7 (18.7–18.7) | 21.1 (21–21.1) | 18.3 (18.3–18.4) | 959 (954–970) | win/win/win |
+| memory | checksum | 72000 | 72000 | 72000 | 72000 |  |
+| css-list | wall_ms | 1.49 (1.33–2.21) | 1.18 (0.982–1.48) | 1.32 (0.719–3.11) | 6 (5.9–6.3) | win/win/win |
+| css-list | cpu_ms | 13.3 (12–14.5) | 8.22 (8.17–11.1) | 5.39 (4.98–8.72) | 110 (80–130) | win/win/win |
+| css-list | peak_rss | 12.1 (10.8–12.2) | 11.9 (9.55–19.7) | 10.8 (10.7–12.5) | 952 (944–953) | win/win/win |
+| css-list | steady_rss | 17.6 (17.5–17.7) | 20 (20–20) | 17.4 (17.3–17.4) | 952 (944–953) | win/win/win |
+| css-list | checksum | 18000 | 18000 | 18000 | 18000 |  |
+| flex-list | wall_ms | 1.37 (0.581–2.43) | 0.429 (0.312–1.32) | 0.428 (0.27–1.15) | 5.8 (5.3–6.3) | win/win/win |
+| flex-list | cpu_ms | 13 (11.5–17.1) | 8.06 (7.85–10.2) | 6.7 (5.2–7.2) | 90 (80–130) | win/win/win |
+| flex-list | peak_rss | 14.3 (12.1–16.5) | 13.4 (8.33–17) | 11.3 (11.2–13.9) | 941 (940–954) | win/win/win |
+| flex-list | steady_rss | 17.3 (17.2–17.3) | 19.7 (19.6–19.7) | 17 (16.9–17.1) | 941 (940–954) | win/win/win |
+| flex-list | checksum | 7200 | 7200 | 7200 | 7200 |  |
+| events | wall_ms | 0.299 (0.263–0.743) | 0.147 (0.132–0.38) | 0.107 (0.0683–0.173) | 0.2 (0.2–0.4) | overlap/overlap/win |
+| events | cpu_ms | 17.6 (13.3–23.1) | 9.58 (8.12–11.8) | 6.13 (5.77–6.3) | 90 (80–120) | win/win/win |
+| events | peak_rss | 12 (11.4–13.5) | 11.8 (7.64–13.7) | 11.2 (10.8–12.2) | 945 (943–953) | win/win/win |
+| events | steady_rss | 17.6 (17.5–17.6) | 19.8 (19.8–19.8) | 17.1 (17.1–17.1) | 945 (943–952) | win/win/win |
+| events | checksum | 400 | 400 | 400 | 400 |  |
+| table-repaint | wall_ms | 1.74 (1.66–2) | 0.96 (0.895–2.06) | 0.893 (0.68–2.71) | 1.4 (1.2–1.8) | overlap/overlap/overlap |
+| table-repaint | cpu_ms | 320 (305–425) | 269 (250–363) | 259 (247–278) | 110 (90–140) | loss/loss/loss |
+| table-repaint | peak_rss | 816 (566–816) | 819 (263–821) | 816 (451–819) | 946 (944–957) | win/win/win |
+| table-repaint | steady_rss | 817 (522–817) | 821 (819–822) | 819 (817–820) | 946 (944–957) | win/win/win |
+| table-repaint | checksum | 5704 | 5704 | 5704 | 5704 |  |
+| styled-scroll | wall_ms | 1.63 (1.39–2.16) | 1.16 (0.901–1.33) | 0.816 (0.745–1.5) | 5.3 (4.7–6.9) | win/win/win |
+| styled-scroll | cpu_ms | 11.2 (9.21–14.2) | 6.7 (6.08–8.91) | 4.95 (4.46–6) | 120 (100–130) | win/win/win |
+| styled-scroll | peak_rss | 11.9 (11.3–12.2) | 10.5 (8.34–13.2) | 11.3 (10.8–12.3) | 945 (943–955) | win/win/win |
+| styled-scroll | steady_rss | 17.6 (17.5–17.6) | 20 (19.9–20.1) | 17.4 (17.3–17.4) | 944 (940–955) | win/win/win |
+| styled-scroll | checksum | 650115 | 650115 | 650115 | 650115 |  |
+| text-layout | wall_ms | 0.235 (0.2–0.427) | 0.182 (0.135–0.326) | 0.121 (0.111–0.402) | 0.9 (0.7–2.3) | win/win/win |
+| text-layout | cpu_ms | 376 (290–411) | 301 (239–333) | 273 (221–346) | 120 (90–130) | loss/loss/loss |
+| text-layout | peak_rss | 812 (810–816) | 815 (814–816) | 812 (811–814) | 947 (944–950) | win/win/win |
+| text-layout | steady_rss | 812 (811–816) | 816 (815–817) | 813 (811–815) | 947 (943–950) | win/win/win |
+| text-layout | checksum | 34320 | 34320 | 34320 | 34320 |  |
+| md-long-history | wall_ms | 4.79e+04 (4.23e+04–1.11e+05) | 3.08e+04 (2.71e+04–4.11e+04) | 2.26e+04 (2.2e+04–4.55e+04) | 286 (253–288) | loss/loss/loss |
+| md-long-history | build_ms | 4.78e+04 (4.22e+04–1.11e+05) | 3.08e+04 (2.71e+04–4.11e+04) | 2.25e+04 (2.19e+04–4.54e+04) | 283 (251–286) | loss/loss/loss |
+| md-long-history | scroll_ms | 101 (74.4–152) | 53.5 (47.4–64.9) | 43.5 (37.1–90.3) | 2.3 (1.9–2.4) | loss/loss/loss |
+| md-long-history | cpu_ms | 4.6e+04 (4.15e+04–6.27e+04) | 2.95e+04 (2.65e+04–3.68e+04) | 2.18e+04 (2.11e+04–3.14e+04) | 530 (470–630) | loss/loss/loss |
+| md-long-history | peak_rss | 5.01e+03 (3.05e+03–5.53e+03) | 5.47e+03 (5.02e+03–5.56e+03) | 5.21e+03 (4.15e+03–5.77e+03) | 1.32e+03 (1.32e+03–1.32e+03) | loss/loss/loss |
+| md-long-history | steady_rss | 2.62e+03 (1.86e+03–3.42e+03) | 3.19e+03 (2.91e+03–3.45e+03) | 2.7e+03 (1.79e+03–4.91e+03) | 1.32e+03 (1.32e+03–1.32e+03) | loss/loss/loss |
+| md-long-history | checksum | 5.99068e+08 | 5.99068e+08 | 5.99068e+08 | 5.99068e+08 |  |
+| dom-ops | wall_ms | 4.1e+03 (3.29e+03–4.99e+03) | 2.59e+03 (2.35e+03–3.27e+03) | 1.94e+03 (1.64e+03–2.19e+03) | 69.3 (67.1–71.2) | loss/loss/loss |
+| dom-ops | churn_ms | 988 (821–1.35e+03) | 741 (636–931) | 575 (499–665) | 35.7 (33.8–36.6) | loss/loss/loss |
+| dom-ops | shuffle_ms | 490 (372–628) | 278 (260–330) | 163 (132–186) | 3.4 (3.2–4.3) | loss/loss/loss |
+| dom-ops | parse_ms | 110 (96.7–132) | 57.3 (52.3–69.7) | 51.9 (37.7–207) | 1.7 (1.5–2.3) | loss/loss/loss |
+| dom-ops | clone_ms | 183 (126–218) | 76.5 (72–103) | 57.9 (39.1–145) | 2.2 (2.2–2.3) | loss/loss/loss |
+| dom-ops | query_ms | 1.31e+03 (1.04e+03–1.65e+03) | 899 (845–1.18e+03) | 619 (598–786) | 2.8 (2.6–2.9) | loss/loss/loss |
+| dom-ops | classlist_ms | 538 (457–660) | 320 (285–417) | 242 (236–311) | 4.6 (4.2–6.5) | loss/loss/loss |
+| dom-ops | attr_ms | 407 (354–451) | 162 (153–238) | 102 (87.8–119) | 13.3 (13–14.1) | loss/loss/loss |
+| dom-ops | fragment_ms | 23.7 (20–26.2) | 12.5 (11.8–19.8) | 8.18 (6.88–9.52) | 5 (4.5–5.4) | loss/loss/loss |
+| dom-ops | cpu_ms | 4.77e+03 (4.29e+03–5.53e+03) | 3.09e+03 (2.77e+03–3.79e+03) | 2.25e+03 (2.1e+03–2.6e+03) | 210 (190–270) | loss/loss/loss |
+| dom-ops | peak_rss | 1.61e+03 (1.61e+03–1.61e+03) | 1.61e+03 (1.61e+03–1.61e+03) | 1.61e+03 (1.6e+03–1.62e+03) | 1.01e+03 (998–1.01e+03) | loss/loss/loss |
+| dom-ops | steady_rss | 1.61e+03 (1.61e+03–1.61e+03) | 1.61e+03 (1.61e+03–1.61e+03) | 1e+03 (1e+03–1.62e+03) | 1.01e+03 (998–1.01e+03) | loss/loss/overlap |
+| dom-ops | checksum | 5.60427e+08 | 5.60427e+08 | 5.60427e+08 | 5.60427e+08 |  |
+| css-ops | wall_ms | 1.12e+04 (1.03e+04–1.36e+04) | 9.63e+03 (8.38e+03–1.16e+04) | 7.31e+03 (6.8e+03–7.72e+03) | 76.1 (72.2–79.6) | mismatch/mismatch/mismatch |
+| css-ops | match_ms | 291 (268–335) | 199 (196–358) | 178 (165–197) | 2.7 (2.3–3.1) | mismatch/mismatch/mismatch |
+| css-ops | toggle_ms | 5.54e+03 (4.96e+03–6.31e+03) | 4.71e+03 (3.82e+03–5.95e+03) | 3.57e+03 (3.33e+03–3.99e+03) | 35 (33.7–36.8) | mismatch/mismatch/mismatch |
+| css-ops | computed_ms | 138 (128–171) | 84.6 (71–103) | 70 (55.4–190) | 4.1 (3.7–4.6) | mismatch/mismatch/mismatch |
+| css-ops | vars_ms | 5.22e+03 (4.91e+03–6.82e+03) | 4.74e+03 (4.29e+03–5.17e+03) | 3.39e+03 (3.22e+03–3.61e+03) | 33.1 (31.6–35.7) | mismatch/mismatch/mismatch |
+| css-ops | media_ms | 6.04 (5.17–11) | 5.11 (4.01–5.84) | 3.86 (3.19–4.01) | 0.2 (0.2–0.3) | mismatch/mismatch/mismatch |
+| css-ops | cpu_ms | 1.09e+04 (1.01e+04–1.27e+04) | 9.17e+03 (8.23e+03–1.06e+04) | 6.97e+03 (6.65e+03–7.26e+03) | 220 (170–260) | mismatch/mismatch/mismatch |
+| css-ops | peak_rss | 44.6 (41.1–47.2) | 49.2 (43.5–49.5) | 46.8 (40.8–46.9) | 963 (959–970) | mismatch/mismatch/mismatch |
+| css-ops | steady_rss | 40.8 (40.6–47) | 43.4 (42.3–49.8) | 47 (40.4–47.2) | 963 (959–970) | mismatch/mismatch/mismatch |
+| css-ops | checksum | 5.30668e+08 | 5.30668e+08 | 5.30668e+08 | 7.38508e+08 |  |
+| animation | wall_ms | 1.6e+03 (1.3e+03–1.94e+03) | 972 (753–1.08e+03) | 701 (662–729) | 175 (157–196) | mismatch/mismatch/mismatch |
+| animation | frame_p50_ms | 25.4 (20.8–30.4) | 15.2 (12–17.2) | 11.2 (9.44–11.7) | 2.9 (2.6–3.3) | mismatch/mismatch/mismatch |
+| animation | frame_p95_ms | 35 (28.5–44.3) | 20.8 (17.5–24.7) | 16.6 (15–18.8) | 3.5 (3.2–3.9) | mismatch/mismatch/mismatch |
+| animation | cpu_ms | 2.54e+03 (2.17e+03–2.84e+03) | 1.69e+03 (1.35e+03–1.8e+03) | 1.33e+03 (1.24e+03–1.44e+03) | 540 (500–560) | mismatch/mismatch/mismatch |
+| animation | peak_rss | 841 (840–843) | 844 (842–846) | 841 (841–842) | 1.09e+03 (1.09e+03–1.1e+03) | mismatch/mismatch/mismatch |
+| animation | steady_rss | 841 (840–844) | 845 (843–846) | 842 (842–843) | 1.09e+03 (1.09e+03–1.1e+03) | mismatch/mismatch/mismatch |
+| animation | checksum | n/a | n/a | n/a | 6.47715e+08 |  |
+| event-flood | wall_ms | 4.06e+03 (3.16e+03–4.63e+03) | 2.31e+03 (1.85e+03–2.52e+03) | 1.33e+03 (1.06e+03–1.59e+03) | 95.6 (94.5–116) | loss/loss/loss |
+| event-flood | listen_ms | 131 (105–158) | 59.5 (52–79.3) | 34.3 (29.1–45.9) | 2.7 (2.6–3) | loss/loss/loss |
+| event-flood | bubble_ms | 1.06e+03 (892–1.31e+03) | 663 (568–818) | 385 (296–405) | 11.1 (10.5–13.7) | loss/loss/loss |
+| event-flood | delegate_ms | 281 (206–358) | 153 (118–184) | 84.2 (68.4–97.7) | 4.7 (4.5–5.8) | loss/loss/loss |
+| event-flood | dispatch_ms | 222 (153–257) | 99.1 (75.8–110) | 51.8 (36.6–63.1) | 40 (39–50.2) | loss/loss/overlap |
+| event-flood | churn_ms | 194 (150–290) | 94.3 (81.5–121) | 60.7 (52.7–79) | 3.4 (3.3–6.7) | loss/loss/loss |
+| event-flood | flood_ms | 2.14e+03 (1.66e+03–2.33e+03) | 1.18e+03 (932–1.23e+03) | 711 (576–925) | 32.7 (32.3–38.6) | loss/loss/loss |
+| event-flood | cpu_ms | 3.87e+03 (3.15e+03–4.31e+03) | 2.13e+03 (1.82e+03–2.36e+03) | 1.29e+03 (1.06e+03–1.46e+03) | 230 (200–280) | loss/loss/loss |
+| event-flood | peak_rss | 596 (596–597) | 599 (592–600) | 593 (590–596) | 1.04e+03 (1.04e+03–1.05e+03) | win/win/win |
+| event-flood | steady_rss | 596 (596–597) | 599 (598–600) | 596 (595–596) | 1.04e+03 (1.04e+03–1.05e+03) | win/win/win |
+| event-flood | checksum | 2.42083e+08 | 2.42083e+08 | 2.42083e+08 | 2.42083e+08 |  |
+
+`md-stream-*` are not in this run. After the `scrollHeight` fix each chunk
+triggers a full component-tree and Taffy rebuild, about 1.1 s per chunk on the
+speed profile with the 200-message history, so 5000 chunks exceed the
+timeout. Chromium streams all 5000 chunks in about 340 ms.
+
+Font-using workloads (`startup`, `layout-css`, `frames`, `table-repaint`,
+`text-layout`) show about 810 MB native RSS and 200–300 ms CPU on this host.
+Most of it is loading the macOS system font database.
+
 ## Method
 
 Both engines execute the same script bytes. The harness only sets

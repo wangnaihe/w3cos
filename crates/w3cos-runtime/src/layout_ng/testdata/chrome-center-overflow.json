@@ -1,0 +1,95 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "fl-center-overflow",
+   "html": "<div id=r style='width:300px'><div id=a style='float:left;display:flex;align-items:center;width:70px;height:70px;overflow:hidden'><div id=b style='height:10px;border:solid;border-width:50px 2px;flex:3'></div><div id=c style='height:20px;flex:1'></div></div></div>",
+   "rects": {
+    "r": [
+     0,
+     13,
+     300,
+     0
+    ],
+    "a": [
+     0,
+     13,
+     70,
+     70
+    ],
+    "b": [
+     0,
+     -7,
+     53.5,
+     110
+    ],
+    "c": [
+     53.5,
+     38,
+     16.5,
+     20
+    ]
+   }
+  },
+  {
+   "name": "center-overflow-visible",
+   "html": "<div id=r style='width:300px'><div id=a style='display:flex;align-items:center;width:70px;height:70px'><div id=b style='height:10px;border:solid;border-width:50px 2px;flex:3'></div><div id=c style='height:20px;flex:1'></div></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     300,
+     70
+    ],
+    "a": [
+     0,
+     0,
+     70,
+     70
+    ],
+    "b": [
+     0,
+     -20,
+     53.5,
+     110
+    ],
+    "c": [
+     53.5,
+     25,
+     16.5,
+     20
+    ]
+   }
+  },
+  {
+   "name": "end-overflow",
+   "html": "<div id=r style='width:300px'><div id=a style='display:flex;align-items:flex-end;width:70px;height:70px'><div id=b style='height:10px;border:solid;border-width:50px 2px;flex:3'></div><div id=c style='height:20px;flex:1'></div></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     300,
+     70
+    ],
+    "a": [
+     0,
+     0,
+     70,
+     70
+    ],
+    "b": [
+     0,
+     -40,
+     53.5,
+     110
+    ],
+    "c": [
+     53.5,
+     50,
+     16.5,
+     20
+    ]
+   }
+  }
+ ]
+}

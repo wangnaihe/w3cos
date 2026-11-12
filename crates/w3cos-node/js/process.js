@@ -85,10 +85,40 @@ proc.abort = function abort() {
   proc.exit(134);
 };
 
-proc.kill = function kill() {
-  const error = new Error('process.kill() is not supported');
-  error.code = 'ERR_W3COS_UNSUPPORTED';
-  throw error;
+// process.kill(pid[, signal]): signal 0 probes liveness (Code-OSS utility
+// processes poll their parent this way and exit when it throws).
+proc.kill = function kill(pid, signal) {
+  if (typeof pid !== 'number' && typeof pid !== 'string' || pid != (pid | 0)) {
+    const error = new TypeError('The "pid" argument must be of type number. Received ' +
+      (pid === null ? 'null' : typeof pid));
+    error.code = 'ERR_INVALID_ARG_TYPE';
+    throw error;
+  }
+  let number;
+  if (signal === undefined || signal === null) {
+    number = 15;
+  } else if (typeof signal === 'number') {
+    number = signal;
+  } else {
+    number = require('os').constants.signals[String(signal)];
+    if (number === undefined) {
+      const error = new TypeError('Unknown signal: ' + signal);
+      error.code = 'ERR_UNKNOWN_SIGNAL';
+      throw error;
+    }
+  }
+  const failure = nodeHost !== null && typeof nodeHost.processKill === 'function'
+    ? nodeHost.processKill(pid | 0, number)
+    : 'ENOSYS';
+  if (failure !== null) {
+    const errnos = { EPERM: -1, ESRCH: -3, EINVAL: -22, ENOSYS: -38 };
+    const error = new Error('kill ' + failure);
+    error.errno = errnos[failure];
+    error.code = failure;
+    error.syscall = 'kill';
+    throw error;
+  }
+  return true;
 };
 
 // nextTick callbacks run before promise jobs queued after them; a dedicated
@@ -154,6 +184,37 @@ proc.memoryUsage = function memoryUsage() {
 proc.memoryUsage.rss = function rss() { return 0; };
 proc.cpuUsage = function cpuUsage() { return { user: 0, system: 0 }; };
 proc.resourceUsage = function resourceUsage() { return {}; };
+
+// Electron's process extensions (main, renderer preload, utility). Code-OSS
+// reads them for startup telemetry (timerService `getProcessMemoryInfo()
+// .residentSet`). Like `memoryUsage`, the runtime reports no live numbers
+// yet, but the shapes match Electron so callers do not throw. Sizes are KB.
+const creationTime = Date.now();
+proc.getProcessMemoryInfo = function getProcessMemoryInfo() {
+  return Promise.resolve({ residentSet: 0, private: 0, shared: 0 });
+};
+proc.getSystemMemoryInfo = function getSystemMemoryInfo() {
+  return { total: 0, free: 0, swapTotal: 0, swapFree: 0 };
+};
+proc.getHeapStatistics = function getHeapStatistics() {
+  return {
+    totalHeapSize: 0, totalHeapSizeExecutable: 0, totalPhysicalSize: 0, totalAvailableSize: 0,
+    usedHeapSize: 0, heapSizeLimit: 0, mallocedMemory: 0, peakMallocedMemory: 0, doesZapGarbage: false,
+  };
+};
+proc.getBlinkMemoryInfo = function getBlinkMemoryInfo() {
+  return { allocated: 0, total: 0 };
+};
+proc.getCPUUsage = function getCPUUsage() {
+  return { percentCPUUsage: 0, cumulativeCPUUsage: 0, idleWakeupsPerSecond: 0 };
+};
+proc.getIOCounters = function getIOCounters() {
+  return {
+    readOperationCount: 0, writeOperationCount: 0, otherOperationCount: 0,
+    readTransferCount: 0, writeTransferCount: 0, otherTransferCount: 0,
+  };
+};
+proc.getCreationTime = function getCreationTime() { return creationTime; };
 
 proc.emitWarning = function emitWarning(warning, type, code) {
   if (typeof type === 'object' && type !== null) {

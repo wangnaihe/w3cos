@@ -6,12 +6,40 @@ worker_realm_source="crates/w3cos-runtime/src/worker_realm.rs"
 allowed_consumers="$(printf '%s\n' "$runtime_source" "$worker_realm_source" | sort)"
 
 ordinary_tree="$(cargo tree -p w3cos-runtime --no-default-features -e normal)"
-for forbidden in w3cos-compiler w3cos-vm w3cos-ir swc_; do
+for forbidden in w3cos-compiler w3cos-vm w3cos-ir swc_ wuff brotli; do
     if grep -q "$forbidden" <<<"$ordinary_tree"; then
         echo "ordinary AOT runtime unexpectedly contains $forbidden" >&2
         exit 1
     fi
 done
+
+woff_tree="$(
+    cargo tree \
+        -p w3cos-runtime \
+        --no-default-features \
+        --features woff \
+        -e normal
+)"
+if ! grep -q 'wuff' <<<"$woff_tree"; then
+    echo "standalone WOFF runtime is missing wuff" >&2
+    exit 1
+fi
+for forbidden in w3cos-compiler w3cos-vm w3cos-ir; do
+    if grep -q "$forbidden" <<<"$woff_tree"; then
+        echo "standalone WOFF runtime unexpectedly contains $forbidden" >&2
+        exit 1
+    fi
+done
+# `w3cos-core` always depends on `base64`, so package presence cannot distinguish
+# standalone WOFF from `dynamic-js`. The compiler/VM/IR checks above enforce the
+# execution boundary; the tests below exercise both the decoder error path and
+# real WOFF/WOFF2 success paths with only that feature enabled.
+cargo test \
+    -p w3cos-runtime \
+    --no-default-features \
+    --features woff \
+    woff \
+    --lib
 
 dynamic_tree="$(
     cargo tree \

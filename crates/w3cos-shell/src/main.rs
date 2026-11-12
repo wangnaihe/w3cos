@@ -3110,7 +3110,7 @@ fn apply_screen_override() {
         }
         Some("devices") => {
             present_settings(4, 0);
-            handoff::demo_pending();
+            handoff::demo_pending_signed();
         }
         Some("devices-sync") => {
             present_settings(4, 0);
@@ -3526,7 +3526,7 @@ fn defocus_node(node: &mut Component) {
 fn mark_dialog(card: &mut Component, role: &str) {
     card.style
         .custom_properties
-        .get_or_insert_with(HashMap::new)
+        .get_or_insert_with(Default::default)
         .insert("--w3cos-dialog".to_string(), role.to_string());
 }
 
@@ -3540,7 +3540,7 @@ fn permission_layer(card: Component) -> Component {
 
 fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
     let (width, height) = state::shell_viewport();
-    let scrim_h = if fill || posture() == Posture::Phone {
+    let scrim_h = if fill || narrow_sheet() {
         height
     } else {
         (height - 68.0).max(0.0)
@@ -3563,22 +3563,37 @@ fn place_modal(mut card: Component, fill: bool, phone_sheet: f32) -> Component {
     scrim.on_click = invoke(OP_SCRIM);
     card.style.position = Position::Absolute;
     card.style.z_index = CHROME_Z + 3;
+    // Border box, so padding and the safe area stay inside the viewport
+    // instead of pushing the card past the right edge.
+    card.style.box_sizing = BoxSizing::BorderBox;
+    card.style.min_width = Dimension::Px(0.0);
+    card.style.overflow = Overflow::Auto;
     if fill {
         card.style.left = Dimension::Px(0.0);
         card.style.top = Dimension::Px(0.0);
         card.style.width = Dimension::Px(width);
+        card.style.max_width = Dimension::Px(width);
         card.style.height = Dimension::Px(height);
-    } else if posture() == Posture::Phone {
-        let sheet_h = phone_sheet.min(height - 24.0);
+    } else if narrow_sheet() {
+        let sheet_h = phone_sheet.max(height * 0.7).min(height);
         card.style.left = Dimension::Px(0.0);
         card.style.width = Dimension::Px(width);
+        card.style.max_width = Dimension::Px(width);
         card.style.height = Dimension::Px(sheet_h);
+        card.style.max_height = Dimension::Px(height);
         card.style.top = Dimension::Px((height - sheet_h).max(0.0));
+        card.style.border_radius = 22.0;
+        card.style.border_top_left_radius = Some(22.0);
+        card.style.border_top_right_radius = Some(22.0);
+        card.style.border_bottom_left_radius = Some(0.0);
+        card.style.border_bottom_right_radius = Some(0.0);
     } else {
-        let card_w = 440.0_f32.min(width - 32.0);
+        let card_w = 440.0_f32.min((width - 32.0).max(280.0));
         card.style.width = Dimension::Px(card_w);
+        card.style.max_width = Dimension::Px(card_w);
         card.style.left = Dimension::Px(((width - card_w) / 2.0).max(16.0));
         card.style.top = Dimension::Px((height * 0.22).max(32.0));
+        card.style.max_height = Dimension::Px((height - 48.0).max(240.0));
     }
     Component::column(
         Style {
@@ -3615,17 +3630,24 @@ fn place_receipts(mut panel: Component) -> Component {
     let (width, height) = state::shell_viewport();
     panel.style.position = Position::Absolute;
     panel.style.z_index = CHROME_Z + 1;
+    panel.style.box_sizing = BoxSizing::BorderBox;
+    panel.style.min_width = Dimension::Px(0.0);
     if posture() == Posture::Phone {
         let top = 56.0_f32.min((height * 0.22).max(48.0));
+        panel.style.box_sizing = BoxSizing::BorderBox;
+        panel.style.min_width = Dimension::Px(0.0);
         panel.style.left = Dimension::Px(0.0);
         panel.style.top = Dimension::Px(top);
         panel.style.width = Dimension::Px(width);
+        panel.style.max_width = Dimension::Px(width);
         panel.style.height = Dimension::Px((height - top).max(240.0));
         panel.style.border_radius = 22.0;
         panel.style.border_top_left_radius = Some(22.0);
         panel.style.border_top_right_radius = Some(22.0);
         panel.style.border_bottom_left_radius = Some(0.0);
         panel.style.border_bottom_right_radius = Some(0.0);
+        panel.style.padding = sheet_padding(16.0);
+        fit_sheet_text(&mut panel);
         return panel;
     }
     let panel_w = 400.0_f32.min((width - 48.0).max(280.0));
@@ -4328,7 +4350,7 @@ fn build_intent_panel() -> Component {
         min_height: Dimension::Px(go),
         ..Style::default()
     };
-    input_style.custom_properties = Some(HashMap::from([
+    input_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         ("--w3cos-intent-submit".to_string(), OP_PROPOSE.to_string()),
         ("--w3cos-ime".to_string(), "intent".to_string()),
     ]));
@@ -4856,26 +4878,178 @@ fn build_tablet_row() -> Component {
     )
 }
 
+/// Phone, and any width under the same 600px break. One layout, not a second skin.
+fn narrow_sheet() -> bool {
+    state::shell_viewport().0 < 600.0
+}
+
+/// `max(base, env(safe-area-inset-*))`. Zero insets leave the base padding.
+fn safe_edge(base: f32, edge: SafeAreaEdge) -> Spacing {
+    Spacing::Maximum {
+        px: base,
+        safe_area: edge,
+    }
+}
+
+/// Bottom sheets keep a fixed top inset. The home indicator and side notches
+/// grow the other edges so labels stay in the safe area.
+fn sheet_padding(base: f32) -> Edges {
+    if narrow_sheet() {
+        Edges {
+            top: Spacing::Px(base),
+            right: safe_edge(base, SafeAreaEdge::Right),
+            bottom: safe_edge(base.max(20.0), SafeAreaEdge::Bottom),
+            left: safe_edge(base, SafeAreaEdge::Left),
+        }
+    } else {
+        Edges::all(base)
+    }
+}
+
+fn fit_sheet_text(node: &mut Component) {
+    let pill = node.style.border_radius >= 100.0;
+    if matches!(node.kind, ComponentKind::Text { .. }) && !pill {
+        node.style.min_width = Dimension::Px(0.0);
+        node.style.max_width = Dimension::Percent(100.0);
+        node.style.word_break = WordBreak::BreakWord;
+        if !matches!(
+            node.style.white_space,
+            WhiteSpace::NoWrap | WhiteSpace::Pre | WhiteSpace::PreWrap
+        ) {
+            node.style.white_space = WhiteSpace::Normal;
+        }
+    }
+    if matches!(node.kind, ComponentKind::Row | ComponentKind::Column) {
+        node.style.min_width = Dimension::Px(0.0);
+        if matches!(node.style.width, Dimension::Auto) {
+            node.style.max_width = Dimension::Percent(100.0);
+        }
+    }
+    if matches!(node.kind, ComponentKind::TextInput { .. }) {
+        node.style.min_width = Dimension::Px(0.0);
+        node.style.max_width = Dimension::Percent(100.0);
+        if matches!(node.style.width, Dimension::Auto) {
+            node.style.width = Dimension::Percent(100.0);
+        }
+    }
+    if matches!(node.kind, ComponentKind::Button { .. })
+        && matches!(node.style.width, Dimension::Auto)
+    {
+        // Desktop/tablet cards are 440px. A wide Latin label's min-content can
+        // exceed half of that; without min-width:0 FlexEnd keeps two
+        // unshrinkable buttons and overflows the viewport (sandbox-en@768).
+        node.style.min_width = Dimension::Px(0.0);
+        if narrow_sheet() {
+            node.style.flex_grow = 0.0;
+            node.style.width = Dimension::Percent(100.0);
+            node.style.max_width = Dimension::Percent(100.0);
+        }
+    }
+    // A percentage width is the border box. Content-box padding would push
+    // the control past the sheet's right edge.
+    if matches!(
+        node.kind,
+        ComponentKind::Button { .. } | ComponentKind::TextInput { .. }
+    ) && matches!(node.style.width, Dimension::Percent(_))
+    {
+        node.style.box_sizing = BoxSizing::BorderBox;
+        node.style.min_width = Dimension::Px(0.0);
+        if matches!(node.style.max_width, Dimension::Auto) {
+            node.style.max_width = Dimension::Percent(100.0);
+        }
+    }
+    for child in &mut node.children {
+        fit_sheet_text(child);
+    }
+}
+
+/// Secondary action first, primary last. Narrow widths stack that order so
+/// the primary sits at the bottom; wider widths keep it on the right.
+fn sheet_actions(children: Vec<Component>) -> Component {
+    let narrow = narrow_sheet();
+    let children = children
+        .into_iter()
+        .map(|mut child| {
+            if narrow {
+                child.style.flex_grow = 0.0;
+                child.style.flex_shrink = 0.0;
+                child.style.width = Dimension::Percent(100.0);
+                child.style.min_width = Dimension::Px(0.0);
+                child.style.max_width = Dimension::Percent(100.0);
+                child.style.align_self = AlignSelf::Stretch;
+                let height = touch_min().max(48.0);
+                child.style.height = Dimension::Px(height);
+                child.style.min_height = Dimension::Px(height);
+            }
+            child
+        })
+        .collect();
+    if narrow {
+        Component::column(
+            Style {
+                gap: 8.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                align_items: AlignItems::Stretch,
+                ..Style::default()
+            },
+            children,
+        )
+    } else {
+        // Keep the pair on one row when the labels fit. Long English
+        // actions such as "Allow reading files" must wrap instead of
+        // overflowing past the left edge of a FlexEnd row.
+        let children = children
+            .into_iter()
+            .map(|mut child| {
+                child.style.min_width = Dimension::Px(0.0);
+                child.style.max_width = Dimension::Percent(100.0);
+                child.style.flex_shrink = 0.0;
+                child
+            })
+            .collect();
+        Component::row(
+            Style {
+                gap: 8.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                flex_wrap: FlexWrap::Wrap,
+                justify_content: JustifyContent::FlexEnd,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            children,
+        )
+    }
+}
+
 fn dialog_shell(children: Vec<Component>) -> Component {
-    let phone = posture() == Posture::Phone;
-    Component::column(
+    let narrow = narrow_sheet();
+    let mut card = Component::column(
         Style {
             gap: 10.0,
-            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
-            background: if phone {
+            width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
+            max_width: Dimension::Percent(100.0),
+            box_sizing: BoxSizing::BorderBox,
+            align_items: AlignItems::Stretch,
+            padding: sheet_padding(if narrow { 16.0 } else { 20.0 }),
+            background: if narrow {
                 Color::from_hex("#1c2631")
             } else {
                 sheet_fill()
             },
-            border_width: if phone { 0.0 } else { 1.0 },
+            border_width: if narrow { 0.0 } else { 1.0 },
             border_color: line_strong(),
-            border_radius: if phone { 22.0 } else { 16.0 },
+            border_radius: if narrow { 22.0 } else { 16.0 },
             box_shadow: Some(shadow_lg()),
             box_shadows: vec![inset_highlight(15)],
             ..Style::default()
         },
         children,
-    )
+    );
+    fit_sheet_text(&mut card);
+    card
 }
 
 fn sheet_button(label: impl Into<String>, code: u8, kind: SheetKind) -> Component {
@@ -4926,7 +5100,7 @@ fn mark_initial_focus(button: &mut Component) {
     let props = button
         .style
         .custom_properties
-        .get_or_insert_with(HashMap::new);
+        .get_or_insert_with(Default::default);
     props.insert("--w3cos-initial-focus".to_string(), "1".to_string());
 }
 
@@ -4971,14 +5145,7 @@ fn build_locale_confirm() -> Component {
         sheet_button(locale::t("lock-first"), OP_UNLOCK, SheetKind::Primary)
     };
     mark_initial_focus(&mut cancel);
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![cancel, accept],
-    ));
+    rows.push(sheet_actions(vec![cancel, accept]));
     rows.push(Component::text(
         locale::t("confirm-footnote"),
         Style {
@@ -4987,7 +5154,9 @@ fn build_locale_confirm() -> Component {
             ..Style::default()
         },
     ));
-    dialog_shell(rows)
+    let mut card = dialog_shell(rows);
+    mark_dialog(&mut card, "locale");
+    card
 }
 
 fn build_confirm_dialog() -> Component {
@@ -5036,14 +5205,7 @@ fn build_confirm_dialog() -> Component {
     } else if unlocked {
         mark_initial_focus(&mut accept);
     }
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![cancel, accept],
-    ));
+    rows.push(sheet_actions(vec![cancel, accept]));
     rows.push(Component::text(
         locale::t("confirm-footnote"),
         Style {
@@ -5129,14 +5291,7 @@ fn build_permission_sheet() -> Component {
     if unlocked && focus_kind("deny") == "deny" {
         mark_initial_focus(&mut deny);
     }
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![deny, once],
-    ));
+    rows.push(sheet_actions(vec![deny, once]));
     rows.push(Component::text(
         locale::t("perm-footnote"),
         Style {
@@ -5234,13 +5389,7 @@ fn build_sandbox_sheet() -> Component {
     } else {
         disabled_choice(locale::t(net_key))
     };
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            ..Style::default()
-        },
-        vec![fs, net],
-    ));
+    rows.push(sheet_actions(vec![fs, net]));
     let mut deny = if unlocked {
         sheet_button(locale::t("sandbox-deny"), OP_PERM_DENY, SheetKind::Danger)
     } else {
@@ -5254,14 +5403,7 @@ fn build_sandbox_sheet() -> Component {
     if unlocked {
         mark_initial_focus(&mut deny);
     }
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![deny, once],
-    ));
+    rows.push(sheet_actions(vec![deny, once]));
     rows.push(Component::text(
         locale::t("sandbox-footnote"),
         Style {
@@ -5360,14 +5502,7 @@ fn build_chain_sheet() -> Component {
     if unlocked {
         mark_initial_focus(&mut deny);
     }
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![deny, once],
-    ));
+    rows.push(sheet_actions(vec![deny, once]));
     rows.push(Component::text(
         locale::t("chain-footnote"),
         Style {
@@ -5467,14 +5602,7 @@ fn build_sign_sheet() -> Component {
     if unlocked && focus_kind("deny") == "deny" {
         mark_initial_focus(&mut deny);
     }
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![deny, once],
-    ));
+    rows.push(sheet_actions(vec![deny, once]));
     rows.push(Component::text(
         locale::t("sign-footnote"),
         Style {
@@ -5579,14 +5707,7 @@ fn build_broadcast_sheet() -> Component {
     if unlocked {
         mark_initial_focus(&mut deny);
     }
-    rows.push(Component::row(
-        Style {
-            gap: 8.0,
-            justify_content: JustifyContent::FlexEnd,
-            ..Style::default()
-        },
-        vec![deny, once],
-    ));
+    rows.push(sheet_actions(vec![deny, once]));
     rows.push(Component::text(
         locale::t("broadcast-footnote"),
         Style {
@@ -5601,28 +5722,45 @@ fn build_broadcast_sheet() -> Component {
 }
 
 fn permission_shell(children: Vec<Component>) -> Component {
-    let phone = posture() == Posture::Phone;
-    Component::column(
+    let narrow = narrow_sheet();
+    let mut card = Component::column(
         Style {
             gap: 10.0,
-            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
+            max_width: Dimension::Percent(100.0),
+            box_sizing: BoxSizing::BorderBox,
+            align_items: AlignItems::Stretch,
+            padding: sheet_padding(if narrow { 16.0 } else { 20.0 }),
             background: Color::from_hex("#241c14"),
             border_width: 1.0,
             border_color: Color::from_hex("#e2a45c"),
-            border_radius: if phone { 22.0 } else { 16.0 },
+            border_radius: if narrow { 22.0 } else { 16.0 },
             box_shadow: Some(shadow_lg()),
             ..Style::default()
         },
         children,
-    )
+    );
+    fit_sheet_text(&mut card);
+    card
 }
 
 fn build_lock_screen() -> Component {
     let subject = truncate_middle(&current_subject(), 28);
     let (width, _) = state::shell_viewport();
-    let card_w = 420.0_f32.min((width - 32.0).max(280.0));
+    let narrow = narrow_sheet();
+    let card_w = if narrow {
+        width
+    } else {
+        420.0_f32.min((width - 32.0).max(280.0))
+    };
+    let field_w = if narrow {
+        Dimension::Percent(100.0)
+    } else {
+        Dimension::Px(card_w - 56.0)
+    };
     let mut field_style = Style {
-        width: Dimension::Px(card_w - 56.0),
+        width: field_w,
         font_size: 15.0,
         color: Color::from_hex("#1a2836"),
         background: Color::from_hex("#f4f7fb"),
@@ -5630,7 +5768,7 @@ fn build_lock_screen() -> Component {
         padding: Edges::xy(12.0, 10.0),
         ..Style::default()
     };
-    field_style.custom_properties = Some(HashMap::from([
+    field_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         ("--w3cos-intent-submit".to_string(), OP_UNLOCK.to_string()),
         ("--w3cos-ime".to_string(), "secure".to_string()),
     ]));
@@ -5644,7 +5782,13 @@ fn build_lock_screen() -> Component {
         code: OP_UNLOCK,
         input_placeholder: locale::t("lock-passphrase"),
     };
-    unlock.style.width = Dimension::Px(card_w - 56.0);
+    unlock.style.width = if narrow {
+        Dimension::Percent(100.0)
+    } else {
+        Dimension::Px(card_w - 56.0)
+    };
+    unlock.style.min_width = Dimension::Px(0.0);
+    unlock.style.max_width = Dimension::Percent(100.0);
     unlock.style.height = Dimension::Px(if state::pointer_is_coarse() {
         48.0
     } else {
@@ -5656,6 +5800,105 @@ fn build_lock_screen() -> Component {
     } else {
         0.0
     };
+    let mut card = Component::column(
+        Style {
+            width: if narrow {
+                Dimension::Percent(100.0)
+            } else {
+                Dimension::Px(card_w)
+            },
+            max_width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
+            box_sizing: if narrow {
+                BoxSizing::BorderBox
+            } else {
+                BoxSizing::ContentBox
+            },
+            padding: if narrow {
+                sheet_padding(20.0)
+            } else {
+                Edges::all(28.0)
+            },
+            gap: 8.0,
+            align_items: if narrow {
+                AlignItems::Stretch
+            } else {
+                AlignItems::Center
+            },
+            background: sheet_fill(),
+            border_width: 1.0,
+            border_color: line_strong(),
+            border_radius: 16.0,
+            box_shadow: Some(shadow_lg()),
+            box_shadows: vec![inset_highlight(15)],
+            ..Style::default()
+        },
+        vec![
+            Component::column(
+                Style {
+                    width: Dimension::Px(64.0),
+                    height: Dimension::Px(64.0),
+                    border_radius: 20.0,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    background: Color::rgba(224, 122, 120, 31),
+                    border_width: 1.0,
+                    border_color: Color::rgba(224, 122, 120, 71),
+                    ..Style::default()
+                },
+                vec![Component::svg_document(
+                    glyph_svg("lock", "#ffd5d4"),
+                    24,
+                    24,
+                    Style {
+                        width: Dimension::Px(28.0),
+                        height: Dimension::Px(28.0),
+                        ..Style::default()
+                    },
+                )],
+            ),
+            Component::text(
+                locale::t("locked"),
+                Style {
+                    font_size: 32.0,
+                    font_weight: 650,
+                    color: ink_token(),
+                    text_align: TextAlign::Center,
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                subject,
+                Style {
+                    font_size: 12.0,
+                    color: muted_token(),
+                    text_align: TextAlign::Center,
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                locale::t("lock-body"),
+                Style {
+                    font_size: 13.0,
+                    color: muted_token(),
+                    text_align: TextAlign::Center,
+                    ..Style::default()
+                },
+            ),
+            passphrase,
+            unlock,
+            Component::text(
+                locale::t("lock-footnote"),
+                Style {
+                    font_size: 12.0,
+                    color: faint_token(),
+                    text_align: TextAlign::Center,
+                    ..Style::default()
+                },
+            ),
+        ],
+    );
+    fit_sheet_text(&mut card);
     Component::column(
         Style {
             width: Dimension::Vw(100.0),
@@ -5672,85 +5915,7 @@ fn build_lock_screen() -> Component {
             },
             ..Style::default()
         },
-        vec![Component::column(
-            Style {
-                width: Dimension::Px(card_w),
-                padding: Edges::all(28.0),
-                gap: 8.0,
-                align_items: AlignItems::Center,
-                background: sheet_fill(),
-                border_width: 1.0,
-                border_color: line_strong(),
-                border_radius: 16.0,
-                box_shadow: Some(shadow_lg()),
-                box_shadows: vec![inset_highlight(15)],
-                ..Style::default()
-            },
-            vec![
-                Component::column(
-                    Style {
-                        width: Dimension::Px(64.0),
-                        height: Dimension::Px(64.0),
-                        border_radius: 20.0,
-                        align_items: AlignItems::Center,
-                        justify_content: JustifyContent::Center,
-                        background: Color::rgba(224, 122, 120, 31),
-                        border_width: 1.0,
-                        border_color: Color::rgba(224, 122, 120, 71),
-                        ..Style::default()
-                    },
-                    vec![Component::svg_document(
-                        glyph_svg("lock", "#ffd5d4"),
-                        24,
-                        24,
-                        Style {
-                            width: Dimension::Px(28.0),
-                            height: Dimension::Px(28.0),
-                            ..Style::default()
-                        },
-                    )],
-                ),
-                Component::text(
-                    locale::t("locked"),
-                    Style {
-                        font_size: 32.0,
-                        font_weight: 650,
-                        color: ink_token(),
-                        text_align: TextAlign::Center,
-                        ..Style::default()
-                    },
-                ),
-                Component::text(
-                    subject,
-                    Style {
-                        font_size: 12.0,
-                        color: muted_token(),
-                        text_align: TextAlign::Center,
-                        ..Style::default()
-                    },
-                ),
-                Component::text(
-                    locale::t("lock-body"),
-                    Style {
-                        font_size: 13.0,
-                        color: muted_token(),
-                        text_align: TextAlign::Center,
-                        ..Style::default()
-                    },
-                ),
-                passphrase,
-                unlock,
-                Component::text(
-                    locale::t("lock-footnote"),
-                    Style {
-                        font_size: 12.0,
-                        color: faint_token(),
-                        text_align: TextAlign::Center,
-                        ..Style::default()
-                    },
-                ),
-            ],
-        )],
+        vec![card],
     )
 }
 
@@ -5790,7 +5955,7 @@ fn notice_row(notice: &ShellNotice) -> Component {
         lines,
     );
     if !notice.draft.is_empty() {
-        row.style.custom_properties = Some(HashMap::from([(
+        row.style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-draft".to_string(),
             notice.draft.clone(),
         )]));
@@ -5813,6 +5978,8 @@ fn build_notify_panel() -> Component {
             align_items: AlignItems::Center,
             justify_content: JustifyContent::SpaceBetween,
             gap: 8.0,
+            width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
             ..Style::default()
         },
         vec![
@@ -5823,6 +5990,10 @@ fn build_notify_panel() -> Component {
                     font_weight: 700,
                     color: ink(),
                     flex_grow: 1.0,
+                    flex_shrink: 1.0,
+                    min_width: Dimension::Px(0.0),
+                    max_width: Dimension::Percent(100.0),
+                    word_break: WordBreak::BreakWord,
                     ..Style::default()
                 },
             ),
@@ -5845,15 +6016,23 @@ fn build_notify_panel() -> Component {
     }
     if phone {
         let panel_h = (height * 0.46).clamp(160.0, 420.0);
-        return Component::column(
+        let mut panel = Component::column(
             Style {
                 position: Position::Absolute,
                 left: Dimension::Px(0.0),
                 top: Dimension::Px(0.0),
                 width: Dimension::Px(width),
+                max_width: Dimension::Px(width),
+                min_width: Dimension::Px(0.0),
                 height: Dimension::Px(panel_h),
+                box_sizing: BoxSizing::BorderBox,
                 overflow: Overflow::Auto,
-                padding: Edges::all(16.0),
+                padding: Edges {
+                    top: safe_edge(16.0, SafeAreaEdge::Top),
+                    right: safe_edge(16.0, SafeAreaEdge::Right),
+                    bottom: Spacing::Px(16.0),
+                    left: safe_edge(16.0, SafeAreaEdge::Left),
+                },
                 gap: 8.0,
                 background: Color::from_hex("#1b2c3e"),
                 border_bottom_left_radius: Some(22.0),
@@ -5863,6 +6042,8 @@ fn build_notify_panel() -> Component {
             },
             body,
         );
+        fit_sheet_text(&mut panel);
+        return panel;
     }
     let panel_w = 320.0_f32.min((width - 32.0).max(220.0));
     let floor = intent_block_top(height) - 12.0;
@@ -5880,14 +6061,17 @@ fn build_notify_panel() -> Component {
             });
     let panel_h = desired.min((floor - 16.0).max(96.0));
     let top = (floor - panel_h).max(8.0);
-    Component::column(
+    let mut panel = Component::column(
         Style {
             position: Position::Absolute,
             left: Dimension::Px((width - panel_w - 16.0).max(8.0)),
             top: Dimension::Px(top),
             width: Dimension::Px(panel_w),
+            max_width: Dimension::Px(panel_w),
+            min_width: Dimension::Px(0.0),
             height: Dimension::Px(panel_h),
             max_height: Dimension::Px(panel_h),
+            box_sizing: BoxSizing::BorderBox,
             overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
@@ -5897,7 +6081,9 @@ fn build_notify_panel() -> Component {
             ..Style::default()
         },
         body,
-    )
+    );
+    fit_sheet_text(&mut panel);
+    panel
 }
 
 fn build_stage() -> Component {
@@ -6010,7 +6196,7 @@ fn build_window_frame(id: i64, focused: bool) -> Component {
         label: String::new(),
     };
     window.on_click = invoke(focus_code(id));
-    window.style.custom_properties = Some(win_props(id, None));
+    window.style.custom_properties = Some(win_props(id, None).into());
     window
 }
 
@@ -6037,7 +6223,7 @@ fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) ->
         },
         invoke(focus_code(id)),
     );
-    handle.style.custom_properties = Some(win_props(id, Some(gesture)));
+    handle.style.custom_properties = Some(win_props(id, Some(gesture)).into());
     handle
 }
 
@@ -6056,7 +6242,7 @@ fn resize_corner(id: i64) -> Component {
         },
         invoke(focus_code(id)),
     );
-    corner.style.custom_properties = Some(win_props(id, Some("se")));
+    corner.style.custom_properties = Some(win_props(id, Some("se")).into());
     corner
 }
 
@@ -6425,7 +6611,7 @@ fn nav_button(name: &str, active: bool, code: u8) -> Component {
         let props = button
             .style
             .custom_properties
-            .get_or_insert_with(HashMap::new);
+            .get_or_insert_with(Default::default);
         props.insert("--w3cos-selected".to_string(), "1".to_string());
     }
     button
@@ -6450,7 +6636,7 @@ fn settings_switch(label: &str, on: bool, code: u8) -> Component {
     let props = button
         .style
         .custom_properties
-        .get_or_insert_with(HashMap::new);
+        .get_or_insert_with(Default::default);
     props.insert(
         "--w3cos-switch".to_string(),
         if on { "1" } else { "0" }.to_string(),
@@ -6478,10 +6664,11 @@ fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
         Component::button_with_click(name, name_style, invoke(open.unwrap_or(OP_PREVIEW)));
     name_node.style.min_height = Dimension::Px(48.0);
     if open.is_none() {
-        name_node.style.custom_properties = Some(HashMap::from([(
-            "--w3cos-draft".to_string(),
-            name.to_string(),
-        )]));
+        name_node.style.custom_properties =
+            Some(w3cos_std::style::CustomProperties::from_iter([(
+                "--w3cos-draft".to_string(),
+                name.to_string(),
+            )]));
     }
     Component::row(
         Style {
@@ -6555,10 +6742,13 @@ fn build_terminal_app() -> Component {
                     Component::row(
                         Style {
                             gap: 8.0,
+                            width: Dimension::Percent(100.0),
+                            min_width: Dimension::Px(0.0),
                             padding: Edges::xy(12.0, 10.0),
                             background: Color::from_hex("#1b2c3e"),
                             border_radius: 8.0,
                             align_items: AlignItems::Center,
+                            box_sizing: BoxSizing::BorderBox,
                             ..Style::default()
                         },
                         vec![
@@ -6576,12 +6766,15 @@ fn build_terminal_app() -> Component {
                                     color: Color::from_hex("#f4f7fb"),
                                     background: Color::from_hex("#1b2c3e"),
                                     flex_grow: 1.0,
+                                    flex_shrink: 1.0,
+                                    min_width: Dimension::Px(0.0),
                                     ..Style::default()
                                 };
-                                term_style.custom_properties = Some(HashMap::from([(
-                                    "--w3cos-ime".to_string(),
-                                    "terminal".to_string(),
-                                )]));
+                                term_style.custom_properties =
+                                    Some(w3cos_std::style::CustomProperties::from_iter([(
+                                        "--w3cos-ime".to_string(),
+                                        "terminal".to_string(),
+                                    )]));
                                 note_preedit(&mut term_style, "terminal");
                                 Component::text_input(
                                     state::get_signal_text(TERMINAL_SIGNAL),
@@ -6641,42 +6834,57 @@ fn build_settings_app() -> Component {
     let phone = posture() == Posture::Phone;
     let menu = state::get_signal(SETTINGS_MENU_SIGNAL) != 0;
     if phone && menu {
-        return Component::column(
+        let mut menu = Component::column(
             Style {
                 flex_grow: 1.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                box_sizing: BoxSizing::BorderBox,
                 background: Color::from_hex("#24384a"),
-                padding: Edges::all(12.0),
+                padding: sheet_padding(12.0),
                 gap: 8.0,
                 ..Style::default()
             },
             settings_nav(tab, false),
         );
+        fit_sheet_text(&mut menu);
+        return menu;
     }
-    let pane = Component::column(
+    let mut pane = Component::column(
         Style {
             flex_grow: 1.0,
+            width: Dimension::Percent(100.0),
             min_width: Dimension::Px(0.0),
-            padding: Edges::all(if phone { 16.0 } else { 20.0 }),
+            max_width: Dimension::Percent(100.0),
+            box_sizing: BoxSizing::BorderBox,
+            padding: if phone { Edges::ZERO } else { Edges::all(20.0) },
             gap: 12.0,
             overflow: Overflow::Auto,
             ..Style::default()
         },
         settings_page(tab),
     );
+    fit_sheet_text(&mut pane);
     if phone {
         let mut back = chrome_button(locale::t("back"), OP_SETTINGS_BACK, "#31475e");
         back.style.min_height = Dimension::Px(48.0);
         back.style.width = Dimension::Percent(100.0);
-        return Component::column(
+        back.style.min_width = Dimension::Px(0.0);
+        let mut page = Component::column(
             Style {
                 flex_grow: 1.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                box_sizing: BoxSizing::BorderBox,
                 background: Color::from_hex("#24384a"),
-                padding: Edges::all(12.0),
+                padding: sheet_padding(12.0),
                 gap: 12.0,
                 ..Style::default()
             },
             vec![back, pane],
         );
+        fit_sheet_text(&mut page);
+        return page;
     }
     Component::column(
         Style {
@@ -6748,16 +6956,86 @@ fn device_line(label: String, color: Color) -> Component {
     }
 }
 
+fn pair_id_keep() -> usize {
+    let width = state::shell_viewport().0;
+    if width < 600.0 {
+        18
+    } else if width < 1024.0 {
+        20
+    } else {
+        28
+    }
+}
+
+/// One wrapping row. A card's minimum width is wider than a phone column and
+/// narrower than half a tablet or desktop pane, so the same tree stacks or
+/// sits side by side without a second layout.
+fn pair_identifier_row(fingerprint: &str, did: Option<&str>) -> Component {
+    let mut cards = vec![pair_identifier(
+        &locale::t("pair-fingerprint-label"),
+        fingerprint,
+    )];
+    if let Some(did) = did {
+        cards.push(pair_identifier(&locale::t("pair-did-label"), did));
+    }
+    Component::row(
+        Style {
+            width: Dimension::Percent(100.0),
+            gap: 8.0,
+            flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Stretch,
+            ..Style::default()
+        },
+        cards,
+    )
+}
+
+fn pair_identifier(label: &str, value: &str) -> Component {
+    let coarse = state::pointer_is_coarse();
+    Component::column(
+        Style {
+            flex_grow: 1.0,
+            flex_shrink: 0.0,
+            min_width: Dimension::Px(220.0),
+            gap: 4.0,
+            padding: Edges::xy(12.0, if coarse { 12.0 } else { 10.0 }),
+            background: Color::from_hex("#31475e"),
+            border_radius: 8.0,
+            min_height: Dimension::Px(if coarse { 64.0 } else { 0.0 }),
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                label.to_string(),
+                Style {
+                    font_size: 12.0,
+                    color: muted_ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                truncate_middle(value, pair_id_keep()),
+                Style {
+                    font_size: 14.0,
+                    color: Color::from_hex("#ffe08a"),
+                    font_family: Some("ui-monospace, monospace".to_string()),
+                    white_space: WhiteSpace::NoWrap,
+                    ..Style::default()
+                },
+            ),
+        ],
+    )
+}
+
 fn settings_devices_page() -> Vec<Component> {
     let mut page = settings_heading(
         &locale::t("settings-devices-nav"),
         &locale::t("settings-devices-detail"),
     );
-    let fingerprint = truncate_middle(&handoff::local_fingerprint(), 28);
-    page.push(device_line(
-        format!("{} · {fingerprint}", handoff::local_name()),
-        ink(),
-    ));
+    let fingerprint = handoff::local_fingerprint();
+    let did = handoff::local_did_key();
+    page.push(device_line(handoff::local_name(), ink()));
+    page.push(pair_identifier_row(&fingerprint, Some(&did)));
     let qr = handoff::pairing_qr_svg();
     if qr.contains("<svg") {
         page.push(Component::svg_document(
@@ -6777,10 +7055,12 @@ fn settings_devices_page() -> Vec<Component> {
             &peer.fingerprint,
             &peer.nonce,
         );
+        let peer_did = handoff::peer_display_did(&peer);
         page.push(device_line(
             format!("{} · {}", peer.name, locale::t("pair-pending")),
             Color::from_hex("#f0d7b4"),
         ));
+        page.push(pair_identifier_row(&peer.fingerprint, peer_did.as_deref()));
         page.push(Component::text(
             grouped,
             Style {
@@ -6828,7 +7108,9 @@ fn settings_devices_page() -> Vec<Component> {
             } else {
                 locale::t("pair-pending").to_string()
             };
+            let peer_did = handoff::peer_display_did(&peer);
             page.push(device_line(format!("{} · {state}", peer.name), ink()));
+            page.push(pair_identifier_row(&peer.fingerprint, peer_did.as_deref()));
         }
     }
     let placeholder = locale::t("pair-paste-placeholder");
@@ -6889,6 +7171,9 @@ fn banner_anchor() -> (f32, f32, f32) {
     } else {
         40.0
     };
+    if narrow_sheet() {
+        return (0.0, 0.0, width);
+    }
     if posture() == Posture::Desktop {
         let id = state::get_signal(APP_SIGNAL).clamp(1, 6);
         let frame = windows::frame(id);
@@ -6902,20 +7187,41 @@ fn banner_anchor() -> (f32, f32, f32) {
 }
 
 fn handoff_strip(children: Vec<Component>, width: f32) -> Component {
-    Component::row(
-        Style {
-            width: Dimension::Px(width),
-            padding: Edges::xy(14.0, 10.0),
-            gap: 12.0,
-            align_items: AlignItems::Center,
-            background: Color::from_hex("#1c2631"),
-            border_radius: 12.0,
-            border_width: 1.0,
-            border_color: Color::rgba(244, 241, 234, 31),
-            ..Style::default()
+    let narrow = narrow_sheet();
+    let style = Style {
+        width: Dimension::Px(width),
+        max_width: Dimension::Px(width),
+        min_width: Dimension::Px(0.0),
+        box_sizing: BoxSizing::BorderBox,
+        padding: if narrow {
+            Edges {
+                top: safe_edge(12.0, SafeAreaEdge::Top),
+                right: safe_edge(16.0, SafeAreaEdge::Right),
+                bottom: Spacing::Px(12.0),
+                left: safe_edge(16.0, SafeAreaEdge::Left),
+            }
+        } else {
+            Edges::xy(14.0, 10.0)
         },
-        children,
-    )
+        gap: 12.0,
+        align_items: if narrow {
+            AlignItems::Stretch
+        } else {
+            AlignItems::Center
+        },
+        background: Color::from_hex("#1c2631"),
+        border_radius: if narrow { 0.0 } else { 12.0 },
+        border_width: if narrow { 0.0 } else { 1.0 },
+        border_color: Color::rgba(244, 241, 234, 31),
+        ..Style::default()
+    };
+    let mut strip = if narrow {
+        Component::column(style, children)
+    } else {
+        Component::row(style, children)
+    };
+    fit_sheet_text(&mut strip);
+    strip
 }
 
 fn build_handoff_banner() -> Component {
@@ -6987,26 +7293,32 @@ fn build_handoff_banner() -> Component {
             )],
         ),
     };
+    let actions = if narrow_sheet() {
+        sheet_actions(buttons)
+    } else {
+        Component::row(
+            Style {
+                gap: 8.0,
+                flex_shrink: 0.0,
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            buttons,
+        )
+    };
     let mut strip = handoff_strip(
         vec![
             Component::column(
                 Style {
                     flex_grow: 1.0,
                     gap: 2.0,
+                    width: Dimension::Percent(100.0),
                     min_width: Dimension::Px(0.0),
                     ..Style::default()
                 },
                 copy,
             ),
-            Component::row(
-                Style {
-                    gap: 8.0,
-                    flex_shrink: 0.0,
-                    align_items: AlignItems::Center,
-                    ..Style::default()
-                },
-                buttons,
-            ),
+            actions,
         ],
         width,
     );
@@ -7025,7 +7337,7 @@ fn build_sync_sheet() -> Component {
         handoff::SyncSurface::Scene => ("sync-scene-title", "sync-scene-detail"),
         handoff::SyncSurface::Clipboard => ("sync-clipboard-title", "sync-clipboard-detail"),
     };
-    dialog_shell(vec![
+    let mut card = dialog_shell(vec![
         Component::text(
             locale::t(title),
             Style {
@@ -7043,22 +7355,17 @@ fn build_sync_sheet() -> Component {
                 ..Style::default()
             },
         ),
-        Component::row(
-            Style {
-                gap: 8.0,
-                justify_content: JustifyContent::FlexEnd,
-                ..Style::default()
-            },
-            vec![
-                sheet_button(locale::t("sync-ask-skip"), OP_SYNC_SKIP, SheetKind::Danger),
-                sheet_button(
-                    locale::t("sync-ask-allow"),
-                    OP_SYNC_ALLOW,
-                    SheetKind::Primary,
-                ),
-            ],
-        ),
-    ])
+        sheet_actions(vec![
+            sheet_button(locale::t("sync-ask-skip"), OP_SYNC_SKIP, SheetKind::Danger),
+            sheet_button(
+                locale::t("sync-ask-allow"),
+                OP_SYNC_ALLOW,
+                SheetKind::Primary,
+            ),
+        ]),
+    ]);
+    mark_dialog(&mut card, "sync");
+    card
 }
 
 fn clip_sheet_rows() -> Vec<Component> {
@@ -7124,62 +7431,131 @@ fn clip_sheet_rows() -> Vec<Component> {
 
 fn build_clip_dock() -> Component {
     let (width, height) = state::shell_viewport();
-    let dock_w = 420.0_f32.min((width - 24.0).max(280.0));
+    let narrow = narrow_sheet();
+    let dock_w = if narrow {
+        width
+    } else {
+        420.0_f32.min((width - 24.0).max(280.0))
+    };
     let mut card = Component::column(
         Style {
             width: Dimension::Px(dock_w),
-            padding: Edges::all(14.0),
+            max_width: Dimension::Px(dock_w),
+            min_width: Dimension::Px(0.0),
+            box_sizing: BoxSizing::BorderBox,
+            padding: if narrow {
+                sheet_padding(16.0)
+            } else {
+                Edges::all(14.0)
+            },
             gap: 8.0,
             background: Color::from_hex("#1c2631"),
-            border_radius: 16.0,
-            border_width: 1.0,
+            border_radius: if narrow { 22.0 } else { 16.0 },
+            border_width: if narrow { 0.0 } else { 1.0 },
             border_color: Color::rgba(244, 241, 234, 31),
+            overflow: Overflow::Auto,
             ..Style::default()
         },
         clip_sheet_rows(),
     );
+    if narrow {
+        card.style.border_top_left_radius = Some(22.0);
+        card.style.border_top_right_radius = Some(22.0);
+        card.style.border_bottom_left_radius = Some(0.0);
+        card.style.border_bottom_right_radius = Some(0.0);
+    }
+    fit_sheet_text(&mut card);
     card.style.position = Position::Absolute;
-    card.style.left = Dimension::Px(((width - dock_w) / 2.0).max(12.0));
-    card.style.bottom = Dimension::Px(24.0);
+    card.style.left = Dimension::Px(if narrow {
+        0.0
+    } else {
+        ((width - dock_w) / 2.0).max(12.0)
+    });
+    card.style.bottom = Dimension::Px(if narrow { 0.0 } else { 24.0 });
     card.style.top = Dimension::Auto;
     card.style.z_index = CHROME_Z + 1;
-    card.style.max_height = Dimension::Px((height * 0.42).max(160.0));
+    card.style.max_height = Dimension::Px((height * if narrow { 0.72 } else { 0.42 }).max(160.0));
     card
 }
 
 fn build_handoff_notice() -> Component {
     let (from, _, _) = handoff::incoming().unwrap_or_default();
     let (width, _) = state::shell_viewport();
-    let card_w = 420.0_f32.min((width - 24.0).max(240.0));
-    let mut card = Component::row(
+    let narrow = narrow_sheet();
+    let card_w = if narrow {
+        width
+    } else {
+        420.0_f32.min((width - 24.0).max(240.0))
+    };
+    let copy = Component::text(
+        locale::t_args("handoff-incoming", &[("name", &from)]),
+        Style {
+            flex_grow: 1.0,
+            min_width: Dimension::Px(0.0),
+            max_width: Dimension::Percent(100.0),
+            word_break: WordBreak::BreakWord,
+            font_size: 14.0,
+            font_weight: 650,
+            color: ink(),
+            ..Style::default()
+        },
+    );
+    let mut reveal = chrome_button(locale::t("handoff-reveal"), OP_HANDOFF_REVEAL, "#0c6d4c");
+    let body = if narrow {
+        reveal.style.width = Dimension::Percent(100.0);
+        reveal.style.min_width = Dimension::Px(0.0);
+        reveal.style.flex_grow = 0.0;
+        Component::column(
+            Style {
+                gap: 12.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                align_items: AlignItems::Stretch,
+                ..Style::default()
+            },
+            vec![copy, reveal],
+        )
+    } else {
+        Component::row(
+            Style {
+                gap: 12.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                align_items: AlignItems::Center,
+                ..Style::default()
+            },
+            vec![copy, reveal],
+        )
+    };
+    let mut card = Component::column(
         Style {
             width: Dimension::Px(card_w),
-            padding: Edges::xy(14.0, 12.0),
+            max_width: Dimension::Px(card_w),
+            min_width: Dimension::Px(0.0),
+            box_sizing: BoxSizing::BorderBox,
+            padding: if narrow {
+                Edges {
+                    top: safe_edge(12.0, SafeAreaEdge::Top),
+                    right: safe_edge(16.0, SafeAreaEdge::Right),
+                    bottom: Spacing::Px(12.0),
+                    left: safe_edge(16.0, SafeAreaEdge::Left),
+                }
+            } else {
+                Edges::xy(14.0, 12.0)
+            },
             gap: 12.0,
-            align_items: AlignItems::Center,
             background: Color::from_hex("#1c2631"),
-            border_radius: 16.0,
-            border_width: 1.0,
+            border_radius: if narrow { 0.0 } else { 16.0 },
+            border_width: if narrow { 0.0 } else { 1.0 },
             border_color: Color::rgba(240, 215, 180, 90),
             ..Style::default()
         },
-        vec![
-            Component::text(
-                locale::t_args("handoff-incoming", &[("name", &from)]),
-                Style {
-                    flex_grow: 1.0,
-                    font_size: 14.0,
-                    font_weight: 650,
-                    color: ink(),
-                    ..Style::default()
-                },
-            ),
-            chrome_button(locale::t("handoff-reveal"), OP_HANDOFF_REVEAL, "#0c6d4c"),
-        ],
+        vec![body],
     );
+    fit_sheet_text(&mut card);
     card.style.position = Position::Absolute;
-    card.style.left = Dimension::Px(12.0);
-    card.style.top = Dimension::Px(12.0);
+    card.style.left = Dimension::Px(if narrow { 0.0 } else { 12.0 });
+    card.style.top = Dimension::Px(if narrow { 0.0 } else { 12.0 });
     card.style.z_index = CHROME_Z + 1;
     card
 }
@@ -7222,16 +7598,10 @@ fn handoff_page_body(from: &str, path: &str, draft: &str) -> Vec<Component> {
                 ..Style::default()
             },
         ),
-        Component::row(
-            Style {
-                gap: 8.0,
-                ..Style::default()
-            },
-            vec![
-                chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
-                chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
-            ],
-        ),
+        sheet_actions(vec![
+            chrome_button(locale::t("handoff-later"), OP_HANDOFF_HIDE, "#3d5570"),
+            chrome_button(locale::t("handoff-open"), OP_HANDOFF_OPEN, "#0c6d4c"),
+        ]),
     ];
     if handoff::clip_conflict().is_some() {
         rows.push(Component::column(
@@ -7258,8 +7628,15 @@ fn build_handoff_incoming() -> Component {
     let phone = posture() == Posture::Phone;
     let mut card = Component::column(
         Style {
-            padding: Edges::all(if phone { 20.0 } else { 16.0 }),
+            padding: if phone {
+                sheet_padding(20.0)
+            } else {
+                Edges::all(16.0)
+            },
             gap: 12.0,
+            width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
+            box_sizing: BoxSizing::BorderBox,
             background: Color::from_hex("#1c2631"),
             border_radius: if phone { 0.0 } else { 16.0 },
             overflow: Overflow::Auto,
@@ -7267,12 +7644,14 @@ fn build_handoff_incoming() -> Component {
         },
         handoff_page_body(&from, &path, &draft),
     );
+    fit_sheet_text(&mut card);
     card.style.position = Position::Absolute;
     card.style.z_index = CHROME_Z + 1;
     if phone {
         card.style.left = Dimension::Px(0.0);
         card.style.top = Dimension::Px(0.0);
         card.style.width = Dimension::Px(width);
+        card.style.max_width = Dimension::Px(width);
         card.style.height = Dimension::Px(height);
     } else {
         let card_w = 440.0_f32.min((width - 32.0).max(280.0));
@@ -7363,11 +7742,29 @@ fn settings_lexicon_page() -> Vec<Component> {
 }
 
 fn lexicon_pair(mut left: Component, mut right: Component) -> Component {
-    left.style.flex_grow = 1.0;
-    right.style.flex_grow = 1.0;
+    left.style.flex_grow = if narrow_sheet() { 0.0 } else { 1.0 };
+    right.style.flex_grow = if narrow_sheet() { 0.0 } else { 1.0 };
+    if narrow_sheet() {
+        left.style.width = Dimension::Percent(100.0);
+        right.style.width = Dimension::Percent(100.0);
+        left.style.min_width = Dimension::Px(0.0);
+        right.style.min_width = Dimension::Px(0.0);
+        return Component::column(
+            Style {
+                gap: 8.0,
+                width: Dimension::Percent(100.0),
+                min_width: Dimension::Px(0.0),
+                align_items: AlignItems::Stretch,
+                ..Style::default()
+            },
+            vec![left, right],
+        );
+    }
     Component::row(
         Style {
             gap: 8.0,
+            width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
             align_items: AlignItems::Center,
             ..Style::default()
         },
@@ -7435,7 +7832,7 @@ fn lexicon_draft_field() -> Component {
         }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([(
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
         "--w3cos-ime".to_string(),
         "text".to_string(),
     )]));
@@ -7688,7 +8085,7 @@ fn sign_message_field() -> Component {
         min_height: Dimension::Px(if coarse { 48.0 } else { 36.0 }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         (
             "--w3cos-intent-submit".to_string(),
             OP_SIGN_PROPOSE.to_string(),
@@ -7831,34 +8228,55 @@ fn infer_backend_label() -> String {
 }
 
 fn settings_row(label: &str, value: &str) -> Component {
-    Component::row(
+    let label = Component::text(
+        label,
         Style {
-            padding: Edges::all(14.0),
-            background: Color::from_hex("#31475e"),
-            border_radius: 8.0,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
+            font_size: 14.0,
+            color: Color::from_hex("#f4f7fb"),
+            min_width: Dimension::Px(0.0),
+            max_width: Dimension::Percent(100.0),
+            word_break: WordBreak::BreakWord,
             ..Style::default()
         },
-        vec![
-            Component::text(
-                label,
-                Style {
-                    font_size: 14.0,
-                    color: Color::from_hex("#f4f7fb"),
-                    ..Style::default()
-                },
-            ),
-            Component::text(
-                value,
-                Style {
-                    font_size: 14.0,
-                    color: Color::from_hex("#ffe08a"),
-                    ..Style::default()
-                },
-            ),
-        ],
-    )
+    );
+    let value = Component::text(
+        value,
+        Style {
+            font_size: 14.0,
+            color: Color::from_hex("#ffe08a"),
+            flex_shrink: 1.0,
+            min_width: Dimension::Px(0.0),
+            max_width: Dimension::Percent(100.0),
+            word_break: WordBreak::BreakWord,
+            ..Style::default()
+        },
+    );
+    let narrow = narrow_sheet();
+    let style = Style {
+        padding: Edges::all(14.0),
+        background: Color::from_hex("#31475e"),
+        border_radius: 8.0,
+        width: Dimension::Percent(100.0),
+        min_width: Dimension::Px(0.0),
+        box_sizing: BoxSizing::BorderBox,
+        justify_content: if narrow {
+            JustifyContent::FlexStart
+        } else {
+            JustifyContent::SpaceBetween
+        },
+        align_items: if narrow {
+            AlignItems::Stretch
+        } else {
+            AlignItems::Center
+        },
+        gap: if narrow { 4.0 } else { 12.0 },
+        ..Style::default()
+    };
+    if narrow {
+        Component::column(style, vec![label, value])
+    } else {
+        Component::row(style, vec![label, value])
+    }
 }
 
 // ==========================================================================
@@ -8036,11 +8454,14 @@ fn build_task_center() -> Component {
     if phase == 1 || phase == 3 {
         body.push(chrome_button(locale::t("stop"), OP_CANCEL, "#a33b45"));
     }
-    Component::column(
+    let mut panel = Component::column(
         Style {
-            width: Dimension::Px(300.0),
-            flex_shrink: 0.0,
+            width: Dimension::Percent(100.0),
+            max_width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
+            flex_shrink: 1.0,
             min_height: Dimension::Px(0.0),
+            box_sizing: BoxSizing::BorderBox,
             overflow: Overflow::Auto,
             padding: Edges::all(14.0),
             gap: 8.0,
@@ -8048,7 +8469,9 @@ fn build_task_center() -> Component {
             ..Style::default()
         },
         body,
-    )
+    );
+    fit_sheet_text(&mut panel);
+    panel
 }
 
 fn planner_subtitle() -> String {
@@ -8828,7 +9251,7 @@ fn window_button(
         8.0,
         false,
     );
-    button.style.custom_properties = Some(win_props(app_id, None));
+    button.style.custom_properties = Some(win_props(app_id, None).into());
     button
 }
 
@@ -8922,7 +9345,7 @@ fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Componen
         label: String::new(),
     };
     bar.on_click = invoke(focus_code(app_id));
-    bar.style.custom_properties = Some(win_props(app_id, Some("move")));
+    bar.style.custom_properties = Some(win_props(app_id, Some("move")).into());
     bar
 }
 
@@ -8983,7 +9406,7 @@ fn build_launcher() -> Component {
         padding: Edges::xy(12.0, 8.0),
         ..Style::default()
     };
-    search_style.custom_properties = Some(HashMap::from([
+    search_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         (
             "--w3cos-intent-submit".to_string(),
             OP_LAUNCHER_SEARCH.to_string(),
@@ -9210,7 +9633,7 @@ fn receipt_query_field() -> Component {
         }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         (
             "--w3cos-intent-submit".to_string(),
             OP_RECEIPT_QUERY.to_string(),
@@ -9564,11 +9987,14 @@ fn build_receipts_viewer() -> Component {
             body.push(receipt_row(line));
         }
     }
-    Component::column(
+    let mut viewer = Component::column(
         Style {
-            width: Dimension::Px(400.0),
-            flex_shrink: 0.0,
+            width: Dimension::Percent(100.0),
+            min_width: Dimension::Px(0.0),
+            max_width: Dimension::Percent(100.0),
+            flex_shrink: 1.0,
             min_height: Dimension::Px(0.0),
+            box_sizing: BoxSizing::BorderBox,
             overflow: Overflow::Auto,
             padding: Edges::all(16.0),
             gap: 10.0,
@@ -9581,7 +10007,9 @@ fn build_receipts_viewer() -> Component {
             ..Style::default()
         },
         body,
-    )
+    );
+    fit_sheet_text(&mut viewer);
+    viewer
 }
 
 #[cfg(test)]
@@ -9589,6 +10017,14 @@ mod shell_ux_tests {
     use super::*;
 
     static POSTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A panicked sibling must not fail the rest of the suite: the first
+    /// assertion is the one that matters, not a poisoned mutex cascade.
+    fn lock_posture() -> std::sync::MutexGuard<'static, ()> {
+        POSTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     struct EnvFlag(&'static str);
 
@@ -9613,7 +10049,7 @@ mod shell_ux_tests {
 
     #[test]
     fn posture_follows_width_breakpoints() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         state::note_shell_viewport(390.0, 760.0);
         assert!(matches!(posture(), Posture::Phone));
         state::note_shell_viewport(800.0, 600.0);
@@ -9672,7 +10108,7 @@ mod shell_ux_tests {
 
     #[test]
     fn coarse_pointer_at_desktop_width_is_a_wide_tablet() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         let _env = EnvFlag::set("W3COS_POINTER", "coarse");
         state::note_shell_viewport(1280.0, 800.0);
         assert!(matches!(posture(), Posture::WideTablet));
@@ -9770,7 +10206,7 @@ mod shell_ux_tests {
 
     #[test]
     fn sign_sheet_confirms_once_and_stores_a_signed_receipt() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         sign_host::reset();
         let dir = std::env::temp_dir().join(format!(
@@ -9950,7 +10386,7 @@ mod shell_ux_tests {
 
     #[test]
     fn dock_icons_keep_names_without_painting_them() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         state::note_shell_viewport(1200.0, 800.0);
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -9973,7 +10409,7 @@ mod shell_ux_tests {
 
     #[test]
     fn window_controls_are_icons_not_a_missing_glyph() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
         assert_ne!(locale::t("win-maximize"), "[]");
@@ -10005,7 +10441,7 @@ mod shell_ux_tests {
 
     #[test]
     fn closing_a_window_returns_home_and_full_bleed_hides_maximize() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -10108,7 +10544,7 @@ mod shell_ux_tests {
 
     #[test]
     fn receipts_drawer_stops_above_the_intent_bar() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         state::note_shell_viewport(1200.0, 800.0);
         let panel = place_receipts(Component::column(Style::default(), vec![]));
         let bottom = px(panel.style.top) + px(panel.style.height);
@@ -10137,7 +10573,7 @@ mod shell_ux_tests {
 
     #[test]
     fn notify_panel_stops_above_the_intent_bar() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         state::note_shell_viewport(1200.0, 800.0);
         let panel = build_notify_panel();
@@ -10151,7 +10587,7 @@ mod shell_ux_tests {
 
     #[test]
     fn phone_keyboard_is_in_the_phone_shell_only_while_a_field_is_focused() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         ime_bar::reset_for_tests();
         locale::set_locale("zh-CN");
@@ -10198,7 +10634,7 @@ mod shell_ux_tests {
 
     #[test]
     fn chrome_accents_are_not_indigo() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         state::note_shell_viewport(768.0, 1024.0);
         let rail = format!("{:?}", build_tablet_rail());
@@ -10266,7 +10702,7 @@ mod shell_ux_tests {
 
     #[test]
     fn terminal_copy_matches_what_run_can_do() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-term-{}-{}",
@@ -10377,7 +10813,7 @@ mod shell_ux_tests {
 
     #[test]
     fn sandbox_sheet_starts_closed_and_a_grant_is_one_run() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-sb-{}-{}",
@@ -10619,7 +11055,7 @@ mod shell_ux_tests {
 
     #[test]
     fn chrome_stays_inside_the_viewport_and_candidates_clear_the_intent() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -10734,7 +11170,7 @@ mod shell_ux_tests {
 
     #[test]
     fn command_action_opens_confirm_without_executing() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         ime_bar::reset_for_tests();
         locale::set_locale("zh-CN");
@@ -10773,7 +11209,7 @@ mod shell_ux_tests {
 
     #[test]
     fn smart_bar_explains_blocked_capture_and_stays_off_the_network() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -10895,7 +11331,7 @@ mod shell_ux_tests {
             }
         }
 
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -10969,7 +11405,7 @@ mod shell_ux_tests {
 
     #[test]
     fn speech_model_stays_off_until_a_second_confirmation() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11008,7 +11444,7 @@ mod shell_ux_tests {
 
     #[test]
     fn handwriting_model_stays_off_until_a_second_confirmation() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11068,7 +11504,7 @@ mod shell_ux_tests {
 
     #[test]
     fn strangers_show_a_grouped_code_and_are_not_connected() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         handoff::demo_pending();
@@ -11093,8 +11529,147 @@ mod shell_ux_tests {
     }
 
     #[test]
+    fn pairing_screen_shows_the_spec_did_beside_the_fingerprint() {
+        let _guard = lock_posture();
+        handoff::reset_for_tests();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        handoff::demo_pending();
+        let legacy = handoff::peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .expect("legacy peer");
+        let legacy_fingerprint = legacy.fingerprint.clone();
+        assert_eq!(legacy.ed25519, [0; 32]);
+        state::note_shell_viewport(1440.0, 900.0);
+        state::note_pointer_coarse(false);
+        let legacy_page = Component::column(Style::default(), settings_devices_page());
+        let legacy_blob = text_blob(&legacy_page);
+        assert_eq!(identifier_rows(&legacy_page), vec![2, 1]);
+        assert_eq!(label_count(&legacy_blob, "配对指纹"), 2, "{legacy_blob}");
+        assert_eq!(
+            label_count(&legacy_blob, "签名 did:key"),
+            1,
+            "{legacy_blob}"
+        );
+        assert!(!legacy_blob.contains(&legacy_fingerprint), "{legacy_blob}");
+        let still = handoff::peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .expect("legacy peer");
+        assert_eq!(still.fingerprint, legacy_fingerprint);
+        assert_eq!(still.ed25519, [0; 32]);
+
+        handoff::reset_for_tests();
+        handoff::demo_pending_signed();
+        let local_fp = handoff::local_fingerprint();
+        let local_did = handoff::local_did_key();
+        let peer = handoff::pending_peer().expect("pending");
+        let peer_fp = peer.fingerprint.clone();
+        let peer_did = handoff::peer_display_did(&peer).expect("signing key");
+        assert_ne!(local_fp, local_did);
+        assert_ne!(peer_fp, peer_did);
+        let stored = (peer_fp.clone(), peer.ed25519, peer.public, peer.trusted);
+
+        for (width, height, coarse, keep) in [
+            (1440.0, 900.0, false, 28usize),
+            (800.0, 1024.0, false, 20usize),
+            (390.0, 760.0, true, 18usize),
+        ] {
+            state::note_shell_viewport(width, height);
+            state::note_pointer_coarse(coarse);
+            let page = Component::column(Style::default(), settings_devices_page());
+            assert_eq!(identifier_rows(&page), vec![2, 2], "{width}");
+            let blob = text_blob(&page);
+            assert_eq!(label_count(&blob, "配对指纹"), 2, "{blob}");
+            assert_eq!(label_count(&blob, "签名 did:key"), 2, "{blob}");
+            assert!(blob.contains("待核对"), "{blob}");
+            for value in [&local_fp, &local_did, &peer_fp, &peer_did] {
+                let shown = truncate_middle(value, keep);
+                assert!(
+                    blob.contains(&shown),
+                    "{shown} missing at {width} from {blob}"
+                );
+                assert!(!blob.contains(value), "{value} leaked at {width}");
+            }
+            let peer_now = handoff::pending_peer().expect("pending");
+            assert_eq!(peer_now.fingerprint, stored.0);
+            assert_eq!(peer_now.ed25519, stored.1);
+            assert_eq!(peer_now.public, stored.2);
+            assert_eq!(peer_now.trusted, stored.3);
+            assert_ne!(peer_now.fingerprint, peer_did);
+        }
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let phone = build_settings_app();
+        let (_, _, _, trust_h) = button_face(&phone, "数字一致，信任这台");
+        assert!(trust_h >= 48.0, "{trust_h}");
+        let (_, _, _, import_h) = button_face(&phone, "导入配对码");
+        assert!(import_h >= 48.0, "{import_h}");
+        let phone_blob = text_blob(&phone);
+        assert!(phone_blob.contains("签名 did:key"), "{phone_blob}");
+        assert!(phone_blob.contains("配对指纹"), "{phone_blob}");
+
+        locale::set_locale("en");
+        state::note_shell_viewport(800.0, 1024.0);
+        state::note_pointer_coarse(false);
+        let english = text_blob(&Component::column(
+            Style::default(),
+            settings_devices_page(),
+        ));
+        assert!(english.contains("Pairing fingerprint"), "{english}");
+        assert!(english.contains("Signing did:key"), "{english}");
+        assert!(
+            english.contains("A stored peer keeps the fingerprint"),
+            "{english}"
+        );
+        assert_eq!(label_count(&english, "Signing did:key"), 2, "{english}");
+        let shown = truncate_middle(&local_did, 20);
+        assert!(english.contains(&shown), "{english}");
+        assert!(!english.contains(&local_did), "{english}");
+
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    fn label_count(blob: &str, label: &str) -> usize {
+        blob.lines().filter(|line| *line == label).count()
+    }
+
+    fn identifier_rows(root: &Component) -> Vec<usize> {
+        let mut counts = Vec::new();
+        walk(root, &mut |node| {
+            if node.style.flex_wrap != FlexWrap::Wrap {
+                return;
+            }
+            let Dimension::Percent(width) = node.style.width else {
+                return;
+            };
+            if (width - 100.0).abs() > 0.1 {
+                return;
+            }
+            assert_eq!(node.kind, ComponentKind::Row);
+            assert_eq!(node.style.flex_direction, FlexDirection::Row);
+            for child in &node.children {
+                assert!(
+                    matches!(child.style.min_width, Dimension::Px(value) if (value - 220.0).abs() < 0.1)
+                );
+                assert_eq!(child.style.flex_shrink, 0.0);
+                assert_eq!(child.kind, ComponentKind::Column);
+            }
+            counts.push(node.children.len());
+        });
+        counts
+    }
+
+    #[test]
     fn sync_sheet_asks_one_surface_and_does_not_enable_the_rest() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         handoff::demo_pending();
@@ -11116,7 +11691,7 @@ mod shell_ux_tests {
 
     #[test]
     fn continue_banner_sits_under_the_title_bar_and_is_not_a_scrim() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         ensure_shell_signals();
@@ -11150,7 +11725,7 @@ mod shell_ux_tests {
 
     #[test]
     fn phone_receive_page_opens_the_file_without_confirming() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         let _name = EnvFlag::set("W3COS_DEVICE_NAME", "手机");
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
@@ -11191,7 +11766,7 @@ mod shell_ux_tests {
 
     #[test]
     fn an_unrevealed_phone_handoff_is_a_notification() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         ensure_shell_signals();
@@ -11231,7 +11806,7 @@ mod shell_ux_tests {
 
     #[test]
     fn personal_lexicon_learns_on_accept_and_skips_secure_fields() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         lexicon::reset_for_tests();
         ime_bar::reset_for_tests();
@@ -11362,7 +11937,7 @@ mod shell_ux_tests {
 
     #[test]
     fn receipts_show_four_decisions_and_keep_the_written_subject() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -11476,7 +12051,7 @@ mod shell_ux_tests {
 
     #[test]
     fn lock_screen_covers_the_shell_and_the_open_lock_locks() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -11611,7 +12186,7 @@ mod shell_ux_tests {
     #[test]
     #[test]
     fn chain_sheet_names_the_saved_endpoint_and_does_not_broadcast() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -11656,7 +12231,7 @@ mod shell_ux_tests {
 
     #[test]
     fn tx_sheet_decodes_fields_and_broadcast_is_a_second_confirm() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         sign_host::reset();
         let dir = std::env::temp_dir().join(format!(
@@ -11837,7 +12412,7 @@ mod shell_ux_tests {
     }
 
     fn passkey_binds_the_device_did_and_keeps_the_pairing_fingerprint() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-passkey-{}-{}",
@@ -11938,7 +12513,7 @@ mod shell_ux_tests {
 
     #[test]
     fn passphrase_refuses_empty_and_wrong_and_lock_blocks_confirm() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-lock-{}-{}",
@@ -12057,7 +12632,7 @@ mod shell_ux_tests {
 
     #[test]
     fn confirm_does_not_grant_process_and_permission_is_once() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-perm-{}-{}",
@@ -12299,7 +12874,7 @@ mod shell_ux_tests {
 
     #[test]
     fn settings_sidebar_switches_panes_and_toggles_night_and_context() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-settings-{}-{}",
@@ -12567,7 +13142,7 @@ mod shell_ux_tests {
 
     #[test]
     fn desktop_has_no_assistant_app_and_no_fake_metrics() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-honesty-{}-{}",
@@ -12744,7 +13319,7 @@ mod shell_ux_tests {
 
     #[test]
     fn notifications_start_empty_and_record_a_real_receipt() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         reset_notices();
         locale::set_locale("zh-CN");
@@ -12939,7 +13514,7 @@ mod shell_ux_tests {
 
     #[test]
     fn dialogs_trap_focus_and_chrome_meets_the_touch_minimum() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_pointer_coarse(false);
@@ -13074,7 +13649,7 @@ mod shell_ux_tests {
 
     #[test]
     fn tier_badges_lead_with_words_and_l2_off_stays_on_the_chrome() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_pointer_coarse(false);
@@ -13175,7 +13750,7 @@ mod shell_ux_tests {
 
     #[test]
     fn infer_backend_toggle_uses_fluent_and_stays_out_of_process_by_default() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         w3cos_ai_bridge::infer::clear_runtime_backend();
         state::note_shell_viewport(1200.0, 800.0);
@@ -13233,5 +13808,307 @@ mod shell_ux_tests {
         }
         w3cos_ai_bridge::infer::clear_runtime_backend();
         locale::set_locale("zh-CN");
+    }
+
+    struct SafeAreaGuard;
+
+    impl Drop for SafeAreaGuard {
+        fn drop(&mut self) {
+            w3cos_std::safe_area::set_enabled(false);
+            w3cos_std::safe_area::set_insets(w3cos_std::safe_area::SafeAreaInsets::ZERO);
+        }
+    }
+
+    fn flatten_nodes(root: &Component) -> Vec<&Component> {
+        let mut nodes = Vec::new();
+        fn walk<'a>(node: &'a Component, nodes: &mut Vec<&'a Component>) {
+            nodes.push(node);
+            for child in &node.children {
+                walk(child, nodes);
+            }
+        }
+        walk(root, &mut nodes);
+        nodes
+    }
+
+    fn layout_surface(
+        node: &Component,
+        width: f32,
+        height: f32,
+    ) -> (Component, Vec<(w3cos_runtime::layout::LayoutRect, usize)>) {
+        let root = Component::column(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                overflow: Overflow::Hidden,
+                ..Style::default()
+            },
+            vec![node.clone()],
+        );
+        let laid = w3cos_runtime::layout::compute(&root, width, height).expect("layout");
+        (root, laid)
+    }
+
+    fn assert_no_horizontal_overflow(
+        name: &str,
+        root: &Component,
+        width: f32,
+        layout: &[(w3cos_runtime::layout::LayoutRect, usize)],
+    ) {
+        let nodes = flatten_nodes(root);
+        for (rect, index) in layout {
+            let node = nodes.get(*index).copied();
+            let right = rect.x + rect.width;
+            assert!(
+                rect.x >= -1.0 && right <= width + 1.0,
+                "{name} overflows horizontally: x={} w={} right={right} viewport={width} kind={:?}",
+                rect.x,
+                rect.width,
+                node.map(|item| &item.kind)
+            );
+        }
+    }
+
+    fn button_rect(
+        nodes: &[&Component],
+        layout: &[(w3cos_runtime::layout::LayoutRect, usize)],
+        label: &str,
+    ) -> w3cos_runtime::layout::LayoutRect {
+        layout
+            .iter()
+            .find_map(|(rect, index)| {
+                nodes.get(*index).and_then(|node| match &node.kind {
+                    ComponentKind::Button { label: current } if current == label => Some(*rect),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| panic!("missing button {label}"))
+    }
+
+    fn assert_stacked(
+        root: &Component,
+        layout: &[(w3cos_runtime::layout::LayoutRect, usize)],
+        secondary: &str,
+        primary: &str,
+    ) {
+        let nodes = flatten_nodes(root);
+        let above = button_rect(&nodes, layout, secondary);
+        let below = button_rect(&nodes, layout, primary);
+        assert!(
+            below.y >= above.y + above.height - 1.0,
+            "{primary} should sit under {secondary}: {above:?} {below:?}"
+        );
+        assert!(
+            (below.x - above.x).abs() < 2.0,
+            "{primary} and {secondary} should share the left edge"
+        );
+        assert!(
+            (below.width - above.width).abs() < 2.0,
+            "stacked actions should be the same width"
+        );
+    }
+
+    fn assert_side_by_side(
+        root: &Component,
+        layout: &[(w3cos_runtime::layout::LayoutRect, usize)],
+        secondary: &str,
+        primary: &str,
+    ) {
+        let nodes = flatten_nodes(root);
+        let left = button_rect(&nodes, layout, secondary);
+        let right = button_rect(&nodes, layout, primary);
+        assert!(
+            right.x >= left.x + left.width - 1.0,
+            "{primary} should sit to the right of {secondary}: {left:?} {right:?}"
+        );
+        assert!(
+            (right.y - left.y).abs() < 8.0,
+            "{primary} and {secondary} should share a row"
+        );
+    }
+
+    #[test]
+    fn narrow_sheets_fit_the_viewport_and_stack_the_primary_action() {
+        let _guard = lock_posture();
+        let _safe = SafeAreaGuard;
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(true);
+        w3cos_std::safe_area::set_enabled(true);
+        w3cos_std::safe_area::set_insets(w3cos_std::safe_area::SafeAreaInsets {
+            top: 47.0,
+            right: 0.0,
+            bottom: 34.0,
+            left: 0.0,
+        });
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_signal(PERM_SIGNAL, 0);
+        state::set_signal(SANDBOX_SIGNAL, 0);
+        state::set_signal(SIGN_SIGNAL, 0);
+        state::set_signal(CHAIN_SIGNAL, 0);
+        state::set_signal(BROADCAST_SIGNAL, 0);
+        state::set_signal(NOTIFY_SIGNAL, 0);
+        state::set_text_signal(TERMINAL_SIGNAL, "ls");
+        state::set_text_signal(SUMMARY_SIGNAL, "打开文件");
+        state::set_text_signal(
+            IMPACT_SIGNAL,
+            "切换到文件窗口。不读取、不修改磁盘上的内容。",
+        );
+        state::set_text_signal(TIER_SIGNAL, "L0");
+        state::set_text_signal(SIGN_SUMMARY_SIGNAL, "签一段本机文字");
+        state::set_text_signal(SIGN_IMPACT_SIGNAL, "签名留在这台设备上。");
+        state::set_text_signal(
+            SIGN_MESSAGE_SIGNAL,
+            "hello from this device\n0x00112233445566778899aabbccddeeff",
+        );
+        state::set_text_signal(CHAIN_RPC_SIGNAL, "http://127.0.0.1:8545");
+
+        let scenes: Vec<(&str, fn() -> Component, &str, &str)> = vec![
+            ("confirm", build_confirm_dialog, "取消", "确认"),
+            ("permission", build_permission_sheet, "拒绝", "仅此一次"),
+            ("sandbox", build_sandbox_sheet, "不运行", "运行这一次"),
+            ("sign", build_sign_sheet, "不签", "签这一次"),
+            ("chain", build_chain_sheet, "拒绝", "允许这一次"),
+            ("broadcast", build_broadcast_sheet, "不广播", "广播这一次"),
+            ("sync", build_sync_sheet, "不允许", "允许这一面"),
+            ("locale", build_locale_confirm, "取消", "确认"),
+        ];
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "en");
+
+        for width in [360.0_f32, 390.0, 768.0] {
+            let height = if width < 600.0 { 760.0 } else { 1024.0 };
+            state::note_shell_viewport(width, height);
+            for (name, build, secondary, primary) in &scenes {
+                let surface = modal_layer(build());
+                let (root, layout) = layout_surface(&surface, width, height);
+                assert_no_horizontal_overflow(&format!("{name}@{width}"), &root, width, &layout);
+                if width < 600.0 {
+                    assert_stacked(&root, &layout, secondary, primary);
+                    let nodes = flatten_nodes(&root);
+                    let dialog = nodes.iter().find(|node| {
+                        node.style
+                            .custom_properties
+                            .as_ref()
+                            .and_then(|props| props.get("--w3cos-dialog"))
+                            .is_some()
+                    });
+                    let dialog = dialog.unwrap_or_else(|| panic!("{name} missing dialog"));
+                    let pad = dialog.style.padding_lengths();
+                    assert!(pad.bottom >= 34.0 - 0.1, "{name} bottom safe area {pad:?}");
+                    assert!(pad.left >= 16.0 - 0.1 && pad.right >= 16.0 - 0.1);
+                    let placed = layout.iter().find_map(|(rect, index)| {
+                        nodes.get(*index).and_then(|node| {
+                            node.style
+                                .custom_properties
+                                .as_ref()
+                                .and_then(|props| props.get("--w3cos-dialog"))
+                                .map(|_| *rect)
+                        })
+                    });
+                    let placed = placed.expect("dialog layout");
+                    assert!(
+                        placed.x.abs() < 1.0 && (placed.width - width).abs() < 1.0,
+                        "{name} should be a full-width sheet: {placed:?}"
+                    );
+                    assert!(
+                        (placed.y + placed.height - height).abs() < 1.0,
+                        "{name} should sit on the bottom edge: {placed:?}"
+                    );
+                }
+            }
+
+            let notify = build_notify_panel();
+            let (root, layout) = layout_surface(&notify, width, height);
+            assert_no_horizontal_overflow(&format!("notify@{width}"), &root, width, &layout);
+
+            state::set_signal(SETTINGS_MENU_SIGNAL, 1);
+            let settings = build_settings_app();
+            let (root, layout) = layout_surface(&settings, width, height);
+            assert_no_horizontal_overflow(&format!("settings@{width}"), &root, width, &layout);
+            state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+            let settings = build_settings_app();
+            let (root, layout) = layout_surface(&settings, width, height);
+            assert_no_horizontal_overflow(&format!("settings-pane@{width}"), &root, width, &layout);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+            let l2 = build_settings_app();
+            let (root, layout) = layout_surface(&l2, width, height);
+            assert_no_horizontal_overflow(&format!("settings-l2@{width}"), &root, width, &layout);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 0);
+
+            let receipts = place_receipts(build_receipts_viewer());
+            let (root, layout) = layout_surface(&receipts, width, height);
+            assert_no_horizontal_overflow(&format!("receipts@{width}"), &root, width, &layout);
+
+            let lock = build_lock_screen();
+            let (root, layout) = layout_surface(&lock, width, height);
+            assert_no_horizontal_overflow(&format!("lock@{width}"), &root, width, &layout);
+
+            let clip = build_clip_dock();
+            let (root, layout) = layout_surface(&clip, width, height);
+            assert_no_horizontal_overflow(&format!("clip@{width}"), &root, width, &layout);
+
+            handoff::reset_for_tests();
+            handoff::demo_incoming();
+            let incoming = build_handoff_incoming();
+            let (root, layout) = layout_surface(&incoming, width, height);
+            assert_no_horizontal_overflow(&format!("handoff@{width}"), &root, width, &layout);
+            handoff::reset_for_tests();
+            handoff::demo_banner();
+            let banner = build_handoff_banner();
+            let (root, layout) = layout_surface(&banner, width, height);
+            assert_no_horizontal_overflow(&format!("banner@{width}"), &root, width, &layout);
+            if width < 600.0 {
+                assert_stacked(&root, &layout, "不是现在", "继续");
+            }
+            handoff::reset_for_tests();
+        }
+
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        locale::set_locale("zh-CN");
+        let desktop = modal_layer(build_sandbox_sheet());
+        let (root, layout) = layout_surface(&desktop, 1200.0, 800.0);
+        assert_no_horizontal_overflow("sandbox@1200", &root, 1200.0, &layout);
+        assert_side_by_side(&root, &layout, "不运行", "运行这一次");
+        assert_side_by_side(&root, &layout, "允许读文件", "允许联网");
+
+        locale::set_locale("en");
+        state::note_pointer_coarse(true);
+        for width in [360.0_f32, 390.0, 768.0] {
+            let height = if width < 600.0 { 760.0 } else { 1024.0 };
+            state::note_shell_viewport(width, height);
+            let surface = modal_layer(build_sandbox_sheet());
+            let (root, layout) = layout_surface(&surface, width, height);
+            assert_no_horizontal_overflow(&format!("sandbox-en@{width}"), &root, width, &layout);
+            if width < 600.0 {
+                assert_stacked(&root, &layout, "Don't run", "Run once");
+                assert_stacked(&root, &layout, "Allow reading files", "Allow the network");
+            }
+            let sign = modal_layer(build_sign_sheet());
+            let (root, layout) = layout_surface(&sign, width, height);
+            assert_no_horizontal_overflow(&format!("sign-en@{width}"), &root, width, &layout);
+            state::set_signal(SETTINGS_TAB_SIGNAL, 3);
+            state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+            let l2 = build_settings_app();
+            let (root, layout) = layout_surface(&l2, width, height);
+            assert_no_horizontal_overflow(
+                &format!("settings-l2-en@{width}"),
+                &root,
+                width,
+                &layout,
+            );
+            state::set_signal(SETTINGS_TAB_SIGNAL, 0);
+        }
+
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(UNLOCKED_SIGNAL, 0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        state::set_text_signal(PENDING_LOCALE_SIGNAL, "");
+        state::set_text_signal(TERMINAL_SIGNAL, "");
+        state::set_text_signal(SIGN_MESSAGE_SIGNAL, "");
     }
 }

@@ -1,0 +1,215 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "fl-row",
+   "html": "<div id=r style='width:700px'><div id=a style='float:left;display:flex;margin:3px;padding:2px;border:1px solid'><div id=b style='width:30px;height:10px'></div><div id=c style='width:50px;height:20px;margin-left:4px'></div></div><div id=d style='float:left;display:flex;height:15px'><div id=e style='width:40px;height:5px'></div></div><div id=f style='clear:both;height:7px'></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     700,
+     39
+    ],
+    "a": [
+     3,
+     3,
+     90,
+     26
+    ],
+    "b": [
+     6,
+     6,
+     30,
+     10
+    ],
+    "c": [
+     40,
+     6,
+     50,
+     20
+    ],
+    "d": [
+     96,
+     0,
+     40,
+     15
+    ],
+    "e": [
+     96,
+     0,
+     40,
+     5
+    ],
+    "f": [
+     0,
+     32,
+     700,
+     7
+    ]
+   }
+  },
+  {
+   "name": "fl-wrap",
+   "html": "<div id=r style='width:800px'><div id=a style='float:left;display:flex;width:450px;height:10px'><div id=b style='flex:1;height:4px'></div></div><div id=c style='float:left;display:flex;width:400px;height:12px'></div><div id=d style='clear:both'></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     800,
+     22
+    ],
+    "a": [
+     0,
+     0,
+     450,
+     10
+    ],
+    "b": [
+     0,
+     0,
+     450,
+     4
+    ],
+    "c": [
+     0,
+     10,
+     400,
+     12
+    ],
+    "d": [
+     0,
+     22,
+     800,
+     0
+    ]
+   }
+  },
+  {
+   "name": "fl-col-right",
+   "html": "<div id=r style='width:500px'><div id=a style='float:right;display:flex;flex-direction:column'><div id=b style='width:20px;height:10px'></div><div id=c style='width:60px;height:12px'></div></div><div id=d style='height:30px'></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     500,
+     30
+    ],
+    "a": [
+     440,
+     0,
+     60,
+     22
+    ],
+    "b": [
+     440,
+     0,
+     20,
+     10
+    ],
+    "c": [
+     440,
+     10,
+     60,
+     12
+    ],
+    "d": [
+     0,
+     0,
+     500,
+     30
+    ]
+   }
+  },
+  {
+   "name": "fl-grid",
+   "html": "<div id=r style='width:500px'><div id=a style='float:left;display:grid;width:100px;grid-template-columns:40px 1fr;grid-template-rows:10px 20px'><div id=b></div><div id=c></div><div id=d></div></div><div id=e style='clear:left;height:5px'></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     500,
+     35
+    ],
+    "a": [
+     0,
+     0,
+     100,
+     30
+    ],
+    "b": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "c": [
+     40,
+     0,
+     60,
+     10
+    ],
+    "d": [
+     0,
+     10,
+     40,
+     20
+    ],
+    "e": [
+     0,
+     30,
+     500,
+     5
+    ]
+   }
+  },
+  {
+   "name": "fl-grow",
+   "html": "<div id=r style='width:600px'><div id=a style='float:left;display:flex;margin-right:9px'><div id=b style='flex:1 1 auto;width:30px;height:10px'></div><div id=c style='flex:2 1 0;width:20px;height:6px'></div></div><div id=d style='float:left;display:flex;width:50%;height:10px'><div id=e style='flex:1;height:3px'></div></div><div id=f style='clear:both'></div></div>",
+   "rects": {
+    "r": [
+     0,
+     0,
+     600,
+     10
+    ],
+    "a": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "b": [
+     0,
+     0,
+     36.671875,
+     10
+    ],
+    "c": [
+     36.671875,
+     0,
+     13.328125,
+     6
+    ],
+    "d": [
+     59,
+     0,
+     300,
+     10
+    ],
+    "e": [
+     59,
+     0,
+     300,
+     3
+    ],
+    "f": [
+     0,
+     10,
+     600,
+     0
+    ]
+   }
+  }
+ ]
+}

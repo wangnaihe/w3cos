@@ -127,3 +127,41 @@ fn native_keymap_and_policy_watcher_match_linux_natives() {
     let expected: Vec<&str> = KEYMAP_POLICY_NODE.lines().collect();
     assert_eq!(lines, expected);
 }
+
+/// From `@vscode/native-watchdog` 1.4's `index.js` (its argument checks run
+/// in JS before the addon; `exit` ends the process at once).
+const NATIVE_WATCHDOG_NODE: &str = "api function function
+rejected 1 Expected integer pid!
+rejected 1.5 Expected integer pid!
+rejected undefined Expected integer pid!
+started parent
+again Can only monitor a single process!
+";
+
+#[test]
+fn native_watchdog_matches_native_watchdog_js() {
+    let lines = run(
+        "native_watchdog",
+        include_str!("fixtures/node_native/native_watchdog.js"),
+    );
+    let expected: Vec<&str> = NATIVE_WATCHDOG_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+#[test]
+fn node_pty_runs_programs_on_a_pseudo_terminal() {
+    let lines = run("node_pty", include_str!("fixtures/node_native/node_pty.js"));
+    let expected = [
+        "api function",
+        "pid number true sh 100 30",
+        "size true",
+        "echo true got true",
+        "exit 3",
+        "resized 120 40",
+        "second 40 120 0",
+        "killed 0 15",
+        "missing ENOENT",
+        "done",
+    ];
+    assert_eq!(lines, expected);
+}

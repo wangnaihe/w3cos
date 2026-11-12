@@ -53,6 +53,82 @@ fn node_child_process_matches_node() {
     assert_eq!(lines, expected);
 }
 
+const PROCESS_KILL_NODE: &str = r#"self true
+missing ESRCH -3 kill kill ESRCH
+pid ERR_INVALID_ARG_TYPE true
+pid ERR_INVALID_ARG_TYPE true
+pid ERR_INVALID_ARG_TYPE true
+signal ERR_UNKNOWN_SIGNAL true
+child alive true
+child term true
+child exit null SIGTERM
+reaped true
+done
+"#;
+
+/// `process.kill(pid, 0)` probes liveness; Code-OSS utility processes poll
+/// their parent this way and exit when it throws.
+#[test]
+fn node_process_kill_matches_node() {
+    let lines = run(
+        "process_kill",
+        include_str!("fixtures/node_io/process_kill.js"),
+        &[],
+    );
+    let expected: Vec<&str> = PROCESS_KILL_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+/// Electron's process metric extensions; output matches Electron 39's shapes.
+const ELECTRON_PROCESS_METRICS: &str = r#"shared true
+memory true
+system free,swapFree,swapTotal,total
+heap number number
+blink allocated,total
+cpu number number
+io number
+created number true
+resident private,residentSet,shared number
+"#;
+
+#[test]
+fn electron_process_metric_extensions_have_electron_shapes() {
+    let lines = run(
+        "electron_process_metrics",
+        include_str!("fixtures/node_io/electron_process_metrics.js"),
+        &[],
+    );
+    let expected: Vec<&str> = ELECTRON_PROCESS_METRICS.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+/// `http.createServer` over `net.Server`: Content-Length and chunked request
+/// bodies, header folding, keep-alive pipelining, chunked responses and the
+/// `upgrade` socket hand-off (Code-OSS agent host's `ws` server).
+const HTTP_SERVER_NODE: &str = r#"listening number
+req POST /p?q=1 1.1 1, 2 ["a","b"] "abcde"
+post "HTTP/1.1 201 Created|Content-Type: text/plain|Connection: close|Transfer-Encoding: chunked||4|ok:5|0||"
+req POST /chunked 1.1 undefined undefined "abcde"
+chunked "HTTP/1.1 200 OK|X-Kind: chunked|Connection: close|Transfer-Encoding: chunked||6|hello |5|world|0||"
+req GET /one 1.1 undefined undefined ""
+req GET /two 1.1 undefined undefined ""
+keepalive "HTTP/1.1 201 Created|Content-Type: text/plain|Connection: keep-alive|Keep-Alive: timeout=5|Transfer-Encoding: chunked||4|ok:0|0||HTTP/1.1 201 Created|Content-Type: text/plain|Connection: close|Transfer-Encoding: chunked||4|ok:0|0||"
+upgrade /ws test "ping"
+upgrade "HTTP/1.1 101 Switching Protocols|Upgrade: test|Connection: Upgrade||echo:ping"
+closed
+"#;
+
+#[test]
+fn node_http_server_matches_node() {
+    let lines = run(
+        "http_server",
+        include_str!("fixtures/node_io/http_server.js"),
+        &[],
+    );
+    let expected: Vec<&str> = HTTP_SERVER_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
 const NET_NODE: &str = r#"isIP 4 6 0 true true
 uds listening true true true
 uds connecting true
@@ -120,6 +196,7 @@ t1 ready false number true [6,[1,2],1000,1]
 t1 square 49
 t1 clone [1,"two"] bigint true true undefined true true -Infinity
 t1 clone2 true false hi true 1.5,-2 true bad true a+b gi true {"deep":[[1],{"x":null}]}
+t1 clone3 true 40000 true
 t1 exit 3 online,ready,square,clone -1
 t2 error true TypeError boom from worker
 t2 exit 1
@@ -132,6 +209,9 @@ t4 closed
 t5 message from self self true
 t5 exit 0
 t6 path ERR_WORKER_PATH TypeError
+t7 message string 7 undefined
+t7 default undefined undefined inherited undefined
+t8 burst 5
 done
 "#;
 

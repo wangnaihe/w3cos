@@ -1875,6 +1875,9 @@ impl Vm {
             Instruction::DefineField { object, key, value } => {
                 w3cos_core::intrinsics::define_field(&read(*object), &read(*key), read(*value));
             }
+            Instruction::DefineMethod { object, key, value } => {
+                w3cos_core::intrinsics::define_method(&read(*object), &read(*key), read(*value));
+            }
             Instruction::DefinePrivate {
                 object,
                 brand,
@@ -2084,6 +2087,12 @@ impl Vm {
                     .clone()
                     .ok_or(VmError::Unsupported("DynamicImport"))?;
                 registers[dst.0 as usize] = handler(read(*specifier).to_js_string());
+            }
+            Instruction::NewTarget { dst } => {
+                // VM closures are host functions: [[Construct]] does not
+                // record a code entry for them, so only AOT code observes a
+                // constructor here.
+                registers[dst.0 as usize] = Value::Undefined;
             }
             Instruction::ImportMeta { dst } => {
                 registers[dst.0 as usize] =
@@ -2389,6 +2398,7 @@ mod tests {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
             types: Default::default(),
         }
@@ -2869,6 +2879,7 @@ mod tests {
                 generator_suspension_points: Vec::new(),
                 is_async: true,
                 is_generator: false,
+                own_name_length: None,
                 source_span: None,
                 types: Default::default(),
             }],
@@ -3290,6 +3301,7 @@ mod tests {
             }],
             is_async: false,
             is_generator: true,
+            own_name_length: None,
             source_span: None,
             types: Default::default(),
         };
@@ -3372,6 +3384,7 @@ mod tests {
             }],
             is_async: true,
             is_generator: true,
+            own_name_length: None,
             source_span: None,
             types: Default::default(),
         };

@@ -503,7 +503,7 @@ fn interior_authored_endpoints_are_not_snapped_again_at_font_boundary() {
     let text = ".Test passes if there is a green stripe on the right and ";
     let mut style = Style {
         display: WDisplay::Inline,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-html-standard-font".into(),
             "1".into(),
         )])),
@@ -534,7 +534,7 @@ fn interior_authored_endpoints_are_not_snapped_again_at_font_boundary() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -558,7 +558,7 @@ fn authored_boundary_inside_generated_word_keeps_layout_unit_endpoint() {
     use w3cos_std::Style;
     let mut style = Style {
         display: WDisplay::Inline,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-html-standard-font".into(),
             "1".into(),
         )])),
@@ -579,7 +579,7 @@ fn authored_boundary_inside_generated_word_keeps_layout_unit_endpoint() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -606,11 +606,8 @@ fn resolved_bidi_words_keep_contextual_advances_in_rtl_container() {
     use w3cos_std::{Style, style::TextDirection};
     let style = Style {
         display: WDisplay::Inline,
-        custom_properties: Some(HashMap::from([
-            (
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:bidi".into(),
-            ),
+        text_source_run: Some("text:bidi".into()),
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
             ("--w3cos-internal-bidi-visual-order".into(), "1".into()),
             ("--w3cos-internal-bidi-resolved-level".into(), "2".into()),
             ("--w3cos-internal-bidi-logical-order".into(), "0".into()),
@@ -622,7 +619,7 @@ fn resolved_bidi_words_keep_contextual_advances_in_rtl_container() {
         Style {
             display: WDisplay::Flex,
             direction: TextDirection::Rtl,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -664,13 +661,11 @@ fn terminal_authored_inline_source_uses_layout_unit_endpoint() {
         display: WDisplay::Inline,
         font_size: 16.0,
         font_weight: 700,
-        custom_properties: Some(HashMap::from([
-            (
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:terminal".into(),
-            ),
-            ("--w3cos-internal-html-standard-font".into(), "1".into()),
-        ])),
+        text_source_run: Some("text:terminal".into()),
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
+            "--w3cos-internal-html-standard-font".into(),
+            "1".into(),
+        )])),
         ..Style::default()
     };
     let fragments = ["no", " ", "red"];
@@ -681,7 +676,7 @@ fn terminal_authored_inline_source_uses_layout_unit_endpoint() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -727,7 +722,7 @@ fn absolute_first_child_static_position_uses_inline_block_content_top() {
                 family: "Ahem".into(),
                 src: FontSource::Path(std::path::PathBuf::from(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../../wpt/fonts/Ahem.ttf"
+                    "/src/layout_ng/testdata/Ahem.ttf"
                 ))),
                 ..Default::default()
             },
@@ -891,22 +886,16 @@ fn decorated_source_uses_one_layout_unit_endpoint() {
         font_family: Some("sans-serif".into()),
         font_size: 16.0,
         text_decoration: w3cos_std::style::TextDecoration::Underline,
-        custom_properties: Some(HashMap::from([(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:link".into(),
-        )])),
+        text_source_run: Some("text:link".into()),
         ..Style::default()
     };
     let mut suffix = link.clone();
     suffix.text_decoration = w3cos_std::style::TextDecoration::None;
-    suffix.custom_properties.as_mut().unwrap().insert(
-        w3cos_std::inline_text::SOURCE_RUN.into(),
-        "text:suffix".into(),
-    );
+    w3cos_std::inline_text::set_source_run(&mut suffix, "text:suffix");
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -976,7 +965,9 @@ fn empty_decorated_inline_exports_its_font_box_baseline() {
             1,
         ),
     ];
-    let positions = HashMap::from([(0, 0), (1, 1)]);
+    let positions = [(0, 0), (1, 1)]
+        .into_iter()
+        .collect::<crate::layout::LayoutPositions>();
     assert_eq!(
         last_text_baseline(&root, 0, &layouts, &positions),
         Some(54.0 + inline_font_content_ascent(&inline)),
@@ -999,7 +990,14 @@ fn empty_decorated_inline_exports_its_font_box_baseline() {
         0,
     )];
     assert_eq!(
-        last_text_baseline(&empty, 0, &zero, &HashMap::from([(0, 0)])),
+        last_text_baseline(
+            &empty,
+            0,
+            &zero,
+            &[(0, 0)]
+                .into_iter()
+                .collect::<crate::layout::LayoutPositions>(),
+        ),
         None
     );
 }
@@ -1706,19 +1704,42 @@ fn nonfitting_bfc_margin_separates_at_the_adjoining_float_band() {
 
 #[test]
 fn character_unit_uses_font_zero_not_shaped_fixed_point_advance() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
+    const OWNER: u64 = 202611010001;
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: "W3cosChTinos".into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     install_font_unit_provider();
-    let style = w3cos_std::Style {
+    let controlled = w3cos_std::Style {
+        font_family: Some("W3cosChTinos".into()),
         font_size: 16.0,
-        custom_properties: Some(HashMap::from([(
-            w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
-            "1".into(),
-        )])),
         ..w3cos_std::Style::default()
     };
     assert_eq!(
-        style.ch_advance() * 20.0,
-        180.0,
-        "Chrome155 original align001 has exact20ch192 and10ch96 boxes"
+        controlled.ch_advance(),
+        crate::render_skia::measure_skia_font_zero_advance(&controlled),
+        "the CSS unit must use the selected face's zero metric directly"
+    );
+    assert_eq!(
+        controlled.ch_advance() * 20.0,
+        160.0,
+        "bundled Tinos matches isolated Chrome155: 20ch=160 and 10ch=80"
     );
 }
 
@@ -1732,7 +1753,7 @@ fn pure_image_soft_lines_keep_containing_font_descent() {
         font_size: 20.0,
         line_height: 1.0,
         line_height_is_normal: false,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-inline-formatting-context".into(),
             "1".into(),
         )])),
@@ -1777,7 +1798,7 @@ fn horizontal_decorated_collapsible_separator_stays_on_completed_line() {
         font_size: 20.0,
         line_height: 1.0,
         line_height_is_normal: false,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-inline-formatting-context".into(),
             "1".into(),
         )])),
@@ -2076,17 +2097,14 @@ fn generated_border_words_use_shared_layout_advances() {
         font_size: 16.0,
         font_family: Some("sans-serif".into()),
         border_top_width: Some(3.0),
-        custom_properties: Some(HashMap::from([(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:1".into(),
-        )])),
+        text_source_run: Some("text:1".into()),
         ..Default::default()
     };
     let words = ["Filler", " ", "Text", " ", "Filler", " ", "Text"];
     let root = Component::row(
         w3cos_std::Style {
             display: WDisplay::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2139,10 +2157,7 @@ fn generated_border_box_words_keep_horizontal_edges_in_used_width() {
         font_family: Some("sans-serif".into()),
         box_sizing: WBoxSizing::BorderBox,
         border_top_width: Some(3.0),
-        custom_properties: Some(HashMap::from([(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:1".into(),
-        )])),
+        text_source_run: Some("text:1".into()),
         ..Default::default()
     };
     let mut children = words
@@ -2154,7 +2169,7 @@ fn generated_border_box_words_keep_horizontal_edges_in_used_width() {
     let root = Component::row(
         w3cos_std::Style {
             display: WDisplay::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2198,7 +2213,7 @@ fn nested_normal_inline_text_wraps_without_making_nowrap_shrink() {
                 display: WDisplay::Flex,
                 width: WDim::Px(300.0),
                 flex_wrap: WWrap::Wrap,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),

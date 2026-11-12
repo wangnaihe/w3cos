@@ -1,6 +1,8 @@
 pub mod background;
 pub mod color;
 pub mod component;
+pub mod custom_properties;
+pub mod fxhash;
 pub mod inline_text;
 pub mod keyboard_inset;
 pub mod safe_area;
@@ -9,12 +11,30 @@ pub mod svg;
 pub mod viewport;
 
 pub use color::Color;
-pub use component::{Component, ComponentKind, EventAction, SvgEventTarget, find_text_input};
+pub use component::{
+    Component, ComponentKind, ComponentStyle, EventAction, SvgEventTarget, find_text_input,
+};
 pub use style::Style;
 pub use svg::{SvgPathCommand, SvgPathData};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calc_dimension_stays_compact_and_interned() {
+        use crate::style::{CalcLength, Dimension};
+        assert_eq!(std::mem::size_of::<Dimension>(), 8);
+        let length = CalcLength {
+            percent: 100.0,
+            px: -32.0,
+            ..CalcLength::default()
+        };
+        let a = Dimension::calc(length);
+        assert_eq!(a, Dimension::calc(length));
+        assert_ne!(a, Dimension::calc(CalcLength::default()));
+        let Dimension::Calc(id) = a else { panic!() };
+        assert_eq!(id.get(), length);
+    }
+
     use super::*;
     use crate::style::{Dimension, Style};
 

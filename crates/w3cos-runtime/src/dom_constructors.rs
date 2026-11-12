@@ -520,6 +520,22 @@ fn build_constructors() -> HashMap<String, Value> {
     ] {
         node.set_property(property, Value::Undefined);
     }
+    // Real accessors for the read-only identity/tree getters. Sanitizers
+    // (DOMPurify) capture them up front via
+    // `Object.getOwnPropertyDescriptor(Node.prototype, "nodeName").get` and
+    // fall back to a getter returning null when the slot is a plain data
+    // placeholder, which made every sanitize call throw inside
+    // `toLowerCase(null)`.
+    for property in [
+        "nodeName",
+        "nodeType",
+        "ownerDocument",
+        "nextSibling",
+        "childNodes",
+        "parentNode",
+    ] {
+        install_prototype_getter(&node, property);
+    }
     node.set_property(
         "cloneNode",
         Value::function(|receiver, args| crate::jsdom::node_prototype_clone_node(receiver, args)),
@@ -635,6 +651,43 @@ fn build_constructors() -> HashMap<String, Value> {
         let prototype = constructors[name].get_property("prototype");
         for property in properties.split_whitespace() {
             prototype.set_property(property, Value::Undefined);
+        }
+    }
+    // Methods whose bridge implementation is per node: give the prototype slot
+    // a real function so a captured original (`const f = Element.prototype.matches`,
+    // then `f.call(el, ...)`) is callable and acts on its receiver.
+    for (name, methods) in [
+        (
+            "HTMLElement",
+            "focus blur click attachInternals hidePopover showPopover togglePopover",
+        ),
+        ("SVGElement", "focus blur"),
+        (
+            "Node",
+            "appendChild removeChild getRootNode normalize isEqualNode isSameNode \
+             lookupNamespaceURI lookupPrefix isDefaultNamespace",
+        ),
+        (
+            "Element",
+            "after animate append before checkVisibility closest getAnimations getAttribute \
+             getAttributeNS getAttributeNames getAttributeNode getAttributeNodeNS \
+             getBoundingClientRect getClientRects getElementsByClassName getElementsByTagName \
+             getElementsByTagNameNS getHTML hasAttribute hasAttributeNS hasAttributes \
+             hasPointerCapture insertAdjacentElement insertAdjacentHTML insertAdjacentText \
+             matches prepend querySelector querySelectorAll releasePointerCapture remove \
+             removeAttribute removeAttributeNS removeAttributeNode replaceChildren replaceWith \
+             requestFullscreen requestPointerLock scroll scrollBy scrollIntoView scrollTo \
+             setAttribute setAttributeNS setAttributeNode setAttributeNodeNS setHTMLUnsafe \
+             setPointerCapture toggleAttribute webkitMatchesSelector",
+        ),
+    ] {
+        let prototype = constructors[name].get_property("prototype");
+        for method in methods.split_whitespace() {
+            // Only fill placeholders; never replace a real implementation.
+            if prototype.get_property(method).is_callable() {
+                continue;
+            }
+            prototype.set_property(method, crate::jsdom::element_prototype_method(method));
         }
     }
     for (name, members) in [
@@ -911,6 +964,15 @@ fn build_constructors() -> HashMap<String, Value> {
         "importNode",
     ] {
         document.set_property(method, forward_receiver_method(method));
+    }
+    // Document methods are own data on the document object; give the prototype
+    // slots (placeholders above) real forwarders so captured originals work.
+    for method in "getElementById getElementsByClassName getElementsByTagName querySelector \
+        querySelectorAll elementFromPoint elementsFromPoint hasFocus getSelection execCommand \
+        createRange createEvent adoptNode append prepend"
+        .split_whitespace()
+    {
+        document.set_property(method, crate::jsdom::element_prototype_method(method));
     }
     for (name, members) in [
         ("HTMLAllCollection", "item length namedItem"),
@@ -2096,6 +2158,20 @@ pub fn prototype_for_node(node_type: u16, tag: &str, is_svg: bool) -> Value {
         11 => prototype("DocumentFragment"),
         _ => prototype("Node"),
     }
+}
+
+/// Install a getter-only accessor that answers through the receiver's DOM
+/// bridge (element wrappers) or its own data (document-like plain objects).
+fn install_prototype_getter(prototype: &Value, property: &'static str) {
+    let getter = Value::function(move |receiver, _args| {
+        crate::jsdom::prototype_getter_value(&receiver, property)
+    });
+    let descriptor = Value::object(HashMap::from([
+        ("get".to_string(), getter),
+        ("enumerable".to_string(), Value::Bool(true)),
+        ("configurable".to_string(), Value::Bool(true)),
+    ]));
+    w3cos_core::class::define_property(prototype, property, &descriptor);
 }
 
 #[cfg(test)]

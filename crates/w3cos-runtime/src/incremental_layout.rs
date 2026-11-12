@@ -4,6 +4,7 @@
 //! Tree shape, text metrics, and inherited cascades rebuild once.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
@@ -12,6 +13,9 @@ use w3cos_std::{Component, ComponentKind};
 
 use crate::layout::{LayoutEngine, pre_flatten};
 
+#[path = "incremental_layout_splice.rs"]
+mod splice;
+
 struct WidthMemo {
     structure: u64,
     node: u32,
@@ -19,6 +23,7 @@ struct WidthMemo {
     viewport_w_bits: u32,
     viewport_h_bits: u32,
     rects: Vec<(u32, f32, f32, f32, f32)>,
+    client_rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
 }
 
 struct Cache {
@@ -26,7 +31,7 @@ struct Cache {
     engine: LayoutEngine,
     /// `Document::layout_generation`. Repaint-only text does not bump it.
     structure: u64,
-    /// `Document::structure_generation` at the last build. A later text edit
+    /// `Document::repaint_text_generation` at the last build. A later text edit
     /// can leave these rects valid while the component text is stale, so the
     /// next geometry edit rebuilds from the DOM.
     source_structure: u64,
@@ -37,15 +42,72 @@ struct Cache {
     /// Full rect snapshots keyed by one node's px width. Repeat flushes of
     /// the same width restore the rects instead of solving Taffy again.
     width_memos: Vec<WidthMemo>,
+    /// `Document::precise_drain_epoch` after this cache took the dirty list.
+    /// Any other drain means a structural splice could miss a mutation.
+    drain_epoch: u32,
+    /// `stylesheet::generation` at the last build or splice.
+    sheet_generation: u64,
+    /// No float, out-of-flow (except outside list markers), sticky, or
+    /// multicol box anywhere: a block subtree's used box cannot depend on
+    /// anything but its containing block width.
+    splice_ok: bool,
+    /// Engine flags of the whole tree, reused for a spliced subtree.
+    skip_projections: bool,
+    measure_text: bool,
+    /// The component tree was spliced; `node_ids` and the Taffy tree are stale.
+    node_ids_stale: bool,
 }
 
 thread_local! {
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
+    static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
+        const { std::cell::Cell::new(("none", 0, 0)) };
+    static CLIENT_RECTS: RefCell<HashMap<u32, Vec<w3cos_dom::DOMRect>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
+    CLIENT_RECTS.with(|rects| rects.borrow().get(&node).cloned())
+}
+
+fn client_rect_snapshot() -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
+    CLIENT_RECTS.with(|rects| rects.borrow().clone())
+}
+
+fn restore_client_rects(rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>) {
+    CLIENT_RECTS.with(|current| *current.borrow_mut() = rects);
+}
+
+/// What the most recent [`flush`] solved. `solved_nodes` is the subtree that
+/// was laid out; `shifted_nodes` only had a translation applied.
+pub struct IncrementalFlushStats {
+    pub kind: &'static str,
+    pub solved_nodes: u32,
+    pub shifted_nodes: u32,
+}
+
+pub fn last_flush_stats() -> IncrementalFlushStats {
+    let (kind, solved_nodes, shifted_nodes) = LAST_FLUSH.with(std::cell::Cell::get);
+    IncrementalFlushStats {
+        kind,
+        solved_nodes,
+        shifted_nodes,
+    }
+}
+
+fn note_flush(kind: &'static str, solved_nodes: u32, shifted_nodes: u32) {
+    LAST_FLUSH.with(|slot| slot.set((kind, solved_nodes, shifted_nodes)));
+}
+
+fn phase_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_LAYOUT_PHASES").is_some())
 }
 
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     PAINT.with(|cache| *cache.borrow_mut() = None);
+    CLIENT_RECTS.with(|rects| rects.borrow_mut().clear());
     PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     crate::headless::invalidate_retained_frame();
@@ -53,26 +115,83 @@ pub fn invalidate() {
 
 /// Flush pending layout into stored DOM rects. Returns false when Taffy fails.
 pub fn flush() -> bool {
+    let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
+    let viewport_w = viewport_w as f32;
+    let viewport_h = viewport_h as f32;
+    // `structure` here is the repaint-only text generation: a splice leaves
+    // it alone, so text edited without layout elsewhere stays detectable.
+    let (layout_gen, structure, cascade) = crate::dom::with_document(|document| {
+        (
+            document.layout_generation(),
+            document.repaint_text_generation(),
+            document.cascade_generation(),
+        )
+    });
+    let take = || {
+        crate::dom::with_document_mut(|document| {
+            let before = document.precise_drain_epoch();
+            let dirty = document.take_precise_dirty();
+            (before, dirty, document.precise_drain_epoch())
+        })
+    };
+    // A retained tree that only needs a structural splice skips the
+    // document-wide definite-layout fingerprint below.
+    let mut taken = None;
+    let spliced = CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(cache) = slot.as_mut() else {
+            return false;
+        };
+        if !cache.splice_ok || cache.structure == layout_gen {
+            if !cache.splice_ok && splice::debug_enabled() {
+                eprintln!("[splice] retained tree is not spliceable");
+            }
+            return false;
+        }
+        let (before, dirty, after) = take();
+        let complete = cache.drain_epoch == before;
+        cache.drain_epoch = after;
+        if !complete {
+            if splice::debug_enabled() {
+                eprintln!("[splice] dirty list drained elsewhere");
+            }
+            cache.splice_ok = false;
+            taken = Some((after, dirty, after));
+            return false;
+        }
+        if splice::try_splice(cache, &dirty, viewport_w, viewport_h) {
+            cache.structure = layout_gen;
+            cache.cascade = cascade;
+            return true;
+        }
+        taken = Some((after, dirty, after));
+        false
+    });
+    if spliced {
+        crate::dom::clear_document_dirty();
+        return true;
+    }
     if crate::definite_layout::try_apply() {
         let _ = crate::dom::with_document_mut(|document| document.take_precise_dirty());
         crate::dom::clear_document_dirty();
         invalidate();
         return true;
     }
-    let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
-    let viewport_w = viewport_w as f32;
-    let viewport_h = viewport_h as f32;
-    let (layout_gen, structure, cascade) = crate::dom::with_document(|document| {
-        (
-            document.layout_generation(),
-            document.structure_generation(),
-            document.cascade_generation(),
-        )
-    });
-    let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+    let (drain_before, dirty, drain_after) = match taken {
+        Some(taken) => taken,
+        None => take(),
+    };
     let mut ok = false;
     CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
+        if let Some(cache) = slot.as_mut() {
+            let complete = cache.drain_epoch == drain_before;
+            cache.drain_epoch = drain_after;
+            if !complete {
+                // Another consumer drained mutations this cache never saw.
+                cache.splice_ok = false;
+            }
+        }
         let structure_matches = slot
             .as_ref()
             .is_some_and(|cache| cache.structure == layout_gen);
@@ -81,6 +200,17 @@ pub fn flush() -> bool {
             // Glyphs changed and a used box may now depend on them. Rebuild
             // from the DOM instead of patching the stale component tree.
             let text_stale = cache.source_structure != structure && !dirty.is_empty();
+            if splice::debug_enabled() && !dirty.is_empty() {
+                eprintln!(
+                    "[splice] patch path: {} dirty, text_stale {text_stale}, first {:?}",
+                    dirty.len(),
+                    crate::dom::with_document(|document| document
+                        .get_node(dirty[0])
+                        .tag
+                        .as_str()
+                        .to_string())
+                );
+            }
             let geometry_only = cache.cascade != cascade;
             if !text_stale
                 && patch_and_compute(cache, &dirty, viewport_w, viewport_h, geometry_only)
@@ -90,9 +220,29 @@ pub fn flush() -> bool {
                 return;
             }
         }
+        if splice::debug_enabled() {
+            eprintln!(
+                "[splice] full rebuild: cached {} structure_matches {structure_matches} dirty {}",
+                slot.is_some(),
+                dirty.len()
+            );
+        }
         ok = rebuild(
-            &mut slot, layout_gen, structure, cascade, viewport_w, viewport_h,
+            &mut slot,
+            layout_gen,
+            structure,
+            cascade,
+            viewport_w,
+            viewport_h,
+            drain_after,
         );
+        if ok {
+            let solved = slot
+                .as_ref()
+                .map(|cache| cache.node_ids.len() as u32)
+                .unwrap_or(0);
+            note_flush("rebuild", solved, 0);
+        }
     });
     if ok {
         crate::dom::clear_document_dirty();
@@ -107,6 +257,7 @@ fn rebuild(
     cascade: u64,
     viewport_w: f32,
     viewport_h: f32,
+    drain_epoch: u32,
 ) -> bool {
     let component = crate::dom::to_component_tree();
     let flat = pre_flatten(&component);
@@ -124,7 +275,17 @@ fn rebuild(
     };
     let snaps = write_rects(&flat, &results.layout_cache);
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
+    let splice_ok = splice::tree_is_spliceable(&component);
+    let skip_projections = can_skip_projections(&component);
+    let measure_text = needs_text_metric(&component);
+    drop(flat);
     *slot = Some(Cache {
+        drain_epoch,
+        sheet_generation: w3cos_dom::stylesheet::generation(),
+        splice_ok,
+        skip_projections,
+        measure_text,
+        node_ids_stale: false,
         component,
         engine,
         structure: layout_gen,
@@ -164,6 +325,10 @@ fn patch_and_compute(
         return ok;
     }
     let mut styles = Vec::with_capacity(dirty.len());
+    let mut paint_only = true;
+    let previous = (dirty.len() == 1)
+        .then(|| component_style(&cache.component, dirty[0].as_u32()).cloned())
+        .flatten();
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         if !style_patch_is_safe(&style) {
@@ -176,6 +341,11 @@ fn patch_and_compute(
             if !geometry_only_change(&old, &style) {
                 return false;
             }
+            paint_only &= local_paint_only(&old, &style);
+        } else if let Some(old) = component_style(&cache.component, id.as_u32()) {
+            paint_only &= local_paint_only(old, &style);
+        } else {
+            paint_only = false;
         }
         styles.push((id.as_u32(), style));
     }
@@ -192,20 +362,52 @@ fn patch_and_compute(
                     && memo.viewport_w_bits == viewport_w_bits
                     && memo.viewport_h_bits == viewport_h_bits
             })
-            .map(|memo| memo.rects.clone())
+            .map(|memo| (memo.rects.clone(), memo.client_rects.clone()))
     });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
         }
     }
-    if let Some(rects) = memo_hit {
+    if paint_only
+        && cache.viewport_w_bits == viewport_w.to_bits()
+        && cache.viewport_h_bits == viewport_h.to_bits()
+    {
+        note_flush("paint", 0, 0);
+        return true;
+    }
+    if let Some((rects, client_rects)) = memo_hit {
         restore_rects(&rects);
+        restore_client_rects(client_rects);
+        cache.viewport_w_bits = viewport_w.to_bits();
+        cache.viewport_h_bits = viewport_h.to_bits();
+        note_flush("memo", 0, 0);
+        return true;
+    }
+    if styles.len() == 1
+        && let Some(old) = previous.as_ref()
+        && splice::try_style_subtree(
+            cache,
+            styles[0].0,
+            old,
+            &styles[0].1,
+            viewport_w,
+            viewport_h,
+        )
+    {
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         return true;
     }
+    let phase = phase_log_enabled();
+    let flatten_started = std::time::Instant::now();
     let flat = pre_flatten(&cache.component);
+    let flatten_us = flatten_started.elapsed().as_micros();
+    if cache.node_ids_stale {
+        cache.node_ids = flat.iter().map(flat_host_id).collect();
+        cache.engine.invalidate();
+        cache.node_ids_stale = false;
+    }
     if flat.len() != cache.node_ids.len() {
         return false;
     }
@@ -221,13 +423,25 @@ fn patch_and_compute(
             return false;
         }
     }
+    let compute_started = std::time::Instant::now();
     let Ok(results) = cache
         .engine
         .compute(&cache.component, &flat, viewport_w, viewport_h)
     else {
         return false;
     };
+    let compute_us = compute_started.elapsed().as_micros();
+    let write_started = std::time::Instant::now();
     let snaps = write_rects(&flat, &results.layout_cache);
+    let write_us = write_started.elapsed().as_micros();
+    if phase {
+        eprintln!(
+            "[layout-phase] retained nodes {} flatten_us {flatten_us} compute_us {compute_us} write_us {write_us} passes {}",
+            flat.len(),
+            cache.engine.last_compute_layout_passes
+        );
+    }
+    note_flush("retained", flat.len() as u32, 0);
     cache.viewport_w_bits = viewport_w.to_bits();
     cache.viewport_h_bits = viewport_h.to_bits();
     if let Some((node, bits)) = single_px_width(&styles) {
@@ -238,6 +452,11 @@ fn patch_and_compute(
 
 fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     let flat = pre_flatten(&cache.component);
+    if cache.node_ids_stale {
+        cache.node_ids = flat.iter().map(flat_host_id).collect();
+        cache.engine.invalidate();
+        cache.node_ids_stale = false;
+    }
     configure_engine(&mut cache.engine, &cache.component);
     let Ok(results) = cache
         .engine
@@ -253,6 +472,7 @@ fn write_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
 ) -> Vec<(u32, f32, f32, f32, f32)> {
+    publish_client_rects(flat, layouts);
     let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
@@ -273,6 +493,346 @@ fn write_rects(
         }
     });
     snaps
+}
+
+fn split_inline_owner(info: &crate::layout::FlatNodeInfo<'_>) -> Option<u32> {
+    info.style
+        .custom_properties
+        .as_ref()?
+        .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)?
+        .parse()
+        .ok()
+}
+
+/// Physical advances for one shaped line at every authored owner boundary.
+/// This is produced during layout writeback and consumed by the retained
+/// CSSOM rectangle map; later `getClientRects()` calls only read that map.
+struct PhysicalTextLine {
+    boundaries: Vec<usize>,
+    positions: Vec<f32>,
+}
+
+impl PhysicalTextLine {
+    fn advance(&self, start: usize, end: usize) -> Option<(f32, f32)> {
+        let start_index = self.boundaries.binary_search(&start).ok()?;
+        let end_index = self.boundaries.binary_search(&end).ok()?;
+        let start_position = *self.positions.get(start_index)?;
+        let end_position = *self.positions.get(end_index)?;
+        Some((start_position, (end_position - start_position).max(0.0)))
+    }
+
+    fn total(&self) -> Option<f32> {
+        self.positions.last().copied()
+    }
+}
+
+fn physical_text_line(
+    line: &str,
+    style: &w3cos_std::Style,
+    owner_ranges: &[(u32, usize, usize)],
+) -> Option<PhysicalTextLine> {
+    let mut boundaries = Vec::with_capacity(owner_ranges.len() * 2 + 2);
+    boundaries.extend([0, line.len()]);
+    for &(_, start, end) in owner_ranges {
+        if start <= end
+            && end <= line.len()
+            && line.is_char_boundary(start)
+            && line.is_char_boundary(end)
+        {
+            boundaries.extend([start, end]);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let fragments = boundaries
+        .windows(2)
+        .map(|range| line.get(range[0]..range[1]))
+        .collect::<Option<Vec<_>>>()?;
+    let advances = crate::layout::physical_text_fragment_advances(&fragments, style)?;
+    let mut positions = Vec::with_capacity(advances.len() + 1);
+    positions.push(0.0);
+    for advance in advances {
+        positions.push(positions.last().copied().unwrap_or(0.0) + advance);
+    }
+    (positions.len() == boundaries.len()).then_some(PhysicalTextLine {
+        boundaries,
+        positions,
+    })
+}
+
+fn publish_client_rects(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+) {
+    let mut by_index = vec![None; flat.len()];
+    for (rect, index) in layouts {
+        if let Some(slot) = by_index.get_mut(*index) {
+            *slot = Some(*rect);
+        }
+    }
+    let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
+    let mut owners_with_inline_fragments = HashSet::new();
+    let mut first_fragment_is_block = HashMap::new();
+    let mut last_fragment_is_block = HashMap::new();
+    let synthetic_inline = |info: &crate::layout::FlatNodeInfo<'_>| {
+        info.style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-split-inline-edge")
+                    || properties.contains_key("--w3cos-internal-split-inline-fragment")
+            })
+    };
+    let mut inherited_text_owners = vec![Vec::new(); flat.len()];
+    let mut text_line_owners = HashSet::new();
+    for (index, info) in flat.iter().enumerate() {
+        if !info.component.is_some_and(|component| {
+            matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
+        }) {
+            continue;
+        }
+        let mut parent = info.parent;
+        while let Some(parent_index) = parent {
+            let Some(ancestor) = flat.get(parent_index) else {
+                break;
+            };
+            if synthetic_inline(ancestor)
+                && let Some(owner) = split_inline_owner(ancestor)
+                && !inherited_text_owners[index].contains(&owner)
+            {
+                inherited_text_owners[index].push(owner);
+                text_line_owners.insert(owner);
+            }
+            parent = ancestor.parent;
+        }
+    }
+    for (index, info) in flat.iter().enumerate() {
+        let synthetic_inline = synthetic_inline(info);
+        let Some(mut rect) = by_index.get(index).copied().flatten() else {
+            continue;
+        };
+        if synthetic_inline {
+            // Taffy lays an anonymous inline carrier out at the containing
+            // block's available width. CSSOM exposes the physical inline
+            // fragment instead, whose inline extent is its max-content width.
+            if let Some(component) = info.component {
+                let width = crate::layout::component_max_content_width(component)
+                    .min(rect.width)
+                    .max(0.0);
+                rect.width = width;
+                if width == 0.0 && component.children.is_empty() {
+                    rect.height = 0.0;
+                }
+            }
+        } else if matches!(
+            info.style.display,
+            Display::Block | Display::Flex | Display::Grid | Display::Table | Display::ListItem
+        ) && let Some(parent) = info.parent
+            && let Some(containing) = by_index.get(parent).copied().flatten()
+        {
+            // CSS 2.1 block-in-inline creates an anonymous block around the
+            // in-flow block. Its inline extent is the actual containing block,
+            // while its block extent follows the authored child.
+            rect.x = containing.x;
+            rect.width = containing.width;
+        }
+        let physical = w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height);
+        if let Some(owner) = split_inline_owner(info) {
+            if synthetic_inline {
+                owners_with_inline_fragments.insert(owner);
+            }
+            let text_range_will_publish = info.component.is_some_and(|component| {
+                let w3cos_std::ComponentKind::Text { content } = &component.kind else {
+                    return false;
+                };
+                w3cos_std::inline_text::cssom_owner_ranges(content, info.style)
+                    .iter()
+                    .any(|(range_owner, _, _)| *range_owner == owner)
+            });
+            // Once physical text lines have been published for a split inline,
+            // suppress only its positive-size anonymous inline carrier.  Real
+            // block fragments and the zero-size split edge remain observable
+            // CSSOM fragments and must keep their original ordering entries.
+            let replaced_by_text_lines = synthetic_inline
+                && text_line_owners.contains(&owner)
+                && physical.width > 0.0
+                && physical.height > 0.0;
+            if !text_range_will_publish && !replaced_by_text_lines {
+                published.entry(owner).or_default().push(physical);
+                let is_block = !synthetic_inline;
+                first_fragment_is_block.entry(owner).or_insert(is_block);
+                last_fragment_is_block.insert(owner, is_block);
+            }
+        }
+        for owner in w3cos_std::inline_text::cssom_box_owners(info.style) {
+            published.entry(owner).or_default().push(physical);
+            first_fragment_is_block.entry(owner).or_insert(true);
+            last_fragment_is_block.insert(owner, true);
+        }
+        let Some(component) = info.component else {
+            continue;
+        };
+        let w3cos_std::ComponentKind::Text { content } = &component.kind else {
+            continue;
+        };
+        let line_box = info
+            .parent
+            .and_then(|parent| by_index.get(parent).copied().flatten())
+            .unwrap_or(rect);
+        let measure = |text: &str, style: &w3cos_std::Style| {
+            crate::layout::component_max_content_width(&w3cos_std::Component::text_shared(
+                text.to_string(),
+                style.clone().into(),
+            ))
+        };
+        let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
+        // With LayoutNG the writeback re-wraps with the same UAX #14 mode as
+        // layout and paint (line-break strictness, word-break, lang), so the
+        // published fragments follow the painted lines.
+        // keep-all leaves fall back to the legacy layout and keep its mode.
+        let break_mode = if crate::layout_ng::mode() == crate::layout_ng::Mode::Off
+            || info.style.word_break == w3cos_std::style::WordBreak::KeepAll
+        {
+            crate::line_break::BreakMode::default()
+        } else {
+            crate::line_break::BreakMode::of(info.style)
+        };
+        let lines = crate::text_layout::wrap_text_with_run_width_in(
+            content,
+            line_box.width.max(1.0),
+            info.style.white_space,
+            break_mode,
+            |text| measure(text, info.style),
+        );
+        let line_styles = crate::text_layout::authored_line_styles(content, info.style, &lines);
+        for (line_index, line) in lines.iter().enumerate() {
+            let line_style = line_styles
+                .as_ref()
+                .and_then(|styles| styles.get(line_index))
+                .unwrap_or(info.style);
+            let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(line, line_style);
+            let physical_line = physical_text_line(line, line_style, &owner_ranges);
+            let explicit_owners = owner_ranges
+                .iter()
+                .map(|(owner, _, _)| *owner)
+                .collect::<HashSet<_>>();
+            for (owner, start, end) in owner_ranges {
+                // Resolve every owner boundary together during layout
+                // writeback. Contextual backends shape one physical run and
+                // assign a crossing cluster to its start owner; the current
+                // Vello/fontdue backend preserves its authored-fragment
+                // LayoutUnit endpoints without later CSSOM remeasurement.
+                let (prefix_width, width) = physical_line
+                    .as_ref()
+                    .and_then(|physical| physical.advance(start, end))
+                    .unwrap_or_else(|| {
+                        (
+                            measure(&line[..start], line_style),
+                            measure(&line[start..end], line_style),
+                        )
+                    });
+                let x = match line_style.direction {
+                    w3cos_std::style::TextDirection::Ltr => line_box.x + prefix_width,
+                    w3cos_std::style::TextDirection::Rtl => {
+                        line_box.x + line_box.width - prefix_width - width
+                    }
+                };
+                let line_height = crate::layout::inline_style_line_height(line_style);
+                let font_box = crate::font_face::font_box_metrics_for_text(
+                    line_style,
+                    line.get(start..end).unwrap_or(line),
+                );
+                let font_height = font_box.map_or(line_height, |metrics| metrics.height());
+                let font_top = crate::layout::inline_upper_leading(line_height, font_height);
+                owners_with_inline_fragments.insert(owner);
+                published
+                    .entry(owner)
+                    .or_default()
+                    .push(w3cos_dom::DOMRect::new(
+                        x,
+                        line_box.y + line_index as f32 * line_height + font_top,
+                        width,
+                        font_height,
+                    ));
+                first_fragment_is_block.entry(owner).or_insert(false);
+                last_fragment_is_block.insert(owner, false);
+            }
+            for owner in inherited_text_owners[index]
+                .iter()
+                .copied()
+                .filter(|owner| !explicit_owners.contains(owner))
+            {
+                let width = physical_line
+                    .as_ref()
+                    .and_then(PhysicalTextLine::total)
+                    .unwrap_or_else(|| physical_advance(line, line_style));
+                let x = match line_style.direction {
+                    w3cos_std::style::TextDirection::Ltr => line_box.x,
+                    w3cos_std::style::TextDirection::Rtl => line_box.x + line_box.width - width,
+                };
+                let line_height = crate::layout::inline_style_line_height(line_style);
+                let font_box = crate::font_face::font_box_metrics_for_text(line_style, line);
+                let font_height = font_box.map_or(line_height, |metrics| metrics.height());
+                let font_top = crate::layout::inline_upper_leading(line_height, font_height);
+                owners_with_inline_fragments.insert(owner);
+                published
+                    .entry(owner)
+                    .or_default()
+                    .push(w3cos_dom::DOMRect::new(
+                        x,
+                        line_box.y + line_index as f32 * line_height + font_top,
+                        width,
+                        font_height,
+                    ));
+                first_fragment_is_block.entry(owner).or_insert(false);
+                last_fragment_is_block.insert(owner, false);
+            }
+        }
+    }
+    for owner in owners_with_inline_fragments.iter().copied() {
+        let Some(rects) = published.get_mut(&owner) else {
+            continue;
+        };
+        if rects.is_empty() {
+            continue;
+        }
+        let left = rects
+            .iter()
+            .map(|rect| rect.x)
+            .fold(f32::INFINITY, f32::min);
+        let top = rects
+            .iter()
+            .map(|rect| rect.y)
+            .fold(f32::INFINITY, f32::min);
+        let bottom = rects
+            .iter()
+            .map(|rect| rect.y + rect.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if first_fragment_is_block.get(&owner) == Some(&true) {
+            rects.insert(0, w3cos_dom::DOMRect::new(left, top, 0.0, 0.0));
+        }
+        if last_fragment_is_block.get(&owner) == Some(&true) {
+            rects.push(w3cos_dom::DOMRect::new(left, bottom, 0.0, 0.0));
+        }
+    }
+    for (owner, rects) in &mut published {
+        if owners_with_inline_fragments.contains(owner) || rects.is_empty() {
+            continue;
+        }
+        let mut union = rects[0];
+        for rect in &rects[1..] {
+            let left = union.x.min(rect.x);
+            let top = union.y.min(rect.y);
+            let right = (union.x + union.width).max(rect.x + rect.width);
+            let bottom = (union.y + union.height).max(rect.y + rect.height);
+            union = w3cos_dom::DOMRect::new(left, top, right - left, bottom - top);
+        }
+        let zero_before = w3cos_dom::DOMRect::new(union.x, union.y, 0.0, 0.0);
+        let middle = w3cos_dom::DOMRect::new(union.x, union.y, union.width, union.height);
+        let zero_after = w3cos_dom::DOMRect::new(union.x, union.y + union.height, 0.0, 0.0);
+        *rects = vec![zero_before, middle, zero_after];
+    }
+    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
 }
 
 fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
@@ -325,6 +885,7 @@ fn remember_width(
         viewport_w_bits,
         viewport_h_bits,
         rects,
+        client_rects: client_rect_snapshot(),
     });
 }
 
@@ -349,6 +910,7 @@ fn memos_for_tree(
             viewport_w_bits,
             viewport_h_bits,
             rects: rects.clone(),
+            client_rects: client_rect_snapshot(),
         })
         .collect()
 }
@@ -410,7 +972,31 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
-        component.style = style.clone();
+        let private_metadata = component
+            .style
+            .custom_properties
+            .as_ref()
+            .map(|properties| {
+                [
+                    w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER,
+                    w3cos_std::inline_text::CSSOM_OWNER_RANGES,
+                    w3cos_std::inline_text::CSSOM_BOX_OWNERS,
+                ]
+                .into_iter()
+                .filter_map(|key| properties.get(key).cloned().map(|value| (key, value)))
+                .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        component.style = style.clone().into();
+        if !private_metadata.is_empty() {
+            let properties = component
+                .style
+                .custom_properties
+                .get_or_insert_with(Default::default);
+            for (key, value) in private_metadata {
+                properties.insert(key.into(), value);
+            }
+        }
         return true;
     }
     component
@@ -663,20 +1249,31 @@ fn sync_paint_cache(
     }
     let mut styles = Vec::with_capacity(dirty.len());
     let mut insets_only = true;
+    let mut paint_only = true;
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         let Some(old) = component_style(&cache.component, id.as_u32()) else {
             return false;
         };
-        if !paint_geometry_edit(old, &style) || !style_patch_is_safe(&style) {
+        if !style_patch_is_safe(&style) {
             return false;
         }
-        insets_only &= paint_insets_only(old, &style);
+        if paint_geometry_edit(old, &style) {
+            paint_only = false;
+            insets_only &= paint_insets_only(old, &style);
+        } else if local_paint_only(old, &style) {
+            insets_only = false;
+        } else {
+            return false;
+        }
         styles.push((id.as_u32(), style));
     }
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
+        }
+        if paint_only {
+            continue;
         }
         let Some(index) = cache.node_ids.iter().position(|node| node == id) else {
             return false;
@@ -687,6 +1284,11 @@ fn sync_paint_cache(
         {
             return false;
         }
+    }
+    if paint_only {
+        cache.cascade = cascade;
+        note_paint_patch();
+        return true;
     }
     let flat = pre_flatten(&cache.component);
     if flat.len() != cache.node_ids.len()
@@ -783,6 +1385,8 @@ fn try_shift_absolute_insets(
         }
     }
     write_host_rects(&cache.node_ids, &cache.results.layout_cache);
+    let flat = pre_flatten(&cache.component);
+    publish_client_rects(&flat, &cache.results.layout_cache);
     cache.cascade = cascade;
     note_paint_patch();
     note_paint_shift();
@@ -984,6 +1588,51 @@ fn paint_geometry_edit(old: &w3cos_std::style::Style, new: &w3cos_std::style::St
     left == right
 }
 
+/// Background, opacity, border colors, radii, shadows, outlines, and
+/// `z-index` do not change used boxes. Color and font stay in the comparison
+/// because descendants copy them when the component tree is built.
+fn local_paint_only(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    if old == new {
+        return true;
+    }
+    let mut left = old.clone();
+    let mut right = new.clone();
+    neutralize_local_paint(&mut left);
+    neutralize_local_paint(&mut right);
+    left == right
+}
+
+fn neutralize_local_paint(style: &mut w3cos_std::style::Style) {
+    use w3cos_std::style::OutlineStyle;
+    let clear = w3cos_std::color::Color::BLACK;
+    style.background = clear;
+    style.background_image = None;
+    style.background_size = None;
+    style.background_position = None;
+    style.background_repeat = None;
+    style.background_origin = None;
+    style.background_clip = None;
+    style.background_attachment = None;
+    style.background_blend_mode = None;
+    style.opacity = 1.0;
+    style.border_color = clear;
+    style.border_top_color = None;
+    style.border_right_color = None;
+    style.border_bottom_color = None;
+    style.border_left_color = None;
+    style.border_radius = 0.0;
+    style.border_top_left_radius = None;
+    style.border_top_right_radius = None;
+    style.border_bottom_right_radius = None;
+    style.border_bottom_left_radius = None;
+    style.box_shadow = None;
+    style.box_shadows.clear();
+    style.outline_width = 0.0;
+    style.outline_color = clear;
+    style.outline_style = OutlineStyle::None;
+    style.z_index = 0;
+}
+
 fn neutralize_paint_geometry(style: &mut w3cos_std::style::Style) {
     use w3cos_std::style::{AlignSelf, Edges};
     style.top = Dimension::Auto;
@@ -1038,8 +1687,13 @@ mod paint_layout_tests {
     }
 
     fn fresh_rect(id: u32) -> crate::layout::LayoutRect {
+        // Same entry as the retained paint path (`LayoutEngine::compute`),
+        // so the oracle follows the process mode instead of the always-legacy
+        // Taffy helper.
         let component = crate::dom::to_component_tree();
-        let results = crate::layout::compute_with_scroll_details(&component, 1024.0, 768.0)
+        let flat = crate::layout::pre_flatten(&component);
+        let results = crate::layout::LayoutEngine::new()
+            .compute(&component, &flat, 1024.0, 768.0)
             .expect("full layout");
         host_rect(&component, &results, id)
     }
@@ -1089,17 +1743,21 @@ mod paint_layout_tests {
         crate::dom::set_style_property(box_node, "top", "40px");
         let second = paint_rect(box_node);
         let (rebuilds_after, patches_after) = paint_layout_stats();
-        assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
-        assert_eq!(
-            patches_after - patches,
-            1,
-            "absolute top must patch, not rebuild"
-        );
-        assert_eq!(
-            paint_shift_count() - shifts,
-            1,
-            "a px absolute top skips another Taffy solve"
-        );
+        // The Taffy patch counters describe the legacy retained tree.
+        // LayoutNG replaces that tree, so the default engine rebuilds.
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
+            assert_eq!(
+                patches_after - patches,
+                1,
+                "absolute top must patch, not rebuild"
+            );
+            assert_eq!(
+                paint_shift_count() - shifts,
+                1,
+                "a px absolute top skips another Taffy solve"
+            );
+        }
         assert!(
             second.y > first.y + 30.0,
             "top 40px must move the box, {first:?} -> {second:?}"
@@ -1137,7 +1795,9 @@ mod paint_layout_tests {
         crate::dom::set_style_property(parent, "top", "50px");
         let after = paint_rect(child);
         let fresh = fresh_rect(child);
-        assert_eq!(paint_shift_count() - shifts, 1);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(paint_shift_count() - shifts, 1);
+        }
         assert!(
             after.y > before.y + 40.0,
             "child must move with the absolute parent, {before:?} -> {after:?}"
@@ -1428,5 +2088,178 @@ mod paint_layout_tests {
             height > 40.0,
             "the new text must wrap once height is auto, got {height}"
         );
+    }
+
+    fn component_background(component: &Component, id: u32) -> Option<w3cos_std::color::Color> {
+        if host_id(component) == Some(id) {
+            return Some(component.style.background);
+        }
+        component
+            .children
+            .iter()
+            .find_map(|child| component_background(child, id))
+    }
+
+    #[test]
+    fn background_edit_patches_without_rebuilding_layout() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        crate::dom::set_style_property(parent, "display", "flex");
+        let painted = crate::dom::create_element("div");
+        crate::dom::set_style_property(painted, "width", "40px");
+        crate::dom::set_style_property(painted, "height", "20px");
+        crate::dom::set_style_property(painted, "background", "#112233");
+        let sibling = crate::dom::create_element("div");
+        crate::dom::set_style_property(sibling, "width", "40px");
+        crate::dom::set_style_property(sibling, "height", "20px");
+        crate::dom::append_child(parent, painted);
+        crate::dom::append_child(parent, sibling);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+
+        let (rebuilds, _) = paint_layout_stats();
+        let sibling_before = paint_rect(sibling);
+        let (rebuilds_after, patches_after) = paint_layout_stats();
+        assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
+
+        crate::dom::set_style_property(painted, "background", "#abcdef");
+        let sibling_after = paint_rect(sibling);
+        let (rebuilds_bg, patches_bg) = paint_layout_stats();
+        assert_eq!(rebuilds_bg, rebuilds_after, "background must not rebuild");
+        assert_eq!(patches_bg - patches_after, 1, "background patches the tree");
+        assert!(
+            (sibling_before.x - sibling_after.x).abs() < 0.05
+                && (sibling_before.y - sibling_after.y).abs() < 0.05
+                && (sibling_before.width - sibling_after.width).abs() < 0.05
+                && (sibling_before.height - sibling_after.height).abs() < 0.05,
+            "background moved the sibling {sibling_before:?} -> {sibling_after:?}"
+        );
+        let expected = crate::dom::with_document(|document| {
+            document
+                .computed_style_for(NodeId::from_u32(painted))
+                .background
+        });
+        let stored = with_paint_layout(1024.0, 768.0, |component, _| {
+            Ok(component_background(component, painted).expect("painted node"))
+        })
+        .expect("paint");
+        assert_eq!(stored, expected);
+        assert_ne!(expected, w3cos_std::color::Color::BLACK);
+    }
+
+    #[test]
+    fn width_edit_still_relayouts() {
+        crate::dom::reset_document();
+        let node = crate::dom::create_element("div");
+        crate::dom::set_style_property(node, "width", "40px");
+        crate::dom::set_style_property(node, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), node);
+        let before = paint_rect(node);
+        let (rebuilds, _) = paint_layout_stats();
+        crate::dom::set_style_property(node, "width", "120px");
+        let after = paint_rect(node);
+        let fresh = fresh_rect(node);
+        let (rebuilds_after, _) = paint_layout_stats();
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(rebuilds_after, rebuilds, "width stays on the retained tree");
+        }
+        assert!(
+            after.width > before.width + 40.0,
+            "width edit must move the used box {before:?} -> {after:?}"
+        );
+        assert!(
+            (after.x - fresh.x).abs() < 0.05
+                && (after.y - fresh.y).abs() < 0.05
+                && (after.width - fresh.width).abs() < 0.05
+                && (after.height - fresh.height).abs() < 0.05,
+            "width edit {after:?} diverges from full layout {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_color_updates_child_without_own_color() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        crate::dom::set_style_property(parent, "color", "red");
+        let child = crate::dom::create_element("span");
+        crate::dom::append_child(parent, child);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let red = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(child)).color
+        });
+        crate::dom::set_style_property(parent, "color", "blue");
+        let blue = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(child)).color
+        });
+        let parent_blue = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(parent)).color
+        });
+        assert_ne!(red, blue, "the child had no color of its own");
+        assert_eq!(blue, parent_blue);
+    }
+
+    #[test]
+    fn local_width_keeps_sibling_class_color() {
+        crate::dom::reset_document();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(".alt", &[("color", "green")]);
+        let parent = crate::dom::create_element("div");
+        let edited = crate::dom::create_element("div");
+        let sibling = crate::dom::create_element("div");
+        crate::dom::set_attribute(edited, "class", "alt");
+        crate::dom::set_attribute(sibling, "class", "alt");
+        crate::dom::append_child(parent, edited);
+        crate::dom::append_child(parent, sibling);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let before = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(sibling)).color
+        });
+        crate::dom::set_style_property(edited, "width", "80px");
+        let after = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(sibling)).color
+        });
+        let edited_width = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(edited)).width
+        });
+        w3cos_dom::stylesheet::clear_rules();
+        assert_eq!(before, after);
+        assert_eq!(
+            after,
+            w3cos_std::color::Color::from_css("green").expect("green")
+        );
+        assert_eq!(edited_width, w3cos_std::style::Dimension::Px(80.0));
+    }
+
+    #[test]
+    fn same_class_different_ids_share_style_but_dir_does_not() {
+        crate::dom::reset_document();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(".cell", &[("color", "purple"), ("width", "30px")]);
+        let parent = crate::dom::create_element("div");
+        let first = crate::dom::create_element("div");
+        let second = crate::dom::create_element("div");
+        let directed = crate::dom::create_element("div");
+        for (node, id) in [(first, "a"), (second, "b"), (directed, "c")] {
+            crate::dom::set_attribute(node, "class", "cell");
+            crate::dom::set_attribute(node, "id", id);
+            crate::dom::append_child(parent, node);
+        }
+        crate::dom::set_attribute(directed, "dir", "rtl");
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let (first_style, second_style, directed_style) = crate::dom::with_document(|document| {
+            (
+                document.computed_style_for(NodeId::from_u32(first)),
+                document.computed_style_for(NodeId::from_u32(second)),
+                document.computed_style_for(NodeId::from_u32(directed)),
+            )
+        });
+        w3cos_dom::stylesheet::clear_rules();
+        assert_eq!(first_style.color, second_style.color);
+        assert_eq!(first_style.width, second_style.width);
+        assert_eq!(first_style.direction, second_style.direction);
+        assert_eq!(
+            first_style.color,
+            w3cos_std::color::Color::from_css("purple").expect("purple")
+        );
+        assert_ne!(directed_style.direction, first_style.direction);
     }
 }

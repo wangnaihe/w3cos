@@ -17,26 +17,31 @@ use crate::Value;
 /// getter/setter callables without sharing either backend's private binding
 /// representation. A lexical binding starts uninitialized and therefore
 /// preserves the temporal dead zone across cyclic module graphs.
+///
+/// The state is `(value, initialized)` — the same representation an AOT frame
+/// uses for a captured context slot — so a function can capture a module
+/// binding as a direct context-slot load (V8 ScriptContext slot) instead of
+/// calling a getter closure per read.
 #[derive(Clone)]
 pub struct BindingCell {
-    state: Rc<RefCell<Option<Value>>>,
+    state: Rc<RefCell<(Value, bool)>>,
 }
 
 impl BindingCell {
     pub fn uninitialized() -> Self {
         Self {
-            state: Rc::new(RefCell::new(None)),
+            state: Rc::new(RefCell::new((Value::Undefined, false))),
         }
     }
 
     pub fn initialized(value: Value) -> Self {
         Self {
-            state: Rc::new(RefCell::new(Some(value))),
+            state: Rc::new(RefCell::new((value, true))),
         }
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.state.borrow().is_some()
+        self.state.borrow().1
     }
 
     pub fn read(&self) -> Value {
@@ -53,9 +58,10 @@ impl BindingCell {
     }
 
     pub fn try_read_named(&self, name: &str) -> Result<Value, Value> {
-        match self.state.borrow().clone() {
-            Some(value) => Ok(value),
-            None => Err(crate::intrinsics::reference_error(&format!(
+        let state = self.state.borrow();
+        match state.1 {
+            true => Ok(state.0.clone()),
+            false => Err(crate::intrinsics::reference_error(&format!(
                 "{name} is not initialized"
             ))),
         }
@@ -65,8 +71,13 @@ impl BindingCell {
     /// live binding. Declaration mutability remains enforced by the lowering
     /// metadata; this cell owns only instantiation and TDZ state.
     pub fn initialize_or_set(&self, value: Value) -> Value {
-        *self.state.borrow_mut() = Some(value.clone());
+        *self.state.borrow_mut() = (value.clone(), true);
         value
+    }
+
+    /// The shared `(value, initialized)` slot, for `AotCapture::Cell`.
+    pub fn shared_slot(&self) -> Rc<RefCell<(Value, bool)>> {
+        Rc::clone(&self.state)
     }
 }
 
@@ -214,6 +225,21 @@ fn register_with_kind(
     });
 }
 
+/// The rejection value of `import(specifier)` for a module that is not in the
+/// compiled graph: an `Error` with Node's `ERR_MODULE_NOT_FOUND` code.
+pub fn module_not_found(specifier: &str) -> Value {
+    let error = crate::error_instance(
+        "Error",
+        vec![Value::string(&format!("Cannot find module '{specifier}'"))],
+    );
+    crate::intrinsics::set_property(
+        &error,
+        &Value::string("code"),
+        Value::string("ERR_MODULE_NOT_FOUND"),
+    );
+    error
+}
+
 pub fn contains(specifier: &str) -> bool {
     let specifier = canonical_specifier(specifier);
     MODULES.with(|modules| modules.borrow().contains_key(&specifier))
@@ -279,6 +305,34 @@ pub fn namespace(specifier: &str) -> Option<Value> {
         *record.namespace.borrow_mut() = Some(namespace.clone());
         Some(namespace)
     })
+}
+
+/// `./x.js` / `../x.js` resolved against the referrer module's path or
+/// `file://` URL (`.` and `..` segments folded); `None` for bare or
+/// absolute specifiers.
+pub fn resolve_relative_specifier(referrer: &str, specifier: &str) -> Option<String> {
+    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+        return None;
+    }
+    let referrer = referrer.strip_prefix("file://").unwrap_or(referrer);
+    if !referrer.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = referrer
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    segments.pop();
+    for part in specifier.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            part => segments.push(part),
+        }
+    }
+    Some(format!("/{}", segments.join("/")))
 }
 
 pub fn evaluate(specifier: &str) -> Option<Value> {
@@ -487,6 +541,21 @@ pub fn import_meta(specifier: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_specifiers_resolve_against_the_referrer() {
+        assert_eq!(
+            resolve_relative_specifier("/app/out/bootstrap-fork.js", "./vs/code/main.js")
+                .as_deref(),
+            Some("/app/out/vs/code/main.js")
+        );
+        assert_eq!(
+            resolve_relative_specifier("file:///app/out/a/b.js", "../c/./d.js").as_deref(),
+            Some("/app/out/c/d.js")
+        );
+        assert_eq!(resolve_relative_specifier("/app/out/a.js", "vs/x.js"), None);
+        assert_eq!(resolve_relative_specifier("relative.js", "./x.js"), None);
+    }
     use std::cell::{Cell, RefCell};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;

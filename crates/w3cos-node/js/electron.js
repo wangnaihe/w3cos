@@ -23,11 +23,27 @@ const ELECTRON_VERSION = '44.9.0';
 if (process.versions.electron === undefined) process.versions.electron = ELECTRON_VERSION;
 
 const env = process.env || {};
-const TRACE = env.W3COS_ELECTRON_TRACE === '1';
+// W3COS_ELECTRON_TRACE=1 logs the app lifecycle; =2 also logs renderer
+// script evaluation and renderer→main IPC (to see where a page stalls).
+const TRACE = env.W3COS_ELECTRON_TRACE === '1' || env.W3COS_ELECTRON_TRACE === '2';
+const RENDERER_TRACE = env.W3COS_ELECTRON_TRACE === '2';
 const EXIT_AFTER_LOAD = env.W3COS_ELECTRON_EXIT_AFTER_LOAD === '1';
 
 function trace(message) {
   if (TRACE) console.log('[electron] ' + message);
+}
+
+function rendererTrace(message) {
+  if (RENDERER_TRACE) console.log('[electron] ' + message);
+}
+
+function describeError(error) {
+  if (error && error.message !== undefined) return String(error.message);
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 // One task per message, like Electron's IPC and navigation.
@@ -229,13 +245,35 @@ function moduleKey(file) {
   return relative;
 }
 
-function runRendererScript(file, label) {
+// Chromium starts each renderer with its own command line; Electron appends
+// `webPreferences.additionalArguments` there, and preloads read them from
+// `process.argv` (Code-OSS passes its window-config IPC channel this way).
+// The renderer shares this process, so `process.argv` is swapped for the
+// renderer's argv while a renderer script evaluates and restored after,
+// leaving the main process's argv untouched.
+function rendererArgv(contents) {
+  const extra = contents && contents._preferences.additionalArguments;
+  return [process.argv[0], '--type=renderer'].concat(Array.isArray(extra) ? extra.map(String) : []);
+}
+
+function withRendererArgv(contents, run) {
+  const saved = process.argv;
+  process.argv = rendererArgv(contents);
+  try {
+    return run();
+  } finally {
+    process.argv = saved;
+  }
+}
+
+function runRendererScript(file, label, contents) {
   const key = moduleKey(file);
   if (assets.modules.indexOf(key) < 0) {
     console.error('Unable to load ' + label + ' ' + file + ': not compiled into this app');
     return;
   }
   const report = (error) => {
+    rendererTrace(label + '-failed ' + key + ' ' + describeError(error));
     console.error(label === 'preload'
       ? 'Unable to load preload script: ' + file
       : 'Uncaught ' + (error && error.stack ? error.stack : error));
@@ -244,8 +282,12 @@ function runRendererScript(file, label) {
   try {
     // ES module scripts (`<script type="module">`, ESM preloads) are linked
     // as lazily evaluated modules: `load` returns their `import()` promise.
-    const result = assets.load(key);
-    if (result && typeof result.then === 'function') return result.then(undefined, report);
+    rendererTrace(label + '-start ' + key);
+    const result = withRendererArgv(contents, () => assets.load(key));
+    if (result && typeof result.then === 'function') {
+      return result.then(() => rendererTrace(label + '-done ' + key), report);
+    }
+    rendererTrace(label + '-done ' + key);
   } catch (error) {
     report(error);
   }
@@ -259,11 +301,11 @@ function renderPage(contents, page) {
   document.body.innerHTML = page.body;
   document.title = page.title;
   const preload = contents._preferences.preload;
-  let pending = preload ? runRendererScript(preload, 'preload') : undefined;
+  let pending = preload ? runRendererScript(preload, 'preload', contents) : undefined;
   for (const script of page.scripts) {
     pending = pending
-      ? pending.then(() => runRendererScript(script, 'script'))
-      : runRendererScript(script, 'script');
+      ? pending.then(() => runRendererScript(script, 'script', contents))
+      : runRendererScript(script, 'script', contents);
   }
   const contentLoaded = () => {
     document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
@@ -274,6 +316,34 @@ function renderPage(contents, page) {
 }
 
 // --- webContents -------------------------------------------------------------
+
+// Electron WebFrameMain: w3cos renders one top-level frame per webContents,
+// so the main frame has no parent (ipcMain senders are main frames).
+class WebFrameMain {
+  constructor(contents) {
+    this._contents = contents;
+    this.processId = 1;
+    this.routingId = 1;
+    this.frameTreeNodeId = contents.id;
+    this.name = '';
+    this.parent = null;
+    this.frames = [];
+    this.detached = false;
+  }
+  get url() { return this._contents.getURL(); }
+  get origin() {
+    try { return new URL(this.url).origin; } catch { return ''; }
+  }
+  get top() { return this; }
+  get framesInSubtree() { return [this]; }
+  get osProcessId() { return process.pid; }
+  get visibilityState() { return this._contents._win && this._contents._win.isVisible() ? 'visible' : 'hidden'; }
+  executeJavaScript(code) { return this._contents.executeJavaScript(code); }
+  send(channel, ...args) { this._contents.send(channel, ...args); }
+  postMessage(channel, message, transfer) { this._contents.postMessage(channel, message, transfer); }
+  reload() { this._contents.reload(); return true; }
+  isDestroyed() { return this._contents.isDestroyed(); }
+}
 
 class WebContents extends EventEmitter {
   constructor(win, preferences) {
@@ -286,8 +356,11 @@ class WebContents extends EventEmitter {
     this._destroyed = false;
     this._windowOpenHandler = null;
     this.session = session.defaultSession;
+    this.mainFrame = new WebFrameMain(this);
   }
   getURL() { return this._url; }
+  getProcessId() { return 1; }
+  getOSProcessId() { return process.pid; }
   getTitle() {
     if (this === hostContents && hasDom()) return document.title;
     return this._win ? this._win._title : '';
@@ -382,7 +455,23 @@ class WebContents extends EventEmitter {
       ipcRenderer.emit(String(channel), makeEvent({ sender: ipcRenderer, senderId: 0, ports: [] }), ...copies);
     });
   }
-  postMessage(channel, message) { this.send(channel, message); }
+  // Ports in `transfer` reach the page as DOM-style MessagePorts on the
+  // ipcRenderer event's `ports` (Code-OSS hands out shared-process channels
+  // this way).
+  postMessage(channel, message, transfer) {
+    const ports = transferredPorts(transfer);
+    if (ports.length === 0) {
+      this.send(channel, message);
+      return;
+    }
+    if (this._destroyed) return;
+    const copy = clone(message);
+    const rendererPorts = ports.map(rendererPort);
+    task(() => {
+      if (this._destroyed || this !== hostContents) return;
+      ipcRenderer.emit(String(channel), makeEvent({ sender: ipcRenderer, senderId: 0, ports: rendererPorts }), copy);
+    });
+  }
   executeJavaScript() {
     // No `eval` in an AOT-compiled app: renderer code must be compiled in.
     return Promise.reject(unsupported('webContents.executeJavaScript()'));
@@ -418,6 +507,8 @@ class BrowserWindow extends EventEmitter {
       width: opts.width === undefined ? 800 : opts.width,
       height: opts.height === undefined ? 600 : opts.height,
     };
+    this._minSize = [opts.minWidth || 0, opts.minHeight || 0];
+    this._maxSize = [opts.maxWidth || 0, opts.maxHeight || 0];
     this._title = opts.title === undefined ? appName : String(opts.title);
     this._visible = opts.show !== false;
     this._destroyed = false;
@@ -448,10 +539,21 @@ class BrowserWindow extends EventEmitter {
   getContentSize() { return this.getSize(); }
   setContentSize(width, height) { this.setSize(width, height); }
   getPosition() { return [this._bounds.x, this._bounds.y]; }
+  // Electron: the platform window handle as a Buffer (HWND / NSView* / XID);
+  // w3cos has no native handle, so expose the window id in a pointer-sized buffer.
+  getNativeWindowHandle() {
+    const handle = Buffer.alloc(8);
+    handle.writeUInt32LE(this.id, 0);
+    return handle;
+  }
+  getMediaSourceId() { return 'window:' + this.id + ':0'; }
   setPosition(x, y) { this._bounds.x = x; this._bounds.y = y; this.emit('move'); }
   center() {}
-  setMinimumSize() {}
-  setMaximumSize() {}
+  // Electron returns [width, height]; 0 means "no constraint".
+  setMinimumSize(width, height) { this._minSize = [width | 0, height | 0]; }
+  getMinimumSize() { return this._minSize.slice(); }
+  setMaximumSize(width, height) { this._maxSize = [width | 0, height | 0]; }
+  getMaximumSize() { return this._maxSize.slice(); }
   setResizable() {}
   isResizable() { return true; }
   show() { this._visible = true; this.emit('show'); }
@@ -532,7 +634,7 @@ const ipcMain = new IpcMain();
 function mainEvent(contents) {
   return makeEvent({
     sender: contents,
-    senderFrame: { url: contents ? contents.getURL() : '', processId: 1, routingId: 1 },
+    senderFrame: contents ? contents.mainFrame : null,
     frameId: 1,
     processId: 1,
     ports: [],
@@ -550,6 +652,7 @@ class IpcRenderer extends EventEmitter {
   send(channel, ...args) {
     const contents = rendererContents();
     const copies = cloneArgs(args);
+    rendererTrace('ipc-send ' + String(channel));
     task(() => ipcMain.emit(String(channel), mainEvent(contents), ...copies));
   }
   invoke(channel, ...args) {
@@ -561,17 +664,24 @@ class IpcRenderer extends EventEmitter {
       return Promise.reject(error);
     }
     const copies = cloneArgs(args);
+    rendererTrace('ipc-invoke ' + name);
     return new Promise((resolve, reject) => {
       task(() => {
         const handler = handlers.get(name);
-        const fail = (error) => reject(new Error("Error invoking remote method '" + name + "': " + error));
+        const fail = (error) => {
+          rendererTrace('ipc-invoke-failed ' + name + ' ' + describeError(error));
+          reject(new Error("Error invoking remote method '" + name + "': " + error));
+        };
         if (handler === undefined) {
           fail(new Error("No handler registered for '" + name + "'"));
           return;
         }
         Promise.resolve()
           .then(() => handler(mainEvent(contents), ...copies))
-          .then((result) => resolve(clone(result)), fail);
+          .then((result) => {
+            rendererTrace('ipc-invoke-done ' + name);
+            resolve(clone(result));
+          }, fail);
       });
     });
   }
@@ -620,6 +730,25 @@ const contextBridge = {
     const args = script && script.args ? script.args : [];
     return script.func(...args);
   },
+};
+
+// --- webFrame / webUtils (renderer) -------------------------------------------
+
+// One renderer with no page zoom: zoom calls are recorded so reads match.
+let zoomLevel = 0;
+const webFrame = {
+  setZoomLevel(level) { zoomLevel = Number(level) || 0; },
+  getZoomLevel() { return zoomLevel; },
+  setZoomFactor(factor) { zoomLevel = Math.log(Number(factor) || 1) / Math.log(1.2); },
+  getZoomFactor() { return Math.pow(1.2, zoomLevel); },
+  setVisualZoomLevelLimits() { return Promise.resolve(); },
+  getResourceUsage() { return {}; },
+  clearCache() {},
+};
+
+const webUtils = {
+  // `File` objects from the host's pickers carry their filesystem path.
+  getPathForFile(file) { return file && typeof file.path === 'string' ? file.path : ''; },
 };
 
 // --- dialog (File System Access pickers, alert/confirm) -----------------------
@@ -775,23 +904,44 @@ class MessagePortMain extends EventEmitter {
     this._started = false;
     this._closed = false;
     this._scheduled = false;
+    this._remote = null;
+    this._remoteId = 0;
   }
   postMessage(message, transfer) {
     if (Array.isArray(transfer) && transfer.length > 0) throw unsupported('Transferring MessagePortMain objects');
     const data = structuredCodec.serialize(message);
     const other = this._other;
     if (this._closed || other === null || other._closed) return;
+    if (other._remote !== null) {
+      // The other end was transferred to a utility process.
+      other._remote._sendPort('message', other._remoteId, structuredCodec.deserialize(data));
+      return;
+    }
     other._queue.push(data);
     other._schedule();
+  }
+  // Hand this port to a utility process: messages to it cross the worker
+  // channel, and what the child posts on its end comes back through here.
+  _transferTo(child, id) {
+    this._remote = child;
+    this._remoteId = id;
+    this._started = true;
+    const queued = this._queue;
+    this._queue = [];
+    for (const data of queued) child._sendPort('message', id, structuredCodec.deserialize(data));
   }
   _schedule() {
     if (!this._started || this._scheduled || this._queue.length === 0) return;
     this._scheduled = true;
+    // Like Node's MessagePort::OnMessage: one task delivers everything queued
+    // (up to 1000, including what arrives meanwhile), so a burst costs one
+    // event-loop turn instead of one turn per message.
     task(() => {
       this._scheduled = false;
-      if (!this._started || this._closed || this._queue.length === 0) return;
-      const data = structuredCodec.deserialize(this._queue.shift());
-      this.emit('message', { data, ports: [] });
+      for (let n = 0; n < 1000 && this._started && !this._closed && this._queue.length > 0; n++) {
+        const data = structuredCodec.deserialize(this._queue.shift());
+        this.emit('message', { data, ports: [] });
+      }
       this._schedule();
     });
   }
@@ -803,12 +953,59 @@ class MessagePortMain extends EventEmitter {
   close() {
     if (this._closed) return;
     this._closed = true;
+    if (this._remote !== null) this._remote._sendPort('close', this._remoteId);
     const other = this._other;
     if (other !== null && !other._closed) {
       other._closed = true;
-      task(() => other.emit('close'));
+      if (other._remote !== null) other._remote._sendPort('close', other._remoteId);
+      else task(() => other.emit('close'));
     }
   }
+}
+
+function transferredPorts(transfer) {
+  return Array.isArray(transfer) ? transfer.filter((item) => item instanceof MessagePortMain) : [];
+}
+
+// The page's view of a MessagePortMain: a DOM MessagePort (message events
+// with `data`, `onmessage` starts it, `start()` / `close()`). Main and
+// renderer share this thread, so it drives the main-side port directly.
+function rendererPort(port) {
+  const listeners = [];
+  let onmessage = null;
+  let started = false;
+  const dom = {
+    postMessage(message) { port.postMessage(message); },
+    start() {
+      if (started) return;
+      started = true;
+      port.on('message', (event) => {
+        const messageEvent = { type: 'message', data: event.data, ports: [], target: dom, currentTarget: dom };
+        for (const listener of listeners.slice()) {
+          if (typeof listener === 'function') listener.call(dom, messageEvent);
+          else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(messageEvent);
+        }
+        if (typeof onmessage === 'function') onmessage.call(dom, messageEvent);
+      });
+      port.start();
+    },
+    close() { port.close(); },
+    addEventListener(type, listener) {
+      if (String(type) === 'message' && listeners.indexOf(listener) < 0) listeners.push(listener);
+    },
+    removeEventListener(type, listener) {
+      const index = listeners.indexOf(listener);
+      if (String(type) === 'message' && index >= 0) listeners.splice(index, 1);
+    },
+  };
+  Object.defineProperty(dom, 'onmessage', {
+    get() { return onmessage; },
+    set(value) {
+      onmessage = typeof value === 'function' ? value : null;
+      if (onmessage) dom.start();
+    },
+  });
+  return dom;
 }
 
 class MessageChannelMain {
@@ -821,6 +1018,7 @@ class MessageChannelMain {
 }
 
 const utilityChildren = new Set();
+let nextTransferId = 1;
 
 class UtilityProcess extends EventEmitter {
   constructor(modulePath, args, options) {
@@ -832,6 +1030,8 @@ class UtilityProcess extends EventEmitter {
     this._exited = false;
     this._worker = new workerThreads.Worker(modulePath, {
       workerData: { args: Array.isArray(args) ? args.map(String) : [], serviceName: opts.serviceName },
+      // Electron: `env` replaces the child's environment (default process.env).
+      env: opts.env,
       name: opts.serviceName,
       w3cosKind: 'utility',
     });
@@ -840,7 +1040,23 @@ class UtilityProcess extends EventEmitter {
       this.pid = process.pid;
       this.emit('spawn');
     });
-    this._worker.on('message', (message) => this.emit('message', message));
+    this._ports = new Map();
+    this._worker.on('message', (message) => {
+      const envelope = message !== null && typeof message === 'object' ? message.__w3cosPort : undefined;
+      if (envelope === undefined) {
+        this.emit('message', message);
+        return;
+      }
+      // The child's end of a transferred port posted or closed.
+      const port = this._ports.get(message.id);
+      if (port === undefined) return;
+      if (envelope === 'message') port.postMessage(message.data);
+      else if (envelope === 'close') {
+        this._ports.delete(message.id);
+        port._remote = null;
+        port.close();
+      }
+    });
     this._worker.on('error', (error) => this.emit('error', 'FatalError', error && error.stack ? String(error.stack) : String(error)));
     this._worker.on('exit', (code) => {
       this._exited = true;
@@ -850,8 +1066,22 @@ class UtilityProcess extends EventEmitter {
     });
   }
   postMessage(message, transfer) {
-    if (Array.isArray(transfer) && transfer.length > 0) throw unsupported('Transferring MessagePortMain objects');
-    this._worker.postMessage(message);
+    const ports = transferredPorts(transfer);
+    if (ports.length === 0) {
+      this._worker.postMessage(message);
+      return;
+    }
+    const ids = ports.map((port) => {
+      const id = nextTransferId++;
+      this._ports.set(id, port);
+      return id;
+    });
+    this._worker.postMessage({ __w3cosPort: 'transfer', message, ids });
+    ports.forEach((port, index) => port._transferTo(this, ids[index]));
+  }
+  _sendPort(kind, id, data) {
+    if (this._exited) return;
+    this._worker.postMessage({ __w3cosPort: kind, id, data });
   }
   kill() {
     if (this._exited) return false;
@@ -970,7 +1200,9 @@ const net = {
     const href = typeof input === 'string' ? input : String(input && input.url !== undefined ? input.url : input);
     const scheme = schemeOf(href);
     const bypass = init && init.bypassCustomProtocolHandlers;
-    const handler = bypass ? undefined : (scheme === 'file' ? fileInterceptors.get('file') : protocolHandlers.get(scheme));
+    const handler = bypass
+      ? undefined
+      : protocolHandlers.get(scheme) || (scheme === 'file' ? fileInterceptors.get('file') : undefined);
     if (handler) return runHandler(handler, href, init);
     if (scheme === 'file') return fetchFile(href);
     if (typeof originalFetch === 'function') return originalFetch(href, init);
@@ -1000,9 +1232,13 @@ if (originalFetch !== undefined) {
   };
 }
 
+// `protocol.handle()` also takes the built-in schemes (it intercepts them,
+// e.g. Code-OSS refuses `file:` loads); the legacy `register*Protocol` calls
+// do not.
 function registerHandler(map, scheme, handler, verb) {
   const name = String(scheme);
-  if (map.has(name) || (map === protocolHandlers && BUILTIN_SCHEMES.indexOf(name) >= 0)) {
+  const builtin = map === protocolHandlers && verb === 'boolean' && BUILTIN_SCHEMES.indexOf(name) >= 0;
+  if (map.has(name) || builtin) {
     if (verb === 'boolean') return false;
     throw new Error('Failed to register protocol: ' + name);
   }
@@ -1179,6 +1415,166 @@ class Screen extends EventEmitter {
 
 const screen = new Screen();
 
+// --- powerMonitor / powerSaveBlocker / systemPreferences ----------------------------
+//
+// No OS power or preference events are delivered yet; the objects report a
+// steady, mains-powered, active machine so Code-OSS main can subscribe.
+
+class PowerMonitor extends EventEmitter {
+  get onBatteryPower() { return false; }
+  isOnBatteryPower() { return false; }
+  getSystemIdleState(idleThreshold) { return 'active'; }
+  getSystemIdleTime() { return 0; }
+  getCurrentThermalState() { return 'unknown'; }
+}
+const powerMonitor = new PowerMonitor();
+
+const powerSaveBlockers = new Set();
+let nextPowerSaveBlockerId = 0;
+const powerSaveBlocker = {
+  start(type) {
+    if (type !== 'prevent-app-suspension' && type !== 'prevent-display-sleep') {
+      throw new TypeError('Invalid power save blocker type: ' + type);
+    }
+    const id = nextPowerSaveBlockerId++;
+    powerSaveBlockers.add(id);
+    return id;
+  },
+  stop(id) { return powerSaveBlockers.delete(id); },
+  isStarted(id) { return powerSaveBlockers.has(id); },
+};
+
+class SystemPreferences extends EventEmitter {
+  getAccentColor() { return '0078d7ff'; }
+  getColor(color) { return '#000000'; }
+  getAnimationSettings() { return { shouldRenderRichAnimations: true, scrollAnimationsEnabledBySystem: true, prefersReducedMotion: false }; }
+  getMediaAccessStatus(mediaType) { return 'granted'; }
+  askForMediaAccess(mediaType) { return Promise.resolve(true); }
+  getUserDefault() { return undefined; }
+  isAeroGlassEnabled() { return false; }
+  canPromptTouchID() { return false; }
+}
+const systemPreferences = new SystemPreferences();
+
+// --- globalShortcut ---------------------------------------------------------------------
+//
+// Accelerators are tracked but never fire: there is no OS-wide hook.
+
+const globalShortcuts = new Map();
+const globalShortcut = {
+  register(accelerator, callback) {
+    if (globalShortcuts.has(accelerator)) return false;
+    globalShortcuts.set(accelerator, callback);
+    return true;
+  },
+  registerAll(accelerators, callback) { for (const a of accelerators) globalShortcut.register(a, callback); },
+  isRegistered(accelerator) { return globalShortcuts.has(accelerator); },
+  unregister(accelerator) { globalShortcuts.delete(accelerator); },
+  unregisterAll() { globalShortcuts.clear(); },
+};
+
+// --- clipboard ----------------------------------------------------------------------------
+//
+// Process-local store (main and renderer share the process); not yet the OS
+// clipboard.
+
+const clipboardData = new Map();
+function clipboardKey(type) { return type === 'selection' ? 'selection' : 'clipboard'; }
+function clipboardSlot(type) {
+  const key = clipboardKey(type);
+  if (!clipboardData.has(key)) clipboardData.set(key, {});
+  return clipboardData.get(key);
+}
+const clipboard = {
+  readText(type) { return clipboardSlot(type).text || ''; },
+  writeText(text, type) { clipboardData.set(clipboardKey(type), { text: String(text) }); },
+  readHTML(type) { return clipboardSlot(type).html || ''; },
+  writeHTML(markup, type) { clipboardData.set(clipboardKey(type), { html: String(markup) }); },
+  readRTF(type) { return clipboardSlot(type).rtf || ''; },
+  writeRTF(text, type) { clipboardData.set(clipboardKey(type), { rtf: String(text) }); },
+  readBookmark() { return { title: '', url: '' }; },
+  readFindText() { return clipboardSlot('find').find || ''; },
+  writeFindText(text) { clipboardSlot('find').find = String(text); },
+  readImage() { return nativeImage.createEmpty(); },
+  writeImage() {},
+  readBuffer(format) { return Buffer.from(clipboardSlot().buffers?.[format] || []); },
+  writeBuffer(format, buffer) { const slot = clipboardSlot(); slot.buffers = { ...(slot.buffers || {}), [format]: Buffer.from(buffer) }; },
+  write(data, type) {
+    const slot = {};
+    if (data.text !== undefined) slot.text = String(data.text);
+    if (data.html !== undefined) slot.html = String(data.html);
+    if (data.rtf !== undefined) slot.rtf = String(data.rtf);
+    clipboardData.set(clipboardKey(type), slot);
+  },
+  availableFormats(type) {
+    const slot = clipboardSlot(type);
+    const formats = [];
+    if (slot.text !== undefined) formats.push('text/plain');
+    if (slot.html !== undefined) formats.push('text/html');
+    if (slot.rtf !== undefined) formats.push('text/rtf');
+    return formats;
+  },
+  has(format, type) { return clipboard.availableFormats(type).indexOf(format) >= 0; },
+  clear(type) { clipboardData.delete(clipboardKey(type)); },
+};
+
+// --- nativeImage ------------------------------------------------------------------------
+//
+// Images keep their encoded bytes; decoding and resizing are not provided.
+
+class NativeImage {
+  constructor(buffer) { this._buffer = buffer ? Buffer.from(buffer) : Buffer.alloc(0); }
+  isEmpty() { return this._buffer.length === 0; }
+  getSize() { return { width: 0, height: 0 }; }
+  toPNG() { return Buffer.from(this._buffer); }
+  toJPEG() { return Buffer.from(this._buffer); }
+  toBitmap() { return Buffer.alloc(0); }
+  getBitmap() { return Buffer.alloc(0); }
+  toDataURL() { return 'data:image/png;base64,' + this._buffer.toString('base64'); }
+  resize() { return this; }
+  crop() { return this; }
+  setTemplateImage() {}
+  isTemplateImage() { return false; }
+  getAspectRatio() { return 1; }
+  addRepresentation() {}
+}
+const nativeImage = {
+  createEmpty() { return new NativeImage(); },
+  createFromBuffer(buffer) { return new NativeImage(buffer); },
+  createFromPath(file) {
+    try { return new NativeImage(require('fs').readFileSync(String(file))); } catch (e) { return new NativeImage(); }
+  },
+  createFromDataURL(url) {
+    const match = /^data:[^;,]*(;base64)?,(.*)$/.exec(String(url));
+    if (!match) return new NativeImage();
+    return new NativeImage(match[1] ? Buffer.from(match[2], 'base64') : Buffer.from(decodeURIComponent(match[2])));
+  },
+  createFromNamedImage() { return new NativeImage(); },
+};
+
+// --- Notification / contentTracing / desktopCapturer ----------------------------------
+
+class Notification extends EventEmitter {
+  static isSupported() { return false; }
+  constructor(options) {
+    super();
+    Object.assign(this, { title: '', body: '', silent: false }, options || {});
+  }
+  show() {}
+  close() { this.emit('close', { sender: this }); }
+}
+
+const contentTracing = {
+  getCategories() { return Promise.resolve([]); },
+  startRecording() { return Promise.resolve(); },
+  stopRecording(resultFilePath) { return Promise.resolve(resultFilePath || ''); },
+  getTraceBufferUsage() { return Promise.resolve({ value: 0, percentage: 0 }); },
+};
+
+const desktopCapturer = {
+  getSources() { return Promise.resolve([]); },
+};
+
 // --- safeStorage ------------------------------------------------------------------
 //
 // Sealed with the runtime's local keyring (AES-256-GCM, see
@@ -1240,6 +1636,8 @@ module.exports = {
   ipcMain,
   ipcRenderer,
   contextBridge,
+  webFrame,
+  webUtils,
   dialog,
   shell,
   Menu,
@@ -1253,4 +1651,13 @@ module.exports = {
   MessageChannelMain,
   MessagePortMain,
   utilityProcess,
+  powerMonitor,
+  powerSaveBlocker,
+  systemPreferences,
+  globalShortcut,
+  clipboard,
+  nativeImage,
+  Notification,
+  contentTracing,
+  desktopCapturer,
 };

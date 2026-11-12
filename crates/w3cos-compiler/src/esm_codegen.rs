@@ -245,7 +245,24 @@ pub fn try_generate_with_bodies_and_css(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
 ) -> Result<String, EsmCodegenError> {
-    let parts = generate_parts(bundle, css_rules)?;
+    try_generate_with_bodies_and_stylesheet_parts(bundle, css_rules, &[])
+}
+
+/// Like [`try_generate_with_bodies_and_css`], taking the whole collected
+/// stylesheet so `@font-face` faces are registered next to the rules.
+pub fn try_generate_with_bodies_and_stylesheet(
+    bundle: &EsmBundle,
+    stylesheet: &crate::esm_css::CollectedStylesheet,
+) -> Result<String, EsmCodegenError> {
+    try_generate_with_bodies_and_stylesheet_parts(bundle, &stylesheet.rules, &stylesheet.font_faces)
+}
+
+fn try_generate_with_bodies_and_stylesheet_parts(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+    font_faces: &[crate::esm_css::StylesheetFontFace],
+) -> Result<String, EsmCodegenError> {
+    let parts = generate_parts(bundle, css_rules, font_faces)?;
     let mut out = parts.header;
     for (_, code) in &parts.modules {
         out.push_str(code);
@@ -260,12 +277,15 @@ pub fn try_generate_with_bodies_and_css(
 struct GeneratedParts {
     header: String,
     modules: Vec<(String, String)>,
+    /// Source path of each entry of `modules`.
+    module_paths: Vec<std::path::PathBuf>,
     tail: String,
 }
 
 fn generate_parts(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
+    font_faces: &[crate::esm_css::StylesheetFontFace],
 ) -> Result<GeneratedParts, EsmCodegenError> {
     let mut out = String::new();
     // Generated bundles intentionally use source-shaped JS identifiers and
@@ -283,16 +303,18 @@ fn generate_parts(
     let mut parse_cache = ModuleParseCache::default();
     let mut async_init_namespaces = HashSet::new();
     let mut modules = Vec::with_capacity(bundle.modules.len());
+    let mut module_paths = Vec::with_capacity(bundle.modules.len());
     for module in &bundle.modules {
         let generated = generate_module_with_bodies(bundle, module, &mut parse_cache)?;
         if generated.has_async_init {
             async_init_namespaces.insert(module.namespace.clone());
         }
         modules.push((module.namespace.clone(), generated.code));
+        module_paths.push(module.path.clone());
     }
     let has_async_init = !async_init_namespaces.is_empty();
 
-    out.push_str(&emit_register_styles(css_rules));
+    out.push_str(&emit_register_styles(css_rules, font_faces));
 
     let register_calls = bundle
         .modules
@@ -338,7 +360,11 @@ fn generate_parts(
                 .join(" ")
         )
     };
-    let dynamic_import_adapter = emit_dynamic_import_adapter(bundle);
+    let dynamic_import_adapter = format!(
+        "{}{}",
+        emit_dynamic_import_adapter(bundle),
+        emit_worker_dispatch(bundle)
+    );
 
     let entry_call = if let Some(symbol) = bundle
         .symbols
@@ -427,6 +453,7 @@ fn generate_parts(
     Ok(GeneratedParts {
         header,
         modules,
+        module_paths,
         tail: out,
     })
 }
@@ -442,6 +469,8 @@ pub struct SplitSegment {
     pub code: String,
     /// Module namespaces (`mN`) it defines.
     pub modules: Vec<String>,
+    /// Source path of each module in `modules`, in the same order.
+    pub module_paths: Vec<std::path::PathBuf>,
 }
 
 /// A bundle split across several crates so Code-OSS scale graphs stay
@@ -543,7 +572,17 @@ pub fn try_generate_split_with_bodies_and_css(
     css_rules: &[crate::esm_css::CollectedRule],
     segment_bytes: usize,
 ) -> Result<SplitBundle, EsmCodegenError> {
-    let parts = generate_parts(bundle, css_rules)?;
+    let parts = generate_parts(bundle, css_rules, &[])?;
+    Ok(split_parts(parts, segment_bytes))
+}
+
+/// Split variant of [`try_generate_with_bodies_and_stylesheet`].
+pub fn try_generate_split_with_bodies_and_stylesheet(
+    bundle: &EsmBundle,
+    stylesheet: &crate::esm_css::CollectedStylesheet,
+    segment_bytes: usize,
+) -> Result<SplitBundle, EsmCodegenError> {
+    let parts = generate_parts(bundle, &stylesheet.rules, &stylesheet.font_faces)?;
     Ok(split_parts(parts, segment_bytes))
 }
 
@@ -627,6 +666,10 @@ fn split_parts(parts: GeneratedParts, segment_bytes: usize) -> SplitBundle {
                 .iter()
                 .map(|&m| parts.modules[m].0.clone())
                 .collect(),
+            module_paths: modules
+                .iter()
+                .map(|&m| parts.module_paths[m].clone())
+                .collect(),
         });
     }
     let mut root = parts.header;
@@ -701,7 +744,10 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
         return String::new();
     }
     let mut arms = String::new();
-    let mut fallback = String::from("{ let __s = __specifier.as_str(); ");
+    // A computed relative specifier resolves against its referrer.
+    let mut fallback = String::from(
+        "{ let __s = __specifier.as_str(); let __s = __s.strip_prefix(\"file://\").unwrap_or(__s); let __abs = w3cos_core::module_registry::resolve_relative_specifier(__referrer_path, __s); let __abs = __abs.as_deref(); ",
+    );
     for edge in &bundle.dynamic_imports {
         let referrer = edge.referrer.to_string_lossy();
         let specifier = &edge.specifier;
@@ -720,16 +766,65 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
         // Computed vscode-file / file URL: match by absolute target or by /<specifier> suffix.
         let spec_len = specifier.len();
         fallback.push_str(&format!(
-            "if __s == {target:?} || __s.ends_with({specifier:?}) && (__s.len() == {spec_len} || __s.as_bytes().get(__s.len().saturating_sub({spec_len} + 1)) == Some(&b'/')) {{ {load} }} else ",
+            "if __s == {target:?} || __abs == Some({target:?}) || __s.ends_with({specifier:?}) && (__s.len() == {spec_len} || __s.as_bytes().get(__s.len().saturating_sub({spec_len} + 1)) == Some(&b'/')) {{ {load} }} else ",
             spec_len = spec_len,
             specifier = specifier,
             target = target,
             load = load,
         ));
     }
-    fallback.push_str("{ w3cos_core::Value::Undefined } }");
+    // Not in the compiled graph (unlinked, or excluded via `"w3cos":
+    // { "exclude": [...] }`): reject like a missing module.
+    fallback.push_str("{ return w3cos_core::intrinsics::promise_reject(vec![w3cos_core::module_registry::module_not_found(__specifier.as_str())]); } }");
     format!(
         " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}_ => {fallback}, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
+    )
+}
+
+/// ES-module worker entries (`package.json` `"w3cos": { "workers": [...] }`):
+/// register them so `new Worker(path)` / `utilityProcess.fork(path)` accept
+/// them, and on a worker thread running one, evaluate its static closure
+/// instead of the program entry.
+fn emit_worker_dispatch(bundle: &EsmBundle) -> String {
+    if bundle.workers.is_empty() {
+        return String::new();
+    }
+    let boot = bundle
+        .modules
+        .iter()
+        .find(|module| {
+            module
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "internal__w3cos_worker.js.w3cos-cjs.js")
+        })
+        .map(|module| format!("Some({:?})", module.path.to_string_lossy()))
+        .unwrap_or_else(|| "None".to_string());
+    let paths = bundle
+        .workers
+        .iter()
+        .map(|worker| format!("{:?}", worker.path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let arms = bundle
+        .workers
+        .iter()
+        .map(|worker| {
+            let order = worker
+                .evaluation_order
+                .iter()
+                .map(|&index| format!("{:?}", bundle.modules[index].path.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{:?} => return w3cos_core::node_workers::run_worker_modules({boot}, &[{order}]), ",
+                worker.path.to_string_lossy()
+            )
+        })
+        .collect::<String>();
+    format!(
+        " w3cos_core::node_workers::register_worker_modules(&[{paths}]); if let Some(__w3cos_worker) = w3cos_core::node_workers::worker_entry_path() {{ match __w3cos_worker.as_str() {{ {arms}_ => {{}} }} }}"
     )
 }
 
@@ -757,7 +852,10 @@ fn runtime_dependency_evaluations(runtime_dependencies: &[String], entry_referre
 }
 
 /// Emit the stylesheet registration function (no-op when no CSS was collected).
-fn emit_register_styles(css_rules: &[crate::esm_css::CollectedRule]) -> String {
+fn emit_register_styles(
+    css_rules: &[crate::esm_css::CollectedRule],
+    font_faces: &[crate::esm_css::StylesheetFontFace],
+) -> String {
     let mut out = String::from(
         "\n/// Stylesheet rules collected from ESM `.css` imports (baked in at compile time).\npub fn register_styles() {\n",
     );
@@ -784,8 +882,63 @@ fn emit_register_styles(css_rules: &[crate::esm_css::CollectedRule]) -> String {
             ));
         }
     }
+    for face in font_faces {
+        out.push_str(&emit_font_face_registration(face));
+    }
     out.push_str("}\n\n");
     out
+}
+
+/// Emit the `register_stylesheet_font_file` call for one `@font-face` rule.
+/// Relative `url()` sources resolve against the declaring stylesheet's
+/// directory at compile time; remote/data URLs, unsupported formats and
+/// media-conditional faces are skipped (the runtime tries the files in order
+/// and registers the first that loads).
+fn emit_font_face_registration(face: &crate::esm_css::StylesheetFontFace) -> String {
+    use crate::esm_css::StylesheetFontSource;
+    if face.media.is_some() {
+        return String::new();
+    }
+    let base = std::path::Path::new(&face.source_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let candidates = face
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let StylesheetFontSource::Url { href, format } = source else {
+                return None;
+            };
+            let supported = format.as_deref().is_none_or(|format| {
+                matches!(
+                    format.trim().to_ascii_lowercase().as_str(),
+                    "truetype" | "opentype" | "ttf" | "otf" | "woff" | "woff2"
+                )
+            });
+            let href = href.split(['?', '#']).next().unwrap_or(href);
+            let href = href.strip_prefix("./").unwrap_or(href);
+            if !supported || href.contains(':') || href.starts_with("//") {
+                return None;
+            }
+            Some(format!("{:?}", base.join(href).to_string_lossy()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let option = |value: &Option<String>| match value {
+        Some(value) => format!("Some({value:?})"),
+        None => "None".to_string(),
+    };
+    format!(
+        "    w3cos_runtime::font_face::register_stylesheet_font_file({:?}, {}, {}, {}, {}, &[{}]);\n",
+        face.family,
+        option(&face.weight),
+        option(&face.style),
+        option(&face.display),
+        option(&face.unicode_range),
+        candidates.join(", ")
+    )
 }
 
 struct GeneratedModule {
@@ -812,7 +965,7 @@ fn generate_module_with_bodies(
     // keep per-thread ESM values, binding cells and flags in three
     // module-level registries.
     out.push_str(
-        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str>> = std::cell::RefCell::new(::std::collections::HashSet::new());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
+        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<w3cos_core::fast_hash::FastMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(w3cos_core::fast_hash::FastMap::default());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<w3cos_core::fast_hash::FastMap<&'static str, w3cos_core::module_registry::BindingCell>> = std::cell::RefCell::new(w3cos_core::fast_hash::FastMap::default());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<w3cos_core::fast_hash::FastSet<&'static str>> = std::cell::RefCell::new(w3cos_core::fast_hash::FastSet::default());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
     );
     let namespace_names: HashSet<String> = module
         .namespace_imports
@@ -2766,9 +2919,10 @@ fn direct_typed_callees(
         {
             continue;
         }
+        let lowered_name = w3ir_entry_binding_name(&symbol.original_name);
         let Some(binding) = entry.bindings.iter().find(|binding| {
             // Module-scope declarations lower to hoisted `var`-like cells.
-            binding.name == symbol.original_name
+            binding.name == lowered_name
                 && matches!(
                     binding.kind,
                     w3cos_ir::BindingKind::Function | w3cos_ir::BindingKind::Var
@@ -2821,8 +2975,9 @@ fn direct_boxed_callees(
         {
             continue;
         }
+        let lowered_name = w3ir_entry_binding_name(&symbol.original_name);
         let Some(binding) = entry.bindings.iter().find(|binding| {
-            binding.name == symbol.original_name
+            binding.name == lowered_name
                 && matches!(
                     binding.kind,
                     w3cos_ir::BindingKind::Function | w3cos_ir::BindingKind::Var
@@ -2914,6 +3069,18 @@ fn select_w3ir_function<'a>(
         })
 }
 
+/// Name of the W3IR module-entry binding that holds a codegen symbol.
+///
+/// Codegen records an anonymous `export default function () {}` / class as
+/// `__w3cos_default_export_N` (a Rust-safe symbol), while W3IR lowering binds
+/// the same item as `*default:N*`. Every other symbol keeps its source name.
+fn w3ir_entry_binding_name(name: &str) -> String {
+    name.strip_prefix("__w3cos_default_export_")
+        .filter(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|index| format!("*default:{index}*"))
+        .unwrap_or_else(|| name.to_string())
+}
+
 fn entry_bound_w3ir_function<'a>(
     module: &'a w3cos_ir::Module,
     name: &str,
@@ -2922,6 +3089,7 @@ fn entry_bound_w3ir_function<'a>(
         .functions
         .iter()
         .find(|candidate| candidate.id == module.entry)?;
+    let name = w3ir_entry_binding_name(name);
     let binding = entry
         .bindings
         .iter()
@@ -3686,12 +3854,34 @@ fn emit_class(
         );
     }
     out.push_str("        let __proto = w3cos_core::intrinsics::get_property(&__class, &w3cos_core::Value::string(\"prototype\"));\n");
+    // `class A {}` owns a non-enumerable `name` ("A"); a static `name`
+    // member (method, accessor or field) replaces it.
+    let has_static_name = class.is_some_and(|class| {
+        class.body.iter().any(|member| {
+            let key = match member {
+                ClassMember::Method(method) if method.is_static => &method.key,
+                ClassMember::ClassProp(field) if field.is_static => &field.key,
+                _ => return false,
+            };
+            match key {
+                PropName::Ident(identifier) => identifier.sym == *"name",
+                PropName::Str(value) => value.value == *"name",
+                _ => true,
+            }
+        })
+    });
+    if !has_static_name && !sym.original_name.is_empty() {
+        out.push_str(&format!(
+            "        w3cos_core::intrinsics::define_method(&__class, &w3cos_core::Value::string(\"name\"), w3cos_core::Value::string({:?}));\n",
+            sym.original_name
+        ));
+    }
     for def in unique_methods
         .iter()
         .filter(|def| def.private.is_none() && def.install_on_proto)
     {
         out.push_str(&format!(
-            "        w3cos_core::intrinsics::set_property(&__proto, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
+            "        w3cos_core::intrinsics::define_method(&__proto, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
             def.install_key_arg, def.fn_name
         ));
     }
@@ -3700,7 +3890,7 @@ fn emit_class(
         .filter(|def| def.private.is_none() && !def.install_on_proto)
     {
         out.push_str(&format!(
-            "        w3cos_core::intrinsics::set_property(&__class, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
+            "        w3cos_core::intrinsics::define_method(&__class, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
             def.install_key_arg, def.fn_name
         ));
     }
@@ -3770,6 +3960,9 @@ mod tests {
                 module("m2", &["m1", "m3"]),
                 module("m3", &[]),
             ],
+            module_paths: (0..4)
+                .map(|index| std::path::PathBuf::from(format!("/app/m{index}.js")))
+                .collect(),
             tail: "pub fn run_entry() {}\n".into(),
         };
         let split = split_parts(parts, 1);
@@ -3793,6 +3986,12 @@ mod tests {
                 assert!(index < segment_of(&segment.modules[0]));
             }
             assert!(segment.code.contains("\npub mod "));
+        }
+        for segment in &split.segments {
+            assert_eq!(segment.modules.len(), segment.module_paths.len());
+            for (namespace, path) in segment.modules.iter().zip(&segment.module_paths) {
+                assert_eq!(path, &PathBuf::from(format!("/app/{namespace}.js")));
+            }
         }
         let m0 = &split.segments[segment_of("m0")];
         assert!(
@@ -4324,11 +4523,6 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
                 "Broken.copy",
             ),
             (
-                "constructor",
-                "export class Broken { constructor() { new.target; } }",
-                "Broken.constructor",
-            ),
-            (
                 "instance_field",
                 "export class Broken { value = new.target; }",
                 "class initialization lowering did not produce W3IR",
@@ -4537,7 +4731,7 @@ export function boot() {
             "constructor should lower through W3IR: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(&__proto")
+            code.contains("w3cos_core::intrinsics::define_method(&__proto")
                 && code.contains("Value::string(\"__w3cos_getter_label\")"),
             "getter install: {code}"
         );
@@ -4551,7 +4745,7 @@ export function boot() {
             "method install: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(&__class")
+            code.contains("w3cos_core::intrinsics::define_method(&__class")
                 && code.contains("Value::string(\"create\")"),
             "static method install: {code}"
         );
@@ -10035,6 +10229,7 @@ fn main() {
         matches_js_string!(&r, s, s == "service-not-allowed:end"),
         "unsupported desktop SpeechRecognition error lifecycle: {r:?}"
     );
+    w3cos_runtime::capability_gate::grant("geolocation");
     w3cos_runtime::geolocation_web::update_position(
         w3cos_runtime::geolocation_web::GeoPosition::new(31.23, 121.47, 8.0),
     );
@@ -10394,6 +10589,47 @@ fn main() {
         );
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn emits_font_face_registration_for_local_font_files_only() {
+        let sheet = crate::esm_css::parse_css_source(
+            "@font-face { font-family: codicon; src: url('./codicon.ttf?x#y') format('truetype'); \
+               font-display: block; }\
+             @font-face { font-family: Remote; src: url(https://cdn.example/r.woff2) format('woff2'); }\
+             @font-face { font-family: Data; src: url(data:font/ttf;base64,AAAA); }\
+             @font-face { font-family: Plain; src: url(c.ttf); }\
+             @font-face { font-family: Late; src: url(l.eot) format('embedded-opentype'), url(l.woff2) format('woff2'); font-weight: 700; }",
+            "/assets/css/icons.css",
+        );
+        let bundle = EsmBundle::default();
+        let code = try_generate_with_bodies_and_stylesheet(&bundle, &sheet).unwrap();
+        assert!(
+            code.contains(
+                "w3cos_runtime::font_face::register_stylesheet_font_file(\"codicon\", None, None, Some(\"block\"), None, &[\"/assets/css/codicon.ttf\"]);"
+            ),
+            "codicon registration: {code}"
+        );
+        assert!(
+            code.contains("\"Late\", Some(\"700\"), None, None, None, &[\"/assets/css/l.woff2\"]"),
+            "unsupported formats are skipped: {code}"
+        );
+        assert!(
+            !code.contains("\"Remote\""),
+            "remote sources are not baked: {code}"
+        );
+        assert!(
+            !code.contains("\"Data\""),
+            "data urls are not baked: {code}"
+        );
+        assert_eq!(
+            code.matches("register_stylesheet_font_file(").count(),
+            3,
+            "{code}"
+        );
+        // Faces registered by the legacy rules-only entry points stay absent.
+        let legacy = generate_with_bodies_and_css(&bundle, &sheet.rules);
+        assert!(!legacy.contains("register_stylesheet_font_file"));
     }
 
     #[test]
@@ -10989,15 +11225,21 @@ export function main() {
             bundle.unresolved
         );
         let code = generate_with_bodies(&bundle);
+        let frame = |index: u32| {
+            format!(
+                "struct {}Frame ",
+                crate::w3ir_aot::upper_camel(&format!("m0__init_w3ir_{index}"))
+            )
+        };
         assert_eq!(
-            code.matches("struct M0U2InitW3ir0Frame").count(),
+            code.matches(&frame(0)).count(),
             1,
             "the first bounded segment should produce one W3IR AOT frame"
         );
         assert!(
-            code.matches("struct M0U2InitW3ir32Frame").count() == 1
-                && code.matches("struct M0U2InitW3ir64Frame").count() == 1
-                && !code.contains("struct M0U2InitW3ir65Frame")
+            code.matches(&frame(32)).count() == 1
+                && code.matches(&frame(64)).count() == 1
+                && !code.contains(&frame(65))
                 && code.matches("m0__init_w3ir_0(").count() == 2
                 && code.matches("m0__init_w3ir_32(").count() == 2
                 && code.matches("m0__init_w3ir_64(").count() == 2

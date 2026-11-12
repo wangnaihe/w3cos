@@ -361,3 +361,638 @@ fn electron_module_page_script_evaluates_when_the_page_loads() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// The Code-OSS preload destructures `webFrame` and `webUtils` from
+/// `electron` and sets the zoom level from the window configuration; its
+/// main process intercepts `file:` with `protocol.handle`.
+const WEB_FRAME: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-web-frame", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain, protocol, net } = require('electron')
+const path = require('node:path')
+const { pathToFileURL } = require('node:url')
+let win
+ipcMain.on('line', (event, line) => {
+  console.log(line)
+  // Code-OSS validatedIpcMain only accepts main-frame senders.
+  const frame = event.senderFrame
+  console.log('sender-frame', frame === event.sender.mainFrame, frame.parent, frame.top === frame, frame.url === event.sender.getURL(), frame.framesInSubtree.length)
+  setTimeout(() => win.close(), 0)
+})
+app.whenReady().then(async () => {
+  // Code-OSS's protocolMainService intercepts file: and refuses it.
+  protocol.handle('file', () => new Response('refused', { status: 403 }))
+  try { protocol.handle('file', () => null); console.log('double-handle ok') } catch (e) { console.log('double-handle throws') }
+  const href = pathToFileURL(path.join(__dirname, 'index.html')).href
+  const handled = await net.fetch(href)
+  const bypass = await net.fetch(href, { bypassCustomProtocolHandlers: true })
+  console.log('file-handle', handled.status, bypass.status, (await bypass.text()).startsWith('<!DOCTYPE html>'))
+  protocol.unhandle('file')
+  console.log('file-unhandled', (await net.fetch(href)).status)
+  win = new BrowserWindow({ show: false, webPreferences: { preload: path.join(__dirname, 'preload.js') } })
+  win.loadFile('index.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "preload.js",
+        r#"const { ipcRenderer, webFrame, webUtils } = require('electron')
+const before = [webFrame.getZoomLevel(), webFrame.getZoomFactor()]
+webFrame.setZoomLevel(2)
+const level = webFrame.getZoomLevel()
+const factor = Math.round(webFrame.getZoomFactor() * 100) / 100
+webFrame.setZoomFactor(1)
+ipcRenderer.send('line', JSON.stringify({
+  before, level, factor, reset: webFrame.getZoomLevel(),
+  utils: typeof webUtils.getPathForFile,
+  frame: ['setZoomLevel', 'getZoomLevel', 'setZoomFactor', 'getZoomFactor', 'setVisualZoomLevelLimits'].map((k) => typeof webFrame[k]).join(','),
+}))
+"#,
+    ),
+    (
+        "index.html",
+        r#"<!DOCTYPE html><html><head><title>webFrame</title></head><body></body></html>"#,
+    ),
+];
+
+#[test]
+fn electron_web_frame_web_utils_and_file_protocol_handle() {
+    let root = write_fixture("w3cos_electron_web_frame", WEB_FRAME);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_web_frame",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        [
+            "double-handle throws",
+            "file-handle 403 200 true",
+            "file-unhandled 200",
+            r#"{"before":[0,1],"level":2,"factor":1.44,"reset":0,"utils":"function","frame":"function,function,function,function,function"}"#,
+            "sender-frame true null true true 1",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Code-OSS main imports these modules at startup; on Linux they only need
+/// to exist and answer with Electron's shapes.
+const MAIN_SERVICES: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-main-services", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, powerMonitor, powerSaveBlocker, systemPreferences, globalShortcut, clipboard, nativeImage, Notification, contentTracing, desktopCapturer } = require('electron')
+app.whenReady().then(async () => {
+  let resumed = 0
+  powerMonitor.on('resume', () => resumed++)
+  powerMonitor.emit('resume')
+  console.log('power', resumed, powerMonitor.isOnBatteryPower(), powerMonitor.getSystemIdleState(60), powerMonitor.getSystemIdleTime())
+  const id = powerSaveBlocker.start('prevent-app-suspension')
+  const started = powerSaveBlocker.isStarted(id)
+  powerSaveBlocker.stop(id)
+  console.log('blocker', typeof id, started, powerSaveBlocker.isStarted(id))
+  console.log('prefs', typeof systemPreferences.on, typeof systemPreferences.getAccentColor())
+  const first = globalShortcut.register('CommandOrControl+X', () => {})
+  const again = globalShortcut.register('CommandOrControl+X', () => {})
+  const registered = globalShortcut.isRegistered('CommandOrControl+X')
+  globalShortcut.unregisterAll()
+  console.log('shortcut', first, again, registered, globalShortcut.isRegistered('CommandOrControl+X'))
+  clipboard.writeText('hello')
+  const text = clipboard.readText()
+  clipboard.write({ text: 'a', html: '<b>a</b>' })
+  console.log('clipboard', text, clipboard.readHTML(), clipboard.availableFormats().join(','), clipboard.readText('selection') === '')
+  const image = nativeImage.createFromDataURL('data:image/png;base64,iVBORw0KGgo=')
+  console.log('image', nativeImage.createEmpty().isEmpty(), image.isEmpty(), image.toPNG().length, image.toDataURL())
+  console.log('notification', Notification.isSupported(), new Notification({ title: 't' }).title)
+  console.log('tracing', JSON.stringify(await contentTracing.getCategories()), JSON.stringify(await desktopCapturer.getSources({ types: ['screen'] })))
+  const win = new BrowserWindow({ show: false })
+  const handle = win.getNativeWindowHandle()
+  console.log('window', Buffer.isBuffer(handle), handle.length, handle.buffer instanceof ArrayBuffer, handle.readUInt32LE(0) === win.id, win.getMediaSourceId() === 'window:' + win.id + ':0')
+  const sized = new BrowserWindow({ show: false, minWidth: 400, minHeight: 270 })
+  const before = sized.getMinimumSize().join('x')
+  sized.setMinimumSize(500, 300)
+  console.log('minsize', before, sized.getMinimumSize().join('x'), win.getMinimumSize().join('x'), win.getMaximumSize().join('x'), sized.getSize().join('x'))
+  app.quit()
+})
+"#,
+    ),
+];
+
+#[test]
+fn electron_main_process_service_modules() {
+    let root = write_fixture("w3cos_electron_main_services", MAIN_SERVICES);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_main_services",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        [
+            "power 1 false active 0",
+            "blocker number true false",
+            "prefs function string",
+            "shortcut true false true false",
+            "clipboard hello <b>a</b> text/plain,text/html true",
+            "image true false 8 data:image/png;base64,iVBORw0KGgo=",
+            "notification false t",
+            "tracing [] []",
+            "window true 8 true true true",
+            "minsize 400x270 500x300 0x0 0x0 800x600",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Code-OSS's window boot: the main process passes the window-config IPC
+/// channel through `webPreferences.additionalArguments`; the (classic)
+/// preload reads it from the renderer's `process.argv` and `invoke()`s it;
+/// the workbench module script (placed after `</body>`) awaits that
+/// configuration in an async IIFE before painting its splash.
+const WINDOW_CONFIG: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-window-config", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain } = require('electron')
+const path = require('node:path')
+const argc = process.argv.length
+let win
+ipcMain.handle('vscode:windowConfig', () => ({ zoomLevel: 0, windowId: 7 }))
+ipcMain.on('vscode:line', (_event, line) => { console.log(line); setTimeout(() => win.close(), 0) })
+app.whenReady().then(() => {
+  win = new BrowserWindow({ show: false, webPreferences: {
+    preload: path.join(__dirname, 'preload.js'),
+    additionalArguments: ['--vscode-window-config=vscode:windowConfig'],
+  } })
+  win.webContents.on('did-finish-load', () => {
+    console.log('did-finish-load main-argv-unchanged', process.argv.length === argc)
+  })
+  win.loadFile('workbench.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "preload.js",
+        r#"(function () {
+  const { ipcRenderer, contextBridge } = require('electron')
+  function parseArgv(key) {
+    for (const arg of process.argv) {
+      if (arg.indexOf(`--${key}=`) === 0) return arg.split('=')[1]
+    }
+    return undefined
+  }
+  const resolveConfiguration = (async () => {
+    const channel = parseArgv('vscode-window-config')
+    if (!channel) throw new Error('Preload: did not find expected vscode-window-config in renderer process arguments list.')
+    return ipcRenderer.invoke(channel)
+  })()
+  contextBridge.exposeInMainWorld('vscode', {
+    ipcRenderer: { send: (channel, ...args) => ipcRenderer.send(channel, ...args) },
+    context: { async resolveConfiguration() { return resolveConfiguration } },
+  })
+})()
+"#,
+    ),
+    (
+        "workbench.js",
+        r#"import { splashText } from './splash.js'
+(async function () {
+  const preloadGlobals = window.vscode
+  try {
+    const configuration = await preloadGlobals.context.resolveConfiguration()
+    const splash = document.createElement('div')
+    splash.textContent = splashText(configuration)
+    document.body.appendChild(splash)
+    preloadGlobals.ipcRenderer.send('vscode:line', 'workbench ' + document.body.textContent.trim())
+  } catch (error) {
+    preloadGlobals.ipcRenderer.send('vscode:line', 'error ' + error.message)
+  }
+})()
+"#,
+    ),
+    (
+        "splash.js",
+        r#"export function splashText(configuration) { return 'splash ' + configuration.windowId }
+"#,
+    ),
+    (
+        "workbench.html",
+        r#"<!DOCTYPE html>
+<html>
+	<head><meta charset="utf-8" /></head>
+	<body aria-label="">
+	</body>
+	<!-- Startup (do not modify order of script tags!) -->
+	<script src="./workbench.js" type="module"></script>
+</html>
+"#,
+    ),
+];
+
+#[test]
+fn electron_additional_arguments_reach_the_preload_process_argv() {
+    let root = write_fixture("w3cos_electron_window_config", WINDOW_CONFIG);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_window_config",
+        &[],
+    );
+    // Renderer→main IPC lines arrive asynchronously: compare sorted.
+    let mut sorted: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !line.starts_with("[electron]"))
+        .collect();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        [
+            "did-finish-load main-argv-unchanged true",
+            "workbench splash 7"
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn electron_renderer_trace_logs_scripts_and_ipc() {
+    let root = write_fixture("w3cos_electron_renderer_trace", WINDOW_CONFIG);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_renderer_trace",
+        &[("W3COS_ELECTRON_TRACE", "2")],
+    );
+    let traced: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.contains("-start ") || line.contains("-done ") || line.contains("ipc-"))
+        .collect();
+    let position = |needle: &str| {
+        traced
+            .iter()
+            .position(|line| line.ends_with(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in {lines:#?}"))
+    };
+    // The preload evaluates first and asks for the window config; the
+    // page script runs after it and reports back over ipc.
+    let preload_start = position("preload-start preload.js");
+    let invoke = position("ipc-invoke vscode:windowConfig");
+    let invoke_done = position("ipc-invoke-done vscode:windowConfig");
+    let script_start = position("script-start workbench.js");
+    let send = position("ipc-send vscode:line");
+    assert!(
+        preload_start < invoke && invoke < invoke_done,
+        "{traced:#?}"
+    );
+    assert!(
+        preload_start < script_start && invoke_done < send,
+        "{traced:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Code-OSS's shared-process handshake: main transfers one end of a
+/// MessageChannelMain to a utility process and the other to the page
+/// (`webContents.postMessage(channel, nonce, [port])`); the preload forwards
+/// it with `window.postMessage(nonce, '*', event.ports)`.
+const PORT_TRANSFER: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-port-transfer", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain, utilityProcess, MessageChannelMain } = require('electron')
+const path = require('node:path')
+let win
+let child
+app.whenReady().then(() => {
+  child = utilityProcess.fork(path.join(__dirname, 'child.js'))
+  ipcMain.on('report', (_event, line) => {
+    console.log(line)
+    if (line.startsWith('renderer got')) {
+      child.kill()
+      setTimeout(() => win.close(), 0)
+    }
+  })
+  win = new BrowserWindow({ show: false, webPreferences: { preload: path.join(__dirname, 'preload.js') } })
+  win.webContents.on('did-finish-load', () => {
+    const { port1, port2 } = new MessageChannelMain()
+    child.postMessage({ hello: 'child' }, [port2])
+    win.webContents.postMessage('port', 'nonce-1', [port1])
+  })
+  win.loadFile('index.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "child.js",
+        r#"process.parentPort.on('message', (event) => {
+  const port = event.ports[0]
+  port.on('message', (e) => port.postMessage('pong:' + e.data + ':' + event.data.hello))
+  port.start()
+})
+"#,
+    ),
+    (
+        "preload.js",
+        r#"const { contextBridge, ipcRenderer } = require('electron')
+ipcRenderer.on('port', (event, nonce) => window.postMessage(nonce, '*', event.ports))
+contextBridge.exposeInMainWorld('bridge', { report: (line) => ipcRenderer.send('report', line) })
+"#,
+    ),
+    (
+        "renderer.js",
+        r#"window.addEventListener('message', (event) => {
+  if (event.data !== 'nonce-1') return
+  const port = event.ports[0]
+  window.bridge.report('renderer ports ' + event.ports.length)
+  port.onmessage = (e) => window.bridge.report('renderer got ' + e.data)
+  port.postMessage('ping')
+})
+"#,
+    ),
+    (
+        "index.html",
+        r#"<!DOCTYPE html><html><head><title>ports</title></head><body><script src="renderer.js"></script></body></html>"#,
+    ),
+];
+
+#[test]
+fn electron_message_ports_transfer_to_the_page_and_a_utility_process() {
+    let root = write_fixture("w3cos_electron_port_transfer", PORT_TRANSFER);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_port_transfer",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        ["renderer ports 1", "renderer got pong:ping:child"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Code-OSS forks `bootstrap-fork.js` (an ES module) through a computed
+/// path and imports its entry point with a computed specifier: the app
+/// declares both in `package.json` (`"w3cos": { "workers", "modules" }`).
+const ESM_UTILITY: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-esm-utility", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "workers": ["child.js"], "modules": ["lazy/feature.js"] } }"#,
+    ),
+    (
+        "main.js",
+        r#"import { app, utilityProcess } from 'electron'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { shared } from './shared.js'
+const dir = path.dirname(fileURLToPath(import.meta.url))
+const name = ['child', 'js'].join('.')
+app.whenReady().then(() => {
+  const child = utilityProcess.fork(path.join(dir, name), ['feature'], { env: { ...process.env, W3COS_FORK_ENTRY: 'lazy' } })
+  child.on('message', (message) => {
+    console.log('main got', message, shared, typeof process.env.W3COS_FORK_ENTRY)
+    child.kill()
+  })
+  child.on('exit', () => app.quit())
+  child.postMessage('hi')
+})
+"#,
+    ),
+    (
+        "shared.js",
+        r#"export const shared = 'shared'
+console.log('shared evaluated in', process.parentPort ? 'child' : 'main')
+"#,
+    ),
+    (
+        "child.js",
+        r#"import { shared } from './shared.js'
+const which = process.argv[2]
+// Like Code-OSS's bootstrap-fork.js: the entry comes from the fork's env.
+const feature = await import(`./${process.env.W3COS_FORK_ENTRY}/${which}.js`)
+process.parentPort.on('message', (event) => {
+  process.parentPort.postMessage(shared + ':' + feature.describe(event.data))
+})
+"#,
+    ),
+    (
+        "lazy/feature.js",
+        r#"export function describe(data) { return 'feature(' + data + ')' }
+"#,
+    ),
+];
+
+#[test]
+fn electron_declared_esm_utility_process_and_computed_import() {
+    let root = write_fixture("w3cos_electron_esm_utility", ESM_UTILITY);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_esm_utility",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        [
+            "shared evaluated in main",
+            "shared evaluated in child",
+            "main got shared:feature(hi) shared undefined",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Code-OSS posts the shared process's configuration right after
+/// `utilityProcess.fork()`; the child only listens (`parentPort.once`) once
+/// its entry module has loaded. Electron's ParentPort queues messages until a
+/// 'message' listener is added and pauses again when the last one goes.
+const PARENT_PORT_QUEUE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-parent-port-queue", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, utilityProcess } = require('electron')
+const path = require('node:path')
+app.whenReady().then(() => {
+  const child = utilityProcess.fork(path.join(__dirname, 'child.js'))
+  child.postMessage('first')
+  child.postMessage('second')
+  child.on('message', (message) => {
+    console.log('main got', message)
+    if (message === 'done') child.kill()
+  })
+  child.on('exit', () => app.quit())
+})
+"#,
+    ),
+    (
+        "child.js",
+        r#"setTimeout(() => {
+  process.parentPort.once('message', (event) => {
+    process.parentPort.postMessage('once ' + event.data)
+    setTimeout(() => {
+      process.parentPort.on('message', (later) => {
+        process.parentPort.postMessage('on ' + later.data)
+        process.parentPort.postMessage('done')
+      })
+    }, 20)
+  })
+}, 20)
+"#,
+    ),
+];
+
+#[test]
+fn electron_parent_port_queues_messages_until_a_listener_is_added() {
+    let root = write_fixture("w3cos_electron_parent_port_queue", PARENT_PORT_QUEUE);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_parent_port_queue",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        ["main got once first", "main got on second", "main got done"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A burst posted on a `MessageChannelMain` port arrives in one task (like
+/// Node's MessagePort::OnMessage), not one event-loop turn per message: the
+/// ptyHost / SharedProcess replies otherwise wait one busy turn each.
+const MESSAGE_PORT_MAIN_BURST: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-port-burst", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, MessageChannelMain } = require('electron')
+app.whenReady().then(() => {
+  const { port1, port2 } = new MessageChannelMain()
+  const got = []
+  port2.on('message', (e) => got.push(e.data))
+  port2.start()
+  setTimeout(() => {
+    for (let i = 0; i < 5; i++) port1.postMessage(i)
+    setTimeout(() => {
+      console.log('burst ' + got.join(','))
+      port1.postMessage('after')
+      setTimeout(() => { console.log('last ' + got[got.length - 1]); app.quit() }, 0)
+    }, 0)
+  }, 5)
+})
+"#,
+    ),
+];
+
+#[test]
+fn electron_message_port_main_delivers_a_burst_in_one_task() {
+    let root = write_fixture("w3cos_electron_port_burst", MESSAGE_PORT_MAIN_BURST);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_port_burst",
+        &[],
+    );
+    assert_eq!(lines, ["burst 0,1,2,3,4", "last after"], "{lines:#?}");
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Code-OSS's ptyHost: main transfers `port2` of a `MessageChannelMain` to a
+/// utility process, both sides speak binary (`Uint8Array`) IPC over it, and
+/// the child pushes unsolicited timer-driven messages (the heartbeat) that the
+/// main side must receive on `port1`.
+const UTILITY_PORT_PUSH: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-utility-port-push", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, utilityProcess, MessageChannelMain } = require('electron')
+const path = require('node:path')
+app.whenReady().then(() => {
+  const child = utilityProcess.fork(path.join(__dirname, 'child.js'))
+  const { port1, port2 } = new MessageChannelMain()
+  child.postMessage('vscode:createMessageChannel', [port2])
+  let beats = 0
+  port1.on('message', (e) => {
+    const d = e.data
+    const kind = d instanceof Uint8Array ? 'u8' : typeof d
+    if (kind === 'u8' && d[0] === 1) console.log('main got reply ' + kind + ' ' + Array.from(d).join(','))
+    if (kind === 'u8' && d[0] === 2) {
+      beats++
+      if (beats === 3) { console.log('main got 3 beats ' + kind); child.kill() }
+    }
+    if (kind !== 'u8') console.log('main got non-binary ' + kind)
+  })
+  port1.start()
+  port1.postMessage(new Uint8Array([9, 8, 7]))
+  child.on('exit', () => app.quit())
+})
+"#,
+    ),
+    (
+        "child.js",
+        r#"process.parentPort.on('message', (event) => {
+  const port = event.ports.at(0)
+  if (!port) return
+  port.on('message', (e) => {
+    const d = e.data
+    port.postMessage(new Uint8Array([1, d instanceof Uint8Array ? d.length : 0]))
+  })
+  port.start()
+  setInterval(() => port.postMessage(new Uint8Array([2])), 20)
+})
+"#,
+    ),
+];
+
+#[test]
+fn electron_utility_process_pushes_binary_messages_on_a_transferred_port() {
+    let root = write_fixture("w3cos_electron_utility_port_push", UTILITY_PORT_PUSH);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_utility_port_push",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        ["main got reply u8 1,3", "main got 3 beats u8"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

@@ -47,8 +47,10 @@ pub fn dynamic_import(specifier: Value, referrer: Value) -> Value {
         Some(implementation) if implementation.is_callable() => {
             implementation.call(Value::Undefined, vec![specifier, referrer])
         }
-        _ => crate::promise::reject(vec![Value::string(
-            "TypeError: dynamic import requires an AOT module-loader adapter",
+        // No adapter means the build linked no dynamically importable
+        // module, so every specifier is missing from the graph.
+        _ => crate::promise::reject(vec![crate::module_registry::module_not_found(
+            &specifier.to_js_string(),
         )]),
     }
 }
@@ -86,10 +88,18 @@ mod tests {
             Value::string("./missing.js"),
             Value::string("app:///entry.js"),
         );
-        assert!(matches!(
-            crate::promise::status(&missing),
-            Some(crate::promise::PromiseStatus::Rejected(_))
-        ));
+        let Some(crate::promise::PromiseStatus::Rejected(error)) = crate::promise::status(&missing)
+        else {
+            panic!("import() without an adapter must reject");
+        };
+        assert_eq!(
+            crate::intrinsics::get_property(&error, &Value::string("code")).to_js_string(),
+            "ERR_MODULE_NOT_FOUND"
+        );
+        assert_eq!(
+            crate::intrinsics::get_property(&error, &Value::string("message")).to_js_string(),
+            "Cannot find module './missing.js'"
+        );
 
         register(
             DYNAMIC_IMPORT_PATH,

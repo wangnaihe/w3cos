@@ -33,11 +33,22 @@ pub(crate) fn authored_line_styles(
     style: &Style,
     lines: &[String],
 ) -> Option<Vec<Style>> {
-    let ends = w3cos_std::inline_text::fragment_ends(text, style)?;
+    let ends =
+        w3cos_std::inline_text::fragment_ends(text, style).unwrap_or_else(|| vec![text.len()]);
     let normalized = prepare_text_for_white_space(text, style.white_space);
     let ends = ends
         .into_iter()
         .map(|end| prepare_text_for_white_space(&text[..end], style.white_space).len())
+        .collect::<Vec<_>>();
+    let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(text, style)
+        .into_iter()
+        .map(|(owner, start, end)| {
+            (
+                owner,
+                prepare_text_for_white_space(&text[..start], style.white_space).len(),
+                prepare_text_for_white_space(&text[..end], style.white_space).len(),
+            )
+        })
         .collect::<Vec<_>>();
     let mut cursor = 0;
     let mut result = Vec::with_capacity(lines.len());
@@ -53,20 +64,33 @@ pub(crate) fn authored_line_styles(
             .collect::<Vec<_>>();
         let mut line_style = style.clone();
         w3cos_std::inline_text::set_fragment_ends(&mut line_style, line, &local_ends);
+        let local_owner_ranges = owner_ranges
+            .iter()
+            .filter_map(|(owner, owner_start, owner_end)| {
+                // Owners that end before (or start after) this line clip to
+                // an empty range. `bool::then_some` evaluates its tuple
+                // eagerly, so the line-relative offsets must only be computed
+                // once the clipped range is known to be non-empty.
+                let local_start = (*owner_start).max(start);
+                let local_end = (*owner_end).min(end);
+                (local_start < local_end).then(|| (*owner, local_start - start, local_end - start))
+            })
+            .collect::<Vec<_>>();
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut line_style, line, &local_owner_ranges);
         result.push(line_style);
         cursor = end;
     }
     Some(result)
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct TextPaintKey {
-    text: String,
+struct TextPaintSlot {
     max_width: u32,
     line_widths: Vec<u32>,
     font: u64,
     font_size: u32,
     white_space: u8,
+    break_mode: crate::line_break::BreakMode,
+    layout: Rc<TextPaintLayout>,
 }
 
 /// Retained shaped text data shared by CPU and GPU painters. Blink keeps the
@@ -287,7 +311,9 @@ pub struct TextPrepaintRequest {
 
 #[derive(Default)]
 struct TextPaintCache {
-    entries: HashMap<TextPaintKey, Rc<TextPaintLayout>>,
+    /// Keyed by the text alone so a hit does not allocate the key.
+    entries: HashMap<String, Vec<TextPaintSlot>>,
+    len: usize,
 }
 
 thread_local! {
@@ -481,10 +507,33 @@ fn merge_orphan_punctuation_lines(lines: &mut Vec<String>) {
     }
 }
 
+/// Byte index of the last ASCII space in `current` when overflowing `next`
+/// would otherwise split a Latin-style word. Returns `None` when the break
+/// falls on whitespace or CJK (already a break opportunity) or the line holds a
+/// single unbroken word, which keeps the character-level fallback.
+fn word_break_split(current: &str, next: char) -> Option<usize> {
+    let last = current.chars().last()?;
+    if next.is_whitespace()
+        || last.is_whitespace()
+        || is_cjk_line_break_character(next)
+        || is_cjk_line_break_character(last)
+    {
+        return None;
+    }
+    let split = current.rfind(' ')?;
+    (split + 1 < current.len() && current[..split].chars().any(|c| !c.is_whitespace()))
+        .then_some(split)
+}
+
+fn collapses_wrap_space(white_space: WhiteSpace) -> bool {
+    matches!(white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
+}
+
 fn wrap_greedy<F>(
     text: &str,
     max_width: f32,
     first_line_width: f32,
+    collapse_overflow_space: bool,
     mut char_width: F,
 ) -> Vec<String>
 where
@@ -498,6 +547,7 @@ where
             text,
             1,
             false,
+            crate::line_break::BreakMode::default(),
             |index| {
                 if index == 0 {
                     first_line_width
@@ -533,6 +583,20 @@ where
             max_width
         };
         if !current.is_empty() && current_w + cw > available_width {
+            // `white-space: normal` / `pre-line`: the space that ends the
+            // line is the wrap opportunity. It is not the first glyph of
+            // the next line (an Ahem space is one em and would force
+            // another break).
+            if collapse_overflow_space && ch == ' ' {
+                // Only a space that does not fit is the wrap opportunity.
+                // A space that fits — a leading space, a trailing space
+                // inside the line, or a run whose whole text is one space —
+                // stays in the measured line. Dropping every space that
+                // starts an empty buffer turned " BB" into "BB" (one em
+                // short) and " " into an empty line.
+                flush(&mut lines, &mut current, &mut current_w);
+                continue;
+            }
             if may_not_start_line(ch) {
                 // Keep closing punctuation with the preceding character
                 // without letting the completed line exceed its paint box.
@@ -549,6 +613,17 @@ where
                 flush(&mut lines, &mut current, &mut current_w);
                 current.push(last);
                 current_w = char_width(last);
+            } else if let Some(split) = word_break_split(&current, ch) {
+                // Wrapping mid-word is only a last resort: move the partial
+                // word to the next line when an earlier space allows it.
+                let remainder = current[split + 1..].to_string();
+                current.truncate(split);
+                while current.ends_with(' ') {
+                    current.pop();
+                }
+                flush(&mut lines, &mut current, &mut current_w);
+                current_w = remainder.chars().map(&mut char_width).sum();
+                current = remainder;
             } else {
                 flush(&mut lines, &mut current, &mut current_w);
             }
@@ -580,6 +655,7 @@ fn wrap_greedy_with_run_width<F>(
     max_width: f32,
     first_line_width: f32,
     preserve_spaces: bool,
+    mode: crate::line_break::BreakMode,
     run_width: F,
 ) -> Vec<String>
 where
@@ -589,6 +665,7 @@ where
         text,
         1,
         preserve_spaces,
+        mode,
         |index| {
             if index == 0 {
                 first_line_width
@@ -632,6 +709,7 @@ fn wrap_greedy_with_line_width(
     text: &str,
     max_defer_lines: usize,
     preserve_spaces: bool,
+    mode: crate::line_break::BreakMode,
     mut line_width: impl FnMut(usize) -> f32,
     mut run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
@@ -652,13 +730,19 @@ fn wrap_greedy_with_line_width(
     }
     let mut lines = Vec::new();
     let mut current = String::new();
+    // `current` is always `text[current_start..]` up to the character being
+    // placed, so break opportunities of the whole text index into it.
+    let mut current_start = 0usize;
+    // UAX #14 opportunities (crate::line_break), computed on the first
+    // overflow only: most runs fit and never need them.
+    let mut opportunities: Option<Vec<usize>> = None;
     let flush = |lines: &mut Vec<String>, current: &mut String| {
         if !current.is_empty() {
             lines.push(std::mem::take(current));
         }
     };
 
-    for ch in text.chars() {
+    for (position, ch) in text.char_indices() {
         if matches!(ch, ' ' | '\n' | FORCED_LINE_BREAK) {
             defer_unbreakable_word_to_available_band(
                 &mut lines,
@@ -670,6 +754,7 @@ fn wrap_greedy_with_line_width(
         }
         if matches!(ch, '\n' | FORCED_LINE_BREAK) {
             lines.push(std::mem::take(&mut current));
+            current_start = position + ch.len_utf8();
             continue;
         }
 
@@ -681,25 +766,70 @@ fn wrap_greedy_with_line_width(
         // far below a 1/64px LayoutUnit, so genuinely narrower lines still wrap.
         let fitting_roundoff = available_width.max(1.0) * f32::EPSILON * 4.0;
         if current.chars().count() > 1 && run_width(&current) > available_width + fitting_roundoff {
-            if preserve_spaces && ch == ' ' {
+            if mode.hang_last_punctuation
+                && position + ch.len_utf8() == text.len()
+                && crate::line_break::is_hangable_last(ch)
+            {
+                // hanging-punctuation: last.
                 continue;
             }
-            // Explicit hyphens remain painted on the preceding line. Choose
-            // the latest opportunity, rather than always preferring an older
-            // space and moving the entire hyphenated word to the next line.
-            // U+2011 is deliberately not a break opportunity.
-            let soft_break = current.char_indices().rev().find_map(|(index, character)| {
-                if character == ' ' {
-                    Some((index + 1, if preserve_spaces { index + 1 } else { index }))
-                } else if let Some(end) = explicit_hyphen_break_end(&current, index) {
-                    Some((end, end))
-                } else {
-                    None
+            if ch == ' ' && mode.break_space == crate::line_break::BreakSpace::AfterSpaceRun {
+                if preserve_spaces {
+                    // Preserved spaces hang past the line end.
+                    continue;
                 }
-            });
-            if let Some((next_start, line_end)) = soft_break {
-                let remainder = current[next_start..].trim_start_matches(' ').to_string();
-                current.truncate(line_end);
+                // A collapsible space at the end of the line is removed;
+                // the next line starts after it.
+                current.pop();
+                while current.ends_with(' ') {
+                    current.pop();
+                }
+                flush(&mut lines, &mut current);
+                current_start = position + 1;
+                continue;
+            }
+            // NGLineBreaker: the latest break opportunity before the
+            // overflowing character (explicit hyphens stay on the preceding
+            // line), or, for overflow-wrap: anywhere / break-word, the latest
+            // grapheme boundary when the run has no opportunity.
+            let opportunities = opportunities
+                .get_or_insert_with(|| crate::line_break::break_opportunities(text, mode));
+            let latest = |boundaries: &[usize]| {
+                let k = boundaries.partition_point(|&o| o <= position);
+                (k > 0 && boundaries[k - 1] > current_start).then(|| boundaries[k - 1])
+            };
+            let split = latest(opportunities)
+                .or_else(|| {
+                    // CSS Text 3 5.2: with overflow-wrap: normal, keep-all
+                    // may relax to word-break: normal when the line has no
+                    // other opportunity.
+                    (mode.kind == crate::line_break::LineBreakType::KeepAll)
+                        .then(|| {
+                            let normal = crate::line_break::BreakMode {
+                                kind: crate::line_break::LineBreakType::Normal,
+                                ..mode
+                            };
+                            latest(&crate::line_break::break_opportunities(text, normal))
+                        })
+                        .flatten()
+                })
+                .or_else(|| {
+                    mode.break_anywhere_if_overflow
+                        .then(|| latest(&crate::line_break::grapheme_boundaries(text)))
+                        .flatten()
+                });
+            if let Some(split) = split {
+                let at = split - current_start;
+                let rest = &current[at..];
+                // break-spaces keeps the spaces that start the next line.
+                let trimmed = if mode.break_space == crate::line_break::BreakSpace::AfterSpaceRun {
+                    rest.trim_start_matches(' ')
+                } else {
+                    rest
+                };
+                let skipped = rest.len() - trimmed.len();
+                let remainder = trimmed.to_string();
+                current.truncate(at);
                 if !preserve_spaces {
                     while current.ends_with(' ') {
                         current.pop();
@@ -707,24 +837,7 @@ fn wrap_greedy_with_line_width(
                 }
                 flush(&mut lines, &mut current);
                 current = remainder;
-                continue;
-            }
-
-            let mut characters = current.chars();
-            let current_character = characters.next_back().unwrap_or(ch);
-            let previous_character = characters.next_back();
-            let cjk_break = previous_character.is_some_and(is_cjk_line_break_character)
-                || is_cjk_line_break_character(current_character);
-            if cjk_break && !may_not_start_line(current_character) {
-                current.pop();
-                if current.chars().last().is_some_and(may_not_end_line) {
-                    let opening = current.pop().unwrap();
-                    flush(&mut lines, &mut current);
-                    current.push(opening);
-                } else {
-                    flush(&mut lines, &mut current);
-                }
-                current.push(current_character);
+                current_start = split + skipped;
             }
         }
     }
@@ -784,9 +897,33 @@ pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
     }
 }
 
+/// Content identity plus all parsing settings, not a recyclable Font address.
+/// Reading the precomputed file hash keeps the hot-path key allocation-free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlyphMetricKey {
+    file_hash: usize,
+    collection_index: u32,
+    geometry_scale: u32,
+    load_substitutions: bool,
+    font_size: u32,
+}
+
+impl GlyphMetricKey {
+    fn new(font: &fontdue::Font, font_size: f32) -> Self {
+        let settings = font.settings();
+        Self {
+            file_hash: font.file_hash(),
+            collection_index: settings.collection_index,
+            geometry_scale: settings.scale.to_bits(),
+            load_substitutions: settings.load_substitutions,
+            font_size: font_size.to_bits(),
+        }
+    }
+}
+
 thread_local! {
-    static ASCII_ADVANCE: RefCell<(usize, u32, u32, [f32; 128])> =
-        const { RefCell::new((0, 0, 0, [0.0; 128])) };
+    static ASCII_ADVANCE: RefCell<(Option<GlyphMetricKey>, [f32; 128])> =
+        const { RefCell::new((None, [0.0; 128])) };
 }
 
 pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
@@ -804,14 +941,12 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
         return estimated_char_width(ch, font_size);
     }
     let ascii = (ch as u32) < 128;
-    let font_id = font as *const fontdue::Font as usize;
-    let em = font.units_per_em().to_bits();
-    let size_bits = font_size.to_bits();
+    let key = GlyphMetricKey::new(font, font_size);
     if ascii {
         let cached = ASCII_ADVANCE.with(|slot| {
             let slot = slot.borrow();
-            (slot.0 == font_id && slot.1 == em && slot.2 == size_bits)
-                .then(|| slot.3[ch as usize])
+            (slot.0 == Some(key))
+                .then(|| slot.1[ch as usize])
                 .filter(|advance| *advance > 0.0)
         });
         if let Some(advance) = cached {
@@ -828,10 +963,10 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
     if ascii && advance > 0.0 {
         ASCII_ADVANCE.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot.0 != font_id || slot.1 != em || slot.2 != size_bits {
-                *slot = (font_id, em, size_bits, [0.0; 128]);
+            if slot.0 != Some(key) {
+                *slot = (Some(key), [0.0; 128]);
             }
-            slot.3[ch as usize] = advance;
+            slot.1[ch as usize] = advance;
         });
     }
     advance
@@ -1044,6 +1179,18 @@ pub fn text_intrinsic_size_font(
     wrap_width: f32,
     font: &fontdue::Font,
 ) -> (f32, f32) {
+    if let Some(measured) = fast_text_intrinsic_size(content, style, wrap_width, font) {
+        return measured;
+    }
+    text_intrinsic_size_font_slow(content, style, wrap_width, font)
+}
+
+fn text_intrinsic_size_font_slow(
+    content: &str,
+    style: &Style,
+    wrap_width: f32,
+    font: &fontdue::Font,
+) -> (f32, f32) {
     let inner_w =
         (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
@@ -1074,6 +1221,18 @@ pub fn wrapped_block_height_font(
     style: &Style,
     font: &fontdue::Font,
 ) -> f32 {
+    if let Some(height) = fast_wrapped_block_height(content, width, style, font) {
+        return height;
+    }
+    wrapped_block_height_font_slow(content, width, style, font)
+}
+
+fn wrapped_block_height_font_slow(
+    content: &str,
+    width: f32,
+    style: &Style,
+    font: &fontdue::Font,
+) -> f32 {
     let inner_w = (width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = crate::layout::inline_style_line_height(&style);
@@ -1098,21 +1257,10 @@ pub fn single_line_vertical_metrics(
     let mut top = f32::MAX;
     let mut bottom = f32::MIN;
     for character in text.chars() {
-        if is_non_rendering_format_character(character) {
+        let Some((char_top, char_bottom)) = glyph_vertical_extent(character, font_size, font)
+        else {
             continue;
-        }
-        let ch = font_glyph_character(character);
-        if !font.chars().contains_key(&ch) {
-            top = top.min(-font_size * 0.88);
-            bottom = bottom.max(font_size * 0.12);
-            continue;
-        }
-        let m = font.metrics(ch, font_size);
-        if m.width == 0 && m.height == 0 {
-            continue;
-        }
-        let char_top = -(m.height as f32) - m.ymin as f32;
-        let char_bottom = -m.ymin as f32;
+        };
         top = top.min(char_top);
         bottom = bottom.max(char_bottom);
     }
@@ -1121,6 +1269,159 @@ pub fn single_line_vertical_metrics(
     } else {
         (top, bottom)
     }
+}
+
+thread_local! {
+    /// Per-ASCII vertical extents for one font metric key. `tag` 0 is empty,
+    /// 1 is a zero-ink glyph that does not contribute, 2 is a real extent.
+    static ASCII_VERTICAL: RefCell<(Option<GlyphMetricKey>, [(u8, f32, f32); 128])> =
+        const { RefCell::new((None, [(0, 0.0, 0.0); 128])) };
+}
+
+fn glyph_vertical_extent(
+    character: char,
+    font_size: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    if is_non_rendering_format_character(character) {
+        return None;
+    }
+    let ch = font_glyph_character(character);
+    if (ch as u32) < 128 {
+        let key = GlyphMetricKey::new(font, font_size);
+        let cached = ASCII_VERTICAL.with(|slot| {
+            let slot = slot.borrow();
+            (slot.0 == Some(key)).then(|| slot.1[ch as usize])
+        });
+        if let Some(entry) = cached {
+            return match entry.0 {
+                1 => None,
+                2 => Some((entry.1, entry.2)),
+                _ => {
+                    let extent = uncached_glyph_vertical_extent(ch, font_size, font);
+                    store_ascii_vertical(key, ch, extent);
+                    extent
+                }
+            };
+        }
+        let extent = uncached_glyph_vertical_extent(ch, font_size, font);
+        store_ascii_vertical(key, ch, extent);
+        return extent;
+    }
+    uncached_glyph_vertical_extent(ch, font_size, font)
+}
+
+fn store_ascii_vertical(key: GlyphMetricKey, ch: char, extent: Option<(f32, f32)>) {
+    ASCII_VERTICAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.0 != Some(key) {
+            *slot = (Some(key), [(0, 0.0, 0.0); 128]);
+        }
+        slot.1[ch as usize] = match extent {
+            None => (1, 0.0, 0.0),
+            Some((top, bottom)) => (2, top, bottom),
+        };
+    });
+}
+
+fn uncached_glyph_vertical_extent(
+    ch: char,
+    font_size: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    if !font.chars().contains_key(&ch) {
+        return Some((-font_size * 0.88, font_size * 0.12));
+    }
+    let metrics = font.metrics(ch, font_size);
+    if metrics.width == 0 && metrics.height == 0 {
+        return None;
+    }
+    Some((
+        -(metrics.height as f32) - metrics.ymin as f32,
+        -metrics.ymin as f32,
+    ))
+}
+
+/// CSS white-space collapse leaves this string unchanged, so a single-line
+/// measure can skip the allocating wrap. Anything else (controls, non-ASCII,
+/// leading/trailing/doubled spaces) stays on the slow path.
+fn css_collapse_is_identity(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.iter().any(|byte| !byte.is_ascii() || *byte < b' ') {
+        return false;
+    }
+    if bytes.first() == Some(&b' ') || bytes.last() == Some(&b' ') {
+        return false;
+    }
+    let mut previous_space = false;
+    for &byte in bytes {
+        let space = byte == b' ';
+        if space && previous_space {
+            return false;
+        }
+        previous_space = space;
+    }
+    true
+}
+
+/// Intrinsic size of one unwrapped line, or `None` when wrapping or whitespace
+/// collapse might disagree with [`text_intrinsic_size_font_slow`].
+pub(crate) fn fast_text_intrinsic_size(
+    content: &str,
+    style: &Style,
+    wrap_width: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    let (advance, content_height) = fast_single_line(content, style, wrap_width, font)?;
+    let padding = style.padding_lengths();
+    let mut width = advance + padding.left + padding.right;
+    if let w3cos_std::style::Dimension::Px(min_width) = style.min_width {
+        width = width.max(min_width);
+    }
+    Some((width, content_height + padding.top + padding.bottom))
+}
+
+/// Block height of one unwrapped line, or `None` when [`wrapped_block_height_font_slow`]
+/// might break the line or collapse whitespace.
+pub(crate) fn fast_wrapped_block_height(
+    content: &str,
+    width: f32,
+    style: &Style,
+    font: &fontdue::Font,
+) -> Option<f32> {
+    let (_, content_height) = fast_single_line(content, style, width, font)?;
+    let padding = style.padding_lengths();
+    Some(content_height + padding.top + padding.bottom)
+}
+
+fn fast_single_line(
+    content: &str,
+    style: &Style,
+    wrap_width: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
+        return None;
+    }
+    if !css_collapse_is_identity(content) {
+        return None;
+    }
+    let padding = style.padding_lengths();
+    let raw_inner = wrap_width - padding.left - padding.right;
+    let advance = measure_text_width_font(content, style.font_size, font);
+    if style.white_space == WhiteSpace::Normal {
+        // `wrap_greedy` treats a max width of 1px as the narrow-constraint
+        // path, and a run wraps only when the next glyph would exceed it.
+        if raw_inner <= 1.0 || advance > raw_inner {
+            return None;
+        }
+    }
+    let content_height = if style.line_height_computed_px.is_none() {
+        single_line_content_height(content, style.font_size, style.line_height, font)
+    } else {
+        crate::layout::inline_style_line_height(style)
+    };
+    Some((advance, content_height))
 }
 
 /// `y` argument for [`draw_text_line`] so glyphs are vertically centered in `box_height`.
@@ -1291,11 +1592,18 @@ pub fn wrap_text_with_char_width(
             &text,
             1,
             true,
+            crate::line_break::BreakMode::default(),
             |_| max_width,
             |run| run.chars().map(&mut char_width).sum(),
         );
     }
-    wrap_greedy(&text, max_width, max_width, char_width)
+    wrap_greedy(
+        &text,
+        max_width,
+        max_width,
+        collapses_wrap_space(white_space),
+        char_width,
+    )
 }
 
 pub fn wrap_text_with_char_width_and_first_line(
@@ -1317,6 +1625,7 @@ pub fn wrap_text_with_char_width_and_first_line(
             &text,
             1,
             true,
+            crate::line_break::BreakMode::default(),
             |index| {
                 if index == 0 {
                     first_line_width
@@ -1327,13 +1636,35 @@ pub fn wrap_text_with_char_width_and_first_line(
             |run| run.chars().map(&mut char_width).sum(),
         );
     }
-    wrap_greedy(&text, max_width, first_line_width.max(1.0), char_width)
+    wrap_greedy(
+        &text,
+        max_width,
+        first_line_width.max(1.0),
+        collapses_wrap_space(white_space),
+        char_width,
+    )
 }
 
 pub fn wrap_text_with_run_width(
     text: &str,
     max_width: f32,
     white_space: WhiteSpace,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    wrap_text_with_run_width_in(
+        text,
+        max_width,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        run_width,
+    )
+}
+
+pub(crate) fn wrap_text_with_run_width_in(
+    text: &str,
+    max_width: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
@@ -1351,6 +1682,7 @@ pub fn wrap_text_with_run_width(
         max_width,
         max_width,
         white_space == WhiteSpace::PreWrap,
+        mode,
         run_width,
     )
 }
@@ -1360,6 +1692,24 @@ pub fn wrap_text_with_run_width_and_first_line(
     max_width: f32,
     first_line_width: f32,
     white_space: WhiteSpace,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    wrap_text_with_run_width_and_first_line_in(
+        text,
+        max_width,
+        first_line_width,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        run_width,
+    )
+}
+
+pub(crate) fn wrap_text_with_run_width_and_first_line_in(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
@@ -1374,6 +1724,7 @@ pub fn wrap_text_with_run_width_and_first_line(
         max_width,
         first_line_width.max(1.0),
         white_space == WhiteSpace::PreWrap,
+        mode,
         run_width,
     )
 }
@@ -1388,6 +1739,24 @@ pub fn wrap_text_with_run_width_and_line_widths(
     white_space: WhiteSpace,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
+    wrap_text_with_run_width_and_line_widths_in(
+        text,
+        max_width,
+        line_widths,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        run_width,
+    )
+}
+
+pub(crate) fn wrap_text_with_run_width_and_line_widths_in(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
     if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
         return text
@@ -1399,6 +1768,7 @@ pub fn wrap_text_with_run_width_and_line_widths(
         &text,
         line_widths.len().max(1),
         white_space == WhiteSpace::PreWrap,
+        mode,
         |index| line_widths.get(index).copied().unwrap_or(max_width),
         run_width,
     )
@@ -1433,29 +1803,20 @@ pub fn retained_text_paint_layout_with(
     char_width: impl FnMut(char) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: vec![max_width.to_bits()],
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
-    TEXT_PAINT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, layout.clone());
-    });
-    layout
+    cached_text_paint_layout(
+        text,
+        max_width,
+        &[max_width],
+        font_size,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        font_identity,
+        || {
+            let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
 }
 
 pub fn retained_text_paint_layout_with_first_line(
@@ -1468,35 +1829,26 @@ pub fn retained_text_paint_layout_with_first_line(
     char_width: impl FnMut(char) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: vec![first_line_width.to_bits()],
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_char_width_and_first_line(
+    cached_text_paint_layout(
         text,
         max_width,
-        first_line_width,
+        &[first_line_width],
+        font_size,
         white_space,
-        char_width,
-    );
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
-    TEXT_PAINT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, layout.clone());
-    });
-    layout
+        crate::line_break::BreakMode::default(),
+        font_identity,
+        || {
+            let lines = wrap_text_with_char_width_and_first_line(
+                text,
+                max_width,
+                first_line_width,
+                white_space,
+                char_width,
+            );
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
 }
 
 pub fn retained_text_paint_layout_with_run_width(
@@ -1508,29 +1860,20 @@ pub fn retained_text_paint_layout_with_run_width(
     run_width: impl FnMut(&str) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: vec![max_width.to_bits()],
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
-    TEXT_PAINT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, layout.clone());
-    });
-    layout
+    cached_text_paint_layout(
+        text,
+        max_width,
+        &[max_width],
+        font_size,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        font_identity,
+        || {
+            let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
 }
 
 pub fn retained_text_paint_layout_with_run_width_and_first_line(
@@ -1565,35 +1908,113 @@ pub fn retained_text_paint_layout_with_run_width_and_line_widths(
     white_space: WhiteSpace,
     font_identity: u64,
     run_width: impl FnMut(&str) -> f32,
-    mut measure_ink: impl FnMut(&str) -> InkBounds,
+    measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: line_widths.iter().map(|width| width.to_bits()).collect(),
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_run_width_and_line_widths(
+    retained_text_paint_layout_with_run_width_and_line_widths_in(
         text,
         max_width,
         line_widths,
+        font_size,
         white_space,
+        crate::line_break::BreakMode::default(),
+        font_identity,
         run_width,
-    );
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
+        measure_ink,
+    )
+}
+
+pub(crate) fn retained_text_paint_layout_with_run_width_and_line_widths_in(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    font_size: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
+    font_identity: u64,
+    run_width: impl FnMut(&str) -> f32,
+    mut measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
+    cached_text_paint_layout(
+        text,
+        max_width,
+        line_widths,
+        font_size,
+        white_space,
+        mode,
+        font_identity,
+        || {
+            let lines = wrap_text_with_run_width_and_line_widths_in(
+                text,
+                max_width,
+                line_widths,
+                white_space,
+                mode,
+                run_width,
+            );
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
+}
+
+fn cached_text_paint_layout(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    font_size: f32,
+    white_space: WhiteSpace,
+    break_mode: crate::line_break::BreakMode,
+    font_identity: u64,
+    build: impl FnOnce() -> TextPaintLayout,
+) -> Rc<TextPaintLayout> {
+    let max_width_bits = max_width.to_bits();
+    let font_size_bits = font_size.to_bits();
+    let white_space = white_space_key(white_space);
+    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| {
+        cache.borrow().entries.get(text).and_then(|slots| {
+            slots
+                .iter()
+                .find(|slot| {
+                    slot.max_width == max_width_bits
+                        && slot.font == font_identity
+                        && slot.font_size == font_size_bits
+                        && slot.white_space == white_space
+                        && slot.break_mode == break_mode
+                        && slot.line_widths.len() == line_widths.len()
+                        && slot
+                            .line_widths
+                            .iter()
+                            .zip(line_widths)
+                            .all(|(bits, width)| *bits == width.to_bits())
+                })
+                .map(|slot| slot.layout.clone())
+        })
+    }) {
+        return cached;
+    }
+
+    let layout = Rc::new(build());
     TEXT_PAINT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
+        if cache.len >= TEXT_PAINT_CACHE_CAPACITY {
             cache.entries.clear();
+            cache.len = 0;
         }
-        cache.entries.insert(key, layout.clone());
+        let slot = TextPaintSlot {
+            max_width: max_width_bits,
+            line_widths: line_widths.iter().map(|width| width.to_bits()).collect(),
+            font: font_identity,
+            font_size: font_size_bits,
+            white_space,
+            break_mode,
+            layout: layout.clone(),
+        };
+        if let Some(slots) = cache.entries.get_mut(text) {
+            slots.push(slot);
+        } else {
+            cache.entries.insert(text.to_owned(), vec![slot]);
+        }
+        cache.len += 1;
     });
     layout
 }
@@ -1622,7 +2043,11 @@ pub fn prepaint_text_interest_rect(
 }
 
 pub fn clear_paint_cache() {
-    TEXT_PAINT_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+    TEXT_PAINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.entries.clear();
+        cache.len = 0;
+    });
 }
 
 #[cfg(test)]
@@ -1705,6 +2130,18 @@ mod tests {
             w3cos_std::inline_text::fragment_ends(&lines[0], &styles[0]),
             Some(vec![8, 13, lines[0].len()])
         );
+        let owner_start = text.find("the words").unwrap();
+        let owner_end = owner_start + "the words".len();
+        w3cos_std::inline_text::set_cssom_owner_ranges(
+            &mut style,
+            text,
+            &[(17, owner_start, owner_end)],
+        );
+        let styles = authored_line_styles(text, &style, &lines).unwrap();
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges(&lines[0], &styles[0]),
+            vec![(17, 4, 13)]
+        );
         let repeated = "one two one two";
         w3cos_std::inline_text::set_fragment_ends(&mut style, repeated, &[3, 7, 11, 15]);
         let lines = vec!["one two".into(), "one two".into()];
@@ -1715,6 +2152,27 @@ mod tests {
                 Some(vec![3, 7])
             );
         }
+    }
+
+    #[test]
+    fn owner_ranges_ending_before_a_later_line_are_clipped_not_underflowed() {
+        // A coalesced run whose first owner ends before the second line
+        // starts: clipping that owner to the second line yields an empty
+        // range, which must be dropped rather than turned into
+        // `owner_end - line_start` (an unsigned underflow).
+        let text = "aaa bbb";
+        let mut style = Style::default();
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut style, text, &[(1, 0, 3), (2, 4, 7)]);
+        let lines = vec!["aaa".into(), "bbb".into()];
+        let styles = authored_line_styles(text, &style, &lines).unwrap();
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges(&lines[0], &styles[0]),
+            vec![(1, 0, 3)]
+        );
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges(&lines[1], &styles[1]),
+            vec![(2, 0, 3)]
+        );
     }
 
     #[test]
@@ -1993,7 +2451,7 @@ mod tests {
 
     #[test]
     fn retained_paint_layout_reuses_shaping_for_same_interest_item() {
-        TEXT_PAINT_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+        clear_paint_cache();
         let font = fontdue::Font::from_bytes(
             include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
             fontdue::FontSettings::default(),
@@ -2031,13 +2489,25 @@ mod tests {
     #[test]
     fn cjk_closing_punctuation_stays_inside_wrap_width() {
         let max_width = 4.0;
-        let lines = wrap_greedy("甲乙丙丁。戊", max_width, max_width, |_| 1.0);
+        let lines = wrap_greedy("甲乙丙丁。戊", max_width, max_width, false, |_| 1.0);
         assert_eq!(lines, vec!["甲乙丙", "丁。戊"]);
         assert!(
             lines
                 .iter()
                 .all(|line| line.chars().count() as f32 <= max_width)
         );
+    }
+
+    #[test]
+    fn char_width_wrap_moves_a_split_word_to_the_next_line() {
+        // A space that overflows is consumed by the soft wrap.
+        let lines = wrap_text_with_char_width("aa bb cc", 5.0, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(lines, vec!["aa bb", "cc"]);
+        let lines = wrap_text_with_char_width("aa bbbb", 5.0, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(lines, vec!["aa", "bbbb"]);
+        // A single over-long word still falls back to character breaks.
+        let lines = wrap_text_with_char_width("abcdefgh", 3.0, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(lines, vec!["abc", "def", "gh"]);
     }
 
     #[test]
@@ -2052,6 +2522,32 @@ mod tests {
     }
 
     #[test]
+    fn char_width_wrap_drops_the_space_that_ends_an_exact_line() {
+        let lines = wrap_text_with_char_width("XX XX XX XX", 100.0, WhiteSpace::Normal, |_| 20.0);
+        assert_eq!(lines, vec!["XX XX".to_string(), "XX XX".to_string()]);
+    }
+
+    #[test]
+    fn char_width_wrap_keeps_a_space_that_fits() {
+        // A fitting space is part of the measured run. The previous
+        // empty-buffer skip deleted it and every following inline box
+        // that started with a space lost one em.
+        assert_eq!(
+            wrap_text_with_char_width(" BB", 80.0, WhiteSpace::Normal, |_| 20.0),
+            vec![" BB".to_string()]
+        );
+        assert_eq!(
+            wrap_text_with_char_width(" ", 80.0, WhiteSpace::Normal, |_| 20.0),
+            vec![" ".to_string()]
+        );
+        // The word before an overflowing space is kept whole; only that
+        // space is consumed.
+        assert_eq!(
+            wrap_text_with_char_width("XX XX ", 100.0, WhiteSpace::Normal, |_| 20.0),
+            vec!["XX XX".to_string()]
+        );
+    }
+
     fn overflowing_collapsible_space_is_consumed_by_the_soft_wrap() {
         let lines = wrap_text_with_run_width("1 2 3 4", 6.0, WhiteSpace::Normal, |text| {
             text.chars()
@@ -2241,7 +2737,7 @@ mod tests {
     #[test]
     fn visual_order_marker_skips_a_second_bidi_reorder() {
         let mut style = w3cos_std::style::Style::default();
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-bidi-visual-order".to_string(),
             "1".to_string(),
         )]));
@@ -2483,7 +2979,7 @@ mod tests {
 
         let turkish = Style {
             text_transform: TextTransform::Uppercase,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-text-language".to_string(),
                 "tr".to_string(),
             )])),
@@ -2512,5 +3008,143 @@ mod tests {
             // remain a separate strict-reference result.
             "ἈΙἨΙὨΙΑΙΗΙΩΙ"
         );
+    }
+
+    fn inter_font() -> fontdue::Font {
+        fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap()
+    }
+
+    fn assert_same_size(left: (f32, f32), right: (f32, f32)) {
+        assert_eq!(left.0.to_bits(), right.0.to_bits(), "width");
+        assert_eq!(left.1.to_bits(), right.1.to_bits(), "height");
+    }
+
+    #[test]
+    fn ascii_metrics_follow_font_replacement_at_the_same_address() {
+        let parse = |bytes: &[u8]| {
+            fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).unwrap()
+        };
+        let mut font = Box::new(parse(include_bytes!(
+            "../assets/test-fonts/Arimo-Regular.ttf"
+        )));
+        let replacement = parse(include_bytes!("../assets/test-fonts/Cousine-Regular.ttf"));
+        assert_eq!(font.units_per_em(), replacement.units_per_em());
+        let size = 32.0;
+        let old_address = font.as_ref() as *const fontdue::Font;
+        let old_advance = char_advance('A', size, &font);
+        let old_vertical = glyph_vertical_extent('A', size, &font);
+        let expected_advance = replacement.metrics('A', size).advance_width;
+        let expected_vertical = uncached_glyph_vertical_extent('A', size, &replacement);
+        assert_ne!(old_advance, expected_advance);
+        assert_ne!(old_vertical, expected_vertical);
+
+        *font = replacement;
+        assert_eq!(old_address, font.as_ref() as *const fontdue::Font);
+        assert_eq!(char_advance('A', size, &font), expected_advance);
+        assert_eq!(glyph_vertical_extent('A', size, &font), expected_vertical);
+        // A warm repeat must retain the same metrics too.
+        assert_eq!(char_advance('A', size, &font), expected_advance);
+        assert_eq!(glyph_vertical_extent('A', size, &font), expected_vertical);
+    }
+
+    #[test]
+    fn glyph_metric_keys_include_font_settings_and_size() {
+        let font = inter_font();
+        let clone = font.clone();
+        let key = GlyphMetricKey::new(&font, 16.0);
+        assert_eq!(key, GlyphMetricKey::new(&clone, 16.0));
+        assert_ne!(key, GlyphMetricKey::new(&font, 24.0));
+        for settings in [
+            fontdue::FontSettings {
+                scale: 80.0,
+                ..fontdue::FontSettings::default()
+            },
+            fontdue::FontSettings {
+                load_substitutions: false,
+                ..fontdue::FontSettings::default()
+            },
+        ] {
+            let variant = fontdue::Font::from_bytes(
+                include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+                settings,
+            )
+            .unwrap();
+            assert_eq!(font.file_hash(), variant.file_hash());
+            assert_eq!(variant.settings(), settings);
+            assert_ne!(key, GlyphMetricKey::new(&variant, 16.0));
+        }
+    }
+
+    #[test]
+    fn single_line_fast_path_matches_wrapping_measure() {
+        let font = inter_font();
+        let mut style = Style {
+            font_size: 14.0,
+            ..Style::default()
+        };
+        style.padding.top = w3cos_std::style::Spacing::Px(4.0);
+        style.padding.right = w3cos_std::style::Spacing::Px(4.0);
+        style.padding.bottom = w3cos_std::style::Spacing::Px(4.0);
+        style.padding.left = w3cos_std::style::Spacing::Px(4.0);
+        style.min_width = w3cos_std::style::Dimension::Px(8.0);
+
+        for white_space in [WhiteSpace::Normal, WhiteSpace::NoWrap] {
+            style.white_space = white_space;
+            for (text, width) in [
+                ("Item 12", 360.0),
+                ("Item 12", 80.0),
+                ("", 360.0),
+                ("abc", 40.0),
+                ("a b c d e f", 200.0),
+            ] {
+                let slow = text_intrinsic_size_font_slow(text, &style, width, &font);
+                let fast = fast_text_intrinsic_size(text, &style, width, &font);
+                if let Some(fast) = fast {
+                    assert_same_size(fast, slow);
+                }
+                assert_same_size(text_intrinsic_size_font(text, &style, width, &font), slow);
+                let slow_height = wrapped_block_height_font_slow(text, width, &style, &font);
+                if let Some(fast_height) = fast_wrapped_block_height(text, width, &style, &font) {
+                    assert_eq!(fast_height.to_bits(), slow_height.to_bits());
+                }
+                assert_eq!(
+                    wrapped_block_height_font(text, width, &style, &font).to_bits(),
+                    slow_height.to_bits()
+                );
+            }
+        }
+
+        style.white_space = WhiteSpace::Normal;
+        let narrow = "Item 12 Item 12 Item 12 Item 12";
+        assert!(fast_text_intrinsic_size(narrow, &style, 40.0, &font).is_none());
+        let wrapped = text_intrinsic_size_font_slow(narrow, &style, 40.0, &font);
+        let unwrapped = text_intrinsic_size_font_slow("Item", &style, 400.0, &font);
+        assert!(wrapped.1 > unwrapped.1);
+
+        style.line_height_computed_px = Some(20.0);
+        let authored = text_intrinsic_size_font_slow("Item 3", &style, 360.0, &font);
+        assert_same_size(
+            fast_text_intrinsic_size("Item 3", &style, 360.0, &font).unwrap(),
+            authored,
+        );
+
+        style.line_height_computed_px = None;
+        style.white_space = WhiteSpace::Normal;
+        for text in [" Item", "Item ", "Item  2", "a\nb", "你好", "pre\t"] {
+            assert!(
+                fast_text_intrinsic_size(text, &style, 360.0, &font).is_none(),
+                "{text}"
+            );
+            assert!(
+                fast_wrapped_block_height(text, 360.0, &style, &font).is_none(),
+                "{text}"
+            );
+        }
+        style.white_space = WhiteSpace::Pre;
+        assert!(fast_text_intrinsic_size("Item 1", &style, 360.0, &font).is_none());
     }
 }

@@ -165,6 +165,47 @@ pub struct ScriptLoader {
     inner: Rc<ScriptLoaderInner>,
 }
 
+/// A JS exception that escaped a classic script.  The thrown value is not
+/// `Send`, so it is parked in a thread-local until the HTML script-execution
+/// step takes it to "report the exception" on the global.
+#[derive(Debug)]
+struct UncaughtScriptException(String);
+
+impl std::fmt::Display for UncaughtScriptException {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UncaughtScriptException {}
+
+thread_local! {
+    static UNCAUGHT_SCRIPT_EXCEPTION: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+fn script_error_from_vm(error: w3cos_vm::VmError) -> anyhow::Error {
+    let message = error.to_string();
+    if let w3cos_vm::VmError::Thrown(value) = error {
+        UNCAUGHT_SCRIPT_EXCEPTION.with(|slot| *slot.borrow_mut() = Some(value));
+        return anyhow::Error::new(UncaughtScriptException(message));
+    }
+    anyhow!(message)
+}
+
+/// HTML "run a classic script" step 8: an uncaught exception is reported on
+/// the global and script processing continues.  Returns false for errors that
+/// are not script exceptions.
+fn report_uncaught_script_exception(error: &anyhow::Error, filename: &str) -> bool {
+    if error.downcast_ref::<UncaughtScriptException>().is_none() {
+        return false;
+    }
+    let value = UNCAUGHT_SCRIPT_EXCEPTION
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| Value::string(&error.to_string()));
+    crate::reporting_web::report_exception(value, filename);
+    true
+}
+
 impl ParserScriptHost for ScriptLoader {
     fn begin_document_parse(&self, document_url: &str) -> Result<()> {
         ScriptLoader::begin_document_parse(self, document_url)
@@ -1799,7 +1840,7 @@ impl ScriptLoader {
         Vm::new(module, self.inner.policy.limits)
             .map_err(|error| anyhow!(error.to_string()))?
             .run_with_cells(bindings)
-            .map_err(|error| anyhow!(error.to_string()))
+            .map_err(script_error_from_vm)
     }
 
     fn classic_lexical_declaration_binding(&self, name: &str) -> BindingCell {
@@ -5523,13 +5564,58 @@ impl ScriptLoader {
                     if !supported_stylesheet_font_format(format.as_deref()) {
                         continue;
                     }
-                    let Some(url) = Url::parse(&load.base_url)
-                        .ok()
+                    let base = Url::parse(&load.base_url).ok();
+                    let Some(url) = base
+                        .as_ref()
                         .and_then(|base| base.join(&href).ok())
-                        .filter(|url| matches!(url.scheme(), "http" | "https"))
+                        .and_then(vscode_app_font_url_to_file)
+                        .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
                     else {
                         continue;
                     };
+                    if url.scheme() == "file" {
+                        // Local documents (file:// or app-scheme base) load font
+                        // files directly from disk; a remote document may not
+                        // read them.
+                        if matches!(
+                            base.as_ref().map(Url::scheme),
+                            Some("http" | "https") | None
+                        ) {
+                            continue;
+                        }
+                        let Some(bytes) = url
+                            .to_file_path()
+                            .ok()
+                            .and_then(|path| std::fs::read(path).ok())
+                        else {
+                            eprintln!(
+                                "[w3cos] warning: @font-face source {url} failed: not readable"
+                            );
+                            continue;
+                        };
+                        let native = native_stylesheet_font_face(
+                            &load.face,
+                            crate::font_face::FontSource::Bytes(bytes),
+                        );
+                        match crate::font_face::FontRegistry::global()
+                            .register_for_owner(owner, native)
+                        {
+                            Ok(()) => {
+                                if let Some(face) = &load.js_face {
+                                    face.set_property("status", Value::string("loaded"));
+                                }
+                                self.advance_stylesheet_graph(graph);
+                                return;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[w3cos] warning: @font-face registration failed for {:?}: {error}",
+                                    load.face.family
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     self.start_stylesheet_font_request(graph, load, sources, url.as_str());
                     return;
                 }
@@ -6443,6 +6529,9 @@ impl ScriptLoader {
                     executed += 1;
                 }
                 Ok(None) => {
+                    executed += 1;
+                }
+                Err(error) if report_uncaught_script_exception(&error, document_url) => {
                     executed += 1;
                 }
                 Err(error) => {
@@ -8390,6 +8479,9 @@ impl ScriptLoader {
             .map_err(|error| anyhow!(error))
             .and_then(|source| self.execute_source(&source, url));
         match execution {
+            Err(error) if report_uncaught_script_exception(&error, url) => {
+                crate::jsdom::drain_microtasks();
+            }
             Ok(_) => {
                 let onload = element.get_property("onload");
                 if !onload.is_null() && !onload.is_undefined() {
@@ -8727,6 +8819,16 @@ fn is_supported_image_mime_type(content_type: &str) -> bool {
         .trim()
         .to_ascii_lowercase();
     essence.starts_with("image/") || essence == "application/octet-stream"
+}
+
+/// Code-OSS file icon themes (seti) emit `url(vscode-file://vscode-app/<abs path>)`
+/// font sources. The runtime hosts the workbench itself, so that scheme maps to
+/// the plain on-disk path; every other URL is returned unchanged.
+fn vscode_app_font_url_to_file(url: Url) -> Option<Url> {
+    if url.scheme() == "vscode-file" && url.host_str() == Some("vscode-app") {
+        return Url::parse(&format!("file://{}", url.path())).ok();
+    }
+    Some(url)
 }
 
 fn supported_stylesheet_font_format(format: Option<&str>) -> bool {
@@ -9872,23 +9974,22 @@ fn parse_source_size_length(
 }
 
 fn is_decodable_picture_type(content_type: &str) -> bool {
-    matches!(
-        content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "image/png"
-            | "image/jpeg"
-            | "image/gif"
-            | "image/webp"
-            | "image/apng"
-            | "image/bmp"
-            | "image/x-icon"
-            | "image/vnd.microsoft.icon"
-    )
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" | "image/apng" => cfg!(feature = "image-png"),
+        "image/jpeg" => cfg!(feature = "image-jpeg"),
+        "image/gif" => cfg!(feature = "image-gif"),
+        "image/webp" => cfg!(feature = "image-webp"),
+        "image/bmp" => cfg!(feature = "image-bmp"),
+        "image/x-icon" | "image/vnd.microsoft.icon" => cfg!(feature = "image-ico"),
+        _ => false,
+    }
 }
 
 /// Native lazy-loading policy. Images with established layout boxes are
@@ -10375,6 +10476,188 @@ mod tests {
         (format!("http://{address}/dependency.js"), handle)
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn text_only_flex_item_min_width_does_not_collapse_content_width() {
+        // `h3.title { min-width: 3ch }` in a flex pane header: the authored
+        // min-width must only raise the content-based minimum, not replace
+        // it (the title used to shrink to 3ch and wrap one glyph per line).
+        let html = r#"<!doctype html><html><body style="margin:0"><div style="width:289px">
+            <div style="display:flex"><h3 id="plain" style="margin:0;font-weight:normal">Timeline</h3></div>
+            <div style="display:flex"><h3 id="px" style="margin:0;font-weight:normal;min-width:10px">Timeline</h3></div>
+            <div style="display:flex"><h3 id="ch" style="margin:0;font-weight:normal;min-width:3ch">Timeline</h3></div>
+            <div style="display:flex"><label id="label" style="min-width:10px">Timeline</label></div>
+            <div style="display:flex"><p id="p" style="margin:0;min-width:10px">Timeline</p></div>
+        </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://minwidth.w3cos.local/page.html").unwrap();
+        crate::headless::render_document_rgba_cpu(400, 300).unwrap();
+        let rect = |id: &str| {
+            let node = crate::dom::query_selector_all(&format!("#{id}"))[0];
+            crate::dom::bounding_rect(node)
+        };
+        let plain = rect("plain");
+        assert!(plain.width > 30.0, "plain title width {}", plain.width);
+        for id in ["px", "ch", "label", "p"] {
+            let r = rect(id);
+            assert!(
+                (r.width - plain.width).abs() < 20.0 && r.width > 30.0,
+                "#{id} collapsed to {}x{} (plain {}x{})",
+                r.width,
+                r.height,
+                plain.width,
+                plain.height
+            );
+            assert!(r.height < 30.0, "#{id} wrapped: height {}", r.height);
+        }
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn min_max_height_block_grows_with_inline_block_line_settlement() {
+        // Welcome page `.start-container { min-height: 156px }` holds a list of
+        // `li > button` rows. The rows grow after baseline settlement; the
+        // container must follow (it used to stay short and the next section
+        // overlapped the last row) whether or not it has a min/max-height.
+        let list = r#"<ul style="list-style:none;margin:0;padding:0;line-height:24px">
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">New</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">Open</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">Clone</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">Connect</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">More</button></li>
+            </ul>"#;
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0"><div style="width:231px">
+            <div id="plain"><h2 style="margin:0 0 5px;line-height:22px">Start</h2><div id="plain-s" style="position:relative;overflow:hidden">{list}</div></div>
+            <div id="plain-next">Recent</div>
+            <div id="min" style="min-height:156px"><h2 style="margin:0 0 5px;line-height:22px">Start</h2><div id="min-s" style="position:relative;overflow:hidden">{list}</div></div>
+            <div id="min-next">Recent</div>
+            <div id="max" style="max-height:900px"><h2 style="margin:0 0 5px;line-height:22px">Start</h2><div id="max-s" style="position:relative;overflow:hidden">{list}</div></div>
+            <div id="max-next">Recent</div>
+            <div id="pinned" style="min-height:400px"><h2 style="margin:0">Start</h2></div>
+            </div></body></html>"#
+        );
+        load_html_on_shared_vm(&html, "https://minheight.w3cos.local/page.html").unwrap();
+        crate::headless::render_document_rgba_cpu(400, 1200).unwrap();
+        let rect = |id: &str| {
+            let node = crate::dom::query_selector_all(&format!("#{id}"))[0];
+            crate::dom::bounding_rect(node)
+        };
+        for name in ["plain", "min", "max"] {
+            let owner = rect(name);
+            let scroller = rect(&format!("{name}-s"));
+            let next = rect(&format!("{name}-next"));
+            assert!(
+                owner.y + owner.height >= scroller.y + scroller.height - 0.5,
+                "#{name} height {} ends before its content ({} + {})",
+                owner.height,
+                scroller.y,
+                scroller.height
+            );
+            assert!(
+                next.y >= scroller.y + scroller.height - 0.5,
+                "#{name}-next at {} overlaps content ending {}",
+                next.y,
+                scroller.y + scroller.height
+            );
+        }
+        assert!((rect("pinned").height - 400.0).abs() < 0.5);
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn visibility_hidden_boxes_keep_layout_but_do_not_paint() {
+        // Code-OSS hides the walkthrough "x" buttons with `visibility: hidden`
+        // until hover; they must occupy space without painting, while a
+        // descendant that resets `visibility: visible` still paints.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div id="hidden" style="position:absolute;left:0;top:0;width:40px;height:40px;background:#00ff00;visibility:hidden">
+              <div id="reset" style="position:absolute;left:0;top:0;width:10px;height:10px;background:#ff0000;visibility:visible"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:#00ff00"></div>
+            </body></html>"#;
+        load_html_on_shared_vm(html, "https://visibility.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_ne!(pixel(30, 30), [0, 255, 0], "visibility:hidden box painted");
+        assert_eq!(pixel(5, 5), [255, 0, 0], "visible descendant missing");
+        assert_eq!(pixel(120, 20), [0, 255, 0], "control box missing");
+        let node = crate::dom::query_selector_all("#hidden")[0];
+        assert_eq!(crate::dom::bounding_rect(node).width, 40.0);
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn opacity_zero_ancestor_hides_descendant_paint() {
+        // Code-OSS hides idle scrollbars with `.invisible { opacity: 0 }`; the
+        // slider child must not paint through its transparent parent.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div style="position:absolute;left:0;top:0;width:50px;height:50px;opacity:0">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:50px;height:50px">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://opacity.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_ne!(pixel(5, 5), [0, 255, 0], "child painted through opacity:0");
+        assert_eq!(pixel(105, 5), [0, 255, 0], "visible control child missing");
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn canvas_2d_pixels_paint_in_the_cpu_renderer() {
+        // Monaco's minimap is a 2D canvas positioned inside the editor; the
+        // pixels drawn through getContext('2d') must reach the frame, scaled
+        // to the canvas's CSS box, and a canvas without a context stays empty.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <canvas id="drawn" width="10" height="10" style="position:absolute;left:20px;top:10px;width:40px;height:40px"></canvas>
+            <canvas id="blank" width="10" height="10" style="position:absolute;left:100px;top:10px;width:40px;height:40px"></canvas>
+            <script>
+              var c = document.getElementById('drawn').getContext('2d');
+              c.fillStyle = '#00ff00';
+              c.fillRect(0, 0, 5, 10);
+            </script></body></html>"#;
+        load_html_on_shared_vm(html, "https://canvas-paint.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_eq!(pixel(25, 30), [0, 255, 0], "filled half missing");
+        let backdrop = pixel(190, 90);
+        assert_ne!(backdrop, [0, 255, 0]);
+        assert_eq!(pixel(55, 30), backdrop, "unfilled half painted");
+        assert_eq!(pixel(110, 30), backdrop, "context-less canvas painted");
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn fractional_opacity_ancestor_fades_descendant_paint() {
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div style="position:absolute;left:0;top:0;width:50px;height:50px;opacity:0.5">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:50px;height:50px">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://group-opacity.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let green = |x: usize, y: usize| frame.rgba[(y * frame.width as usize + x) * 4 + 1];
+        let faded = green(5, 5);
+        assert!(
+            (100..=160).contains(&faded),
+            "child of an opacity:0.5 parent should be ~half green, got {faded}"
+        );
+        assert_eq!(green(105, 5), 255, "opaque control child changed");
+    }
+
     #[test]
     fn load_html_on_shared_vm_runs_inline_script() {
         let html = r#"<!doctype html><html><body>
@@ -10392,6 +10675,39 @@ mod tests {
         assert!(
             !text.contains("page loading"),
             "parser kept the pre-script text: {text}"
+        );
+    }
+
+    #[test]
+    fn uncaught_classic_script_exception_is_reported_and_parsing_continues() {
+        // HTML "run a classic script": an uncaught exception is reported on
+        // the global (ErrorEvent at window) and later scripts and markup
+        // still run; the document load does not fail.
+        let html = r#"<!doctype html><html><body>
+            <script>
+              window.reported = [];
+              window.addEventListener("error", function (event) {
+                window.reported.push(event.message + "|" + (event.error instanceof Error));
+              });
+            </script>
+            <script>notDefinedAnywhere();</script>
+            <script>throw new Error("boom");</script>
+            <p id="after">tail</p>
+            <script>document.getElementById("after").textContent = "ran " + window.reported.length;</script>
+        </body></html>"#;
+        load_html_on_shared_vm(html, "https://shared.w3cos.local/throws.html").unwrap();
+        let text = crate::dom::get_descendant_text_content(crate::dom::body_id());
+        assert!(
+            text.contains("ran 2"),
+            "later script did not run after exceptions: {text}"
+        );
+        let reported = crate::jsdom::window_value()
+            .get_property("reported")
+            .call_method("join", vec![Value::string(",")])
+            .to_js_string();
+        assert!(
+            reported.contains("boom|true"),
+            "throw not reported: {reported}"
         );
     }
 
@@ -15442,7 +15758,12 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         for _ in 0..5000 {
             loader.poll();
             poll_script_fetches();
-            if crate::image_loader::dimensions(&source) == Some((3, 2)) {
+            // Image bytes can land in the fetch poll that follows `loader.poll`.
+            // That poll queues the document `load` microtask; the next
+            // `loader.poll` is what marks the navigation complete.
+            if crate::image_loader::dimensions(&source) == Some((3, 2))
+                && matches!(loader.progress(), DocumentLoadProgress::Complete)
+            {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(1));
@@ -15958,17 +16279,22 @@ window.__dynamicInlineHandler = dynamicInlineResult;
 
     #[test]
     fn browser_picture_mime_contract_matches_linked_decoders() {
-        for content_type in [
-            "image/png",
-            "image/jpeg",
-            "image/gif",
-            "image/webp",
-            "image/apng",
-            "image/bmp",
-            "image/x-icon",
-            "image/vnd.microsoft.icon",
-        ] {
-            assert!(is_decodable_picture_type(content_type), "{content_type}");
+        let cases = [
+            ("image/png", cfg!(feature = "image-png")),
+            ("image/jpeg", cfg!(feature = "image-jpeg")),
+            ("image/gif", cfg!(feature = "image-gif")),
+            ("image/webp", cfg!(feature = "image-webp")),
+            ("image/apng", cfg!(feature = "image-png")),
+            ("image/bmp", cfg!(feature = "image-bmp")),
+            ("image/x-icon", cfg!(feature = "image-ico")),
+            ("image/vnd.microsoft.icon", cfg!(feature = "image-ico")),
+        ];
+        for (content_type, enabled) in cases {
+            assert_eq!(
+                is_decodable_picture_type(content_type),
+                enabled,
+                "{content_type}"
+            );
         }
         assert!(!is_decodable_picture_type("image/avif"));
     }
@@ -16544,6 +16870,90 @@ window.__dynamicInlineHandler = dynamicInlineResult;
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn stylesheet_font_face_loads_sibling_file_scheme_fonts() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let directory = tempfile::tempdir().expect("file font directory");
+        std::fs::write(
+            directory.path().join("inter.ttf"),
+            include_bytes!("../assets/Inter-Regular.ttf"),
+        )
+        .unwrap();
+        let html = r#"<!doctype html><style>
+            @font-face { font-family: 'W3COS File Font'; src: url('./inter.ttf') format('truetype'); }
+            span { font-family: 'W3COS File Font'; }
+            </style><span id="s">hello</span>"#;
+        let url = Url::from_file_path(directory.path().join("index.html")).unwrap();
+        load_html_on_shared_vm(html, url.as_str()).unwrap();
+        let registry = crate::font_face::FontRegistry::global();
+        for _ in 0..2_000 {
+            crate::jsdom::document_value()
+                .get_property("fonts")
+                .get_property("ready");
+            if registry
+                .resolve(
+                    "W3COS File Font",
+                    crate::font_face::FontWeight::NORMAL,
+                    crate::font_face::FontFaceStyle::Normal,
+                )
+                .is_some()
+            {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("file:// @font-face source was not registered");
+    }
+
+    #[test]
+    fn stylesheet_font_face_loads_escaped_vscode_file_font_urls() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let directory = tempfile::tempdir().expect("font directory");
+        std::fs::write(
+            directory.path().join("icons.ttf"),
+            include_bytes!("../assets/Inter-Regular.ttf"),
+        )
+        .unwrap();
+        // The Code-OSS icon theme service serialises the seti font as
+        // `url('vscode-file\:\/\/vscode-app\/<abs path>')`.
+        let escaped = format!(
+            "vscode-file://vscode-app{}/icons.ttf",
+            directory.path().display()
+        )
+        .replace(':', "\\:")
+        .replace('/', "\\/")
+        .replace('.', "\\.");
+        let html = format!(
+            "<!doctype html><style>@font-face {{ src: url('{escaped}') format('truetype'); \
+             font-family: 'W3COS Seti Test'; }} span {{ font-family: 'W3COS Seti Test'; }}</style>\
+             <span id=\"s\">hello</span>"
+        );
+        let url = Url::parse("vscode-file://vscode-app/workbench.html").unwrap();
+        load_html_on_shared_vm(&html, url.as_str()).unwrap();
+        let registry = crate::font_face::FontRegistry::global();
+        for _ in 0..2_000 {
+            crate::jsdom::document_value()
+                .get_property("fonts")
+                .get_property("ready");
+            if registry
+                .resolve(
+                    "W3COS Seti Test",
+                    crate::font_face::FontWeight::NORMAL,
+                    crate::font_face::FontFaceStyle::Normal,
+                )
+                .is_some()
+            {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("vscode-file:// @font-face source was not registered");
     }
 
     #[test]

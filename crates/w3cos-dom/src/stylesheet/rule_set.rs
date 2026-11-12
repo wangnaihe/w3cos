@@ -1,19 +1,305 @@
 use std::collections::HashMap;
 
+use super::selector_filter::AncestorBloom;
 use super::{AttributeSelector, CompoundSelector, Document, NodeId, Rule, SelectorContext};
 
 #[derive(Debug, Default)]
 pub(super) struct RuleSet {
     pub(super) rules: Vec<Rule>,
     pub(super) document_roots: HashMap<NodeId, u64>,
+    /// Rules without a pseudo-element, bucketed by their subject compound.
+    main: Buckets,
+    /// `::before`/`::after`/... rules. Kept apart so the per-element cascade
+    /// never gathers them, and pseudo lookups never scan the element rules.
+    pseudo: Buckets,
+    has_sibling_dependencies: bool,
+    has_relational_dependencies: bool,
+    has_structural_dependencies: bool,
+    /// Some selector reads the `style` attribute, so an inline-style write
+    /// can change which rules match on that element or its descendants.
+    has_style_attribute_dependencies: bool,
+    /// A `:has()` argument uses `+` or `~`, so the subject sits before the mutation.
+    has_sibling_scoped_relational: bool,
+    /// Static part (no relational pseudo) of every compound that carries `:has()`,
+    /// and its reach: 0 subject, 1 earlier compound (descendants may change),
+    /// 2 earlier compound followed by a sibling combinator.
+    relational_anchors: Vec<(CompoundSelector, u8)>,
+    /// Compounds whose match can change when an element is inserted into or
+    /// removed from the sibling list: those carrying a positional pseudo-class
+    /// (`:first-child`, `:nth-child()`, ...) and those to the right of a `+`/`~`.
+    positional_anchors: Vec<PositionalAnchor>,
+    /// Compounds carrying `:empty`, which watch their own child list.
+    empty_anchors: Vec<CompoundSelector>,
+    /// Rules that declare a transition the runtime can sample (see
+    /// `declares_sampled_transition`). An element none of them match cannot
+    /// carry a sampled transition, so style change tracking skips it.
+    motion_rules: Vec<usize>,
+}
+
+/// Which siblings a rule reads *after* its subject. A tail append (a new last
+/// element) can change the subject only through this reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FollowingReach(u8);
+
+impl PositionalAnchor {
+    /// Whether the anchor can apply to children of `parent`, whose own and
+    /// outer ancestors are summarised by `ancestors`.
+    fn scoped(&self, parent: &SelectorContext, ancestors: AncestorBloom) -> bool {
+        ancestors.might_contain(self.ancestor_filter)
+            && self
+                .parent
+                .as_ref()
+                .is_none_or(|compound| compound.matches(parent))
+    }
+}
+
+impl FollowingReach {
+    /// Only preceding siblings (`:first-child`, `:nth-child(n)`, `a + b`).
+    const NONE: Self = Self(0);
+    /// `:last-child` / `:only-child`: only the element that was last before
+    /// the append can change.
+    const PREVIOUS_LAST: Self = Self(1);
+    /// `:last-of-type` / `:only-of-type`: only the last earlier sibling of the
+    /// appended element's type can change.
+    const PREVIOUS_OF_TYPE: Self = Self(2);
+    /// `:nth-last-*`, `~`-based `:has()`: any sibling can change.
+    const ANY: Self = Self(4);
+    /// `:nth-last-child(k)` / `:nth-last-of-type(k)` with a constant `k`:
+    /// only the last `k` earlier siblings (of the appended type) can change.
+    const WINDOW: Self = Self(8);
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+/// Whether removing or inserting an earlier sibling can change the pseudo-class.
+fn pseudo_reads_preceding_position(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::LastChild | super::PseudoClass::LastOfType => false,
+        super::PseudoClass::NthLastChild(expression)
+        | super::PseudoClass::NthLastOfType(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
+        super::PseudoClass::FirstChild
+        | super::PseudoClass::FirstOfType
+        | super::PseudoClass::OnlyChild
+        | super::PseudoClass::OnlyOfType
+        | super::PseudoClass::NthChild(_)
+        | super::PseudoClass::NthOfType(_) => true,
+        _ => match selector_list_argument(pseudo) {
+            Some(selector) => {
+                let mut rest = selector.replace(":last-child", "");
+                rest = rest.replace(":last-of-type", "");
+                rest.contains(":nth-")
+                    || rest.contains(":first-")
+                    || rest.contains(":only-")
+                    || rest.contains('+')
+                    || rest.contains('~')
+            }
+            None => pseudo_reads_preceding(pseudo) || pseudo_counts_siblings_by_selector(pseudo),
+        },
+    }
+}
+
+/// `FollowingReach` plus the window sizes of `FollowingReach::WINDOW`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Following {
+    reach: FollowingReach,
+    window_child: usize,
+    window_type: usize,
+}
+
+impl Following {
+    fn union(self, other: Self) -> Self {
+        Self {
+            reach: self.reach.union(other.reach),
+            window_child: self.window_child.max(other.window_child),
+            window_type: self.window_type.max(other.window_type),
+        }
+    }
+
+    /// What a compound right of `+`/`~` inherits from the compound on its
+    /// left: the right one can sit anywhere after the left one, so only a
+    /// dependency on the previous last element stays that narrow.
+    fn through_sibling_combinator(self) -> Self {
+        let reach = if self.reach.0 & !FollowingReach::PREVIOUS_LAST.0 == 0 {
+            self.reach
+        } else {
+            FollowingReach::ANY
+        };
+        Self {
+            reach,
+            ..Self::default()
+        }
+    }
+}
+
+/// Where a sibling sits relative to a tail append.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FollowingPosition {
+    /// It was the last element before the append.
+    pub(crate) last: bool,
+    /// It was the last element of the appended type before the append.
+    pub(crate) of_type: bool,
+    /// Elements from the end, 1 for the last earlier element.
+    pub(crate) distance: usize,
+    /// The same counted over the appended type; `usize::MAX` for other types.
+    pub(crate) type_distance: usize,
+}
+
+/// Which earlier siblings a tail append has to visit.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FollowingScan {
+    /// Some rule can change on any earlier sibling.
+    pub(crate) all: bool,
+    pub(crate) window_child: usize,
+    pub(crate) window_type: usize,
+}
+
+impl FollowingScan {
+    pub(crate) fn needed(&self) -> bool {
+        self.all || self.window_child > 0 || self.window_type > 0
+    }
+}
+
+/// Static part (pseudo-classes dropped, which only widens the match) of a
+/// compound whose result depends on its position among its siblings.
+#[derive(Debug)]
+struct PositionalAnchor {
+    subject: CompoundSelector,
+    /// Static part of the parent compound when joined by `>`; every sibling
+    /// shares one parent, so the anchor can only apply when it matches.
+    parent: Option<CompoundSelector>,
+    /// The compound sits right of `+` or `~` (also inside `:not(.a + .b)`),
+    /// so it reads siblings *before* it.
+    sibling_rhs: bool,
+    /// How far the rule reads siblings *after* the subject; see
+    /// `FollowingReach`. Every anchor that counts only preceding siblings is
+    /// unaffected by a tail append.
+    following: FollowingReach,
+    /// For `FollowingReach::WINDOW`: the farthest earlier element, counted
+    /// from the end over all siblings, that `:nth-last-child(k)` can flip.
+    window_child: usize,
+    /// The same counted over siblings of the appended element's type
+    /// (`:nth-last-of-type(k)`).
+    window_type: usize,
+    /// The compound reads siblings *before* it (`:first-child`,
+    /// `:nth-child(n)`, `+`/`~`, ...), so removing an earlier sibling can
+    /// change it. Pure from-the-end rules (`:last-child`, `:nth-last-child(k)`)
+    /// do not.
+    reads_preceding: bool,
+    /// Features the shared ancestor chain of the siblings must contain.
+    ancestor_filter: AncestorBloom,
+    /// The compound counts siblings by their own attributes
+    /// (`:nth-child(An+B of S)`), so a class change on any sibling, before or
+    /// after it, can change its result.
+    sibling_any: bool,
+}
+
+#[derive(Debug, Default)]
+struct Buckets {
     id_rules: HashMap<String, Vec<usize>>,
     class_rules: HashMap<String, Vec<usize>>,
     attribute_rules: HashMap<String, Vec<usize>>,
     tag_rules: HashMap<String, Vec<usize>>,
     universal_rules: Vec<usize>,
-    has_sibling_dependencies: bool,
-    has_relational_dependencies: bool,
-    has_structural_dependencies: bool,
+}
+
+impl Buckets {
+    fn clear(&mut self) {
+        self.id_rules.clear();
+        self.class_rules.clear();
+        self.attribute_rules.clear();
+        self.tag_rules.clear();
+        self.universal_rules.clear();
+    }
+
+    fn insert(&mut self, bucket: RuleBucket<'_>, index: usize) {
+        match bucket {
+            RuleBucket::Id(id) => self.id_rules.entry(id.to_string()).or_default().push(index),
+            RuleBucket::Class(class) => self
+                .class_rules
+                .entry(class.to_string())
+                .or_default()
+                .push(index),
+            RuleBucket::Attribute(name) => self
+                .attribute_rules
+                .entry(attribute_index_key(name))
+                .or_default()
+                .push(index),
+            RuleBucket::Tag(tag) => self
+                .tag_rules
+                .entry(tag.to_ascii_lowercase())
+                .or_default()
+                .push(index),
+            RuleBucket::Universal => self.universal_rules.push(index),
+        }
+    }
+
+    /// Candidate rule indices. Order is unspecified (callers sort by
+    /// specificity and rule order); each rule lives in exactly one bucket, so
+    /// only repeated attribute/class keys can duplicate an index.
+    fn candidates_for_node(&self, document: &Document, node: NodeId) -> Vec<usize> {
+        let node = document.get_node(node);
+        let mut candidates = Vec::with_capacity(self.universal_rules.len() + 16);
+        candidates.extend_from_slice(&self.universal_rules);
+        let start = candidates.len();
+        if let Some((_, id)) = node
+            .attributes
+            .iter()
+            .find(|(name, _)| name.as_str() == "id")
+            && let Some(indices) = self.id_rules.get(id.as_str())
+        {
+            candidates.extend(indices);
+        }
+        for class in &node.class_list {
+            let class = class.as_str();
+            if let Some(indices) = self.class_rules.get(class.as_str()) {
+                candidates.extend(indices);
+            }
+        }
+        for (name, _) in &node.attributes {
+            let name = name.as_str();
+            if let Some(indices) = self
+                .attribute_rules
+                .get(&attribute_index_key(name.as_str()))
+            {
+                candidates.extend(indices);
+            }
+        }
+        append_tag_candidates(&self.tag_rules, &node.tag.as_str(), &mut candidates);
+        normalize_tail(&mut candidates, start);
+        candidates
+    }
+
+    fn candidates_for_context(&self, ctx: &SelectorContext) -> Vec<usize> {
+        let mut candidates = Vec::with_capacity(self.universal_rules.len() + 16);
+        candidates.extend_from_slice(&self.universal_rules);
+        let start = candidates.len();
+        if let Some(id) = &ctx.id
+            && let Some(indices) = self.id_rules.get(id)
+        {
+            candidates.extend(indices);
+        }
+        for class in &ctx.classes {
+            if let Some(indices) = self.class_rules.get(class) {
+                candidates.extend(indices);
+            }
+        }
+        for (name, _) in &ctx.attributes {
+            if let Some(indices) = self.attribute_rules.get(&attribute_index_key(name)) {
+                candidates.extend(indices);
+            }
+        }
+        append_tag_candidates(&self.tag_rules, &ctx.tag, &mut candidates);
+        normalize_tail(&mut candidates, start);
+        candidates
+    }
 }
 
 enum RuleBucket<'a> {
@@ -64,20 +350,38 @@ impl RuleSet {
     }
 
     pub(super) fn rebuild_index(&mut self) {
-        self.id_rules.clear();
-        self.class_rules.clear();
-        self.attribute_rules.clear();
-        self.tag_rules.clear();
-        self.universal_rules.clear();
+        self.main.clear();
+        self.pseudo.clear();
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
+        self.has_style_attribute_dependencies = false;
+        self.has_sibling_scoped_relational = false;
+        self.relational_anchors.clear();
+        self.positional_anchors.clear();
+        self.empty_anchors.clear();
+        self.motion_rules.clear();
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
     }
 
+    pub(super) fn motion_rules(&self) -> impl Iterator<Item = &Rule> {
+        self.motion_rules.iter().map(|index| &self.rules[*index])
+    }
+
+    pub(super) fn has_motion_rules(&self) -> bool {
+        !self.motion_rules.is_empty()
+    }
+
     fn index_rule(&mut self, index: usize) {
+        if self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, value)| super::declares_sampled_transition(property, value))
+        {
+            self.motion_rules.push(index);
+        }
         self.has_sibling_dependencies |= self.rules[index].combinators.iter().any(|combinator| {
             matches!(
                 combinator,
@@ -99,6 +403,55 @@ impl RuleSet {
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
 
+        self.index_positional_anchors(index);
+
+        self.has_style_attribute_dependencies |= self.rules[index]
+            .chain
+            .iter()
+            .any(compound_reads_style_attribute);
+
+        let last = self.rules[index].chain.len().saturating_sub(1);
+        let mut anchors = Vec::new();
+        let mut sibling_scoped = false;
+        for (position, compound) in self.rules[index].chain.iter().enumerate() {
+            if !compound
+                .pseudo_classes
+                .iter()
+                .any(pseudo_has_relational_dependency)
+            {
+                continue;
+            }
+            if compound
+                .pseudo_classes
+                .iter()
+                .any(pseudo_has_sibling_scoped_relational)
+            {
+                sibling_scoped = true;
+            }
+            let mut anchor = compound.clone();
+            anchor
+                .pseudo_classes
+                .retain(|pseudo| !pseudo_has_relational_dependency(pseudo));
+            let reach = if position == last {
+                0
+            } else if self.rules[index].combinators[position..]
+                .iter()
+                .any(|combinator| {
+                    matches!(
+                        combinator,
+                        super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
+                    )
+                })
+            {
+                2
+            } else {
+                1
+            };
+            anchors.push((anchor, reach));
+        }
+        self.has_sibling_scoped_relational |= sibling_scoped;
+        self.relational_anchors.extend(anchors);
+
         // A rule lives in one best subject bucket. Matching gathers the
         // element's buckets plus universal rules, so no per-node RuleSet scan
         // or cross-bucket rule deduplication is required.
@@ -107,82 +460,233 @@ impl RuleSet {
             .last()
             .map(rule_bucket)
             .unwrap_or(RuleBucket::Universal);
-        match bucket {
-            RuleBucket::Id(id) => self.id_rules.entry(id.to_string()).or_default().push(index),
-            RuleBucket::Class(class) => self
-                .class_rules
-                .entry(class.to_string())
-                .or_default()
-                .push(index),
-            RuleBucket::Attribute(name) => self
-                .attribute_rules
-                .entry(attribute_index_key(name))
-                .or_default()
-                .push(index),
-            RuleBucket::Tag(tag) => self
-                .tag_rules
-                .entry(tag.to_ascii_lowercase())
-                .or_default()
-                .push(index),
-            RuleBucket::Universal => self.universal_rules.push(index),
+        if self.rules[index].pseudo_element.is_some() {
+            self.pseudo.insert(bucket, index);
+        } else {
+            self.main.insert(bucket, index);
         }
     }
 
+    fn index_positional_anchors(&mut self, index: usize) {
+        let rule = &self.rules[index];
+        let mut anchors = Vec::new();
+        let mut empty = Vec::new();
+        // A compound's result depends on the siblings after it through its own
+        // pseudo-classes, and a compound right of `+`/`~` also through the
+        // compounds to its left.
+        let mut following_by_position: Vec<Following> = Vec::new();
+        for (position, compound) in rule.chain.iter().enumerate() {
+            let mut own = compound_following(compound);
+            if position > 0
+                && matches!(
+                    rule.combinators[position - 1],
+                    super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
+                )
+            {
+                own = own.union(following_by_position[position - 1].through_sibling_combinator());
+            }
+            following_by_position.push(own);
+        }
+        for (position, compound) in rule.chain.iter().enumerate() {
+            let sibling_combinator = position > 0
+                && matches!(
+                    rule.combinators[position - 1],
+                    super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
+                );
+            let pseudos = &compound.pseudo_classes;
+            let sibling_rhs = sibling_combinator || pseudos.iter().any(pseudo_reads_preceding);
+            // `:has(+ x)` makes the subject depend on the sibling after it.
+            let positional = pseudos.iter().any(|pseudo| {
+                pseudo_is_positional(pseudo) || pseudo_has_sibling_scoped_relational(pseudo)
+            });
+            let watches_children = pseudos.iter().any(pseudo_watches_children);
+            let sibling_any = pseudos.iter().any(pseudo_counts_siblings_by_selector);
+            if !(positional || sibling_rhs || watches_children) {
+                continue;
+            }
+            let mut subject = compound.clone();
+            subject.pseudo_classes.clear();
+            if watches_children {
+                empty.push(subject.clone());
+            }
+            if positional || sibling_rhs {
+                let parent = (position > 0
+                    && matches!(rule.combinators[position - 1], super::Combinator::Child))
+                .then(|| {
+                    let mut parent = rule.chain[position - 1].clone();
+                    parent.pseudo_classes.clear();
+                    parent
+                });
+                let following = following_by_position[position];
+                anchors.push(PositionalAnchor {
+                    subject,
+                    parent,
+                    sibling_rhs,
+                    following: following.reach,
+                    window_child: following.window_child,
+                    window_type: following.window_type,
+                    reads_preceding: sibling_rhs
+                        || sibling_any
+                        || pseudos.iter().any(pseudo_reads_preceding_position),
+                    ancestor_filter: AncestorBloom::for_compound_at(
+                        &rule.chain,
+                        &rule.combinators,
+                        position,
+                    ),
+                    sibling_any,
+                });
+            }
+        }
+        self.positional_anchors.extend(anchors);
+        self.empty_anchors.extend(empty);
+    }
+
+    /// Whether `ctx` (a child of `parent`) could change its match result when
+    /// an element is appended after the last child. `previous_last` is true
+    /// for the element that was last before the append, the only one
+    /// `:last-child`/`:only-child` rules can flip; `previous_of_type` is true
+    /// for the last earlier sibling of the appended element's type, the only
+    /// one `:last-of-type`/`:only-of-type` rules can flip.
+    pub(super) fn following_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+        previous: FollowingPosition,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            let reach = anchor.following;
+            let reaches = reach.contains(FollowingReach::ANY)
+                || (previous.last && reach.contains(FollowingReach::PREVIOUS_LAST))
+                || (previous.of_type && reach.contains(FollowingReach::PREVIOUS_OF_TYPE))
+                || (reach.contains(FollowingReach::WINDOW)
+                    && (previous.distance <= anchor.window_child
+                        || previous.type_distance <= anchor.window_type));
+            reaches && anchor.subject.matches(ctx) && anchor.scoped(parent, ancestors)
+        })
+    }
+
+    /// Whether `ctx` (a child of `parent`) could change its match result when
+    /// a sibling was removed. `later` is true for children after the removed
+    /// one, which only lose from-the-start position; earlier children only
+    /// lose from-the-end position.
+    pub(super) fn removal_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+        later: bool,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            let reaches = if later {
+                anchor.reads_preceding
+            } else {
+                anchor.following.0 != 0
+            };
+            reaches && anchor.subject.matches(ctx) && anchor.scoped(parent, ancestors)
+        })
+    }
+
+    /// How a tail append has to look at the siblings under `parent`.
+    pub(super) fn following_scan(
+        &self,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+    ) -> FollowingScan {
+        let mut scan = FollowingScan::default();
+        for anchor in &self.positional_anchors {
+            if !anchor.scoped(parent, ancestors) {
+                continue;
+            }
+            if anchor.following.contains(FollowingReach::ANY) {
+                scan.all = true;
+            }
+            if anchor.following.contains(FollowingReach::WINDOW) {
+                scan.window_child = scan.window_child.max(anchor.window_child);
+                scan.window_type = scan.window_type.max(anchor.window_type);
+            }
+        }
+        scan
+    }
+
+    /// Whether some rule under `parent` reads the last earlier sibling of the
+    /// appended element's type (`:last-of-type`, `:only-of-type`).
+    pub(super) fn following_of_type_needed(
+        &self,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+    ) -> bool {
+        self.following_reach_needed(parent, ancestors, FollowingReach::PREVIOUS_OF_TYPE)
+    }
+
+    fn following_reach_needed(
+        &self,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+        reach: FollowingReach,
+    ) -> bool {
+        self.positional_anchors
+            .iter()
+            .any(|anchor| anchor.following.contains(reach) && anchor.scoped(parent, ancestors))
+    }
+
+    /// Whether `ctx` (a child of `parent`) could change match result when its
+    /// sibling list changes. `siblings_only` keeps the `+`/`~` anchors, the
+    /// only ones a class/attribute change on a sibling can reach.
+    pub(super) fn positional_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+        siblings_only: bool,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            (!siblings_only || anchor.sibling_rhs || anchor.sibling_any)
+                && anchor.subject.matches(ctx)
+                && anchor.scoped(parent, ancestors)
+        })
+    }
+
+    /// Whether `ctx` (a child of `parent`) counts siblings by their own
+    /// attributes, so a change on a *following* sibling can restyle it.
+    pub(super) fn sibling_any_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            anchor.sibling_any && anchor.subject.matches(ctx) && anchor.scoped(parent, ancestors)
+        })
+    }
+
+    /// Whether `ctx` carries `:empty` somewhere in a rule, so its own child
+    /// list is observed.
+    pub(super) fn empty_anchor_matches(&self, ctx: &SelectorContext) -> bool {
+        self.empty_anchors.iter().any(|anchor| anchor.matches(ctx))
+    }
+
+    /// Candidates among rules without a pseudo-element.
     pub(super) fn candidate_indices_for_context(&self, ctx: &SelectorContext) -> Vec<usize> {
-        let mut candidates = self.universal_rules.clone();
-        if let Some(id) = &ctx.id
-            && let Some(indices) = self.id_rules.get(id)
-        {
-            candidates.extend(indices);
-        }
-        for class in &ctx.classes {
-            if let Some(indices) = self.class_rules.get(class) {
-                candidates.extend(indices);
-            }
-        }
-        for (name, _) in &ctx.attributes {
-            if let Some(indices) = self.attribute_rules.get(&attribute_index_key(name)) {
-                candidates.extend(indices);
-            }
-        }
-        append_tag_candidates(&self.tag_rules, &ctx.tag, &mut candidates);
-        normalize_candidates(&mut candidates);
-        candidates
+        self.main.candidates_for_context(ctx)
     }
 
+    /// Candidates among rules without a pseudo-element.
     pub(super) fn candidate_indices_for_node(
         &self,
         document: &Document,
         node: NodeId,
     ) -> Vec<usize> {
-        let node = document.get_node(node);
-        let mut candidates = self.universal_rules.clone();
-        if let Some((_, id)) = node
-            .attributes
-            .iter()
-            .find(|(name, _)| name.as_str() == "id")
-            && let Some(indices) = self.id_rules.get(id.as_str())
-        {
-            candidates.extend(indices);
-        }
-        for class in &node.class_list {
-            let class = class.as_str();
-            if let Some(indices) = self.class_rules.get(class.as_str()) {
-                candidates.extend(indices);
-            }
-        }
-        for (name, _) in &node.attributes {
-            let name = name.as_str();
-            if let Some(indices) = self
-                .attribute_rules
-                .get(&attribute_index_key(name.as_str()))
-            {
-                candidates.extend(indices);
-            }
-        }
-        append_tag_candidates(&self.tag_rules, &node.tag.as_str(), &mut candidates);
-        normalize_candidates(&mut candidates);
-        candidates
+        self.main.candidates_for_node(document, node)
+    }
+
+    /// Candidates among `::pseudo-element` rules only.
+    pub(super) fn pseudo_candidate_indices_for_node(
+        &self,
+        document: &Document,
+        node: NodeId,
+    ) -> Vec<usize> {
+        self.pseudo.candidates_for_node(document, node)
     }
 
     pub(super) fn has_sibling_dependencies(&self) -> bool {
@@ -196,14 +700,250 @@ impl RuleSet {
     pub(super) fn has_structural_dependencies(&self) -> bool {
         self.has_structural_dependencies
     }
+
+    pub(super) fn has_style_attribute_dependencies(&self) -> bool {
+        self.has_style_attribute_dependencies
+    }
+
+    pub(super) fn has_sibling_scoped_relational(&self) -> bool {
+        self.has_sibling_scoped_relational
+    }
+
+    /// `None` when `ctx` can never be the subject of, or an earlier compound
+    /// of, a `:has()` rule. Otherwise the largest reach of a matching anchor.
+    pub(super) fn relational_anchor(&self, ctx: &SelectorContext) -> Option<u8> {
+        let mut found = None;
+        for (anchor, reach) in &self.relational_anchors {
+            if found.is_none_or(|current| *reach > current) && anchor.matches(ctx) {
+                found = Some(*reach);
+            }
+        }
+        found
+    }
+}
+
+/// Conservative: an attribute selector on `style`, or a functional pseudo-class
+/// whose argument mentions it (`:not([style])`, `:is(...)`, `:has(...)`).
+fn compound_reads_style_attribute(compound: &super::CompoundSelector) -> bool {
+    use super::AttributeSelector as A;
+    compound.attributes.iter().any(|attribute| {
+        let (A::Present(name)
+        | A::Equals(name, ..)
+        | A::Includes(name, ..)
+        | A::DashMatch(name, ..)
+        | A::Prefix(name, ..)
+        | A::Suffix(name, ..)
+        | A::Substring(name, ..)) = attribute;
+        name.eq_ignore_ascii_case("style")
+    }) || compound.pseudo_classes.iter().any(|pseudo| match pseudo {
+        super::PseudoClass::Has(selector)
+        | super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector) => selector_text_reads_style_attribute(selector),
+        _ => false,
+    })
+}
+
+/// Whether selector text contains an attribute selector on `style`
+/// (`[style]`, `[ STYLE*="x" ]`). A class or tag that merely contains the
+/// word (`.monaco-style`, `:not(.inline-style)`) cannot observe the attribute.
+/// An escape could spell the name differently, so any backslash stays
+/// conservative.
+fn selector_text_reads_style_attribute(selector: &str) -> bool {
+    if selector.contains('\\') {
+        return true;
+    }
+    let lower = selector.to_ascii_lowercase();
+    lower.match_indices('[').any(|(at, _)| {
+        let rest = lower[at + 1..].trim_start();
+        // `[ns|style]` and `[*|style]` name the same attribute.
+        let rest = rest.strip_prefix("*|").unwrap_or(rest);
+        rest.strip_prefix("style").is_some_and(|after| {
+            !after
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || next == '-' || next == '_')
+        })
+    }) || (lower.contains('|') && lower.contains("style"))
 }
 
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
     match pseudo {
         super::PseudoClass::Has(_) => true,
-        super::PseudoClass::Not(selector) => selector.contains('+') || selector.contains('~'),
+        super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector) => selector.contains('+') || selector.contains('~'),
+        // `:nth-child(An+B of S)` counts siblings by their own attributes.
+        super::PseudoClass::NthChild(expression) | super::PseudoClass::NthLastChild(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
         _ => false,
     }
+}
+
+/// Position-dependent pseudo-classes whose subject is the sibling itself.
+fn pseudo_is_positional(pseudo: &super::PseudoClass) -> bool {
+    pseudo_nests_position(pseudo)
+        || matches!(
+            pseudo,
+            super::PseudoClass::FirstChild
+                | super::PseudoClass::LastChild
+                | super::PseudoClass::FirstOfType
+                | super::PseudoClass::LastOfType
+                | super::PseudoClass::OnlyChild
+                | super::PseudoClass::OnlyOfType
+                | super::PseudoClass::NthChild(_)
+                | super::PseudoClass::NthLastChild(_)
+                | super::PseudoClass::NthOfType(_)
+                | super::PseudoClass::NthLastOfType(_)
+        )
+}
+
+const POSITIONAL_KEYWORDS: [&str; 7] = [
+    ":empty",
+    ":first-child",
+    ":last-child",
+    ":first-of-type",
+    ":last-of-type",
+    ":only-child",
+    ":only-of-type",
+];
+
+/// Selector-list pseudo-classes whose argument is evaluated against the
+/// subject itself (`:not(:first-child)`), as opposed to `:has()`, which reads
+/// the subject's descendants and is tracked by the relational anchors.
+fn selector_list_argument(pseudo: &super::PseudoClass) -> Option<String> {
+    match pseudo {
+        super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector) => Some(selector.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// The compound's result depends on its position in the child list through a
+/// nested selector list (`:not(:first-child)`, `:is(:nth-child(2n), .x)`).
+fn pseudo_nests_position(pseudo: &super::PseudoClass) -> bool {
+    selector_list_argument(pseudo).is_some_and(|selector| {
+        selector.contains(":nth-")
+            || POSITIONAL_KEYWORDS
+                .iter()
+                .any(|needle| *needle != ":empty" && selector.contains(needle))
+    })
+}
+
+/// How far the compound's result depends on siblings after it.
+fn compound_following(compound: &super::CompoundSelector) -> Following {
+    compound
+        .pseudo_classes
+        .iter()
+        .map(pseudo_following)
+        .fold(Following::default(), Following::union)
+}
+
+/// `:nth-last-*(k)` with a constant `k` (no `n`, no `of S`).
+fn constant_nth(expression: &str) -> Option<usize> {
+    if super::split_nth_of_selector(expression).1.is_some() {
+        return None;
+    }
+    match super::parse_an_plus_b(expression)? {
+        (0, b) => Some(b.clamp(0, 1 << 20) as usize),
+        _ => None,
+    }
+}
+
+/// `:has(+ x)` only changes on the element just before an appended one; every
+/// other relative sibling combinator (`~`, `+ a + b`) reaches further back.
+fn has_following_reach(selector: &str) -> FollowingReach {
+    if !selector.contains('~') && selector.matches('+').count() == 1 {
+        FollowingReach::PREVIOUS_LAST
+    } else {
+        FollowingReach::ANY
+    }
+}
+
+fn pseudo_following(pseudo: &super::PseudoClass) -> Following {
+    let reach = |reach| Following {
+        reach,
+        ..Following::default()
+    };
+    match pseudo {
+        super::PseudoClass::LastChild | super::PseudoClass::OnlyChild => {
+            reach(FollowingReach::PREVIOUS_LAST)
+        }
+        super::PseudoClass::LastOfType | super::PseudoClass::OnlyOfType => {
+            reach(FollowingReach::PREVIOUS_OF_TYPE)
+        }
+        super::PseudoClass::NthLastChild(expression) => match constant_nth(expression) {
+            Some(k) => Following {
+                reach: FollowingReach::WINDOW,
+                window_child: k,
+                window_type: 0,
+            },
+            None => reach(FollowingReach::ANY),
+        },
+        super::PseudoClass::NthLastOfType(expression) => match constant_nth(expression) {
+            Some(k) => Following {
+                reach: FollowingReach::WINDOW,
+                window_child: 0,
+                window_type: k,
+            },
+            None => reach(FollowingReach::ANY),
+        },
+        super::PseudoClass::Has(selector) if selector.contains('+') || selector.contains('~') => {
+            reach(has_following_reach(selector))
+        }
+        _ => match selector_list_argument(pseudo) {
+            Some(selector) => reach(selector_list_following_reach(&selector)),
+            None => Following::default(),
+        },
+    }
+}
+
+fn selector_list_following_reach(selector: &str) -> FollowingReach {
+    let mut reach = FollowingReach::NONE;
+    if selector.contains(":has(") && (selector.contains('+') || selector.contains('~')) {
+        reach = has_following_reach(selector);
+    }
+    let mut rest = selector.to_string();
+    for (needle, found) in [
+        (":last-child", FollowingReach::PREVIOUS_LAST),
+        (":only-child", FollowingReach::PREVIOUS_LAST),
+        (":last-of-type", FollowingReach::PREVIOUS_OF_TYPE),
+        (":only-of-type", FollowingReach::PREVIOUS_OF_TYPE),
+    ] {
+        if rest.contains(needle) {
+            reach = reach.union(found);
+            rest = rest.replace(needle, "");
+        }
+    }
+    if rest.contains(":last-") || rest.contains(":only-") || rest.contains(":nth-last-") {
+        FollowingReach::ANY
+    } else {
+        reach
+    }
+}
+
+/// `:not(.a + .b)`: the subject reads siblings before it.
+fn pseudo_reads_preceding(pseudo: &super::PseudoClass) -> bool {
+    selector_list_argument(pseudo)
+        .is_some_and(|selector| selector.contains('+') || selector.contains('~'))
+}
+
+/// `:nth-child(An+B of S)` and `:nth-last-child(An+B of S)`.
+fn pseudo_counts_siblings_by_selector(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::NthChild(expression) | super::PseudoClass::NthLastChild(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
+        _ => false,
+    }
+}
+
+/// `:empty`, also nested in `:not(:empty)`.
+fn pseudo_watches_children(pseudo: &super::PseudoClass) -> bool {
+    matches!(pseudo, super::PseudoClass::Empty)
+        || selector_list_argument(pseudo).is_some_and(|selector| selector.contains(":empty"))
 }
 
 fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
@@ -219,7 +959,10 @@ fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
         | super::PseudoClass::NthLastChild(_)
         | super::PseudoClass::NthOfType(_)
         | super::PseudoClass::NthLastOfType(_) => true,
-        super::PseudoClass::Not(selector) | super::PseudoClass::Has(selector) => {
+        super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector)
+        | super::PseudoClass::Has(selector) => {
             let selector = selector.to_ascii_lowercase();
             [
                 ":empty",
@@ -236,6 +979,17 @@ fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
             ]
             .iter()
             .any(|needle| selector.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+fn pseudo_has_sibling_scoped_relational(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::Has(selector) => selector.contains('+') || selector.contains('~'),
+        super::PseudoClass::Not(selector) => {
+            let lower = selector.to_ascii_lowercase();
+            lower.contains(":has(") && (lower.contains('+') || lower.contains('~'))
         }
         _ => false,
     }
@@ -290,7 +1044,18 @@ fn append_tag_candidates(
     }
 }
 
-fn normalize_candidates(candidates: &mut Vec<usize>) {
-    candidates.sort_unstable();
-    candidates.dedup();
+/// Universal rules (before `start`) are unique; only the bucketed tail can repeat.
+fn normalize_tail(candidates: &mut Vec<usize>, start: usize) {
+    if candidates.len() - start < 2 {
+        return;
+    }
+    candidates[start..].sort_unstable();
+    let mut write = start + 1;
+    for read in start + 1..candidates.len() {
+        if candidates[read] != candidates[write - 1] {
+            candidates[write] = candidates[read];
+            write += 1;
+        }
+    }
+    candidates.truncate(write);
 }

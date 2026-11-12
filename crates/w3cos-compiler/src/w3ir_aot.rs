@@ -480,8 +480,8 @@ fn single_definition(function: &Function, register: u32) -> Option<&Instruction>
 }
 
 /// `callee(args)` where `callee` is a same-module function with a direct
-/// typed entry, `this` is `undefined`, and every argument is an unboxed
-/// number: returns the entry to call.
+/// typed or boxed entry, `this` is `undefined`, and (for the typed entry)
+/// every argument is an unboxed number: returns the entry to call.
 #[derive(Debug, Clone)]
 enum DirectCallTarget {
     Typed(String),
@@ -495,6 +495,11 @@ fn direct_call_target(
     this_value: Register,
     arguments: &[Register],
 ) -> Option<DirectCallTarget> {
+    if DIRECT_TYPED_CALLEES.with(|callees| callees.borrow().is_empty())
+        && DIRECT_BOXED_CALLEES.with(|callees| callees.borrow().is_empty())
+    {
+        return None;
+    }
     let Some(Instruction::LoadBinding { binding, .. }) = single_definition(function, callee.0)
     else {
         return None;
@@ -1713,6 +1718,7 @@ fn apply_register_def(
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => def_class(classes, *dst, RegClass::Unknown),
         _ => {}
@@ -2080,6 +2086,7 @@ fn instruction_dst(instruction: &Instruction) -> Option<u32> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(dst.0),
@@ -2400,6 +2407,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(*dst),
@@ -2408,6 +2416,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::RefreshBinding { .. }
         | Instruction::SetProperty { .. }
         | Instruction::DefineField { .. }
+        | Instruction::DefineMethod { .. }
         | Instruction::DefinePrivate { .. }
         | Instruction::SetPrivate { .. }
         | Instruction::DefinePrivateMethod { .. }
@@ -2428,6 +2437,7 @@ pub(crate) fn read_registers(instruction: &Instruction) -> Vec<u32> {
         | Instruction::LoadBinding { .. }
         | Instruction::RefreshBinding { .. }
         | Instruction::ImportMeta { .. }
+        | Instruction::NewTarget { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::Jump { .. } => Vec::new(),
         Instruction::Move { src, .. } => vec![src.0],
@@ -2444,6 +2454,9 @@ pub(crate) fn read_registers(instruction: &Instruction) -> Vec<u32> {
             object, key, value, ..
         }
         | Instruction::DefineField {
+            object, key, value, ..
+        }
+        | Instruction::DefineMethod {
             object, key, value, ..
         } => vec![object.0, key.0, value.0],
         Instruction::DefinePrivate {
@@ -2685,32 +2698,72 @@ fn last_uses_in_sequence(
     last_uses
 }
 
+/// String constants known to sit in each register before `instructions[index]`.
+#[cfg(test)]
 fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32, String> {
     let mut known = HashMap::new();
     for instruction in &instructions[..index] {
-        match instruction {
-            Instruction::LoadConstant {
-                dst,
-                value: Constant::String(value),
-            } => {
-                known.insert(dst.0, value.clone());
-            }
-            other => {
-                if let Some(dst) = written_register(other) {
-                    known.remove(&dst.0);
-                }
-            }
-        }
+        advance_proven_string_keys(&mut known, instruction);
     }
     known
 }
 
+/// Apply one instruction's effect to the proven string-key map. Callers walk a
+/// block forward once instead of recomputing the prefix per instruction, which
+/// was quadratic (cubic in `dead_string_loads`) on huge bundled blocks.
+fn advance_proven_string_keys(known: &mut HashMap<u32, String>, instruction: &Instruction) {
+    match instruction {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::String(value),
+        } => {
+            known.insert(dst.0, value.clone());
+        }
+        other => {
+            if let Some(dst) = written_register(other) {
+                known.remove(&dst.0);
+            }
+        }
+    }
+}
+
 fn analyze_and_warn(function: &Function, specifier: Option<&str>) -> UniqueBackEdgePlan {
-    let plan = analyze_unique_back_edges(function, specifier);
+    let mut plan = analyze_unique_back_edges(function, specifier);
+    // A weakened capture is a snapshot read through a WeakRef with no
+    // setter: a binding that is ever reassigned (`let p = load();
+    // p.then(() => { p = undefined; })`) must stay a shared cell.
+    if !plan.weak_captures.is_empty() {
+        let reassigned = reassigned_bindings(function);
+        plan.weak_captures
+            .retain(|(_, binding)| !reassigned.contains(&binding.0));
+    }
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
     }
     plan
+}
+
+/// Binding ids that some `StoreBinding` (ordinary assignment, not the
+/// declaration's `InitializeBinding`) writes, in `function` or anywhere in
+/// the module being emitted.
+fn reassigned_bindings(function: &Function) -> HashSet<u32> {
+    fn collect(function: &Function, out: &mut HashSet<u32>) {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                if let Instruction::StoreBinding { binding, .. } = instruction {
+                    out.insert(binding.0);
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    collect(function, &mut out);
+    MODULE_FUNCTIONS.with(|functions| {
+        for other in functions.borrow().iter() {
+            collect(other, &mut out);
+        }
+    });
+    out
 }
 
 /// Emit a native synchronous-generator factory for one W3IR function.
@@ -3145,6 +3198,7 @@ fn generate_sync_function_with_factories(
     module_specifier: Option<&str>,
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let shared = shared_numeric_ids(function);
     SHARED_NUMBERS.with(|numbers| *numbers.borrow_mut() = shared.clone());
@@ -3268,6 +3322,7 @@ fn generate_async_function_with_factories(
         bail!("ordinary async W3IR AOT emission requires an async non-generator function");
     }
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
     let back_edges = analyze_and_warn(function, module_specifier);
@@ -3525,6 +3580,7 @@ fn generate_generator_with_factories(
         );
     }
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
     let back_edges = analyze_and_warn(function, module_specifier);
@@ -3800,6 +3856,7 @@ fn generate_async_generator_with_factories(
     module_specifier: Option<&str>,
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
     let back_edges = analyze_and_warn(function, module_specifier);
@@ -4553,32 +4610,34 @@ fn dead_string_loads(
     live_in: &HashMap<BlockId, HashSet<u32>>,
 ) -> HashSet<usize> {
     let end_live = successor_live(instructions, function, exception_target, live_in);
+    // Forward pass: what each instruction reads, given the keys proven there.
+    let mut proven = HashMap::new();
+    let uses: Vec<_> = instructions
+        .iter()
+        .map(|instruction| {
+            let reads = value_uses(instruction, &proven);
+            advance_proven_string_keys(&mut proven, instruction);
+            reads
+        })
+        .collect();
+    // Backward pass: `pending` holds registers read later in the block before
+    // being overwritten, so a string load is needed iff its dst is pending.
     let mut dead = HashSet::new();
-    for (index, instruction) in instructions.iter().enumerate() {
-        let Instruction::LoadConstant {
+    let mut pending: HashSet<u32> = HashSet::new();
+    for (index, instruction) in instructions.iter().enumerate().rev() {
+        if let Instruction::LoadConstant {
             dst,
             value: Constant::String(_),
         } = instruction
-        else {
-            continue;
-        };
-        if end_live.contains(&dst.0) {
-            continue;
-        }
-        let mut needed = false;
-        for (later_index, later) in instructions.iter().enumerate().skip(index + 1) {
-            let proven = proven_string_keys(instructions, later_index);
-            if value_uses(later, &proven).contains(&dst.0) {
-                needed = true;
-                break;
-            }
-            if written_register(later).is_some_and(|written| written.0 == dst.0) {
-                break;
-            }
-        }
-        if !needed {
+            && !end_live.contains(&dst.0)
+            && !pending.contains(&dst.0)
+        {
             dead.insert(index);
         }
+        if let Some(written) = written_register(instruction) {
+            pending.remove(&written.0);
+        }
+        pending.extend(uses[index].iter().copied());
     }
     dead
 }
@@ -4599,12 +4658,12 @@ fn emit_block_instructions(
     let live_in = analyze_live_in(function);
     let last_uses = last_uses_in_sequence(instructions, function, exception_target, &live_in);
     let dead_strings = dead_string_loads(instructions, function, exception_target, &live_in);
+    let mut proven = HashMap::new();
     let emitted = instructions
         .iter()
         .enumerate()
         .map(|(index, instruction)| {
-            let proven = proven_string_keys(instructions, index);
-            emit_instruction(
+            let emitted = emit_instruction(
                 instruction,
                 exception_target,
                 function,
@@ -4617,8 +4676,9 @@ fn emit_block_instructions(
                 back_edges,
                 &reaching[index],
                 &last_uses[index],
-            )
-            .map(|emitted| match mode {
+            );
+            advance_proven_string_keys(&mut proven, instruction);
+            emitted.map(|emitted| match mode {
                 EmissionMode::Async => emitted.replace("__W3COS_ASYNC_FRAME__", type_name),
                 EmissionMode::Generator | EmissionMode::AsyncGenerator => {
                     emitted.replace("__W3COS_STATE__", &format!("{type_name}State"))
@@ -7515,6 +7575,29 @@ fn emit_capture_pair_store(capture_id: u32, weaken: bool, inherited: bool) -> St
     )
 }
 
+thread_local! {
+    /// Rust name of the sync factory being emitted; `new.target` compares it
+    /// with the code entry [[Construct]] recorded.
+    static CURRENT_AOT_FACTORY: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+struct CurrentAotFactoryGuard(String);
+
+impl CurrentAotFactoryGuard {
+    fn new(factory: &str) -> Self {
+        Self(CURRENT_AOT_FACTORY.with(|current| current.replace(factory.to_owned())))
+    }
+}
+
+impl Drop for CurrentAotFactoryGuard {
+    fn drop(&mut self) {
+        CURRENT_AOT_FACTORY.with(|current| {
+            current.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -7889,6 +7972,18 @@ fn emit_instruction(
                 &hoisted,
                 format!(
                     "w3cos_core::intrinsics::define_field(&{}, &{}, {value_expr});",
+                    emit_boxed_ref(plan, object.0),
+                    emit_boxed_ref(plan, key.0),
+                ),
+            )
+        }
+        Instruction::DefineMethod { object, key, value } => {
+            let reads = [object.0, key.0, value.0];
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &reads, value.0);
+            with_hoisted(
+                &hoisted,
+                format!(
+                    "w3cos_core::intrinsics::define_method(&{}, &{}, {value_expr});",
                     emit_boxed_ref(plan, object.0),
                     emit_boxed_ref(plan, key.0),
                 ),
@@ -8379,6 +8474,13 @@ fn emit_instruction(
                 emit_boxed_value(plan, specifier.0)
             )
         }
+        Instruction::NewTarget { dst } => {
+            let factory = CURRENT_AOT_FACTORY.with(|name| name.borrow().clone());
+            format!(
+                "self.registers[{}] = w3cos_core::class::take_new_target({factory} as usize);",
+                register(*dst)
+            )
+        }
         Instruction::ImportMeta { dst } => {
             let specifier = module_specifier
                 .ok_or_else(|| anyhow!("import.meta AOT emission requires its W3IR module"))?;
@@ -8726,7 +8828,43 @@ fn sanitize_identifier(name: &str) -> String {
 /// `m5_NKeyMap__m_values` and `m5_NKeyMap__m__values` are distinct JS
 /// methods (`values` / `_values`) and need distinct frame types, so each
 /// underscore run is kept as a count-tagged separator instead of dropped.
-fn upper_camel(name: &str) -> String {
+/// Rust type-name stem for a generated function, injective over Rust idents.
+///
+/// Plain snake_case names (`[a-z][a-z0-9]*` segments joined by single `_`,
+/// no segment starting with `u<digit>`) keep the readable camel form, which
+/// is unambiguous for them. Any other name (minified `y` vs `Y`, `a_1` vs
+/// `a1`, `a__b` vs `a_u2_b`) gets a `U0<fnv64>` suffix, a sequence the plain
+/// form can never produce, so distinct symbols never share a frame type.
+pub(crate) fn upper_camel(name: &str) -> String {
+    let readable = readable_upper_camel(name);
+    if is_plain_snake_ident(name) {
+        return readable;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{readable}U0{hash:016x}")
+}
+
+fn is_plain_snake_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('_').all(|segment| {
+            let mut bytes = segment.bytes();
+            match bytes.next() {
+                Some(first) if first.is_ascii_lowercase() => {
+                    let rest = segment.as_bytes()[1..].to_vec();
+                    rest.iter()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                        && !(first == b'u' && rest.first().is_some_and(u8::is_ascii_digit))
+                }
+                _ => false,
+            }
+        })
+}
+
+fn readable_upper_camel(name: &str) -> String {
     let mut output = String::new();
     let mut uppercase = true;
     let mut underscores = 0usize;
@@ -8755,11 +8893,422 @@ fn upper_camel(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_type_names_are_distinct_for_case_and_underscore_variants() {
+        assert_eq!(upper_camel("values_aot"), "ValuesAot");
+        let names = [
+            "m5644_y", "m5644_Y", "a_1", "a1", "a__b", "a_u2_b", "_a", "a", "a_", "aB", "a_b",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            assert!(seen.insert(upper_camel(name)), "collision for {name}");
+        }
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::process::Command;
     use w3cos_core::Value;
     use w3cos_vm::{Limits, Vm};
+
+    fn new_target_function(id: u32, is_async: bool, is_generator: bool) -> Function {
+        Function {
+            id: FunctionId(id),
+            name: Some("constructor".into()),
+            parameters: Vec::new(),
+            rest_parameter: None,
+            arguments_binding: None,
+            bindings: Vec::new(),
+            captures: Vec::new(),
+            this_binding: None,
+            registers: 1,
+            entry: BlockId(0),
+            blocks: vec![w3cos_ir::Block {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::NewTarget { dst: Register(0) },
+                    Instruction::Return { value: Register(0) },
+                ],
+                source_span: None,
+            }],
+            exception_regions: Vec::new(),
+            suspension_points: Vec::new(),
+            generator_suspension_points: Vec::new(),
+            is_async,
+            is_generator,
+            source_span: None,
+            types: Default::default(),
+            own_name_length: None,
+        }
+    }
+
+    #[test]
+    fn generated_new_target_uses_its_factory_and_runs_construct_semantics() {
+        let function = new_target_function(0, false, false);
+        let generated = generate_sync_function_with_factories(
+            &function,
+            "new_target_aot",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            generated.contains("take_new_target(new_target_aot as usize)"),
+            "new.target must compare against the emitted factory: {generated}"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_new_target_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{generated}
+fn main() {{
+    let constructor = w3cos_core::Value::aot_function(
+        new_target_aot,
+        w3cos_core::AotCaptureMap::new(),
+    );
+    let direct = new_target_aot(
+        w3cos_core::Value::Undefined,
+        &[],
+        &w3cos_core::AotCaptureMap::new(),
+    );
+    let constructed = w3cos_core::class::construct(&constructor, Vec::new());
+    println!("{{}}:{{}}", direct.is_undefined(), constructed == constructor);
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated new.target fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "true:true");
+    }
+
+    #[test]
+    fn nested_and_all_state_machine_factories_bind_their_own_new_target() {
+        let nested = new_target_function(1, false, false);
+        let parent = Function {
+            id: FunctionId(0),
+            name: Some("outer".into()),
+            parameters: Vec::new(),
+            rest_parameter: None,
+            arguments_binding: None,
+            bindings: Vec::new(),
+            captures: Vec::new(),
+            this_binding: None,
+            registers: 1,
+            entry: BlockId(0),
+            blocks: vec![w3cos_ir::Block {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::CreateClosure {
+                        dst: Register(0),
+                        function: nested.id,
+                        captures: Vec::new(),
+                    },
+                    Instruction::Return { value: Register(0) },
+                ],
+                source_span: None,
+            }],
+            exception_regions: Vec::new(),
+            suspension_points: Vec::new(),
+            generator_suspension_points: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            source_span: None,
+            types: Default::default(),
+            own_name_length: None,
+        };
+        let module = Module::new(
+            "app:///new-target.w3ir",
+            parent.id,
+            vec![parent.clone(), nested],
+        );
+        let nested_generated =
+            generate_sync_function_from_module(&module, &parent, "outer_aot").unwrap();
+        assert!(nested_generated.contains("take_new_target(outer_aot__nested_1 as usize)"));
+
+        let sync = generate_sync_function_with_factories(
+            &new_target_function(2, false, false),
+            "sync_new_target_aot",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let asynchronous = generate_async_function_with_factories(
+            &new_target_function(3, true, false),
+            "async_new_target_aot",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let generator = generate_generator_with_factories(
+            &new_target_function(4, false, true),
+            "generator_new_target_aot",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let async_generator = generate_generator_with_factories(
+            &new_target_function(5, true, true),
+            "async_generator_new_target_aot",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        for (generated, factory) in [
+            (&sync, "sync_new_target_aot"),
+            (&asynchronous, "async_new_target_aot"),
+            (&generator, "generator_new_target_aot"),
+            (&async_generator, "async_generator_new_target_aot"),
+        ] {
+            assert!(
+                generated.contains(&format!("take_new_target({factory} as usize)")),
+                "{factory} did not own new.target: {generated}"
+            );
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_new_target_modes_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{nested_generated}
+{sync}
+{asynchronous}
+{generator}
+{async_generator}
+fn main() {{
+    let captures = w3cos_core::AotCaptureMap::new();
+    let nested = outer_aot(w3cos_core::Value::Undefined, &[], &captures);
+    let nested_constructed = w3cos_core::class::construct(&nested, Vec::new());
+    let sync = w3cos_core::Value::aot_function(sync_new_target_aot, captures.clone());
+    let sync_constructed = w3cos_core::class::construct(&sync, Vec::new());
+    let asynchronous = async_new_target_aot(w3cos_core::Value::Undefined, &[], &captures);
+    let generator = generator_new_target_aot(w3cos_core::Value::Undefined, &[], &captures);
+    let generator_result = generator.call_method("next", Vec::new());
+    let async_generator = async_generator_new_target_aot(
+        w3cos_core::Value::Undefined,
+        &[],
+        &captures,
+    );
+    let async_result = async_generator.call_method("next", Vec::new());
+    println!(
+        "{{}}:{{}}:{{}}:{{}}:{{}}:{{}}",
+        nested_constructed == nested,
+        sync_constructed == sync,
+        asynchronous.is_object(),
+        generator_result.get_property("done").to_bool(),
+        generator_result.get_property("value").is_undefined(),
+        async_result.is_object(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated new.target modes fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "true:true:true:true:true:true"
+        );
+    }
+
+    #[test]
+    fn new_target_factory_scope_restores_after_errors_and_is_thread_local() {
+        let previous = CURRENT_AOT_FACTORY.with(|current| current.borrow().clone());
+        let mut invalid = new_target_function(0, false, false);
+        invalid.blocks[0].instructions = vec![Instruction::Yield {
+            dst: Register(0),
+            value: Register(0),
+            suspension: w3cos_ir::SuspensionId(0),
+        }];
+        assert!(
+            generate_sync_function_with_factories(
+                &invalid,
+                "invalid_new_target_aot",
+                &HashMap::new(),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            CURRENT_AOT_FACTORY.with(|current| current.borrow().clone()),
+            previous
+        );
+
+        let threads = (0..4)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let factory = format!("parallel_new_target_{index}");
+                    let generated = generate_sync_function_with_factories(
+                        &new_target_function(index, false, false),
+                        &factory,
+                        &HashMap::new(),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(generated.contains(&format!("take_new_target({factory} as usize)")));
+                    assert!(CURRENT_AOT_FACTORY.with(|current| current.borrow().is_empty()));
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    /// The pre-linearization `dead_string_loads`: rescans the proven-key
+    /// prefix for every later instruction.
+    fn naive_dead_string_loads(
+        instructions: &[Instruction],
+        function: &Function,
+        live_in: &HashMap<BlockId, HashSet<u32>>,
+    ) -> HashSet<usize> {
+        let end_live = successor_live(instructions, function, None, live_in);
+        let mut dead = HashSet::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            let Instruction::LoadConstant {
+                dst,
+                value: Constant::String(_),
+            } = instruction
+            else {
+                continue;
+            };
+            if end_live.contains(&dst.0) {
+                continue;
+            }
+            let mut needed = false;
+            for (later_index, later) in instructions.iter().enumerate().skip(index + 1) {
+                let proven = proven_string_keys(instructions, later_index);
+                if value_uses(later, &proven).contains(&dst.0) {
+                    needed = true;
+                    break;
+                }
+                if written_register(later).is_some_and(|written| written.0 == dst.0) {
+                    break;
+                }
+            }
+            if !needed {
+                dead.insert(index);
+            }
+        }
+        dead
+    }
+
+    #[test]
+    fn linear_dead_string_loads_match_the_prefix_rescan() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export function keys(o, flag) {
+                    let k = "alpha";
+                    o.alpha = "one";
+                    o[k] = o.beta + "two";
+                    k = "gamma";
+                    const s = "lit";
+                    o.gamma = s;
+                    if (flag) { o[k] = k; } else { o.delta = "x" + s; }
+                    return o["epsilon"] + k;
+                }
+            "#,
+            "app:///dead-strings.mjs",
+        )
+        .unwrap();
+        let mut checked = 0;
+        for function in &module.functions {
+            let live_in = analyze_live_in(function);
+            for block in &function.blocks {
+                let instructions = &block.instructions;
+                assert_eq!(
+                    dead_string_loads(instructions, function, None, &live_in),
+                    naive_dead_string_loads(instructions, function, &live_in),
+                );
+                checked += instructions.len();
+            }
+        }
+        assert!(checked > 20, "test fixture lowered to too few instructions");
+    }
+
+    #[test]
+    fn huge_straight_line_blocks_emit_in_linear_time() {
+        // esbuild bundles (playwright-core's coreBundle.js) put thousands of
+        // string-keyed stores in one block; per-instruction prefix rescans
+        // made AOT emission effectively hang there.
+        let mut source = String::from("export function init(o) {\n");
+        for index in 0..4000 {
+            source.push_str(&format!("o.k{index} = \"v{index}\";\n"));
+        }
+        source.push_str("return o;\n}\n");
+        let module = crate::w3ir_lowering::lower_module(&source, "app:///huge-block.mjs").unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("init"))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let generated =
+            generate_sync_function_from_module(&module, function, "huge_block").unwrap();
+        let elapsed = started.elapsed();
+        assert!(generated.contains("k3999"), "last store missing");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "emitting 4000 stores took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn emits_a_native_state_machine_from_generator_suspension_metadata() {
@@ -9569,6 +10118,7 @@ fn main() {{
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         };
 
         let blocks = coalesce_sync_blocks(&function);
@@ -11327,6 +11877,7 @@ fn main() {{
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         }
     }
 

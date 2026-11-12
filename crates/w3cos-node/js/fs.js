@@ -8,6 +8,8 @@ const { Buffer } = require('buffer');
 const constants = {
   F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1,
   O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024,
+  O_NOCTTY: 256, O_DIRECTORY: 65536, O_NOATIME: 262144, O_NOFOLLOW: 131072, O_SYNC: 1052672,
+  O_DSYNC: 4096, O_DIRECT: 16384, O_NONBLOCK: 2048,
   S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFCHR: 8192, S_IFBLK: 24576,
   S_IFIFO: 4096, S_IFLNK: 40960, S_IFSOCK: 49152,
   COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
@@ -215,6 +217,7 @@ function writeSync(fd, buffer, offsetOrPosition, lengthOrEncoding, position) {
   return host.write(fd, view, position === undefined ? null : position);
 }
 function fsyncSync(fd) { host.fsync(fd); }
+function fdatasyncSync(fd) { host.fdatasync(fd); }
 function ftruncateSync(fd, len) { host.ftruncate(fd, len || 0); }
 
 // ── callback API ──
@@ -247,7 +250,7 @@ const SYNC = {
   rmdir: rmdirSync, rm: rmSync, unlink: unlinkSync, rename: renameSync, copyFile: copyFileSync,
   cp: cpSync, realpath: realpathSync, readlink: readlinkSync, symlink: symlinkSync, link: linkSync,
   chmod: chmodSync, utimes: utimesSync, access: accessSync, truncate: truncateSync,
-  mkdtemp: mkdtempSync, open: openSync, close: closeSync, fsync: fsyncSync, ftruncate: ftruncateSync,
+  mkdtemp: mkdtempSync, open: openSync, close: closeSync, fsync: fsyncSync, fdatasync: fdatasyncSync, ftruncate: ftruncateSync,
 };
 Object.keys(SYNC).forEach(function (name) {
   fs[name + 'Sync'] = SYNC[name];
@@ -410,6 +413,7 @@ FileHandle.prototype.writeFile = function (data, options) { return promisify(wri
 FileHandle.prototype.appendFile = FileHandle.prototype.writeFile;
 FileHandle.prototype.truncate = function (len) { return promisify(ftruncateSync)(this.fd, len); };
 FileHandle.prototype.sync = function () { return promisify(fsyncSync)(this.fd); };
+FileHandle.prototype.datasync = function () { return promisify(fdatasyncSync)(this.fd); };
 FileHandle.prototype.read = function (buffer, offset, length, position) {
   const fd = this.fd;
   if (buffer === undefined || (buffer && !(buffer instanceof Uint8Array) && typeof buffer === 'object')) {
@@ -429,7 +433,7 @@ FileHandle.prototype.write = function (buffer, a, b, c) {
 
 const promises = {};
 Object.keys(SYNC).forEach(function (name) {
-  if (name === 'open' || name === 'close' || name === 'fstat' || name === 'fsync' || name === 'ftruncate') return;
+  if (name === 'open' || name === 'close' || name === 'fstat' || name === 'fsync' || name === 'fdatasync' || name === 'ftruncate') return;
   promises[name] = promisify(SYNC[name]);
 });
 promises.open = function open(path, flags, mode) {

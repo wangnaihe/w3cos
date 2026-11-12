@@ -494,6 +494,7 @@ pub fn render_frame(
             ),
             _ => None,
         };
+        crate::canvas2d::set_paint_client(idx);
         let is_focused = focused_index == Some(idx);
         if !is_focused
             && let Some(key) = glyph_cache.ensure_display_chunk(
@@ -954,12 +955,22 @@ fn render_node(
         }
         ComponentKind::SvgDocument { source, .. } => {
             let rect = crate::svg_renderer::content_box(rect, style);
-            if let Some(raster) = crate::svg_renderer::get_or_render_inline(
-                source,
-                rect.width.ceil().max(1.0) as u32,
-                rect.height.ceil().max(1.0) as u32,
-            ) {
-                draw_decoded_image(scene, rect, &raster);
+            crate::svg_gpu::draw_inline_svg(scene, source, rect, dpi);
+        }
+        ComponentKind::Canvas { .. } => {
+            if let Some(snapshot) =
+                crate::canvas2d::surface_snapshot(crate::canvas2d::paint_client())
+            {
+                let decoded = crate::image_loader::DecodedImage {
+                    width: snapshot.width,
+                    height: snapshot.height,
+                    intrinsic_width: snapshot.width,
+                    intrinsic_height: snapshot.height,
+                    svg_intrinsic_size: None,
+                    svg_source: None,
+                    data: snapshot.pixels,
+                };
+                draw_decoded_image(scene, rect, &decoded);
             }
         }
         _ => {}
@@ -1590,7 +1601,7 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     text_content_box(rect, style)
 }
 
-fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
+fn single_line_h_align(style: &Style, _box_w: f32, _ink_w: f32) -> TextAlign {
     if style.display == w3cos_std::style::Display::Inline {
         return TextAlign::Left;
     }
@@ -1603,14 +1614,6 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     };
     match text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
-        TextAlign::Left
-            if matches!(
-                style.white_space,
-                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre
-            ) && box_w > ink_w + 1.5 =>
-        {
-            TextAlign::Center
-        }
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => TextAlign::Left,
     }
 }
@@ -1839,6 +1842,7 @@ pub fn record_layer_scene(
             ),
             _ => None,
         };
+        crate::canvas2d::set_paint_client(idx);
         render_node(
             &mut scene,
             rect,

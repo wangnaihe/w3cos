@@ -446,6 +446,16 @@ pub fn get_descendant_text_content(node: u32) -> String {
     with_document(|doc| doc.descendant_text_content(NodeId::from_u32(node)))
 }
 
+/// Animated style inputs of `node` changed (effect timing/keyframes or the
+/// timeline advanced): restyle it like an inline-style edit.
+pub fn invalidate_animated_style(node: u32) {
+    if !is_connected(node) {
+        return;
+    }
+    with_document_mut(|doc| doc.mark_inline_style_dirty(NodeId::from_u32(node)));
+    mark_dom_dirty();
+}
+
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
     // CSSOM writes notify attribute observers with the previous style
     // attribute. With no observers, serializing that attribute on every
@@ -458,7 +468,8 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
     };
     with_document_mut(|doc| {
         let id = NodeId::from_u32(node);
-        doc.get_style_mut(id).set_property(prop, value);
+        doc.get_style_mut_for_property(id, prop)
+            .set_property(prop, value);
         if inline_style_change_is_local(prop) {
             doc.note_local_style(id);
         } else {
@@ -469,6 +480,16 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
     if notify {
         crate::observers_web::notify_attribute(node, "style", old_value.as_deref());
     }
+}
+
+pub fn set_empty_custom_property_declaration(node: u32, prop: &str) {
+    with_document_mut(|doc| {
+        let id = NodeId::from_u32(node);
+        doc.get_style_mut_for_property(id, prop)
+            .set_parsed_empty_custom_property(prop);
+        doc.mark_inline_style_dirty(id);
+    });
+    mark_dom_dirty();
 }
 
 /// Known non-inherited properties. Everything else, including custom
@@ -541,6 +562,7 @@ fn inline_style_change_is_local(prop: &str) -> bool {
             | "grid-template-areas"
             | "grid-column"
             | "grid-row"
+            | "grid-area"
             | "grid-auto-flow"
             | "grid-auto-columns"
             | "grid-auto-rows"
@@ -662,6 +684,11 @@ pub fn parent_node(node: u32) -> Option<u32> {
 
 pub fn tag_name(node: u32) -> String {
     with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str())
+}
+
+/// Interned tag bytes; the atom arena never frees, so no copy is needed.
+pub fn tag_static(node: u32) -> &'static str {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_static())
 }
 
 pub fn tag_is(node: u32, expected: &str) -> bool {
@@ -975,8 +1002,9 @@ pub fn bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     })
 }
 
-/// Build Component tree from the current DOM state (for rendering).
-pub fn to_component_tree() -> w3cos_std::Component {
+/// Install the font metrics `Document::to_component_tree` reads. A no-op when
+/// the font revision did not change.
+fn install_lowering_providers() {
     crate::layout::install_font_unit_provider();
     fn normal_line_height(style: &w3cos_std::style::Style) -> Option<f32> {
         #[cfg(feature = "skia")]
@@ -991,30 +1019,59 @@ pub fn to_component_tree() -> w3cos_std::Component {
             crate::font_face::FontRegistry::global().revision(),
         );
     });
-    let mut tree = with_document(|doc| doc.to_component_tree());
-    #[cfg(feature = "dynamic-js")]
-    crate::jsdom::graft_shadow_component_subtrees(&mut tree);
-    crate::jsdom::graft_frame_component_subtrees(&mut tree);
-    fn resolve_text_leading(component: &mut w3cos_std::Component) {
-        if let w3cos_std::ComponentKind::Text { content } = &component.kind
-            && component.style.line_height_is_normal
+}
+
+fn resolve_text_leading(component: &mut w3cos_std::Component) {
+    if let w3cos_std::ComponentKind::Text { content } = &component.kind
+        && component.style.line_height_is_normal
+    {
+        let registry = crate::font_face::FontRegistry::global();
+        if let Some(primary) = registry.resolve_style(&component.style)
+            && content
+                .chars()
+                .any(|ch| !ch.is_whitespace() && !primary.supports_character(ch))
         {
-            let registry = crate::font_face::FontRegistry::global();
-            if let Some(primary) = registry.resolve_style(&component.style)
-                && content
-                    .chars()
-                    .any(|ch| !ch.is_whitespace() && !primary.supports_character(ch))
-            {
-                component.style.line_height =
-                    registry.normal_line_height_for_text(&component.style, content);
-            }
-        }
-        for child in &mut component.children {
-            resolve_text_leading(child);
+            component.style.line_height =
+                registry.normal_line_height_for_text(&component.style, content);
         }
     }
-    resolve_text_leading(&mut tree);
+    for child in &mut component.children {
+        resolve_text_leading(child);
+    }
+}
+
+/// Host-side passes applied to every lowered tree or subtree.
+fn finish_lowered_subtree(tree: &mut w3cos_std::Component) {
+    #[cfg(feature = "dynamic-js")]
+    crate::jsdom::graft_shadow_component_subtrees(tree);
+    crate::jsdom::graft_frame_component_subtrees(tree);
+    resolve_text_leading(tree);
+}
+
+/// Build Component tree from the current DOM state (for rendering).
+pub fn to_component_tree() -> w3cos_std::Component {
+    install_lowering_providers();
+    let mut tree = with_document(|doc| doc.to_component_tree());
+    finish_lowered_subtree(&mut tree);
     tree
+}
+
+/// Snapshot of the document inputs behind a tree from [`to_component_tree`].
+pub(crate) fn component_baseline() -> w3cos_dom::document::ComponentBaseline {
+    with_document(|doc| doc.component_baseline())
+}
+
+/// Bring `tree` (built when `baseline` was taken) up to date by re-lowering
+/// only the frontiers under changed nodes, applying the same host passes as
+/// [`to_component_tree`] to each. `NeedsRebuild` leaves `tree` unspecified.
+pub(crate) fn patch_component_tree(
+    tree: &mut w3cos_std::Component,
+    baseline: &w3cos_dom::document::ComponentBaseline,
+) -> w3cos_dom::document::ComponentPatch {
+    install_lowering_providers();
+    with_document(|doc| {
+        doc.patch_component_tree_with(tree, baseline, &mut |fresh| finish_lowered_subtree(fresh))
+    })
 }
 
 #[cfg(test)]

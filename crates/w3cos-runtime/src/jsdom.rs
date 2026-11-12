@@ -150,6 +150,15 @@ impl StyleCache {
         self.values().insert((node, id), value);
     }
 
+    fn remove_value(&mut self, node: u32, property: &str) {
+        let Some(id) = self.ids.as_ref().and_then(|ids| ids.get(property).copied()) else {
+            return;
+        };
+        if let Some(values) = self.values.as_mut() {
+            values.remove(&(node, id));
+        }
+    }
+
     fn get_value(&self, node: u32, property: &str) -> Option<String> {
         let id = self.ids.as_ref()?.get(property).copied()?;
         self.values.as_ref()?.get(&(node, id)).cloned()
@@ -170,7 +179,10 @@ impl StyleCache {
             .map(|values| {
                 values
                     .iter()
-                    .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+                    .filter(|((candidate, id), value)| {
+                        *candidate == node
+                            && (!value.is_empty() || self.names[*id as usize].starts_with("--"))
+                    })
                     .count()
             })
             .unwrap_or(0)
@@ -183,7 +195,10 @@ impl StyleCache {
         };
         let mut pairs = values
             .iter()
-            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+            .filter(|((candidate, id), value)| {
+                *candidate == node
+                    && (!value.is_empty() || self.names[*id as usize].starts_with("--"))
+            })
             .map(|((_, id), value)| (self.names[*id as usize].clone(), value.clone()))
             .collect::<Vec<_>>();
         pairs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -280,6 +295,81 @@ impl ListenerStore {
         }
     }
 
+    /// Whether a non-inline listener with this callback and capture flag is
+    /// registered on `(node, event_type)`. Uses the index, not a full scan.
+    fn contains(&self, node: u32, event_type: EventType, handler: &Value, capture: bool) -> bool {
+        let Some(index) = self.index.as_ref() else {
+            return false;
+        };
+        index.get(&(node, event_type)).is_some_and(|idxs| {
+            idxs.iter().any(|&idx| {
+                same_listener(
+                    &self.items[idx as usize],
+                    node,
+                    event_type,
+                    handler,
+                    capture,
+                )
+            })
+        })
+    }
+
+    /// Remove the first non-inline listener matching `(node, event_type,
+    /// handler, capture)` without rebuilding the whole index. The last item
+    /// moves into the hole; its index entry is rewritten in place, so every
+    /// `(node, event type)` list keeps registration order.
+    fn remove_one(
+        &mut self,
+        node: u32,
+        event_type: EventType,
+        handler: &Value,
+        capture: bool,
+    ) -> bool {
+        let Some(index) = self.index.as_mut() else {
+            return false;
+        };
+        let key = (node, event_type);
+        let Some(idxs) = index.get_mut(&key) else {
+            return false;
+        };
+        let Some(pos) = idxs.iter().position(|&idx| {
+            same_listener(
+                &self.items[idx as usize],
+                node,
+                event_type,
+                handler,
+                capture,
+            )
+        }) else {
+            return false;
+        };
+        let removed = idxs.remove(pos);
+        if idxs.is_empty() {
+            index.remove(&key);
+        }
+        let last = (self.items.len() - 1) as u32;
+        let gone = self.items.swap_remove(removed as usize);
+        if removed != last {
+            let moved = &self.items[removed as usize];
+            if let Some(slot) = index
+                .get_mut(&(moved.node, moved.event_type))
+                .and_then(|v| v.iter_mut().find(|idx| **idx == last))
+            {
+                *slot = removed;
+            }
+        }
+        if gone.capture {
+            self.capture_count = self.capture_count.saturating_sub(1);
+        }
+        // `Many` always falls back to the index, so it stays correct.
+        if !gone.capture {
+            if let Some(slot) = self.ones.get_mut(node as usize) {
+                *slot = Some(OneListener::Many);
+            }
+        }
+        true
+    }
+
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
         self.items.retain(|listener| pred(listener));
         self.reindex();
@@ -373,6 +463,11 @@ struct JsTimer {
     args: Vec<Value>,
     fire_at: Instant,
     interval: Option<Duration>,
+    /// `requestIdleCallback` entry: runs only in an idle period (no other
+    /// due timer, event, rAF or microtask), one per tick, unless its
+    /// `timeout` has expired.
+    idle: bool,
+    idle_timeout_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -623,8 +718,11 @@ thread_local! {
     /// Negative prototype-chain checks are stable until an authored shape
     /// mutation advances the core epoch. Cache them across pooled-node
     /// removals instead of re-walking the same HTMLElement chain each time.
-    static LIFECYCLE_PROTOTYPE_CACHE: RefCell<(u32, u64, HashMap<u64, bool>)> =
-        RefCell::new((0, 0, HashMap::new()));
+    static LIFECYCLE_PROTOTYPE_CACHE: RefCell<(
+        u32,
+        u64,
+        w3cos_std::fxhash::FxHashMap<u64, bool>,
+    )> = RefCell::new((0, 0, w3cos_std::fxhash::FxHashMap::default()));
 }
 
 #[cfg(target_os = "ios")]
@@ -835,6 +933,46 @@ pub(crate) fn report_callback_exception(callback: &Value, exception: Value) {
     });
 }
 
+/// Report an exception no script caught (HTML "report the exception", Node
+/// `process` 'uncaughtException'). Returns `false` when neither the
+/// callback's global has an `onerror` handler nor `process` has an
+/// 'uncaughtException' listener, so the caller keeps the throw fatal.
+pub(crate) fn report_uncaught_callback_exception(callback: &Value, exception: Value) -> bool {
+    let global = callback.get_property("__w3cos_callback_global");
+    let global = if global.is_object() {
+        global
+    } else {
+        window_value()
+    };
+    if global.get_property("onerror").is_callable() {
+        eprintln!("[js.uncaught] {}", exception.to_js_string());
+        report_callback_exception(callback, exception);
+        return true;
+    }
+    let process = global.get_property("process");
+    if process.is_object()
+        && process.get_property("listenerCount").is_callable()
+        && process
+            .call_method("listenerCount", vec![Value::string("uncaughtException")])
+            .to_number()
+            > 0.0
+    {
+        eprintln!("[js.uncaught] {}", exception.to_js_string());
+        let _ = w3cos_core::catch_js(|| {
+            process.call_method(
+                "emit",
+                vec![
+                    Value::string("uncaughtException"),
+                    exception,
+                    Value::string("uncaughtException"),
+                ],
+            )
+        });
+        return true;
+    }
+    false
+}
+
 pub(crate) type WeakRealmObject = WeakJsObject;
 
 pub(crate) fn weak_realm_object(value: &Value) -> WeakRealmObject {
@@ -980,14 +1118,14 @@ fn is_default_document(value: &Value) -> bool {
     })
 }
 
-fn get_expando(node: u32, key: &str) -> Option<Value> {
+pub(crate) fn get_expando(node: u32, key: &str) -> Option<Value> {
     if let Some(id) = known_expando(key) {
         return KNOWN_EXPANDS.with(|props| props.borrow().get(&(node, id)).cloned());
     }
     ELEMENT_PROPS.with(|p| p.borrow().get(&(node, key.to_string())).cloned())
 }
 
-fn set_expando(node: u32, key: &str, value: Value) {
+pub(crate) fn set_expando(node: u32, key: &str, value: Value) {
     if key == "dispatchEvent" {
         note_dispatch_override();
     }
@@ -1014,6 +1152,13 @@ fn shadow_host_for_root(root: u32) -> Option<u32> {
             .iter()
             .find_map(|(&host, info)| (info.root == root).then_some(host))
     })
+}
+
+/// Whether any element has a shadow root. Grafted shadow content is lowered
+/// from nodes that are not reachable from the document root, so a patch of the
+/// light tree cannot see their edits.
+pub(crate) fn has_shadow_roots() -> bool {
+    SHADOW_ROOTS.with(|roots| !roots.borrow().is_empty())
 }
 
 pub(crate) fn shadow_root_id_for_host(host: u32) -> Option<u32> {
@@ -1188,16 +1333,97 @@ pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &
 
 /// Extract the DOM node id carried by an element Value (`__node_id` hidden
 /// prop, read directly so the proxy trap is bypassed).
+/// A prototype-level DOM method (`HTMLElement.prototype.focus`, ...). Element
+/// wrappers resolve these through the bridge per node, so the prototype slot is
+/// otherwise an undefined placeholder. Scripts that capture the original
+/// (`const orig = HTMLElement.prototype.focus; ... orig.apply(this, args)`,
+/// as the workbench's window focus handling does) need a callable that
+/// forwards to the receiver's bridge method.
+/// Value behind a prototype getter installed by `dom_constructors`.
+pub(crate) fn prototype_getter_value(receiver: &Value, name: &str) -> Value {
+    if let Some(node) = node_id_of(receiver) {
+        let value = element_computed_get(node, name);
+        if !value.is_undefined() {
+            return value;
+        }
+        // Some members (`attributes`, ...) are answered by the wrapper's
+        // own lookup rather than the computed table; read through it once,
+        // guarding against landing back on this prototype getter.
+        thread_local! {
+            static IN_PROTOTYPE_GETTER: Cell<bool> = const { Cell::new(false) };
+        }
+        if IN_PROTOTYPE_GETTER.with(|flag| flag.replace(true)) {
+            return Value::Undefined;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IN_PROTOTYPE_GETTER.with(|flag| flag.set(false));
+            }
+        }
+        let _reset = Reset;
+        return receiver.get_property(name);
+    }
+    receiver
+        .as_object()
+        .and_then(|object| object.borrow().own_data(name))
+        .unwrap_or(Value::Undefined)
+}
+
+pub(crate) fn element_prototype_method(name: &'static str) -> Value {
+    let forwarder = func(move |this, args| {
+        let mut method = node_id_of(&this)
+            .map(|node| element_computed_get(node, name))
+            .unwrap_or(Value::Undefined);
+        if !method.is_callable() {
+            // Documents are plain objects whose methods are own data.
+            let own = this
+                .as_object()
+                .and_then(|object| object.borrow().own_data(name));
+            method = own.unwrap_or(Value::Undefined);
+        }
+        if !method.is_callable() || is_prototype_forwarder(&method) {
+            return Value::Undefined;
+        }
+        method.call(this, args)
+    });
+    if let Some(function) = forwarder.as_function() {
+        PROTOTYPE_FORWARDERS.with(|set| {
+            set.borrow_mut().insert(function.identity());
+        });
+    }
+    forwarder
+}
+
+thread_local! {
+    static PROTOTYPE_FORWARDERS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Forwarders installed by [`element_prototype_method`] stand in for the
+/// per-node bridge methods, so property lookup treats them like the undefined
+/// placeholders they replace and lets the bridge answer.
+fn is_prototype_forwarder(value: &Value) -> bool {
+    value.as_function().is_some_and(|function| {
+        PROTOTYPE_FORWARDERS.with(|set| set.borrow().contains(&function.identity()))
+    })
+}
+
 pub fn node_id_of(value: &Value) -> Option<u32> {
     if let Some(id) = value.live_dom_node() {
         return Some(id);
     }
     let object = value.object_ref_raw()?;
     let object = object.borrow();
+    // Strict equality and SameValueZero call this for every pair of objects,
+    // nearly all of which are not DOM wrappers: one failed lookup answers
+    // them, so the generation is only read for an object that has an id.
     let direct = object.get_direct("__node_id");
+    if !direct.is_number() {
+        return None;
+    }
     let generation = object.get_direct("__w3cos_realm_generation");
-    if direct.is_number() && generation.is_number() && bridge_realm_is_current(generation.to_u32())
-    {
+    if generation.is_number() && bridge_realm_is_current(generation.to_u32()) {
         return Some(direct.to_u32());
     }
     None
@@ -1296,7 +1522,7 @@ fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Optio
         if let Some(data) = data {
             // Builtin DOM prototypes have undefined data placeholders; the
             // bridge computes those properties after a descriptor miss.
-            return (!data.is_undefined()).then_some(data);
+            return (!data.is_undefined() && !is_prototype_forwarder(&data)).then_some(data);
         }
         if accessor {
             return Some(Value::Undefined); // setter-only descriptor
@@ -4088,6 +4314,15 @@ fn normalized_attribute_name(node: u32, name: &str) -> String {
     }
 }
 
+/// Borrow the attribute name when HTML normalization cannot change it.
+fn with_normalized_attribute_name<R>(node: u32, name: &str, body: impl FnOnce(&str) -> R) -> R {
+    if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return body(name);
+    }
+    let normalized = normalized_attribute_name(node, name);
+    body(&normalized)
+}
+
 fn valid_processing_instruction_attribute_name(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|character| {
@@ -4872,15 +5107,19 @@ fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
     let inspect_expandos = LIFECYCLE_EXPANDO_AUTHORED.with(Cell::get);
     let generation = realm_generation();
     let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+    // Reuse the probe keys instead of allocating two Strings per node.
+    let mut upgraded = (0u32, "__w3cos_custom_element_upgraded".to_string());
+    let mut disconnected = (0u32, "disconnectedCallback".to_string());
     walk_subtree(root, &mut |node| {
         if found {
             return;
         }
+        upgraded.0 = node;
+        disconnected.0 = node;
         let direct = inspect_expandos
             && ELEMENT_PROPS.with(|props| {
                 let props = props.borrow();
-                props.contains_key(&(node, "__w3cos_custom_element_upgraded".to_string()))
-                    || props.contains_key(&(node, "disconnectedCallback".to_string()))
+                props.contains_key(&upgraded) || props.contains_key(&disconnected)
             });
         if direct {
             found = true;
@@ -4917,6 +5156,20 @@ fn disconnected_lifecycle_may_be_observable(root: u32) -> bool {
 }
 
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
+    #[cfg(not(feature = "dynamic-js"))]
+    let roots = if dom::node_type(child) == 11 {
+        dom::children(child)
+    } else {
+        vec![child]
+    };
+    insert_child_or_fragment_inner(parent, child, reference);
+    #[cfg(not(feature = "dynamic-js"))]
+    for root in roots {
+        crate::aot_script::notify_inserted(root);
+    }
+}
+
+fn insert_child_or_fragment_inner(parent: u32, child: u32, reference: Option<u32>) {
     let foreign_owner = parent != 0
         && get_expando(parent, "ownerDocument").is_some_and(|owner| !is_default_document(&owner));
     if reference.is_none() && !foreign_owner && fresh_simple_element(parent, child) {
@@ -5619,14 +5872,20 @@ fn parsed_document_value(
                 _ => Some(""),
             };
             move |document, args| {
-                let mut tag = arg(&args, 0).to_js_string();
-                if !valid_element_name(&tag) {
-                    dom_exception("The element name is not valid", "InvalidCharacterError");
-                }
-                if is_html {
-                    tag.make_ascii_lowercase();
-                }
-                let node = dom::create_element(&tag);
+                let tag_value = arg(&args, 0);
+                let node = with_value_text(&tag_value, |tag| {
+                    if !valid_element_name(tag) {
+                        dom_exception("The element name is not valid", "InvalidCharacterError");
+                    }
+                    let lowered;
+                    let tag = if is_html && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                        lowered = tag.to_ascii_lowercase();
+                        lowered.as_str()
+                    } else {
+                        tag
+                    };
+                    dom::create_element(tag)
+                });
                 if let Some(namespace) = element_namespace {
                     dom::set_html_element(
                         node,
@@ -6154,11 +6413,13 @@ pub(crate) fn empty_document_value(content_type: &str, prototype_name: &str) -> 
     props.insert(
         "createElement".to_string(),
         func(|document, args| {
-            let tag = arg(&args, 0).to_js_string();
-            if !valid_element_name(&tag) {
-                dom_exception("The element name is not valid", "InvalidCharacterError");
-            }
-            let node = dom::create_element(&tag);
+            let tag_value = arg(&args, 0);
+            let node = with_value_text(&tag_value, |tag| {
+                if !valid_element_name(tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                dom::create_element(tag)
+            });
             dom::set_html_element(node, false);
             set_expando(node, "ownerDocument", document);
             set_expando(node, "namespaceURI", Value::Null);
@@ -7590,6 +7851,7 @@ fn function_compat_class() -> Value {
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
     install_function_prototype_methods(&prototype);
+    w3cos_core::register_function_prototype(&prototype);
     class.set_property("prototype", prototype);
     class
 }
@@ -7609,56 +7871,11 @@ fn incompatible_function_receiver(method: &str, this: &Value) -> Value {
 /// bind.call($call, $apply)`) see real functions. Each dispatches on its
 /// receiver directly instead of re-entering the method lookup.
 fn install_function_prototype_methods(prototype: &Value) {
-    prototype.set_property(
-        "call",
-        Value::function(|this, args| {
-            if !this.is_callable() {
-                return incompatible_function_receiver("call", &this);
-            }
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            this.call(this_arg, args.into_iter().skip(1).collect())
-        }),
-    );
-    prototype.set_property(
-        "apply",
-        Value::function(|this, args| {
-            if !this.is_callable() {
-                return incompatible_function_receiver("apply", &this);
-            }
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            let list = args.get(1).cloned().unwrap_or(Value::Undefined);
-            let applied = if list.is_undefined() || list.is_null() {
-                Vec::new()
-            } else {
-                let length = list.get_property("length").to_number();
-                let length = if length.is_finite() && length > 0.0 {
-                    length as usize
-                } else {
-                    0
-                };
-                (0..length)
-                    .map(|index| list.get_property(&index.to_string()))
-                    .collect()
-            };
-            this.call(this_arg, applied)
-        }),
-    );
-    prototype.set_property(
-        "bind",
-        Value::function(|this, args| {
-            if !this.is_callable() {
-                return incompatible_function_receiver("bind", &this);
-            }
-            let target = this.clone();
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
-            Value::function(move |_, call_args| {
-                let mut combined = bound_args.clone();
-                combined.extend(call_args);
-                target.call(this_arg.clone(), combined)
-            })
-        }),
-    );
+    for method in ["call", "apply", "bind"] {
+        if let Some(function) = w3cos_core::function_prototype_method(method) {
+            prototype.set_property(method, function);
+        }
+    }
     prototype.set_property(
         "toString",
         Value::function(|this, _| {
@@ -8796,6 +9013,14 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
             ) {
                 return None;
             }
+            // `visibility: hidden` boxes keep their layout but are never a
+            // hit-test target (a visible descendant resolves to its own
+            // `visible` value and still hits). Without this, invisible
+            // overlays such as Code OSS's `.drop-block-overlay` swallow every
+            // click on the editor and side bar.
+            if entry.style.visibility == w3cos_std::style::Visibility::Hidden {
+                return None;
+            }
             let node = match entry.on_click {
                 w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok()?,
                 _ => return None,
@@ -9640,6 +9865,12 @@ pub(crate) fn invalidate_scroll_size_cache() {
 }
 
 fn forced_scroll_size(node: u32) -> (f64, f64) {
+    // scrollWidth/scrollHeight flush pending style and layout like every
+    // other geometry getter. Without this an appended child was invisible to
+    // scrollHeight (and to the scrollTop clamp) until something else flushed.
+    if dom::is_document_dirty() {
+        let _ = crate::incremental_layout::flush();
+    }
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
@@ -9706,8 +9937,22 @@ fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    static BLOCK_INLINE_PARENT_STYLE_QUERIES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[inline]
+fn block_inline_parent_style(node: u32) -> w3cos_std::style::Style {
+    #[cfg(test)]
+    BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(count.get() + 1));
+    dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)))
+}
+
 fn block_in_inline_host(node: u32) -> bool {
-    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    let style = block_inline_parent_style(node);
     matches!(style.display, w3cos_std::style::Display::Inline)
         && dom::children(node).iter().copied().any(|child| {
             dom::node_type(child) == 1
@@ -9726,11 +9971,55 @@ fn block_in_inline_host(node: u32) -> bool {
         })
 }
 
+fn inline_with_only_out_of_flow_children(node: u32) -> bool {
+    let style = block_inline_parent_style(node);
+    if !matches!(style.display, w3cos_std::style::Display::Inline) {
+        return false;
+    }
+    let mut has_out_of_flow_child = false;
+    for child in dom::children(node) {
+        match dom::node_type(child) {
+            1 => {
+                let child_style = dom::with_document(|document| {
+                    document.computed_style_for(NodeId::from_u32(child))
+                });
+                if matches!(child_style.display, w3cos_std::style::Display::None) {
+                    continue;
+                }
+                if !matches!(
+                    child_style.position,
+                    w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+                ) {
+                    return false;
+                }
+                has_out_of_flow_child = true;
+            }
+            3 if !dom::get_text_content(child)
+                .unwrap_or_default()
+                .trim()
+                .is_empty() =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    has_out_of_flow_child
+}
+
 fn block_in_inline_fragment_bounds(
     node: u32,
     mut child_rect: impl FnMut(u32) -> Option<w3cos_dom::DOMRect>,
 ) -> Option<w3cos_dom::DOMRect> {
-    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    let children = dom::children(node);
+    if !children
+        .iter()
+        .copied()
+        .any(|child| dom::node_type(child) == 1)
+    {
+        return None;
+    }
+    let style = block_inline_parent_style(node);
     if !block_in_inline_host(node)
         || style.padding != w3cos_std::style::Edges::ZERO
         || style.border_width != 0.0
@@ -9742,7 +10031,7 @@ fn block_in_inline_fragment_bounds(
         return None;
     }
     let mut bounds: Option<w3cos_dom::DOMRect> = None;
-    for child in dom::children(node) {
+    for child in children {
         if dom::node_type(child) != 1 {
             continue;
         }
@@ -9763,13 +10052,46 @@ fn block_in_inline_fragment_bounds(
     bounds
 }
 
+fn published_fragment_bounds(node: u32) -> Option<w3cos_dom::DOMRect> {
+    let rects = crate::incremental_layout::client_rects(node)?;
+    let mut bounds: Option<w3cos_dom::DOMRect> = None;
+    for rect in rects {
+        if rect.width == 0.0 || rect.height == 0.0 {
+            continue;
+        }
+        bounds = Some(bounds.map_or(rect, |bounds| {
+            let left = bounds.x.min(rect.x);
+            let top = bounds.y.min(rect.y);
+            let right = (bounds.x + bounds.width).max(rect.x + rect.width);
+            let bottom = (bounds.y + bounds.height).max(rect.y + rect.height);
+            w3cos_dom::DOMRect::new(left, top, right - left, bottom - top)
+        }));
+    }
+    bounds
+}
+
+fn forced_client_rects(node: u32) -> Vec<w3cos_dom::DOMRect> {
+    let bounds = forced_bounding_rect(node);
+    crate::incremental_layout::client_rects(node)
+        .unwrap_or_else(|| vec![bounds])
+        .into_iter()
+        .map(|rect| apply_css_motion_to_rect(node, rect))
+        .collect()
+}
+
 fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     let live = dom::bounding_rect(node);
     if !dom::is_document_dirty() {
+        if let Some(rect) = published_fragment_bounds(node) {
+            return apply_css_motion_to_rect(node, rect);
+        }
         if let Some(rect) =
             block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
         {
             return apply_css_motion_to_rect(node, rect);
+        }
+        if inline_with_only_out_of_flow_children(node) {
+            return w3cos_dom::DOMRect::default();
         }
         if live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0 {
             return apply_css_motion_to_rect(node, live);
@@ -9787,18 +10109,78 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
         return live;
     }
     let stored = dom::bounding_rect(node);
+    if let Some(rect) = published_fragment_bounds(node) {
+        return apply_css_motion_to_rect(node, rect);
+    }
     if let Some(rect) =
         block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
     {
         return apply_css_motion_to_rect(node, rect);
     }
+    if inline_with_only_out_of_flow_children(node) {
+        return w3cos_dom::DOMRect::default();
+    }
     let rect = if stored.width != 0.0 || stored.height != 0.0 || stored.x != 0.0 || stored.y != 0.0
     {
         stored
+    } else if let Some(rect) = merged_inline_text_rect(node) {
+        rect
     } else {
         live
     };
     apply_css_motion_to_rect(node, rect)
+}
+
+/// An inline element whose only content is text is merged into the enclosing
+/// block's text run, so layout gives it no rect of its own and it would read
+/// back as 0x0 even though it renders text. Measure that text on its own,
+/// wrapped at the enclosing block's width, as a browser's inline box would.
+fn merged_inline_text_rect(node: u32) -> Option<w3cos_dom::DOMRect> {
+    if dom::node_type(node) != 1 || !dom::is_connected(node) {
+        return None;
+    }
+    let children = dom::children(node);
+    if children.is_empty() || children.iter().any(|child| dom::node_type(*child) != 3) {
+        return None;
+    }
+    let parent = dom::parent_node(node)?;
+    let parent_rect = dom::bounding_rect(parent);
+    // A hidden ancestor lays out as 0x0; only a laid-out block yields a box.
+    if parent_rect.width <= 0.0 || parent_rect.height <= 0.0 {
+        return None;
+    }
+    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    if style.display != w3cos_std::style::Display::Inline {
+        return None;
+    }
+    let mut ancestor = Some(parent);
+    while let Some(id) = ancestor {
+        let hidden = dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(id)).display
+                == w3cos_std::style::Display::None
+        });
+        if hidden {
+            return None;
+        }
+        ancestor = dom::parent_node(id);
+    }
+    let text = children
+        .iter()
+        .filter_map(|child| dom::get_text_content(*child))
+        .collect::<String>();
+    if text
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}'))
+    {
+        return None;
+    }
+    let (width, height) = crate::layout::inline_text_box_size(&text, &style, parent_rect.width);
+    Some(w3cos_dom::DOMRect::new(
+        parent_rect.x,
+        parent_rect.y,
+        width,
+        height,
+    ))
 }
 
 /// Border box of a definite px width and height whose position is unchanged
@@ -10538,11 +10920,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }))
         }),
         "getAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            match dom::get_attribute(node, &name) {
-                Some(v) => Value::from(v),
-                None => Value::Null,
-            }
+            let name = arg(&args, 0);
+            with_value_text(&name, |name| {
+                with_normalized_attribute_name(node, name, |name| {
+                    dom::get_attribute(node, name).map_or(Value::Null, Value::from)
+                })
+            })
         }),
         "getAttributeNS" => func(move |_, args| {
             let namespace = normalized_namespace_argument(&arg(&args, 0));
@@ -11296,7 +11679,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         // ── Layout (zeros until the layout engine runs) ──
         "getBoundingClientRect" => func(move |_, _| rect_value(forced_bounding_rect(node))),
         "getClientRects" => func(move |_, _| {
-            crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
+            crate::geometry_web::rect_list(
+                forced_client_rects(node)
+                    .into_iter()
+                    .map(rect_value)
+                    .collect(),
+            )
         }),
         "offsetWidth" => Value::Number(forced_bounding_rect(node).width as f64),
         "offsetHeight" => Value::Number(forced_bounding_rect(node).height as f64),
@@ -11391,7 +11779,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "removeEventListener" => func(move |_, args| {
-            js_remove_event_listener(node, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                node,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
         "dispatchEvent" => func(move |_, args| Value::Bool(js_dispatch_event(node, arg(&args, 0)))),
@@ -11768,12 +12161,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
     }
 }
 
-fn with_value_text(value: &Value, body: impl FnOnce(&str)) {
+fn with_value_text<R>(value: &Value, body: impl FnOnce(&str) -> R) -> R {
     if let Some(text) = value.as_js_string() {
-        body(text.as_str());
+        body(text.as_str())
     } else {
         let owned = value.to_js_string();
-        body(&owned);
+        body(&owned)
     }
 }
 
@@ -13310,6 +13703,12 @@ fn motion_style(node: u32, pseudo: Option<&str>) -> w3cos_std::style::Style {
 }
 
 fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
+    // Only `left`/`transform` transitions are sampled. When no rule or inline
+    // declaration can give this node one, skip the three computed styles.
+    if !dom::with_document(|document| document.may_have_sampled_transition(NodeId::from_u32(node)))
+    {
+        return Vec::new();
+    }
     let mut snapshots = Vec::new();
     for pseudo in [None, Some("::before"), Some("::after")] {
         let style = motion_style(node, pseudo);
@@ -13439,8 +13838,8 @@ fn scan_css_animations() {
                 from,
                 to,
                 started_at: Instant::now(),
-                delay: Duration::from_millis(u64::from(animation.delay_ms)),
-                duration: Duration::from_millis(u64::from(animation.duration_ms)),
+                delay: Duration::from_millis(animation.delay_ms.max(0) as u64),
+                duration: Duration::from_millis(animation.duration_ms.max(0) as u64),
                 easing: animation.easing,
                 direction: animation.direction,
                 event_pending: true,
@@ -13550,14 +13949,29 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // cache is published first in that case. The common path moves the string
     // in after the typed write and does not clone it.
     let observers = !crate::observers_web::mutation_observers_empty();
+    let removes_custom_property = kebab.starts_with("--") && value.is_empty();
     if observers {
-        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value.clone()));
+        STYLE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if removes_custom_property {
+                cache.remove_value(node, kebab);
+            } else {
+                cache.insert_value(node, kebab, value.clone());
+            }
+        });
     }
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, &value);
     if !observers {
-        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value));
+        STYLE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if removes_custom_property {
+                cache.remove_value(node, kebab);
+            } else {
+                cache.insert_value(node, kebab, value);
+            }
+        });
     }
     if let Some(before) = discrete_before {
         start_discrete_css_transition(
@@ -13731,6 +14145,12 @@ fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
 }
 
 fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
+    // Custom-property values are token streams. Preserve whitespace so an
+    // all-whitespace stream remains distinct from CSSOM's exact empty-string
+    // removal operation.
+    if property.starts_with("--") {
+        return Some(value.to_string());
+    }
     let value = value.trim();
     if property != "color" && !property.ends_with("-color") || value.is_empty() {
         return Some(value.to_string());
@@ -14001,7 +14421,12 @@ fn parse_css_text(node: u32, css: &str) {
                 }
                 _ => (value, false),
             };
-            style_apply(node, &prop, value);
+            if prop.starts_with("--") && value.is_empty() {
+                dom::set_empty_custom_property_declaration(node, &prop);
+                STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, &prop, String::new()));
+            } else {
+                style_apply(node, &prop, value);
+            }
             set_inline_important(node, &prop, important);
         }
     }
@@ -14334,7 +14759,44 @@ fn inline_computed_style_fallback(node: u32, property: &str) -> String {
     }
 }
 
+thread_local! {
+    /// `getComputedStyle(el)` declarations, reused per element and realm.
+    /// The declaration is live (every read resolves the current style), so
+    /// layout helpers that call `getComputedStyle` once per measured edge
+    /// (VS Code's `getContentHeight` reads four) stop building a proxy, a
+    /// method table and two closures per read.
+    static COMPUTED_STYLE_DECLS: RefCell<HashMap<u32, (u64, Value)>> =
+        RefCell::new(HashMap::new());
+}
+
+const COMPUTED_STYLE_DECL_CACHE_LIMIT: usize = 4096;
+
 fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
+    if pseudo.is_some() {
+        return build_computed_style_value(node, pseudo);
+    }
+    let generation = realm_generation() as u64;
+    if let Some(value) = COMPUTED_STYLE_DECLS.with(|cache| {
+        cache
+            .borrow()
+            .get(&node)
+            .filter(|(cached_generation, _)| *cached_generation == generation)
+            .map(|(_, value)| value.clone())
+    }) {
+        return value;
+    }
+    let value = build_computed_style_value(node, None);
+    COMPUTED_STYLE_DECLS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= COMPUTED_STYLE_DECL_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(node, (generation, value.clone()));
+    });
+    value
+}
+
+fn build_computed_style_value(node: u32, pseudo: Option<String>) -> Value {
     let generation = realm_generation();
     let getter_pseudo = pseudo.clone();
     let handler = ProxyBuilder::new()
@@ -14388,28 +14850,63 @@ fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
 
 // ── JS event bridge ────────────────────────────────────────────────────────
 
+fn note_window_motion_listener(node: u32, type_name: &str, added: bool) {
+    if node != 0 {
+        return;
+    }
+    crate::orientation_web::adjust_motion_listener(type_name, if added { 1 } else { -1 });
+}
+
 fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
     if !handler.is_function() {
         return;
     }
-    let capture = if let Some(b) = options.as_bool() {
-        b
-    } else if options.is_object() {
-        options.get_property("capture").to_bool()
-    } else {
-        false
-    };
+    let capture = listener_capture(&options);
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().push(JsListener {
+    let added = LISTENERS.with(|l| {
+        let mut listeners = l.borrow_mut();
+        // DOM: a listener already registered with the same type, callback
+        // and capture flag is not added again.
+        if listeners.contains(node, et, &handler, capture) {
+            return false;
+        }
+        listeners.push(JsListener {
             node,
             event_type: et,
             handler,
             capture,
             inline: false,
-        })
+        });
+        true
     });
-    ensure_native_registration(node, et);
+    if added {
+        ensure_native_registration(node, et);
+        note_window_motion_listener(node, type_name, true);
+    }
+}
+
+fn listener_capture(options: &Value) -> bool {
+    if let Some(b) = options.as_bool() {
+        b
+    } else if options.is_object() {
+        options.get_property("capture").to_bool()
+    } else {
+        false
+    }
+}
+
+fn same_listener(
+    jl: &JsListener,
+    node: u32,
+    et: EventType,
+    handler: &Value,
+    capture: bool,
+) -> bool {
+    !jl.inline
+        && jl.node == node
+        && jl.event_type == et
+        && jl.capture == capture
+        && jl.handler.strict_eq(handler)
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -14458,12 +14955,22 @@ fn ensure_native_registration(node: u32, et: EventType) {
 /// v1 limitation: removes ALL bridge listeners for (node, type) — individual
 /// JS function identity cannot be compared (`Value` equality on functions is
 /// always false).
-fn js_remove_event_listener(node: u32, type_name: &str) {
+/// DOM `removeEventListener(type, callback, options)`: removes only the
+/// listener registered with that callback and capture flag, so disposing one
+/// subscriber leaves the node's other listeners of the same type in place.
+fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
+    if !handler.is_function() {
+        return;
+    }
+    let capture = listener_capture(&options);
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut()
-            .retain(|jl| !(jl.node == node && jl.event_type == et));
+    let removed = LISTENERS.with(|l| {
+        let mut listeners = l.borrow_mut();
+        listeners.remove_one(node, et, &handler, capture)
     });
+    if removed {
+        note_window_motion_listener(node, type_name, false);
+    }
 }
 
 fn key_code_for(key: &str, code: &str) -> u32 {
@@ -14903,7 +15410,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     // Phase 1: capture, root → parent (skip target). Ancestors with no
     // capture listeners are not wrapped.
     if has_capture {
-        for &id in chain.iter().rev().skip(1) {
+        for &id in chain.iter().skip(1).rev() {
             if stopped(&js_ev) {
                 break;
             }
@@ -15149,6 +15656,17 @@ pub(crate) fn dispatch_native_focus(target: u32, focused: bool) -> bool {
 /// `textarea.focus()` also becomes the native keyboard target.
 pub(crate) fn active_element_id() -> Option<u32> {
     ACTIVE_ELEMENT.with(|active| *active.borrow())
+}
+
+/// Target for a native key event. Per spec keyboard events go to
+/// `document.activeElement`; the native focus chain (a hit-tested widget)
+/// is only the fallback when nothing in the DOM is focused. A script-driven
+/// `focus()` (Monaco's EditContext div) therefore receives keydown/keyup
+/// even when the native focused index points somewhere else or nowhere.
+pub(crate) fn keyboard_event_target(fallback: Option<u32>) -> Option<u32> {
+    active_element_id()
+        .filter(|id| dom::node_type(*id) == 1)
+        .or(fallback)
 }
 
 fn native_touch_value(touch: &NativeTouch) -> Value {
@@ -15639,6 +16157,265 @@ pub(crate) fn dispatch_native_key(
             location: 0,
         }),
     )
+}
+
+/// Deliver user-typed text to the focused element when it is driven by an
+/// `EditContext` (Monaco's native edit context). The UA fires a cancelable
+/// `beforeinput` at the element, then a `textupdate` on the context that
+/// replaces the current selection. Returns true when the text was consumed
+/// by an EditContext, so the caller must not also treat it as a text control edit.
+pub fn deliver_edit_context_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let Some(active) = active_element_id() else {
+        return false;
+    };
+    let context = get_expando(active, "editContext").unwrap_or(Value::Null);
+    if context.is_nullish()
+        || !w3cos_core::class::instance_of(&context, &crate::edit_context_web::edit_context_class())
+    {
+        return false;
+    }
+    if dispatch_native_before_input(active, text, "insertText", false) {
+        return true;
+    }
+    let start = context.get_property("selectionStart").to_number();
+    let end = context.get_property("selectionEnd").to_number();
+    let (start, end) = (start.min(end), start.max(end));
+    context.call_method(
+        "__w3cos_userTextUpdate",
+        vec![
+            Value::Number(start),
+            Value::Number(end),
+            Value::string(text),
+        ],
+    );
+    true
+}
+
+/// `beforeinput` type a non-text editing key produces on an EditContext target.
+pub(crate) fn edit_context_input_type_for_key(key: &str, shift: bool) -> Option<&'static str> {
+    match key {
+        "Enter" if shift => Some("insertLineBreak"),
+        "Enter" => Some("insertParagraph"),
+        "Backspace" => Some("deleteContentBackward"),
+        "Delete" => Some("deleteContentForward"),
+        _ => None,
+    }
+}
+
+/// Run a non-text editing command (`insertParagraph`, `insertLineBreak`,
+/// `deleteContentBackward`, `deleteContentForward`) against the focused
+/// element's `EditContext`. A cancelable `beforeinput` goes to the element
+/// first. Line breaks are left to the page's `beforeinput` handler, as in
+/// browsers (no `textupdate`). Deletions then fire a user `textupdate` with
+/// empty text over the removed range. Returns true when an EditContext
+/// consumed the command.
+pub(crate) fn deliver_edit_context_command(input_type: &str) -> bool {
+    let Some(active) = active_element_id() else {
+        return false;
+    };
+    let context = get_expando(active, "editContext").unwrap_or(Value::Null);
+    if context.is_nullish()
+        || !w3cos_core::class::instance_of(&context, &crate::edit_context_web::edit_context_class())
+    {
+        return false;
+    }
+    let backward = match input_type {
+        "insertParagraph" | "insertLineBreak" => {
+            dispatch_native_before_input(active, "", input_type, false);
+            return true;
+        }
+        "deleteContentBackward" => true,
+        "deleteContentForward" => false,
+        _ => return false,
+    };
+    if dispatch_native_before_input(active, "", input_type, false) {
+        return true;
+    }
+    let units: Vec<u16> = context
+        .get_property("text")
+        .to_js_string()
+        .encode_utf16()
+        .collect();
+    let a = context.get_property("selectionStart").to_u32() as usize;
+    let b = context.get_property("selectionEnd").to_u32() as usize;
+    let (mut start, mut end) = (a.min(b).min(units.len()), a.max(b).min(units.len()));
+    if start == end {
+        let is_high = |u: u16| (0xD800..0xDC00).contains(&u);
+        let is_low = |u: u16| (0xDC00..0xE000).contains(&u);
+        if backward && start > 0 {
+            start -= if start >= 2 && is_low(units[start - 1]) && is_high(units[start - 2]) {
+                2
+            } else {
+                1
+            };
+        } else if !backward && end < units.len() {
+            end += if end + 1 < units.len() && is_high(units[end]) && is_low(units[end + 1]) {
+                2
+            } else {
+                1
+            };
+        } else {
+            return true;
+        }
+    }
+    context.call_method(
+        "__w3cos_userTextUpdate",
+        vec![
+            Value::Number(start as f64),
+            Value::Number(end as f64),
+            Value::string(""),
+        ],
+    );
+    true
+}
+
+/// Code-OSS / cpu-render harness: synthesize a keydown+keyup on the focused
+/// target (and deliver EditContext commands when the key is not prevented).
+pub fn harness_key_press(key: &str, code: &str, shift: bool) -> bool {
+    let Some(target) = keyboard_event_target(None) else {
+        return false;
+    };
+    let prevented = dispatch_native_key(target, key, code, false, false, false, false, shift, true);
+    if !prevented && let Some(input_type) = edit_context_input_type_for_key(key, shift) {
+        deliver_edit_context_command(input_type);
+    }
+    dispatch_native_key(target, key, code, false, false, false, false, shift, false);
+    true
+}
+
+fn active_edit_context() -> Option<(u32, Value)> {
+    let active = active_element_id()?;
+    let context = get_expando(active, "editContext").unwrap_or(Value::Null);
+    if context.is_nullish()
+        || !w3cos_core::class::instance_of(&context, &crate::edit_context_web::edit_context_class())
+    {
+        return None;
+    }
+    Some((active, context))
+}
+
+fn fire_edit_context_composition(context: &Value, kind: &str, data: &str) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("CompositionEvent"),
+        vec![
+            Value::string(kind),
+            Value::object(HashMap::from([("data".into(), Value::string(data))])),
+        ],
+    );
+    context.call_method("dispatchEvent", vec![event]);
+}
+
+fn fire_edit_context_text_formats(context: &Value, ranges: &[(u32, u32)]) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("TextFormatUpdateEvent"),
+        vec![Value::string("textformatupdate")],
+    );
+    let formats: Vec<Value> = ranges
+        .iter()
+        .map(|(start, end)| {
+            w3cos_core::class::construct(
+                &crate::edit_context_web::text_format_class(),
+                vec![Value::object(HashMap::from([
+                    ("rangeStart".into(), Value::Number(*start as f64)),
+                    ("rangeEnd".into(), Value::Number(*end as f64)),
+                    ("underlineStyle".into(), Value::string("solid")),
+                    ("underlineThickness".into(), Value::string("thin")),
+                ]))],
+            )
+        })
+        .collect();
+    event.set_property(
+        "getTextFormats",
+        func(move |_, _| Value::array(formats.clone())),
+    );
+    context.call_method("dispatchEvent", vec![event]);
+}
+
+/// Drive IME composition on the focused element's `EditContext`.
+/// `step` is `preedit` (new composition text, empty cancels), `commit`
+/// (final text) or `end` (composition dropped without changing the text).
+/// Fires `compositionstart`, `textupdate` over the composition range,
+/// `textformatupdate` (underline over the preedit) and `compositionend`.
+/// Returns true when an EditContext consumed the event.
+pub fn deliver_edit_context_ime(step: &str, text: &str) -> bool {
+    let Some((active, context)) = active_edit_context() else {
+        return false;
+    };
+    let composing = get_expando(active, "__w3cos_comp_len")
+        .filter(|v| !v.is_nullish())
+        .map(|v| v.to_u32());
+    let comp_start = get_expando(active, "__w3cos_comp_start")
+        .map(|v| v.to_u32())
+        .unwrap_or(0);
+    let clear = || {
+        set_expando(active, "__w3cos_comp_len", Value::Null);
+    };
+    let replace = |start: u32, end: u32, with: &str| {
+        context.call_method(
+            "__w3cos_userTextUpdate",
+            vec![
+                Value::Number(start as f64),
+                Value::Number(end as f64),
+                Value::string(with),
+            ],
+        );
+    };
+    match step {
+        "preedit" => {
+            if text.is_empty() && composing.is_none() {
+                return true;
+            }
+            let (start, end) = match composing {
+                Some(len) => (comp_start, comp_start + len),
+                None => {
+                    let a = context.get_property("selectionStart").to_u32();
+                    let b = context.get_property("selectionEnd").to_u32();
+                    let (a, b) = (a.min(b), a.max(b));
+                    set_expando(active, "__w3cos_comp_start", Value::Number(a as f64));
+                    fire_edit_context_composition(&context, "compositionstart", "");
+                    dispatch_native_before_input(active, text, "insertCompositionText", true);
+                    (a, b)
+                }
+            };
+            let units = text.encode_utf16().count() as u32;
+            replace(start, end, text);
+            if text.is_empty() {
+                clear();
+                fire_edit_context_text_formats(&context, &[]);
+                fire_edit_context_composition(&context, "compositionend", "");
+            } else {
+                set_expando(active, "__w3cos_comp_len", Value::Number(units as f64));
+                fire_edit_context_text_formats(&context, &[(start, start + units)]);
+            }
+            true
+        }
+        "commit" => {
+            let Some(len) = composing else {
+                return deliver_edit_context_text(text);
+            };
+            let units = text.encode_utf16().count() as u32;
+            let end = comp_start + len;
+            clear();
+            if len != 0 || units != 0 {
+                replace(comp_start, end, text);
+            }
+            fire_edit_context_text_formats(&context, &[]);
+            fire_edit_context_composition(&context, "compositionend", text);
+            true
+        }
+        "end" => {
+            if composing.is_some() {
+                clear();
+                fire_edit_context_text_formats(&context, &[]);
+                fire_edit_context_composition(&context, "compositionend", "");
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Bridge the cancelable `beforeinput` phase. Returns true when canceled.
@@ -16190,6 +16967,38 @@ fn canvas_context_value(node: u32) -> Value {
     );
     set_expando(node, "__ctx2d", value.clone());
     value
+}
+
+/// Publish every DOM canvas's 2D pixels under its flat paint index so the
+/// retained paint backends can draw them (`canvas2d::surface_snapshot`).
+pub(crate) fn publish_canvas_surfaces(flat: &[crate::layout::FlatNodeInfo<'_>]) {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        if contexts.is_empty() {
+            return;
+        }
+        for (index, info) in flat.iter().enumerate() {
+            if !matches!(info.kind, w3cos_std::ComponentKind::Canvas { .. }) {
+                continue;
+            }
+            let w3cos_std::EventAction::NativeHost { id, .. } = info.on_click else {
+                continue;
+            };
+            let Ok(node) = u32::try_from(*id) else {
+                continue;
+            };
+            match contexts.get(&node) {
+                Some(context) => {
+                    if let Ok(mut context) = context.try_borrow_mut() {
+                        context.publish_to_surface(index);
+                    }
+                }
+                // A canvas without a 2D context must not show the snapshot a
+                // previous canvas left under this index.
+                None => crate::canvas2d::remove_surface(index),
+            }
+        }
+    });
 }
 
 fn canvas_ctx_get(
@@ -18251,6 +19060,22 @@ pub fn document_value() -> Value {
     value
 }
 
+/// A document-like receiver other than the main document that carries its
+/// own `name` method; main-document methods captured and `.call`ed on it
+/// forward there.
+fn foreign_document_method(receiver: &Value, name: &str) -> Option<Value> {
+    if !receiver.is_object() || node_id_of(receiver).is_some() {
+        return None;
+    }
+    if *receiver == document_value() {
+        return None;
+    }
+    receiver
+        .as_object()
+        .and_then(|object| object.borrow().own_data(name))
+        .filter(|method| method.is_callable())
+}
+
 fn build_document_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     let implementation = dom_implementation_value();
@@ -18311,14 +19136,26 @@ fn build_document_value() -> Value {
     props.insert(
         "createElement".to_string(),
         func(|_, args| {
-            let mut tag = arg(&args, 0).to_js_string();
-            if !valid_element_name(&tag) {
-                dom_exception("The element name is not valid", "InvalidCharacterError");
-            }
-            if document_value().get_property("contentType").to_js_string() == "text/html" {
-                tag.make_ascii_lowercase();
-            }
-            let id = dom::create_element(&tag);
+            let tag_value = arg(&args, 0);
+            let id = with_value_text(&tag_value, |tag| {
+                if !valid_element_name(tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                let lowered;
+                let tag = if document_value().get_property("contentType").to_js_string()
+                    == "text/html"
+                    && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+                {
+                    lowered = tag.to_ascii_lowercase();
+                    lowered.as_str()
+                } else {
+                    tag
+                };
+                dom::create_element(tag)
+            });
+            // End the page-arena borrow before a custom-element constructor can
+            // re-enter JavaScript. DOM atoms have process-lifetime storage.
+            let tag = dom::tag_static(id);
             let element = dom_handle(id);
             if tag == "template" {
                 ensure_template_content(id);
@@ -18535,7 +19372,13 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "getElementsByTagName".to_string(),
-        func(|_, args| {
+        func(|this, args| {
+            // Captured as `const gebtn = document.getElementsByTagName` and
+            // re-targeted with `.call(otherDoc, ...)` (DOMPurify does this
+            // with DOMParser output): answer for that document, not this one.
+            if let Some(other) = foreign_document_method(&this, "getElementsByTagName") {
+                return other.call(this, args);
+            }
             let tag = arg(&args, 0).to_js_string();
             let html_document =
                 document_value().get_property("contentType").to_js_string() == "text/html";
@@ -18657,7 +19500,12 @@ fn build_document_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -19737,7 +20585,7 @@ fn storage_value(persistent: bool) -> Value {
     value
 }
 
-fn crypto_key_class() -> Value {
+pub(crate) fn crypto_key_class() -> Value {
     CRYPTO_KEY_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
@@ -21881,7 +22729,9 @@ fn build_window_value() -> Value {
                     .is_some_and(|timeout| scheduled.elapsed().as_secs_f64() * 1000.0 >= timeout);
                 cb.call(Value::Undefined, vec![idle_deadline_value(did_timeout)])
             });
-            Value::Number(js_set_timer(callback, 0, vec![], false) as f64)
+            let timeout_at =
+                timeout.map(|ms| scheduled + Duration::from_micros((ms * 1000.0) as u64));
+            Value::Number(js_set_idle_timer(callback, timeout_at) as f64)
         }),
     );
     props.insert(
@@ -22004,7 +22854,12 @@ fn build_window_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -22016,13 +22871,26 @@ fn build_window_value() -> Value {
         "postMessage".to_string(),
         func(|target, args| {
             let data = arg(&args, 0);
-            let target_origin = arg(&args, 1).to_js_string();
+            // HTML: postMessage(message, targetOrigin, transfer) or
+            // postMessage(message, { targetOrigin, transfer }).
+            let second = arg(&args, 1);
+            let (target_origin, transfer) = if second.is_object() && !second.is_string() {
+                let origin = second.get_property("targetOrigin");
+                let origin = if origin.is_undefined() {
+                    "/".to_string()
+                } else {
+                    origin.to_js_string()
+                };
+                (origin, second.get_property("transfer"))
+            } else {
+                (second.to_js_string(), arg(&args, 2))
+            };
             let own_origin = target
                 .get_property("location")
                 .get_property("origin")
                 .to_js_string();
-            if target_origin == "*" || target_origin == own_origin {
-                queue_window_message(target, data);
+            if target_origin == "*" || target_origin == "/" || target_origin == own_origin {
+                queue_window_message(target, data, transferred_ports(&transfer), own_origin);
             }
             Value::Undefined
         }),
@@ -22093,9 +22961,52 @@ fn js_set_timer(callback: Value, ms: u64, args: Vec<Value>, repeating: bool) -> 
             args,
             fire_at: Instant::now() + Duration::from_millis(ms),
             interval,
+            idle: false,
+            idle_timeout_at: None,
         })
     });
     id
+}
+
+/// Queue a `requestIdleCallback` callback. It shares the timer store (so
+/// `cancelIdleCallback`, `has_pending_work` and the wake-up deadline work
+/// unchanged) but [`tick_timers`] defers it while other work is ready, as a
+/// browser only runs idle callbacks in an idle period.
+fn js_set_idle_timer(callback: Value, timeout_at: Option<Instant>) -> u32 {
+    let id = NEXT_TIMER_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    JS_TIMERS.with(|t| {
+        t.borrow_mut().push(JsTimer {
+            id,
+            callback,
+            args: Vec::new(),
+            fire_at: Instant::now(),
+            interval: None,
+            idle: true,
+            idle_timeout_at: timeout_at,
+        })
+    });
+    id
+}
+
+/// Longest an idle callback waits for an idle period before it runs anyway.
+const IDLE_STARVATION: Duration = Duration::from_millis(50);
+
+/// True when the event loop has nothing but idle callbacks to run.
+fn idle_period(now: Instant) -> bool {
+    let timers = JS_TIMERS.with(|t| {
+        t.borrow()
+            .iter()
+            .any(|timer| !timer.idle && timer.fire_at <= now)
+    });
+    let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
+    let micro =
+        MICROTASKS.with(|m| !m.borrow().is_empty()) || w3cos_core::promise::queue_count() > 0;
+    let events = PENDING_EVENTS.with(|q| !q.borrow().is_empty());
+    !(timers || raf || micro || events)
 }
 
 pub(crate) fn schedule_timeout_value(callback: Value, delay_ms: u64) -> u32 {
@@ -22108,29 +23019,71 @@ fn js_clear_timer(id: u32) {
 
 /// Fire all due `setTimeout`/`setInterval` callbacks. Returns the number of
 /// callbacks invoked.
+///
+/// Due timers run one at a time in deadline order (creation order breaking
+/// ties), as in Node and browsers, and each is taken from the store only when
+/// it is about to run. So after a long synchronous stretch a `setTimeout(f, 0)`
+/// still runs before an older `setTimeout(g, 1000)`, and `f` can
+/// `clearTimeout` `g` even though both are already due (vs/base/parts/ipc's
+/// ChannelServer flushes pending requests this way before their 1s
+/// "Unknown channel" timeout). Timers created or rescheduled by a callback are
+/// due no earlier than `now` and wait for the next tick.
 pub fn tick_timers() -> usize {
-    let mut fired: Vec<(Value, Vec<Value>)> = Vec::new();
-    JS_TIMERS.with(|t| {
-        let mut timers = t.borrow_mut();
-        let now = Instant::now();
-        let mut i = 0;
-        while i < timers.len() {
-            if now >= timers[i].fire_at {
-                fired.push((timers[i].callback.clone(), timers[i].args.clone()));
-                if let Some(interval) = timers[i].interval {
-                    timers[i].fire_at = now + interval;
-                    i += 1;
-                } else {
-                    timers.remove(i);
-                }
+    let now = Instant::now();
+    let mut ran = 0;
+    let mut ran_idle = false;
+    loop {
+        // Idle callbacks yield to every other ready task: at most one runs
+        // per tick, and only when nothing else is ready, so the loop gets back
+        // to events / IPC between them. An expired `timeout` makes one an
+        // ordinary task.
+        let allow_idle = !ran_idle && idle_period(now);
+        // A busy loop may never be fully idle (self-rescheduling 0ms timers,
+        // a steady IPC stream), so an idle callback that has waited
+        // IDLE_STARVATION still gets its turn, one per tick, as a browser
+        // guarantees an idle period at least every frame.
+        let allow_starved = !ran_idle;
+        let next = JS_TIMERS.with(|t| {
+            let mut timers = t.borrow_mut();
+            let index = timers
+                .iter()
+                .enumerate()
+                .filter(|(_, timer)| timer.fire_at <= now)
+                .filter(|(_, timer)| {
+                    !timer.idle
+                        || allow_idle
+                        || (allow_starved && now.duration_since(timer.fire_at) >= IDLE_STARVATION)
+                        || timer.idle_timeout_at.is_some_and(|at| at <= now)
+                })
+                .min_by_key(|(_, timer)| (timer.fire_at, timer.id))
+                .map(|(index, _)| index)?;
+            if timers[index].idle && !timers[index].idle_timeout_at.is_some_and(|at| at <= now) {
+                ran_idle = true;
+            }
+            let timer = &mut timers[index];
+            let due = (timer.callback.clone(), timer.args.clone());
+            if let Some(interval) = timer.interval {
+                // Strictly after `now`, so it cannot run twice in this tick.
+                timer.fire_at = now + interval;
             } else {
-                i += 1;
+                timers.remove(index);
+            }
+            Some(due)
+        });
+        let Some((cb, args)) = next else {
+            break;
+        };
+        ran += 1;
+        // HTML timer initialization steps: an exception thrown by the callback
+        // is reported (window `onerror`) and does not stop the other due timers
+        // or the event loop. Node semantics apply when nothing handles it: a
+        // `process` 'uncaughtException' listener gets it, otherwise the throw
+        // stays fatal (a worker then exits with an 'error' event).
+        if let Err(exception) = w3cos_core::catch_js(|| cb.call(Value::Undefined, args)) {
+            if !report_uncaught_callback_exception(&cb, exception.clone()) {
+                std::panic::panic_any(w3cos_core::PanicValue(exception));
             }
         }
-    });
-    let ran = fired.len();
-    for (cb, args) in fired {
-        cb.call(Value::Undefined, args);
     }
     ran
 }
@@ -22368,6 +23321,7 @@ fn silent_object(value: &Value, key: &str, seen: &mut HashSet<usize>) -> SilentL
             }
             if let Some(data) = object.own_data(key)
                 && !data.is_undefined()
+                && !is_prototype_forwarder(&data)
             {
                 return SilentLookup::Data(data);
             }
@@ -22663,7 +23617,33 @@ fn dispatch_lifecycle_event(target: &Value, event_type: &str) {
     }
 }
 
-fn queue_window_message(target: Value, data: Value) {
+/// The MessagePorts in a postMessage transfer list (array-like), which the
+/// MessageEvent carries as `ports`; other transferables are left out.
+fn transferred_ports(transfer: &Value) -> Vec<Value> {
+    if !transfer.is_object() && !transfer.is_array() {
+        return Vec::new();
+    }
+    let length = transfer.get_property("length").to_number();
+    if !length.is_finite() || length <= 0.0 {
+        return Vec::new();
+    }
+    (0..length as usize)
+        .map(|index| transfer.get_property(&index.to_string()))
+        .filter(|item| item.is_object() && item.get_property("postMessage").is_callable())
+        .collect()
+}
+
+/// HTML "window post message steps": the MessageEvent's `source` is the
+/// posting window (the incumbent global; this runtime has one window realm,
+/// so it is the target itself) and `origin` the poster's serialized origin.
+/// Code-OSS's `acquirePort` only accepts responses whose `source` is its own
+/// window.
+fn queue_window_message(target: Value, data: Value, ports: Vec<Value>, origin: String) {
+    let origin = if origin.is_empty() {
+        "null".to_string()
+    } else {
+        origin
+    };
     queue_microtask_value(Value::function(move |_, _| {
         let event = w3cos_core::class::construct(
             &crate::web_events::event_subclass_class("MessageEvent"),
@@ -22671,9 +23651,9 @@ fn queue_window_message(target: Value, data: Value) {
                 Value::string("message"),
                 Value::object(HashMap::from([
                     ("data".to_string(), data.clone()),
-                    ("origin".to_string(), Value::string("null")),
-                    ("source".to_string(), Value::Null),
-                    ("ports".to_string(), Value::array(vec![])),
+                    ("origin".to_string(), Value::string(origin.as_str())),
+                    ("source".to_string(), target.clone()),
+                    ("ports".to_string(), Value::array(ports.clone())),
                 ])),
             ],
         );
@@ -22702,6 +23682,13 @@ pub fn drain_microtasks() -> usize {
         ran += crate::eventsource::poll_js_events();
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
+        ran += crate::audio_web::poll_live_outputs();
+        ran += crate::gamepad_web::poll();
+        ran += crate::serial_web::poll_serial_io();
+        ran += crate::device_access_web::poll_device_events();
+        ran += crate::sensors_web::poll_platform_samples();
+        ran += crate::geolocation_web::poll_platform_events();
+        ran += crate::bluetooth_web::poll_platform_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22984,8 +23971,196 @@ pub fn reset_bridge() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn node_id_of_needs_both_an_id_and_the_current_generation() {
+        setup();
+        let current = realm_generation();
+        let wrapper = |id: Option<f64>, generation: Option<u32>| {
+            let mut properties = HashMap::new();
+            if let Some(id) = id {
+                properties.insert("__node_id".to_string(), Value::Number(id));
+            }
+            if let Some(generation) = generation {
+                properties.insert(
+                    "__w3cos_realm_generation".to_string(),
+                    Value::Number(generation as f64),
+                );
+            }
+            Value::object(properties)
+        };
+        assert_eq!(node_id_of(&wrapper(Some(7.0), Some(current))), Some(7));
+        // A plain object, an id without a generation, a generation without
+        // an id and a stale generation are all not DOM wrappers.
+        assert_eq!(node_id_of(&wrapper(None, None)), None);
+        assert_eq!(node_id_of(&wrapper(Some(7.0), None)), None);
+        assert_eq!(node_id_of(&wrapper(None, Some(current))), None);
+        assert_eq!(
+            node_id_of(&wrapper(Some(7.0), Some(current.wrapping_add(1)))),
+            None
+        );
+        assert_eq!(node_id_of(&Value::Number(3.0)), None);
+    }
+
+    #[test]
+    fn window_post_message_carries_transferred_ports() {
+        setup();
+        let window = window_value();
+        let seen = Rc::new(RefCell::new(Vec::<(String, usize, bool)>::new()));
+        let log = Rc::clone(&seen);
+        let sources = Rc::new(RefCell::new(Vec::<bool>::new()));
+        let source_log = Rc::clone(&sources);
+        let own = window.clone();
+        window.set_property(
+            "onmessage",
+            Value::function(move |_, args| {
+                let event = args.first().cloned().unwrap_or(Value::Undefined);
+                let ports = event.get_property("ports");
+                let first = ports.get_property("0");
+                // HTML: a same-window post's `source` is that window.
+                source_log
+                    .borrow_mut()
+                    .push(event.get_property("source").strict_eq(&own));
+                log.borrow_mut().push((
+                    event.get_property("data").to_js_string(),
+                    ports.get_property("length").to_number() as usize,
+                    first.get_property("tag").to_js_string() == "port",
+                ));
+                Value::Undefined
+            }),
+        );
+        let port = Value::object(HashMap::from([
+            ("tag".to_string(), Value::string("port")),
+            (
+                "postMessage".to_string(),
+                Value::function(|_, _| Value::Undefined),
+            ),
+        ]));
+        let not_a_port = Value::object(HashMap::new());
+        window.call_method(
+            "postMessage",
+            vec![
+                Value::string("positional"),
+                Value::string("*"),
+                Value::array(vec![port.clone(), not_a_port]),
+            ],
+        );
+        window.call_method(
+            "postMessage",
+            vec![
+                Value::string("options"),
+                Value::object(HashMap::from([(
+                    "transfer".to_string(),
+                    Value::array(vec![port.clone()]),
+                )])),
+            ],
+        );
+        window.call_method(
+            "postMessage",
+            vec![Value::string("none"), Value::string("*")],
+        );
+        drain_microtasks();
+        window.set_property("onmessage", Value::Null);
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("positional".to_string(), 1, true),
+                ("options".to_string(), 1, true),
+                ("none".to_string(), 0, false),
+            ]
+        );
+        assert_eq!(*sources.borrow(), [true, true, true]);
+    }
+
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn borrowed_create_element_string_preserves_conversion_and_validation() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("DiV")]);
+        assert_eq!(element.get_property("localName").to_js_string(), "div");
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_for_to_string = std::rc::Rc::clone(&calls);
+        let tag = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(move |_, _| {
+                calls_for_to_string.set(calls_for_to_string.get() + 1);
+                Value::string("SpAn")
+            }),
+        )]));
+        let element = document.call_method("createElement", vec![tag]);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(element.get_property("localName").to_js_string(), "span");
+
+        let throwing_tag = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(|_, _| panic!("createElement conversion marker")),
+        )]));
+        let conversion_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.call_method("createElement", vec![throwing_tag])
+        }));
+        assert!(conversion_error.is_err());
+
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.call_method("createElement", vec![Value::string("bad\0tag")])
+        }));
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn borrowed_get_attribute_preserves_case_unicode_and_object_to_string() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("data-x"), Value::string("ascii")],
+        );
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("é"), Value::string("unicode")],
+        );
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("DATA-X")])
+                .to_js_string(),
+            "ascii"
+        );
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("é")])
+                .to_js_string(),
+            "unicode"
+        );
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_for_to_string = std::rc::Rc::clone(&calls);
+        let name = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(move |_, _| {
+                calls_for_to_string.set(calls_for_to_string.get() + 1);
+                Value::string("DATA-X")
+            }),
+        )]));
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![name])
+                .to_js_string(),
+            "ascii"
+        );
+        assert_eq!(calls.get(), 1);
+
+        let throwing_name = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(|_, _| panic!("getAttribute conversion marker")),
+        )]));
+        let conversion_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            element.call_method("getAttribute", vec![throwing_name])
+        }));
+        assert!(conversion_error.is_err());
     }
 
     #[test]
@@ -23547,6 +24722,145 @@ mod tests {
         doc.get_property("body")
             .call_method("appendChild", vec![el.clone()]);
         el
+    }
+
+    #[test]
+    fn long_unbreakable_text_in_a_wide_offscreen_container_measures_its_real_advance() {
+        // Mirrors the editor's DomCharWidthReader: 256 repeated characters in
+        // spans separated by <br> inside a very wide, off-screen container,
+        // read back as offsetWidth / 256. The layout used to wrap such text at
+        // a fixed 360px probe, yielding ~1.4px per character, which made the
+        // reader distrust the font info and re-measure forever.
+        setup();
+        set_viewport(1280.0, 800.0);
+        let document = document_value();
+        // A stylesheet is present in the editor, so authored-rule layout runs.
+        let sheet = document.call_method("createElement", vec![Value::string("style")]);
+        sheet.set_property("textContent", Value::string(".zz { color: red; }"));
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![sheet]);
+        let container = document.call_method("createElement", vec![Value::string("div")]);
+        let container_style = container.get_property("style");
+        container_style.set_property("position", Value::string("absolute"));
+        container_style.set_property("top", Value::string("-50000px"));
+        container_style.set_property("width", Value::string("50000px"));
+        let reg = document.call_method("createElement", vec![Value::string("div")]);
+        reg.get_property("style")
+            .set_property("fontSize", Value::string("12px"));
+        container.call_method("appendChild", vec![reg.clone()]);
+        let mut spans = vec![];
+        for chr in [
+            "n", "0", "|", "m", "\u{ff4d}", "\u{2192}", "\u{b7}", "\u{a0}",
+        ] {
+            reg.call_method(
+                "appendChild",
+                vec![document.call_method("createElement", vec![Value::string("br")])],
+            );
+            let span = document.call_method("createElement", vec![Value::string("span")]);
+            // The editor measures the space with innerText on 256 no-break
+            // spaces; every other character goes through textContent.
+            let property = if chr == "\u{a0}" {
+                "innerText"
+            } else {
+                "textContent"
+            };
+            span.set_property(property, Value::string(&chr.repeat(256)));
+            reg.call_method("appendChild", vec![span.clone()]);
+            spans.push((chr, span));
+        }
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![container.clone()]);
+        let mut advances = vec![];
+        for (chr, span) in &spans {
+            let width = span.get_property("offsetWidth").to_number() / 256.0;
+            let height = span.get_property("offsetHeight").to_number();
+            assert!(
+                width > 2.0,
+                "{chr:?} advance {width} is implausibly small (wrapped at the probe width?)"
+            );
+            assert!(
+                height < 20.0,
+                "{chr:?} wrapped onto several lines (height {height})"
+            );
+            advances.push(width);
+        }
+        assert!(advances[0] > 5.0, "n advance {}", advances[0]);
+    }
+
+    #[test]
+    fn spans_coalesced_across_forced_breaks_each_publish_one_client_rect_per_line() {
+        // `<br>`-separated spans coalesce into one text run whose later lines
+        // start after earlier owners end. Each span must keep exactly one
+        // client rect: earlier owners clip away on later lines (no unsigned
+        // underflow) and no owner range is published twice.
+        setup();
+        set_viewport(1280.0, 800.0);
+        let document = document_value();
+        let sheet = document.call_method("createElement", vec![Value::string("style")]);
+        sheet.set_property("textContent", Value::string(".zz { color: red; }"));
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![sheet]);
+        let host = document.call_method("createElement", vec![Value::string("div")]);
+        let mut spans = vec![];
+        for text in ["first", "second", "third"] {
+            host.call_method(
+                "appendChild",
+                vec![document.call_method("createElement", vec![Value::string("br")])],
+            );
+            let span = document.call_method("createElement", vec![Value::string("span")]);
+            span.set_property("textContent", Value::string(text));
+            host.call_method("appendChild", vec![span.clone()]);
+            spans.push(span);
+        }
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![host]);
+        let mut previous_top = f64::NEG_INFINITY;
+        for span in &spans {
+            let rects = span.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_number(), 1.0);
+            let rect = rects.call_method("item", vec![Value::Number(0.0)]);
+            assert!(rect.get_property("width").to_number() > 0.0);
+            let top = rect.get_property("top").to_number();
+            assert!(top > previous_top, "each span sits on its own line");
+            previous_top = top;
+        }
+    }
+
+    #[test]
+    fn inline_span_holding_only_text_has_a_measured_box() {
+        setup();
+        set_viewport(1280.0, 800.0);
+        let document = document_value();
+        let host = document.call_method("createElement", vec![Value::string("div")]);
+        host.get_property("style")
+            .set_property("fontSize", Value::string("12px"));
+        let span = document.call_method("createElement", vec![Value::string("span")]);
+        span.set_property("textContent", Value::string("hello world"));
+        host.call_method("appendChild", vec![span.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![host.clone()]);
+        let width = span.get_property("offsetWidth").to_number();
+        let height = span.get_property("offsetHeight").to_number();
+        assert!(width > 20.0 && width < 200.0, "span width {width}");
+        assert!(height > 8.0 && height < 30.0, "span height {height}");
+        // Content that is hidden from the start reads as an empty box.
+        let hidden = document.call_method("createElement", vec![Value::string("div")]);
+        hidden
+            .get_property("style")
+            .set_property("display", Value::string("none"));
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        inner.set_property("textContent", Value::string("hello world"));
+        hidden.call_method("appendChild", vec![inner.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![hidden]);
+        assert_eq!(inner.get_property("offsetWidth").to_number(), 0.0);
+        assert_eq!(inner.get_property("offsetHeight").to_number(), 0.0);
     }
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
@@ -24140,6 +25454,41 @@ mod tests {
             calls.get(),
             1,
             "shared prototype callback must not be skipped"
+        );
+    }
+
+    #[test]
+    fn negative_lifecycle_prototype_proof_is_cached_across_removals() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let first = dom::create_element("div");
+        let second = dom::create_element("div");
+        // The first probe may lazily build the bridge realm (advancing its
+        // generation); the second establishes the steady-state proof.
+        assert!(!disconnected_lifecycle_may_be_observable(first));
+        assert!(!disconnected_lifecycle_may_be_observable(first));
+        let primed = LIFECYCLE_PROTOTYPE_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            (cache.0, cache.1, cache.2.len())
+        });
+        assert_eq!(primed.0, realm_generation());
+        assert_eq!(primed.1, w3cos_core::intrinsics::dom_shape_epoch());
+        assert!(
+            primed.2 >= 1,
+            "the first scan must record its prototype proof"
+        );
+        assert!(!disconnected_lifecycle_may_be_observable(second));
+        let reused = LIFECYCLE_PROTOTYPE_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            (cache.0, cache.1, cache.2.len())
+        });
+        assert_eq!(
+            reused, primed,
+            "a second removal on the same prototype must reuse the cached proof"
+        );
+        assert!(
+            !LIFECYCLE_EXPANDO_AUTHORED.with(Cell::get),
+            "fresh immediates must skip the expando probe"
         );
     }
 
@@ -26323,6 +27672,85 @@ mod tests {
                 .get_property("display")
         });
         assert_eq!(typed, "flex");
+    }
+
+    #[test]
+    fn custom_property_empty_cssom_and_declaration_text_have_distinct_semantics() {
+        setup();
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("div")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+
+        let parent_style = parent.get_property("style");
+        let child_style = child.get_property("style");
+        parent_style.call_method(
+            "setProperty",
+            vec![Value::string("--alpha"), Value::string("0.5")],
+        );
+        child_style.call_method(
+            "setProperty",
+            vec![
+                Value::string("opacity"),
+                Value::string("var(--alpha, 0.25)"),
+            ],
+        );
+
+        let computed = || {
+            window_value()
+                .call_method("getComputedStyle", vec![child.clone()])
+                .get_property("opacity")
+                .to_js_string()
+        };
+        assert_eq!(computed(), "0.5");
+
+        // CSSOM setProperty with an empty string removes the declaration, so
+        // the parent value is inherited again.
+        child_style.call_method(
+            "setProperty",
+            vec![Value::string("--alpha"), Value::string("")],
+        );
+        assert_eq!(
+            child_style
+                .call_method("getPropertyValue", vec![Value::string("--alpha")])
+                .to_js_string(),
+            ""
+        );
+        assert_eq!(computed(), "0.5");
+
+        // Whitespace is a valid empty custom-property token stream, not the
+        // CSSOM empty-string removal operation. It shadows the inherited value
+        // and makes the color declaration invalid instead of using fallback.
+        child_style.call_method(
+            "setProperty",
+            vec![Value::string("--alpha"), Value::string("   ")],
+        );
+        assert_eq!(computed(), "1");
+
+        // An empty declaration parsed from declaration text has the same valid
+        // empty-token-stream semantics and must survive cssText parsing.
+        child_style.set_property(
+            "cssText",
+            Value::string("--alpha:; opacity: var(--alpha, 0.25)"),
+        );
+        assert_eq!(computed(), "1");
+        assert_eq!(child_style.get_property("length").to_number(), 2.0);
+        assert!(
+            child_style
+                .get_property("cssText")
+                .to_js_string()
+                .contains("--alpha:")
+        );
+
+        child_style.call_method("removeProperty", vec![Value::string("--alpha")]);
+        assert_eq!(computed(), "0.5");
+        assert!(
+            !child_style
+                .get_property("cssText")
+                .to_js_string()
+                .contains("--alpha:")
+        );
+        parent_style.call_method("removeProperty", vec![Value::string("--alpha")]);
+        assert_eq!(computed(), "0.25");
     }
 
     #[test]
@@ -28777,6 +30205,70 @@ try {
         assert!(stack.get_property("length").to_u32() >= 2);
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn document_hit_testing_skips_visibility_hidden_overlays() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let base = create_in_body("div");
+        let base_style = base.get_property("style");
+        base_style.set_property("width", Value::string("200px"));
+        base_style.set_property("height", Value::string("100px"));
+        let overlay = document.call_method("createElement", vec![Value::string("div")]);
+        base.call_method("appendChild", vec![overlay.clone()]);
+        let overlay_style = overlay.get_property("style");
+        overlay_style.set_property("position", Value::string("absolute"));
+        overlay_style.set_property("top", Value::string("0px"));
+        overlay_style.set_property("width", Value::string("100%"));
+        overlay_style.set_property("height", Value::string("100%"));
+        overlay_style.set_property("visibility", Value::string("hidden"));
+        overlay_style.set_property("opacity", Value::string("0"));
+        overlay_style.set_property("zIndex", Value::string("12"));
+        base_style.set_property("position", Value::string("relative"));
+
+        let bounds = base.call_method("getBoundingClientRect", Vec::new());
+        let x = bounds.get_property("x").to_number() + 20.0;
+        let y = bounds.get_property("y").to_number() + 20.0;
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(
+            hit.strict_eq(&base),
+            "a visibility:hidden overlay must not be the hit target"
+        );
+        let stack = document.call_method(
+            "elementsFromPoint",
+            vec![Value::Number(x), Value::Number(y)],
+        );
+        for i in 0..stack.get_property("length").to_u32() {
+            assert!(
+                !stack.get_property(&i.to_string()).strict_eq(&overlay),
+                "hidden overlay listed in elementsFromPoint"
+            );
+        }
+
+        // A visible descendant of a hidden box still hits.
+        let child = document.call_method("createElement", vec![Value::string("div")]);
+        overlay.call_method("appendChild", vec![child.clone()]);
+        let child_style = child.get_property("style");
+        child_style.set_property("visibility", Value::string("visible"));
+        child_style.set_property("width", Value::string("50px"));
+        child_style.set_property("height", Value::string("50px"));
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(
+            hit.strict_eq(&child),
+            "visible child of hidden parent must hit"
+        );
+
+        // Becoming visible again makes the overlay hittable.
+        child.call_method("remove", Vec::new());
+        overlay_style.set_property("visibility", Value::string("visible"));
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(hit.strict_eq(&overlay));
+    }
+
     #[test]
     fn document_hit_testing_excludes_float_clipped_by_overflow_ancestor() {
         setup();
@@ -29614,6 +31106,73 @@ try {
     }
 
     #[test]
+    fn keypress_capture_listener_on_target_fires_once() {
+        setup();
+        let parent = create_in_body("div");
+        let doc = document_value();
+        let ta = doc.call_method("createElement", vec![Value::string("textarea")]);
+        parent.call_method("appendChild", vec![ta.clone()]);
+        let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        for (ty, cap) in [("keydown", true), ("keypress", true), ("keyup", true)] {
+            let h = hits.clone();
+            let name = ty.to_string();
+            ta.call_method(
+                "addEventListener",
+                vec![
+                    Value::string(ty),
+                    func(move |_, _| {
+                        h.borrow_mut().push(name.clone());
+                        Value::Undefined
+                    }),
+                    Value::Bool(cap),
+                ],
+            );
+        }
+        for (node, name) in [
+            (doc.clone(), "doc-capture"),
+            (parent.clone(), "parent-capture"),
+        ] {
+            let h = hits.clone();
+            node.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("keypress"),
+                    func(move |_, _| {
+                        h.borrow_mut().push(name.to_string());
+                        Value::Undefined
+                    }),
+                    Value::Bool(true),
+                ],
+            );
+        }
+        let ctor = crate::web_events::event_subclass_class("KeyboardEvent");
+        for ty in ["keydown", "keypress", "keyup"] {
+            let mut init = HashMap::new();
+            init.insert("bubbles".to_string(), Value::Bool(true));
+            init.insert("cancelable".to_string(), Value::Bool(true));
+            init.insert("key".to_string(), Value::string(" "));
+            init.insert("charCode".to_string(), Value::Number(32.0));
+            init.insert("keyCode".to_string(), Value::Number(32.0));
+            let ev = w3cos_core::intrinsics::construct(
+                &ctor,
+                vec![Value::string(ty), Value::object(init)],
+            );
+            ta.call_method("dispatchEvent", vec![ev]);
+        }
+        assert_eq!(
+            hits.borrow().as_slice(),
+            &[
+                "keydown",
+                "doc-capture",
+                "parent-capture",
+                "keypress",
+                "keyup"
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
     fn dispatch_event_sync_bubbles_and_cancels() {
         setup();
         let doc = document_value();
@@ -29722,23 +31281,336 @@ try {
         let btn_id = node_id_of(&btn).unwrap();
         let count = Rc::new(Cell::new(0));
         let count2 = count.clone();
+        let listener = func(move |_, _| {
+            count2.set(count2.get() + 1);
+            Value::Undefined
+        });
         btn.call_method(
             "addEventListener",
-            vec![
-                Value::string("click"),
-                func(move |_, _| {
-                    count2.set(count2.get() + 1);
-                    Value::Undefined
-                }),
-            ],
+            vec![Value::string("click"), listener.clone()],
         );
-        btn.call_method("removeEventListener", vec![Value::string("click")]);
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), listener],
+        );
         dom::with_document_mut(|doc| {
             let mut ev = Event::click(NodeId::from_u32(btn_id), 0.0, 0.0);
             doc.dispatch_event_bubbling(&mut ev);
         });
         drain_microtasks();
         assert_eq!(count.get(), 0);
+    }
+
+    fn counting_listener(count: &Rc<Cell<u32>>, weight: u32) -> Value {
+        let count = count.clone();
+        func(move |_, _| {
+            count.set(count.get() + weight);
+            Value::Undefined
+        })
+    }
+
+    fn click(node: u32) {
+        dom::with_document_mut(|doc| {
+            let mut ev = Event::click(NodeId::from_u32(node), 0.0, 0.0);
+            doc.dispatch_event_bubbling(&mut ev);
+        });
+        drain_microtasks();
+    }
+
+    #[test]
+    fn listener_store_remove_one_keeps_order_and_index_consistent() {
+        let click = event_type_for("click");
+        let keydown = event_type_for("keydown");
+        let mut store = ListenerStore::new();
+        let mk = |node, event_type, n: f64, capture| JsListener {
+            node,
+            event_type,
+            handler: Value::Number(n),
+            capture,
+            inline: false,
+        };
+        store.push(mk(1, click, 1.0, false));
+        store.push(mk(1, click, 2.0, false));
+        store.push(mk(2, keydown, 3.0, true));
+        store.push(mk(1, click, 4.0, false));
+        store.push(mk(3, click, 5.0, false));
+        let nums = |v: Vec<Value>| v.iter().map(|x| x.to_number()).collect::<Vec<_>>();
+        // Removing from the middle moves the last item (node 3) into the hole.
+        store.remove_one(1, click, &Value::Number(2.0), false);
+        assert_eq!(nums(store.handlers(1, click, None)), vec![1.0, 4.0]);
+        assert_eq!(nums(store.handlers(3, click, None)), vec![5.0]);
+        assert_eq!(
+            store
+                .one_handler(3, click)
+                .ok()
+                .flatten()
+                .map(|v| v.to_number()),
+            Some(5.0)
+        );
+        // Wrong capture flag or unknown handler: no-op.
+        store.remove_one(2, keydown, &Value::Number(3.0), false);
+        store.remove_one(1, click, &Value::Number(9.0), false);
+        assert!(store.has_capture());
+        assert_eq!(store.iter().count(), 4);
+        store.remove_one(2, keydown, &Value::Number(3.0), true);
+        assert!(!store.has_capture());
+        assert!(store.handlers(2, keydown, None).is_empty());
+        store.remove_one(1, click, &Value::Number(1.0), false);
+        assert_eq!(nums(store.handlers(1, click, None)), vec![4.0]);
+        assert!(store.one_handler(1, click).is_err());
+        store.remove_one(1, click, &Value::Number(4.0), false);
+        assert!(store.handlers(1, click, None).is_empty());
+        assert_eq!(nums(store.handlers(3, click, None)), vec![5.0]);
+        assert_eq!(store.iter().count(), 1);
+    }
+
+    #[test]
+    fn remove_event_listener_many_listeners_keeps_dispatch() {
+        setup();
+        let btn = create_in_body("button");
+        let btn_id = node_id_of(&btn).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let ls: Vec<Value> = (0..200).map(|_| counting_listener(&count, 1)).collect();
+        for l in &ls {
+            btn.call_method("addEventListener", vec![Value::string("click"), l.clone()]);
+        }
+        for l in ls.iter().step_by(2) {
+            btn.call_method(
+                "removeEventListener",
+                vec![Value::string("click"), l.clone()],
+            );
+        }
+        click(btn_id);
+        assert_eq!(count.get(), 100);
+    }
+
+    #[test]
+    fn remove_event_listener_removes_only_the_matching_callback_and_capture() {
+        setup();
+        let btn = create_in_body("button");
+        let btn_id = node_id_of(&btn).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let first = counting_listener(&count, 1);
+        let second = counting_listener(&count, 10);
+        let captured = counting_listener(&count, 100);
+        for (listener, capture) in [(&first, false), (&second, false), (&captured, true)] {
+            btn.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("click"),
+                    listener.clone(),
+                    Value::Bool(capture),
+                ],
+            );
+        }
+        // No callback, an unknown callback, or the wrong capture flag remove nothing.
+        btn.call_method("removeEventListener", vec![Value::string("click")]);
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), counting_listener(&count, 1000)],
+        );
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), captured.clone(), Value::Bool(false)],
+        );
+        click(btn_id);
+        assert_eq!(count.get(), 111);
+
+        count.set(0);
+        btn.call_method("removeEventListener", vec![Value::string("click"), first]);
+        let capture_options =
+            Value::object(HashMap::from([("capture".to_string(), Value::Bool(true))]));
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), captured, capture_options],
+        );
+        click(btn_id);
+        assert_eq!(count.get(), 10);
+    }
+
+    #[test]
+    fn add_event_listener_ignores_a_duplicate_registration() {
+        setup();
+        let btn = create_in_body("button");
+        let btn_id = node_id_of(&btn).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let listener = counting_listener(&count, 1);
+        for _ in 0..2 {
+            btn.call_method(
+                "addEventListener",
+                vec![Value::string("click"), listener.clone()],
+            );
+        }
+        click(btn_id);
+        assert_eq!(count.get(), 1);
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), listener],
+        );
+        click(btn_id);
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn window_message_listeners_survive_removing_another_one() {
+        // Two concurrent `acquirePort` calls each listen for window 'message';
+        // the first to resolve removes only its own listener.
+        setup();
+        let window = window_value();
+        let count = Rc::new(Cell::new(0));
+        let first = counting_listener(&count, 1);
+        let second = counting_listener(&count, 10);
+        for listener in [&first, &second] {
+            window.call_method(
+                "addEventListener",
+                vec![Value::string("message"), listener.clone()],
+            );
+        }
+        window.call_method("removeEventListener", vec![Value::string("message"), first]);
+        window.call_method(
+            "postMessage",
+            vec![Value::string("hello"), Value::string("*")],
+        );
+        drain_microtasks();
+        assert_eq!(count.get(), 10);
+        window.call_method(
+            "removeEventListener",
+            vec![Value::string("message"), second],
+        );
+    }
+
+    #[test]
+    fn throwing_timer_is_reported_and_other_timers_still_run() {
+        setup();
+        let win = window_value();
+        let reported = Rc::new(RefCell::new(String::new()));
+        let reported2 = reported.clone();
+        win.set_property(
+            "onerror",
+            func(move |_, args| {
+                *reported2.borrow_mut() = arg(&args, 0).to_js_string();
+                Value::Undefined
+            }),
+        );
+        let fired = Rc::new(Cell::new(0));
+        let fired2 = fired.clone();
+        win.call_method(
+            "setTimeout",
+            vec![
+                func(|_, _| {
+                    w3cos_core::throw_value(Value::string("timer boom"));
+                }),
+                Value::Number(1.0),
+            ],
+        );
+        win.call_method(
+            "setTimeout",
+            vec![
+                func(move |_, _| {
+                    fired2.set(fired2.get() + 1);
+                    Value::Undefined
+                }),
+                Value::Number(1.0),
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(tick_timers(), 2);
+        assert_eq!(fired.get(), 1);
+        assert_eq!(reported.borrow().as_str(), "timer boom");
+        win.set_property("onerror", Value::Null);
+    }
+
+    #[test]
+    fn unhandled_timer_exception_goes_to_process_uncaught_exception_or_stays_fatal() {
+        setup();
+        let win = window_value();
+        win.set_property("onerror", Value::Null);
+        let saved_process = win.get_property("process");
+        let throwing = || {
+            func(|_, _| {
+                w3cos_core::throw_value(Value::string("no handler"));
+            })
+        };
+        // No onerror and no 'uncaughtException' listener: the throw is fatal.
+        win.set_property("process", Value::Undefined);
+        win.call_method("setTimeout", vec![throwing(), Value::Number(1.0)]);
+        std::thread::sleep(Duration::from_millis(10));
+        let fatal = w3cos_core::catch_js(|| Value::Number(tick_timers() as f64));
+        assert_eq!(
+            fatal.err().map(|e| e.to_js_string()).as_deref(),
+            Some("no handler")
+        );
+        // A process with an 'uncaughtException' listener receives it.
+        let emitted = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = emitted.clone();
+        let process = Value::object(HashMap::new());
+        process.set_property(
+            "listenerCount",
+            func(|_, args| {
+                Value::Number(if arg(&args, 0).to_js_string() == "uncaughtException" {
+                    1.0
+                } else {
+                    0.0
+                })
+            }),
+        );
+        process.set_property(
+            "emit",
+            func(move |_, args| {
+                log.borrow_mut().push(format!(
+                    "{} {} {}",
+                    arg(&args, 0).to_js_string(),
+                    arg(&args, 1).to_js_string(),
+                    arg(&args, 2).to_js_string()
+                ));
+                Value::Bool(true)
+            }),
+        );
+        win.set_property("process", process);
+        win.call_method("setTimeout", vec![throwing(), Value::Number(1.0)]);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(
+            emitted.borrow().as_slice(),
+            ["uncaughtException no handler uncaughtException"]
+        );
+        win.set_property("process", saved_process);
+    }
+
+    #[test]
+    fn due_timers_fire_in_deadline_order_and_can_cancel_each_other() {
+        setup();
+        let win = window_value();
+        let log = Rc::new(RefCell::new(String::new()));
+        let slow_log = log.clone();
+        let slow = win.call_method(
+            "setTimeout",
+            vec![
+                func(move |_, _| {
+                    slow_log.borrow_mut().push('S');
+                    Value::Undefined
+                }),
+                Value::Number(5.0),
+            ],
+        );
+        let fast_log = log.clone();
+        let win_for_fast = win.clone();
+        win.call_method(
+            "setTimeout",
+            vec![
+                func(move |_, _| {
+                    fast_log.borrow_mut().push('F');
+                    win_for_fast.call_method("clearTimeout", vec![slow.clone()]);
+                    Value::Undefined
+                }),
+                Value::Number(0.0),
+            ],
+        );
+        // Both are due by now; the 0ms one must run first and cancel the 5ms one.
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(log.borrow().as_str(), "F");
+        assert!(!has_pending_work() || tick_timers() == 0);
     }
 
     #[test]
@@ -29812,6 +31684,83 @@ try {
         window.call_method("cancelIdleCallback", vec![cancelled]);
         assert_eq!(tick_timers(), 1);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_callbacks_yield_to_ready_tasks_one_per_tick() {
+        setup();
+        let window = window_value();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let push = |tag: &'static str| {
+            let log = Rc::clone(&log);
+            func(move |_, _| {
+                log.borrow_mut().push(tag);
+                Value::Undefined
+            })
+        };
+        window.call_method("requestIdleCallback", vec![push("idle1")]);
+        window.call_method("requestIdleCallback", vec![push("idle2")]);
+        window.call_method("setTimeout", vec![push("task"), Value::Number(0.0)]);
+        std::thread::sleep(Duration::from_millis(2));
+        // The task registered after both idle callbacks runs first, then a
+        // single idle callback; the second waits for the next idle period.
+        assert_eq!(tick_timers(), 2);
+        assert_eq!(*log.borrow(), vec!["task", "idle1"]);
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["task", "idle1", "idle2"]);
+        assert_eq!(tick_timers(), 0);
+    }
+
+    #[test]
+    fn idle_callback_waits_for_pending_microtasks_unless_timed_out() {
+        setup();
+        let window = window_value();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let push = |tag: &'static str| {
+            let log = Rc::clone(&log);
+            func(move |_, _| {
+                log.borrow_mut().push(tag);
+                Value::Undefined
+            })
+        };
+        window.call_method("requestIdleCallback", vec![push("idle")]);
+        window.call_method(
+            "requestIdleCallback",
+            vec![
+                push("expired"),
+                Value::object(HashMap::from([("timeout".to_string(), Value::Number(0.0))])),
+            ],
+        );
+        queue_microtask_value(push("micro"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["expired"]);
+        drain_microtasks();
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["expired", "micro", "idle"]);
+    }
+
+    #[test]
+    fn idle_callback_runs_after_starvation_bound_when_never_idle() {
+        setup();
+        let window = window_value();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let push = |tag: &'static str| {
+            let log = Rc::clone(&log);
+            func(move |_, _| {
+                log.borrow_mut().push(tag);
+                Value::Undefined
+            })
+        };
+        window.call_method("requestIdleCallback", vec![push("idle")]);
+        // Work stays pending, so the loop never reaches an idle period.
+        queue_microtask_value(push("micro"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(tick_timers(), 0);
+        std::thread::sleep(IDLE_STARVATION + Duration::from_millis(5));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["idle"]);
+        drain_microtasks();
     }
 
     #[test]
@@ -31824,6 +33773,837 @@ try {
     }
 
     #[test]
+    fn block_in_inline_cssom_keeps_ordered_physical_fragments() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        host.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("before")])],
+        );
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block.clone()]);
+        host.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("after")])],
+        );
+
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        let before = rects.get_property("0");
+        let middle = rects.get_property("1");
+        let after = rects.get_property("2");
+        assert!(before.get_property("width").to_number() > 0.0);
+        assert!(before.get_property("width").to_number() < 400.0);
+        assert_eq!(middle.get_property("width").to_number(), 400.0);
+        assert_eq!(middle.get_property("height").to_number(), 10.0);
+        assert!(after.get_property("width").to_number() > 0.0);
+        assert!(after.get_property("width").to_number() < 400.0);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert!(bounds.get_property("height").to_number() > 10.0);
+
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("300px"));
+        let narrower = host.call_method("getClientRects", vec![]);
+        assert_eq!(narrower.get_property("length").to_u32(), 3);
+        assert_eq!(
+            narrower.get_property("1").get_property("width").to_number(),
+            300.0
+        );
+        assert_eq!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "retained"
+        );
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let restored = host.call_method("getClientRects", vec![]);
+        assert_eq!(restored.get_property("length").to_u32(), 3);
+        assert_eq!(
+            restored.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        assert_eq!(crate::incremental_layout::last_flush_stats().kind, "memo");
+
+        host.call_method("removeChild", vec![block.clone()]);
+        assert_eq!(
+            host.call_method("getClientRects", vec![])
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        host.call_method("appendChild", vec![block]);
+        let reappended = host.call_method("getClientRects", vec![]);
+        assert_eq!(reappended.get_property("length").to_u32(), 3);
+        assert_eq!(
+            reappended
+                .get_property("2")
+                .get_property("width")
+                .to_number(),
+            0.0,
+            "a block appended after the trailing text retains Chrome's trailing split edge"
+        );
+        let old_host = node_id_of(&host).unwrap();
+        setup();
+        assert!(
+            crate::incremental_layout::client_rects(old_host).is_none(),
+            "document reset must clear sparse fragment geometry before NodeId reuse"
+        );
+    }
+
+    #[test]
+    fn block_in_inline_block_flex_grid_and_positioned_matrix() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        for (display, width, height) in [
+            ("block", 20.0, 10.0),
+            ("flex", 30.0, 11.0),
+            ("grid", 40.0, 12.0),
+        ] {
+            let outer = create_in_body("div");
+            outer
+                .get_property("style")
+                .set_property("width", Value::string("400px"));
+            let host = document.call_method("createElement", vec![Value::string("span")]);
+            outer.call_method("appendChild", vec![host.clone()]);
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            style.set_property("display", Value::string(display));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+            host.call_method("appendChild", vec![child]);
+
+            let rects = host.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_u32(), 3, "{display}");
+            for edge in ["0", "2"] {
+                let rect = rects.get_property(edge);
+                assert_eq!(rect.get_property("width").to_number(), 0.0, "{display}");
+                assert_eq!(rect.get_property("height").to_number(), 0.0, "{display}");
+            }
+            let middle = rects.get_property("1");
+            assert_eq!(middle.get_property("width").to_number(), 400.0, "{display}");
+            assert_eq!(
+                middle.get_property("height").to_number(),
+                height,
+                "{display}"
+            );
+        }
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        for (width, height) in [(20.0, 10.0), (30.0, 11.0)] {
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            style.set_property("display", Value::string("block"));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+            host.call_method("appendChild", vec![child]);
+        }
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        assert_eq!(
+            rects.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        assert_eq!(
+            rects.get_property("1").get_property("height").to_number(),
+            21.0
+        );
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        let nested = document.call_method("createElement", vec![Value::string("span")]);
+        nested.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("nested")])],
+        );
+        block.call_method("appendChild", vec![nested]);
+        host.call_method("appendChild", vec![block]);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert_eq!(bounds.get_property("height").to_number(), 10.0);
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        let host_style = host.get_property("style");
+        host_style.set_property("padding", Value::string("2px"));
+        host_style.set_property("border", Value::string("1px solid black"));
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block]);
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert!(bounds.get_property("height").to_number() >= 10.0);
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let positioned = document.call_method("createElement", vec![Value::string("div")]);
+        let style = positioned.get_property("style");
+        style.set_property("position", Value::string("absolute"));
+        style.set_property("width", Value::string("50px"));
+        style.set_property("height", Value::string("13px"));
+        host.call_method("appendChild", vec![positioned]);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 0.0);
+        assert_eq!(bounds.get_property("height").to_number(), 0.0);
+    }
+
+    #[test]
+    fn block_in_inline_retained_child_geometry_keeps_fragment_owner() {
+        setup();
+        set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::register_rule(
+            ".cold",
+            &[("display", "block"), ("width", "20px"), ("height", "10px")],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".hot",
+            &[("display", "block"), ("width", "24px"), ("height", "12px")],
+        );
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let internal_owner = w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER;
+        let computed_owner = || {
+            window_value()
+                .call_method("getComputedStyle", vec![host.clone()])
+                .call_method("getPropertyValue", vec![Value::string(internal_owner)])
+                .to_js_string()
+        };
+        assert_eq!(computed_owner(), "");
+        host.get_property("style").call_method(
+            "setProperty",
+            vec![Value::string(internal_owner), Value::string("user-token")],
+        );
+        let inline_owner = || {
+            host.get_property("style")
+                .call_method("getPropertyValue", vec![Value::string(internal_owner)])
+                .to_js_string()
+        };
+        assert_eq!(inline_owner(), "user-token");
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        block.set_property("className", Value::string("cold"));
+        host.call_method("appendChild", vec![block.clone()]);
+        let initial = host.call_method("getClientRects", vec![]);
+        assert_eq!(
+            initial.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        // aot-port exposes computed custom properties: the author's own value
+        // is reported, but the internal numeric owner must never leak.
+        assert_eq!(computed_owner(), "user-token");
+        assert_eq!(inline_owner(), "user-token");
+
+        block.set_property("className", Value::string("hot"));
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("420px"));
+        let changed = host.call_method("getClientRects", vec![]);
+        assert_eq!(changed.get_property("length").to_u32(), 3);
+        assert_eq!(
+            changed.get_property("1").get_property("width").to_number(),
+            420.0
+        );
+        assert_eq!(
+            changed.get_property("1").get_property("height").to_number(),
+            12.0
+        );
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 420.0);
+        assert_eq!(bounds.get_property("height").to_number(), 12.0);
+        assert_eq!(computed_owner(), "user-token");
+        assert_eq!(inline_owner(), "user-token");
+    }
+
+    #[test]
+    fn nested_block_in_inline_owners_survive_restyle_and_inner_removal() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let family = "W3cosOwnerTinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register a deterministic face for owner geometry");
+        w3cos_dom::stylesheet::register_rule(
+            ".cold",
+            &[("display", "block"), ("width", "20px"), ("height", "10px")],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".hot",
+            &[("display", "block"), ("width", "24px"), ("height", "12px")],
+        );
+        let document = document_value();
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("400px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
+        let outer = document.call_method("createElement", vec![Value::string("span")]);
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        let inner_block = document.call_method("createElement", vec![Value::string("div")]);
+        inner_block.set_property("className", Value::string("cold"));
+        let outer_block = document.call_method("createElement", vec![Value::string("div")]);
+        let outer_block_style = outer_block.get_property("style");
+        outer_block_style.set_property("display", Value::string("block"));
+        outer_block_style.set_property("width", Value::string("30px"));
+        outer_block_style.set_property("height", Value::string("11px"));
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("inner-before")])],
+        );
+        inner.call_method("appendChild", vec![inner_block.clone()]);
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("inner-after")])],
+        );
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("outer-before")])],
+        );
+        outer.call_method("appendChild", vec![inner.clone()]);
+        outer.call_method("appendChild", vec![outer_block]);
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("outer-after")])],
+        );
+        root.call_method("appendChild", vec![outer.clone()]);
+
+        let assert_split = |element: &Value, expected_len: u32, width: f64| {
+            let rects = element.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_u32(), expected_len);
+            assert_eq!(
+                element
+                    .call_method("getBoundingClientRect", vec![])
+                    .get_property("width")
+                    .to_number(),
+                width
+            );
+        };
+        let outer_id = node_id_of(&outer).unwrap();
+        let inner_id = node_id_of(&inner).unwrap();
+        let (outer_owners, inner_owners, inner_ranges, inner_boxes) = dom::with_document(|tree| {
+            fn collect(
+                component: &w3cos_std::Component,
+                outer_id: u32,
+                inner_id: u32,
+                counts: &mut (usize, usize),
+                ranges: &mut Vec<(String, usize, usize)>,
+                boxes: &mut usize,
+            ) {
+                if let Some(owner) =
+                    component
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .and_then(|properties| {
+                            properties.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+                        })
+                {
+                    for owner in owner
+                        .split(',')
+                        .filter_map(|owner| owner.parse::<u32>().ok())
+                    {
+                        counts.0 += usize::from(owner == outer_id);
+                        counts.1 += usize::from(owner == inner_id);
+                    }
+                }
+                if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                    for (owner, start, end) in
+                        w3cos_std::inline_text::cssom_owner_ranges(content, &component.style)
+                    {
+                        counts.0 += usize::from(owner == outer_id);
+                        counts.1 += usize::from(owner == inner_id);
+                        if owner == inner_id {
+                            ranges.push((content.clone(), start, end));
+                        }
+                    }
+                }
+                for owner in w3cos_std::inline_text::cssom_box_owners(&component.style) {
+                    counts.0 += usize::from(owner == outer_id);
+                    counts.1 += usize::from(owner == inner_id);
+                    *boxes += usize::from(owner == inner_id);
+                }
+                for child in &component.children {
+                    collect(child, outer_id, inner_id, counts, ranges, boxes);
+                }
+            }
+            let mut counts = (0, 0);
+            let mut ranges = Vec::new();
+            let mut boxes = 0;
+            collect(
+                &tree.to_component_tree(),
+                outer_id,
+                inner_id,
+                &mut counts,
+                &mut ranges,
+                &mut boxes,
+            );
+            (counts.0, counts.1, ranges, boxes)
+        });
+        assert!(
+            inner_ranges
+                .iter()
+                .any(|(text, start, end)| text == "outer-beforeinner-before"
+                    && (*start, *end) == (12, 24)),
+            "the inner-before UTF-8 source range must survive outer coalescing"
+        );
+        assert!(
+            inner_ranges
+                .iter()
+                .any(|(text, start, end)| text == "inner-after" && (*start, *end) == (0, 11)),
+            "the inner-after source range must survive outer coalescing"
+        );
+        assert!(
+            inner_boxes > 0,
+            "the inner anonymous block must retain its owner"
+        );
+        assert_split(&outer, 5, 400.0);
+        assert_split(&inner, 3, 400.0);
+        let rect_tuples = |element: &Value| {
+            let rects = element.call_method("getClientRects", vec![]);
+            (0..rects.get_property("length").to_u32())
+                .map(|index| {
+                    let rect = rects.get_property(&index.to_string());
+                    (
+                        rect.get_property("x").to_number(),
+                        rect.get_property("y").to_number(),
+                        rect.get_property("width").to_number(),
+                        rect.get_property("height").to_number(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let outer_rects = rect_tuples(&outer);
+        let inner_rects = rect_tuples(&inner);
+        assert_eq!(inner_rects[0].1, outer_rects[0].1);
+        assert_eq!(inner_rects[0].3, outer_rects[0].3);
+        assert_eq!(inner_rects[1], outer_rects[1]);
+        assert_eq!(inner_rects[2].1, outer_rects[2].1);
+        assert_eq!(inner_rects[2].3, outer_rects[2].3);
+        assert!(
+            (inner_rects[0].2 - 78.7421875).abs() < 0.001,
+            "unexpected leading inner fragment: {inner_rects:?}"
+        );
+        assert!(
+            (inner_rects[2].2 - 67.1875).abs() < 0.001,
+            "unexpected trailing inner fragment: {inner_rects:?}"
+        );
+        assert!(outer_owners > 0, "outer split owner must survive lowering");
+        assert!(inner_owners > 0, "inner split owner must survive lowering");
+
+        inner_block.set_property("className", Value::string("hot"));
+        root.get_property("style")
+            .set_property("width", Value::string("420px"));
+        assert_split(&outer, 5, 420.0);
+        assert_split(&inner, 3, 420.0);
+        assert_eq!(
+            inner_block
+                .call_method("getBoundingClientRect", vec![])
+                .get_property("height")
+                .to_number(),
+            12.0
+        );
+
+        inner.call_method("removeChild", vec![inner_block]);
+        assert_split(&outer, 3, 420.0);
+        let inner_rects = inner.call_method("getClientRects", vec![]);
+        assert_eq!(inner_rects.get_property("length").to_u32(), 1);
+        assert!(
+            inner
+                .call_method("getBoundingClientRect", vec![])
+                .get_property("width")
+                .to_number()
+                < 420.0
+        );
+    }
+
+    #[test]
+    fn nested_block_in_inline_owner_ranges_follow_physical_line_wrapping() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let family = "W3cosNestedTinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register the same deterministic face used by the Chrome control");
+        w3cos_dom::stylesheet::register_rule(".cold", &[("display", "block"), ("height", "12px")]);
+        w3cos_dom::stylesheet::register_rule(".hot", &[("display", "block"), ("height", "14px")]);
+        let document = document_value();
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("130px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
+        let outer = document.call_method("createElement", vec![Value::string("span")]);
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        block.set_property("className", Value::string("cold"));
+        let outer_block = document.call_method("createElement", vec![Value::string("div")]);
+        let outer_block_style = outer_block.get_property("style");
+        outer_block_style.set_property("display", Value::string("block"));
+        outer_block_style.set_property("height", Value::string("11px"));
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("inner words that wrap across lines ")],
+            )],
+        );
+        inner.call_method("appendChild", vec![block.clone()]);
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("inner tail words")])],
+        );
+        outer.call_method(
+            "appendChild",
+            vec![
+                document.call_method("createTextNode", vec![Value::string("outer words before ")]),
+            ],
+        );
+        outer.call_method("appendChild", vec![inner.clone()]);
+        outer.call_method("appendChild", vec![outer_block]);
+        root.call_method("appendChild", vec![outer.clone()]);
+
+        let rects = inner.call_method("getClientRects", vec![]);
+        let rects = (0..rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rects.len() > 3,
+            "inner text must span multiple physical lines: {rects:?}"
+        );
+        assert!(
+            rects
+                .iter()
+                .any(|(_, _, width, height)| (*width - 130.0).abs() < 0.001
+                    && (*height - 12.0).abs() < 0.001),
+            "the anonymous block fragment must remain owned by the inner inline"
+        );
+        assert!(
+            rects.iter().all(|(_, _, width, _)| *width <= 130.001),
+            "an inner physical fragment must not exceed its containing line"
+        );
+        let assert_inline_geometry = |actual: &[(f64, f64, f64, f64)], expected: &[(f64, f64)]| {
+            assert_eq!(actual.len(), expected.len(), "rects={actual:?}");
+            for ((x, _, width, _), (expected_x, expected_width)) in actual.iter().zip(expected) {
+                assert!(
+                    (x - expected_x).abs() < 0.001,
+                    "x={x}, expected={expected_x}"
+                );
+                assert!(
+                    (width - expected_width).abs() < 0.001,
+                    "width={width}, expected={expected_width}, rects={actual:?}"
+                );
+            }
+        };
+        assert_inline_geometry(
+            &rects,
+            &[
+                (8.0, 103.984375),
+                (8.0, 110.1875),
+                (8.0, 130.0),
+                (8.0, 100.421875),
+            ],
+        );
+        let outer_rects = outer.call_method("getClientRects", vec![]);
+        let outer_rects = (0..outer_rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = outer_rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_inline_geometry(
+            &outer_rects,
+            &[
+                (8.0, 120.84375),
+                (8.0, 103.984375),
+                (8.0, 110.1875),
+                (8.0, 130.0),
+                (8.0, 100.421875),
+                (8.0, 130.0),
+                (8.0, 0.0),
+            ],
+        );
+        let assert_full_geometry =
+            |actual: &[(f64, f64, f64, f64)], expected: &[(f64, f64, f64, f64)]| {
+                assert_eq!(actual.len(), expected.len(), "rects={actual:?}");
+                for (actual_rect, expected_rect) in actual.iter().zip(expected) {
+                    for (actual_value, expected_value) in
+                        [actual_rect.0, actual_rect.1, actual_rect.2, actual_rect.3]
+                            .into_iter()
+                            .zip([
+                                expected_rect.0,
+                                expected_rect.1,
+                                expected_rect.2,
+                                expected_rect.3,
+                            ])
+                    {
+                        assert!(
+                            (actual_value - expected_value).abs() < 0.001,
+                            "actual={actual_value}, expected={expected_value}, rects={actual:?}"
+                        );
+                    }
+                }
+            };
+        assert_full_geometry(
+            &outer_rects,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 12.0),
+                (8.0, 78.609375, 100.421875, 17.0),
+                (8.0, 96.8125, 130.0, 11.0),
+                (8.0, 107.8125, 0.0, 0.0),
+            ],
+        );
+        assert_full_geometry(
+            &rects,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 12.0),
+                (8.0, 78.609375, 100.421875, 17.0),
+            ],
+        );
+
+        block.set_property("className", Value::string("hot"));
+        let restyled = inner.call_method("getClientRects", vec![]);
+        let restyled = (0..restyled.get_property("length").to_u32())
+            .map(|index| {
+                let rect = restyled.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let restyled_outer = outer.call_method("getClientRects", vec![]);
+        let restyled_outer = (0..restyled_outer.get_property("length").to_u32())
+            .map(|index| {
+                let rect = restyled_outer.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_full_geometry(
+            &restyled,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 14.0),
+                (8.0, 80.609375, 100.421875, 17.0),
+            ],
+        );
+        assert_full_geometry(
+            &restyled_outer,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 14.0),
+                (8.0, 80.609375, 100.421875, 17.0),
+                (8.0, 98.8125, 130.0, 11.0),
+                (8.0, 109.8125, 0.0, 0.0),
+            ],
+        );
+
+        inner.call_method("removeChild", vec![block]);
+        let removed = inner.call_method("getClientRects", vec![]);
+        let removed = (0..removed.get_property("length").to_u32())
+            .map(|index| {
+                let rect = removed.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let removed_outer = outer.call_method("getClientRects", vec![]);
+        let removed_outer = (0..removed_outer.get_property("length").to_u32())
+            .map(|index| {
+                let rect = removed_outer.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_full_geometry(
+            &removed,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 66.609375, 100.421875, 17.0),
+            ],
+        );
+        assert_full_geometry(
+            &removed_outer,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 66.609375, 100.421875, 17.0),
+                (8.0, 84.8125, 130.0, 11.0),
+                (8.0, 95.8125, 0.0, 0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn nested_owner_ranges_preserve_utf8_and_collapsed_whitespace() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let family = "W3cosUtf8Tinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register a deterministic face for UTF-8 owner geometry");
+        let document = document_value();
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("105px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
+        let outer = document.call_method("createElement", vec![Value::string("span")]);
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let block_style = block.get_property("style");
+        block_style.set_property("display", Value::string("block"));
+        block_style.set_property("height", Value::string("9px"));
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("  café 世界   words wrap  ")],
+            )],
+        );
+        inner.call_method("appendChild", vec![block]);
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string(" tail")])],
+        );
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("prefix  ")])],
+        );
+        outer.call_method("appendChild", vec![inner.clone()]);
+        root.call_method("appendChild", vec![outer]);
+
+        let rects = inner.call_method("getClientRects", vec![]);
+        let rects = (0..rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("width").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            (50.203125, 62.640625),
+            (8.0, 75.09375),
+            (8.0, 105.0),
+            (8.0, 20.4375),
+        ];
+        assert_eq!(rects.len(), expected.len(), "rects={rects:?}");
+        for ((x, width), (expected_x, expected_width)) in rects.iter().zip(expected) {
+            assert!(
+                (x - expected_x).abs() < 0.5,
+                "x={x}, expected={expected_x}, rects={rects:?}"
+            );
+            assert!(
+                (width - expected_width).abs() < 0.001,
+                "width={width}, expected={expected_width}, rects={rects:?}"
+            );
+        }
+    }
+
+    #[test]
     fn focus_and_active_element() {
         setup();
         let doc = document_value();
@@ -31832,6 +34612,610 @@ try {
         assert!(doc.get_property("activeElement") == input);
         input.call_method("blur", vec![]);
         assert!(doc.get_property("activeElement") == doc.get_property("body"));
+    }
+
+    #[test]
+    fn node_prototype_getters_are_real_accessors_for_dompurify() {
+        setup();
+        let window = window_value();
+        let getter = |proto: &Value, name: &str| {
+            w3cos_core::class::get_own_property_descriptor(proto, name).get_property("get")
+        };
+        let node_proto = window.get_property("Node").get_property("prototype");
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("span")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+        let get_name = getter(&node_proto, "nodeName");
+        assert!(get_name.is_callable(), "Node.prototype nodeName getter");
+        assert_eq!(get_name.call(child.clone(), vec![]).to_js_string(), "SPAN");
+        assert_eq!(
+            getter(&node_proto, "nodeType").call(child.clone(), vec![]),
+            Value::Number(1.0)
+        );
+        assert!(getter(&node_proto, "parentNode").call(child.clone(), vec![]) == parent);
+        let kids = getter(&node_proto, "childNodes").call(parent.clone(), vec![]);
+        assert_eq!(kids.get_property("length"), Value::Number(1.0));
+        assert_eq!(
+            getter(&node_proto, "ownerDocument").call(child.clone(), vec![]),
+            document_value()
+        );
+        assert!(child.get_property("attributes").is_object());
+        // Instances still read through the bridge.
+        assert_eq!(child.get_property("nodeName").to_js_string(), "SPAN");
+        assert_eq!(
+            document_value().get_property("nodeName").to_js_string(),
+            "#document"
+        );
+    }
+
+    #[test]
+    fn captured_document_get_elements_by_tag_name_honors_the_receiver() {
+        setup();
+        let gebtn = document_value().get_property("getElementsByTagName");
+        let parser = crate::jsdom::dom_parser_class();
+        let parsed = w3cos_core::intrinsics::construct(&parser, vec![]).call_method(
+            "parseFromString",
+            vec![Value::string("<p id=x>hi</p>"), Value::string("text/html")],
+        );
+        let body = gebtn
+            .call(parsed.clone(), vec![Value::string("body")])
+            .get_property("0");
+        assert!(
+            body != document_value().get_property("body"),
+            "must not return the live body"
+        );
+        assert!(body == parsed.get_property("body"));
+        assert_eq!(
+            body.get_property("firstChild")
+                .get_property("id")
+                .to_js_string(),
+            "x"
+        );
+        // Plain calls still answer for the main document.
+        assert!(
+            gebtn
+                .call(document_value(), vec![Value::string("body")])
+                .get_property("0")
+                == document_value().get_property("body")
+        );
+    }
+
+    #[test]
+    fn captured_prototype_focus_blur_click_act_on_the_receiver() {
+        setup();
+        let doc = document_value();
+        let proto = window_value()
+            .get_property("HTMLElement")
+            .get_property("prototype");
+        // Captured before any element exists, like workbench/window.ts does.
+        let orig_focus = proto.get_property("focus");
+        let orig_blur = proto.get_property("blur");
+        let orig_click = proto.get_property("click");
+        assert!(orig_focus.is_callable(), "HTMLElement.prototype.focus");
+        assert!(orig_blur.is_callable(), "HTMLElement.prototype.blur");
+        assert!(orig_click.is_callable(), "HTMLElement.prototype.click");
+        let input = create_in_body("input");
+        orig_focus.call(input.clone(), vec![]);
+        assert!(doc.get_property("activeElement") == input);
+        orig_blur.call(input.clone(), vec![]);
+        assert!(doc.get_property("activeElement") == doc.get_property("body"));
+        let clicks = Rc::new(Cell::new(0));
+        let seen = clicks.clone();
+        input.call_method(
+            "addEventListener",
+            vec![
+                Value::string("click"),
+                Value::function(move |_, _| {
+                    seen.set(seen.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        orig_click.call(input.clone(), vec![]);
+        assert_eq!(clicks.get(), 1);
+        // A wrapper installed on the prototype that delegates to the captured
+        // original must still focus the element.
+        let wrapped = orig_focus.clone();
+        proto.set_property(
+            "focus",
+            Value::function(move |this, args| wrapped.call(this, args)),
+        );
+        let other = create_in_body("textarea");
+        other.call_method("focus", vec![]);
+        assert!(doc.get_property("activeElement") == other);
+    }
+
+    #[test]
+    fn typed_text_reaches_the_focused_edit_context() {
+        setup();
+        let context =
+            w3cos_core::class::construct(&crate::edit_context_web::edit_context_class(), vec![]);
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        editor.set_property("editContext", context.clone());
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = seen.clone();
+        context.call_method(
+            "addEventListener",
+            vec![
+                Value::string("textupdate"),
+                Value::function(move |_, args| {
+                    let event = &args[0];
+                    log.borrow_mut().push(format!(
+                        "{}@{}-{}",
+                        event.get_property("text").to_js_string(),
+                        event.get_property("updateRangeStart").to_u32(),
+                        event.get_property("updateRangeEnd").to_u32()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+        let before = Rc::new(Cell::new(0));
+        let before_count = before.clone();
+        editor.call_method(
+            "addEventListener",
+            vec![
+                Value::string("beforeinput"),
+                Value::function(move |_, _| {
+                    before_count.set(before_count.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        // Nothing focused yet: not an EditContext target.
+        assert!(!deliver_edit_context_text("x"));
+        editor.call_method("focus", vec![]);
+        assert!(deliver_edit_context_text("H"));
+        assert!(deliver_edit_context_text("i"));
+        assert_eq!(
+            *seen.borrow(),
+            vec!["H@0-0".to_string(), "i@1-1".to_string()]
+        );
+        assert_eq!(context.get_property("text").to_js_string(), "Hi");
+        assert_eq!(before.get(), 2);
+        // A plain focused element is not an EditContext target.
+        let plain = create_in_body("input");
+        plain.call_method("focus", vec![]);
+        assert!(!deliver_edit_context_text("z"));
+    }
+
+    #[test]
+    fn edit_context_commands_fire_beforeinput_and_deletions_fire_textupdate() {
+        setup();
+        let context = w3cos_core::class::construct(
+            &crate::edit_context_web::edit_context_class(),
+            vec![Value::object(HashMap::from([
+                ("text".into(), Value::string("a\u{1F600}bc")),
+                ("selectionStart".into(), Value::Number(4.0)),
+                ("selectionEnd".into(), Value::Number(4.0)),
+            ]))],
+        );
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        editor.set_property("editContext", context.clone());
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let before = log.clone();
+        editor.call_method(
+            "addEventListener",
+            vec![
+                Value::string("beforeinput"),
+                Value::function(move |_, args| {
+                    before.borrow_mut().push(format!(
+                        "before:{}",
+                        args[0].get_property("inputType").to_js_string()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+        let updates = log.clone();
+        context.call_method(
+            "addEventListener",
+            vec![
+                Value::string("textupdate"),
+                Value::function(move |_, args| {
+                    let e = &args[0];
+                    updates.borrow_mut().push(format!(
+                        "update:{:?}@{}-{}",
+                        e.get_property("text").to_js_string(),
+                        e.get_property("updateRangeStart").to_u32(),
+                        e.get_property("updateRangeEnd").to_u32()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(!deliver_edit_context_command("insertParagraph"));
+        editor.call_method("focus", vec![]);
+        assert!(deliver_edit_context_command("insertParagraph"));
+        assert_eq!(*log.borrow(), vec!["before:insertParagraph".to_string()]);
+        log.borrow_mut().clear();
+        // Units: a, D83D, DE00, b, c; caret at 4 so Backspace removes 'b'.
+        assert!(deliver_edit_context_command("deleteContentBackward"));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{1F600}c");
+        assert!(deliver_edit_context_command("deleteContentBackward"));
+        // Surrogate pair removed as one unit.
+        assert_eq!(context.get_property("text").to_js_string(), "ac");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "before:deleteContentBackward".to_string(),
+                "update:\"\"@3-4".to_string(),
+                "before:deleteContentBackward".to_string(),
+                "update:\"\"@1-3".to_string(),
+            ]
+        );
+        log.borrow_mut().clear();
+        assert!(deliver_edit_context_command("deleteContentForward"));
+        assert_eq!(context.get_property("text").to_js_string(), "a");
+        assert_eq!(context.get_property("selectionStart").to_u32(), 1);
+        // At the end nothing more to delete forward, still consumed.
+        assert!(deliver_edit_context_command("deleteContentForward"));
+        assert_eq!(context.get_property("text").to_js_string(), "a");
+        assert_eq!(
+            edit_context_input_type_for_key("Enter", false),
+            Some("insertParagraph")
+        );
+        assert_eq!(
+            edit_context_input_type_for_key("Enter", true),
+            Some("insertLineBreak")
+        );
+        assert_eq!(edit_context_input_type_for_key("a", false), None);
+    }
+
+    #[test]
+    fn leaf_fragment_probe_counts_parent_style_queries() {
+        setup();
+        let document = document_value();
+        let root = create_in_body("div");
+        let mut nodes = Vec::with_capacity(4_000);
+        for _ in 0..4_000 {
+            let node = document.call_method("createElement", vec![Value::string("div")]);
+            let id = node_id_of(&node).expect("element node id");
+            root.call_method("appendChild", vec![node]);
+            nodes.push(id);
+        }
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        for _ in 0..2 {
+            for node in &nodes {
+                assert!(block_in_inline_fragment_bounds(*node, |_| None).is_none());
+            }
+        }
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            0
+        );
+    }
+
+    #[test]
+    fn fragment_probe_preserves_dynamic_element_child_path() {
+        setup();
+        let document = document_value();
+        let target = create_in_body("span");
+        let target_id = node_id_of(&target).expect("target node id");
+        target.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("text")])],
+        );
+
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        assert!(block_in_inline_fragment_bounds(target_id, |_| None).is_none());
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            0,
+            "text-only children cannot form block-in-inline fragments"
+        );
+
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        block
+            .get_property("style")
+            .set_property("display", Value::string("block"));
+        target.call_method("appendChild", vec![block.clone()]);
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        let bounds = block_in_inline_fragment_bounds(target_id, |_| {
+            Some(w3cos_dom::DOMRect::new(3.0, 4.0, 20.0, 10.0))
+        })
+        .expect("the real element-child path must still be evaluated");
+        assert_eq!(bounds, w3cos_dom::DOMRect::new(3.0, 4.0, 20.0, 10.0));
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            2,
+            "the positive path still checks both existing style gates"
+        );
+
+        target.call_method("removeChild", vec![block]);
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        assert!(block_in_inline_fragment_bounds(target_id, |_| None).is_none());
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            0,
+            "removing the last element child must restore the early exit"
+        );
+    }
+
+    #[test]
+    fn display_contents_rect_stays_empty_while_dynamic_child_layout_flushes() {
+        setup();
+        let document = document_value();
+        let contents = create_in_body("div");
+        contents
+            .get_property("style")
+            .set_property("display", Value::string("contents"));
+
+        let assert_empty = |value: &Value| {
+            let rect = value.call_method("getBoundingClientRect", vec![]);
+            assert_eq!(rect.get_property("x").to_number(), 0.0);
+            assert_eq!(rect.get_property("y").to_number(), 0.0);
+            assert_eq!(rect.get_property("width").to_number(), 0.0);
+            assert_eq!(rect.get_property("height").to_number(), 0.0);
+        };
+        assert_empty(&contents);
+
+        contents.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("text")])],
+        );
+        assert_empty(&contents);
+
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let block_style = block.get_property("style");
+        block_style.set_property("display", Value::string("block"));
+        block_style.set_property("width", Value::string("30px"));
+        block_style.set_property("height", Value::string("12px"));
+        contents.call_method("appendChild", vec![block.clone()]);
+        assert_empty(&contents);
+        let child_rect = block.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(child_rect.get_property("width").to_number(), 30.0);
+        assert_eq!(child_rect.get_property("height").to_number(), 12.0);
+
+        contents.call_method("removeChild", vec![block]);
+        assert_empty(&contents);
+    }
+
+    #[test]
+    fn edit_context_ime_composition_fires_textupdate_formats_and_end() {
+        setup();
+        let context = w3cos_core::class::construct(
+            &crate::edit_context_web::edit_context_class(),
+            vec![Value::object(HashMap::from([
+                ("text".into(), Value::string("ab")),
+                ("selectionStart".into(), Value::Number(1.0)),
+                ("selectionEnd".into(), Value::Number(1.0)),
+            ]))],
+        );
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        editor.set_property("editContext", context.clone());
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        for name in [
+            "compositionstart",
+            "compositionend",
+            "textupdate",
+            "textformatupdate",
+        ] {
+            let log = log.clone();
+            context.call_method(
+                "addEventListener",
+                vec![
+                    Value::string(name),
+                    Value::function(move |_, args| {
+                        let e = &args[0];
+                        let entry = match name {
+                            "textupdate" => format!(
+                                "update:{:?}@{}-{}",
+                                e.get_property("text").to_js_string(),
+                                e.get_property("updateRangeStart").to_u32(),
+                                e.get_property("updateRangeEnd").to_u32()
+                            ),
+                            "textformatupdate" => {
+                                let formats = e.call_method("getTextFormats", vec![]);
+                                let n = formats.get_property("length").to_u32();
+                                if n == 0 {
+                                    "formats:none".to_string()
+                                } else {
+                                    let f = formats.get_property("0");
+                                    format!(
+                                        "formats:{}-{}:{}",
+                                        f.get_property("rangeStart").to_u32(),
+                                        f.get_property("rangeEnd").to_u32(),
+                                        f.get_property("underlineThickness").to_js_string()
+                                    )
+                                }
+                            }
+                            _ => format!("{name}:{}", e.get_property("data").to_js_string()),
+                        };
+                        log.borrow_mut().push(entry);
+                        Value::Undefined
+                    }),
+                ],
+            );
+        }
+        assert!(!deliver_edit_context_ime("preedit", "n"));
+        editor.call_method("focus", vec![]);
+        assert!(deliver_edit_context_ime("preedit", "ni"));
+        assert!(deliver_edit_context_ime("preedit", "ni h"));
+        assert_eq!(context.get_property("text").to_js_string(), "ani hb");
+        assert!(deliver_edit_context_ime("commit", "\u{4f60}"));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{4f60}b");
+        assert_eq!(context.get_property("selectionStart").to_u32(), 2);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "compositionstart:".to_string(),
+                "update:\"ni\"@1-1".to_string(),
+                "formats:1-3:thin".to_string(),
+                "update:\"ni h\"@1-3".to_string(),
+                "formats:1-5:thin".to_string(),
+                "update:\"\u{4f60}\"@1-5".to_string(),
+                "formats:none".to_string(),
+                "compositionend:\u{4f60}".to_string(),
+            ]
+        );
+        log.borrow_mut().clear();
+        // Cancelling a preedit removes it and ends the composition.
+        assert!(deliver_edit_context_ime("preedit", "x"));
+        assert!(deliver_edit_context_ime("preedit", ""));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{4f60}b");
+        assert_eq!(
+            log.borrow().last().map(String::as_str),
+            Some("compositionend:")
+        );
+        // A commit without a preedit is plain text input.
+        log.borrow_mut().clear();
+        assert!(deliver_edit_context_ime("commit", "z"));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{4f60}zb");
+        assert_eq!(*log.borrow(), vec!["update:\"z\"@2-2".to_string()]);
+    }
+
+    #[test]
+    fn captured_prototype_methods_are_callable_and_act_on_the_receiver() {
+        setup();
+        let win = window_value();
+        let proto = |name: &str| win.get_property(name).get_property("prototype");
+        for (ctor, names) in [
+            (
+                "Node",
+                "appendChild removeChild getRootNode normalize isEqualNode isSameNode",
+            ),
+            (
+                "Element",
+                "after append before closest getAttribute getAttributeNames getBoundingClientRect \
+                 hasAttribute hasAttributes insertAdjacentElement insertAdjacentHTML matches \
+                 prepend querySelector querySelectorAll remove removeAttribute replaceChildren \
+                 replaceWith scrollIntoView setAttribute toggleAttribute webkitMatchesSelector",
+            ),
+            (
+                "Document",
+                "getElementById getElementsByClassName getElementsByTagName querySelector \
+                 querySelectorAll elementFromPoint elementsFromPoint hasFocus createEvent",
+            ),
+        ] {
+            let prototype = proto(ctor);
+            for name in names.split_whitespace() {
+                assert!(
+                    prototype.get_property(name).is_callable(),
+                    "{ctor}.prototype.{name} should be callable"
+                );
+            }
+        }
+        // Captured before any element exists.
+        let el = proto("Element");
+        let set_attribute = el.get_property("setAttribute");
+        let get_attribute = el.get_property("getAttribute");
+        let has_attribute = el.get_property("hasAttribute");
+        let remove_attribute = el.get_property("removeAttribute");
+        let matches = el.get_property("matches");
+        let closest = el.get_property("closest");
+        let query_selector = el.get_property("querySelector");
+        let remove = el.get_property("remove");
+        let append_child = proto("Node").get_property("appendChild");
+        let get_root_node = proto("Node").get_property("getRootNode");
+
+        let host = create_in_body("div");
+        set_attribute.call(
+            host.clone(),
+            vec![Value::string("id"), Value::string("host")],
+        );
+        assert_eq!(
+            get_attribute
+                .call(host.clone(), vec![Value::string("id")])
+                .to_js_string(),
+            "host"
+        );
+        assert!(has_attribute.call(host.clone(), vec![Value::string("id")]) == Value::Bool(true));
+        assert!(matches.call(host.clone(), vec![Value::string("#host")]) == Value::Bool(true));
+        let child = create_in_body("span");
+        append_child.call(host.clone(), vec![child.clone()]);
+        assert!(query_selector.call(host.clone(), vec![Value::string("span")]) == child);
+        assert!(closest.call(child.clone(), vec![Value::string("#host")]) == host);
+        assert!(get_root_node.call(child.clone(), vec![]) == document_value());
+        remove_attribute.call(host.clone(), vec![Value::string("id")]);
+        assert!(has_attribute.call(host.clone(), vec![Value::string("id")]) == Value::Bool(false));
+        remove.call(child.clone(), vec![]);
+        assert!(query_selector.call(host.clone(), vec![Value::string("span")]) == Value::Null);
+
+        let doc = document_value();
+        let by_id = proto("Document").get_property("getElementById");
+        set_attribute.call(
+            host.clone(),
+            vec![Value::string("id"), Value::string("again")],
+        );
+        assert!(by_id.call(doc.clone(), vec![Value::string("again")]) == host);
+        let doc_query = proto("Document").get_property("querySelector");
+        assert!(doc_query.call(doc, vec![Value::string("#again")]) == host);
+
+        // Instance lookups still reach the per-node bridge method.
+        assert!(host.call_method("matches", vec![Value::string("#again")]) == Value::Bool(true));
+    }
+
+    #[test]
+    fn native_key_events_target_the_active_element() {
+        setup();
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        let other = create_in_body("button");
+        let other_id = node_id_of(&other).unwrap();
+        // Nothing focused: the native chain target is used.
+        assert_eq!(keyboard_event_target(Some(other_id)), Some(other_id));
+        assert_eq!(keyboard_event_target(None), None);
+        editor.call_method("focus", vec![]);
+        let editor_id = node_id_of(&editor).unwrap();
+        assert_eq!(keyboard_event_target(Some(other_id)), Some(editor_id));
+        assert_eq!(keyboard_event_target(None), Some(editor_id));
+        let keys = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = keys.clone();
+        editor.call_method(
+            "addEventListener",
+            vec![
+                Value::string("keydown"),
+                Value::function(move |_, args| {
+                    let event = &args[0];
+                    log.borrow_mut().push(format!(
+                        "{}:{}",
+                        event.get_property("key").to_js_string(),
+                        event.get_property("keyCode").to_u32()
+                    ));
+                    event.call_method("preventDefault", vec![]);
+                    Value::Undefined
+                }),
+            ],
+        );
+        let target = keyboard_event_target(Some(other_id)).unwrap();
+        let prevented = dispatch_native_key(
+            target, "Enter", "Enter", false, false, false, false, false, true,
+        );
+        assert!(prevented);
+        assert_eq!(*keys.borrow(), vec!["Enter:13".to_string()]);
+    }
+
+    #[test]
+    fn focus_readonly_tabindex_textarea_becomes_active_element() {
+        setup();
+        let doc = document_value();
+        let area = create_in_body("textarea");
+        area.call_method(
+            "setAttribute",
+            vec![Value::string("readonly"), Value::string("true")],
+        );
+        area.call_method(
+            "setAttribute",
+            vec![Value::string("tabindex"), Value::string("-1")],
+        );
+        area.call_method(
+            "setAttribute",
+            vec![Value::string("aria-hidden"), Value::string("true")],
+        );
+        area.set_property("className", Value::string("ime-text-area"));
+        let style = area.get_property("style");
+        style.set_property("position", Value::string("absolute"));
+        style.set_property("width", Value::string("1px"));
+        style.set_property("height", Value::string("1px"));
+        area.call_method("focus", vec![]);
+        assert!(
+            doc.get_property("activeElement") == area,
+            "readonly tabindex=-1 textarea must take focus"
+        );
     }
 
     #[test]
@@ -32165,6 +35549,32 @@ try {
             serialize_computed_style_property("color", "rgba(255, 0, 0, 0.5)"),
             "rgba(255, 0, 0, 0.502)"
         );
+    }
+
+    #[test]
+    fn get_computed_style_reuses_a_live_declaration_per_element() {
+        setup();
+        let win = window_value();
+        let div = create_in_body("div");
+        div.get_property("style")
+            .set_property("paddingTop", Value::string("3px"));
+        let first = win.call_method("getComputedStyle", vec![div.clone()]);
+        let second = win.call_method("getComputedStyle", vec![div.clone()]);
+        assert!(first.strict_eq(&second));
+        assert_eq!(
+            first
+                .call_method("getPropertyValue", vec![Value::string("padding-top")])
+                .to_js_string(),
+            "3px"
+        );
+        div.get_property("style")
+            .set_property("paddingTop", Value::string("7px"));
+        assert_eq!(second.get_property("paddingTop").to_js_string(), "7px");
+        let other = create_in_body("div");
+        let third = win.call_method("getComputedStyle", vec![other]);
+        assert!(!third.strict_eq(&first));
+        let before = win.call_method("getComputedStyle", vec![div, Value::string("::before")]);
+        assert!(!before.strict_eq(&first));
     }
 
     #[test]
@@ -32698,4 +36108,13 @@ try {
         );
         assert_eq!(hits.get(), 400);
     }
+}
+
+pub(crate) fn canvas_2d_rgba(node: u32) -> Option<(u32, u32, Vec<u8>)> {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        let context = contexts.get(&node)?;
+        let context = context.borrow();
+        Some((context.width, context.height, context.pixels().to_vec()))
+    })
 }

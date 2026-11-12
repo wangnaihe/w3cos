@@ -180,6 +180,13 @@ pub enum Instruction {
         key: Register,
         value: Register,
     },
+    /// Installs a class method / accessor slot as a non-enumerable own
+    /// property (ECMAScript class elements are not enumerable).
+    DefineMethod {
+        object: Register,
+        key: Register,
+        value: Register,
+    },
     DefinePrivate {
         object: Register,
         brand: Register,
@@ -308,6 +315,12 @@ pub enum Instruction {
     ImportMeta {
         dst: Register,
     },
+    /// `new.target` of the enclosing ordinary function: the constructor
+    /// for a [[Construct]] call, undefined for a [[Call]]. Lowering places
+    /// it first in the entry block.
+    NewTarget {
+        dst: Register,
+    },
     Await {
         dst: Register,
         value: Register,
@@ -408,6 +421,10 @@ pub struct Function {
     pub is_async: bool,
     #[serde(default)]
     pub is_generator: bool,
+    /// Own `name` and `length` of the function object a `CreateClosure`
+    /// produces (SetFunctionName / SetFunctionLength), when known statically.
+    #[serde(default)]
+    pub own_name_length: Option<(String, u32)>,
     pub source_span: Option<SourceSpan>,
     /// Declared (speculative) parameter / return types from TypeScript
     /// annotations. Empty for untyped JavaScript. See [`types`].
@@ -827,6 +844,7 @@ pub fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(*dst),
@@ -835,6 +853,7 @@ pub fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::RefreshBinding { .. }
         | Instruction::SetProperty { .. }
         | Instruction::DefineField { .. }
+        | Instruction::DefineMethod { .. }
         | Instruction::DefinePrivate { .. }
         | Instruction::SetPrivate { .. }
         | Instruction::DefinePrivateMethod { .. }
@@ -851,7 +870,9 @@ pub fn written_register(instruction: &Instruction) -> Option<Register> {
 
 fn registers(instruction: &Instruction) -> Vec<Register> {
     match instruction {
-        Instruction::LoadConstant { dst, .. } | Instruction::ImportMeta { dst } => vec![*dst],
+        Instruction::LoadConstant { dst, .. }
+        | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst } => vec![*dst],
         Instruction::Move { dst, src } => vec![*dst, *src],
         Instruction::LoadBinding { dst, .. } => vec![*dst],
         Instruction::InitializeBinding { value, .. } | Instruction::StoreBinding { value, .. } => {
@@ -866,7 +887,8 @@ fn registers(instruction: &Instruction) -> Vec<Register> {
         Instruction::SetProperty {
             object, key, value, ..
         }
-        | Instruction::DefineField { object, key, value } => vec![*object, *key, *value],
+        | Instruction::DefineField { object, key, value }
+        | Instruction::DefineMethod { object, key, value } => vec![*object, *key, *value],
         Instruction::DefinePrivate {
             object,
             brand,
@@ -1100,6 +1122,7 @@ mod tests {
                 generator_suspension_points: Vec::new(),
                 is_async: false,
                 is_generator: false,
+                own_name_length: None,
                 source_span: None,
                 types: Default::default(),
             }],
@@ -1262,6 +1285,7 @@ mod tests {
                     generator_suspension_points: Vec::new(),
                     is_async: true,
                     is_generator: false,
+                    own_name_length: None,
                     source_span: Some(SourceSpan {
                         source: "app:///main.js".into(),
                         start: 0,
@@ -1295,6 +1319,7 @@ mod tests {
                     generator_suspension_points: Vec::new(),
                     is_async: false,
                     is_generator: false,
+                    own_name_length: None,
                     source_span: None,
                     types: Default::default(),
                 },
@@ -1395,6 +1420,7 @@ mod tests {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
             types: Default::default(),
         });

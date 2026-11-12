@@ -152,7 +152,7 @@ mod tests {
         for (rank, content) in ["a", "b", "c"].into_iter().enumerate() {
             let mut style = Style::default();
             style.display = w3cos_std::style::Display::Inline;
-            style.custom_properties = Some(std::collections::HashMap::from([(
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                 LOGICAL_ORDER.to_string(),
                 rank.to_string(),
             )]));

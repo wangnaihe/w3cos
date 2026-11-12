@@ -2,6 +2,7 @@
 name = "w3cos-demo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "W3C OS showcase demo binary — pre-compiled from examples/showcase/app.tsx"
 
@@ -10,5 +11,5 @@ name = "w3cos-demo"
 path = "src/main.rs"
 
 [dependencies]
-w3cos-runtime = { workspace = true }
+w3cos-runtime = { workspace = true, features = ["image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"] }
 w3cos-std = { workspace = true }

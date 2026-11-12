@@ -4,7 +4,11 @@
 use super::{FontFaceStyle, FontKey, FontWeight, LoadedFont};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+#[path = "platform_fonts.rs"]
+mod platform_fonts;
 
 static DATABASE: OnceLock<Mutex<fontdb::Database>> = OnceLock::new();
 static CACHE: OnceLock<Mutex<HashMap<FontKey, Option<LoadedFont>>>> = OnceLock::new();
@@ -21,6 +25,11 @@ pub(super) fn database() -> MutexGuard<'static, fontdb::Database> {
             database.load_system_fonts();
             #[cfg(any(target_os = "android", target_env = "ohos"))]
             database.load_fonts_dir("/system/fonts");
+            #[cfg(target_os = "android")]
+            {
+                database.load_fonts_dir("/product/fonts");
+                database.load_fonts_dir("/system/product/fonts");
+            }
             #[cfg(target_os = "ios")]
             for path in [
                 "/System/Library/Fonts",
@@ -194,41 +203,88 @@ pub(super) fn pin_test_fontconfig() {
     }
 }
 
+/// The packaged CJK subset is about 9.6 MiB. Tests always link it so layout
+/// metrics do not depend on the host. Production binaries link it only when
+/// the `embed-cjk-font` feature is enabled.
+#[cfg(any(test, feature = "embed-cjk-font"))]
+fn cjk_subset_bytes() -> &'static [u8] {
+    include_bytes!("../assets/CJK-Subset.ttf")
+}
+
+#[cfg(any(test, feature = "embed-cjk-font"))]
+pub(super) fn embedded_cjk_subset_len() -> usize {
+    cjk_subset_bytes().len()
+}
+
 /// Test builds ship a CJK subset so layout checks do not depend on the host.
-/// Release linkage probes stay inside the AOT size budget, so production
-/// fallback keeps using installed faces.
-#[cfg(test)]
-fn bundled_cjk_face() -> Option<LoadedFont> {
+/// Release builds use it only behind `embed-cjk-font`, and only after the
+/// platform font API has no face for the character.
+#[cfg(any(test, feature = "embed-cjk-font"))]
+pub(super) fn bundled_cjk_face() -> Option<LoadedFont> {
     static FACE: OnceLock<Option<LoadedFont>> = OnceLock::new();
     FACE.get_or_init(|| {
-        let data = Arc::new(include_bytes!("../assets/CJK-Subset.ttf").to_vec());
-        let parsed =
-            fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default()).ok()?;
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        Some(LoadedFont {
-            family: "W3COS CJK Subset".into(),
-            weight: FontWeight::NORMAL,
-            style: FontFaceStyle::Normal,
-            data,
-            is_monospace: false,
-            parsed: Some(Arc::new(parsed)),
-            unicode_ranges: None,
-            cache_key: hasher.finish(),
-            collection_index: Some(0),
-            #[cfg(feature = "skia")]
-            skia_typeface: Arc::new(OnceLock::new()),
-        })
+        loaded_from_bytes(
+            "W3COS CJK Subset".into(),
+            Arc::new(cjk_subset_bytes().to_vec()),
+            0,
+        )
     })
     .clone()
+}
+
+fn loaded_from_bytes(family: String, data: Arc<Vec<u8>>, index: u32) -> Option<LoadedFont> {
+    let parsed = fontdue::Font::from_bytes(
+        data.as_slice(),
+        fontdue::FontSettings {
+            collection_index: index,
+            ..fontdue::FontSettings::default()
+        },
+    )
+    .ok()?;
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    index.hash(&mut hasher);
+    Some(LoadedFont {
+        family,
+        weight: FontWeight::NORMAL,
+        style: FontFaceStyle::Normal,
+        data,
+        is_monospace: false,
+        parsed: Some(Arc::new(parsed)),
+        unicode_ranges: None,
+        cache_key: hasher.finish(),
+        collection_index: Some(index),
+        #[cfg(feature = "skia")]
+        skia_typeface: Arc::new(OnceLock::new()),
+    })
+}
+
+fn load_file_covering(path: &std::path::Path, character: char) -> Option<LoadedFont> {
+    let bytes = Arc::new(std::fs::read(path).ok()?);
+    let family = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Platform Font")
+        .to_string();
+    for index in 0..16 {
+        let Some(font) = loaded_from_bytes(family.clone(), Arc::clone(&bytes), index) else {
+            break;
+        };
+        if inks(&font, character) {
+            return Some(font);
+        }
+    }
+    None
 }
 
 /// Face to use when the primary font has no glyph for `character`.
 ///
 /// Order: fontconfig's charset match (when `libfontconfig` is installed),
-/// then a named CJK / emoji / symbol chain, then other installed faces.
-/// A face is kept only when this rasterizer can actually ink the glyph, so a
-/// color-bitmap emoji font does not win and then draw nothing.
+/// the bundled CJK subset during tests, the platform font API in production,
+/// the bundled subset again when `embed-cjk-font` is enabled, a named CJK /
+/// emoji / symbol chain, then other installed faces. A missing CJK face warns
+/// once. A face is kept only when this rasterizer can actually ink the glyph,
+/// so a color-bitmap emoji font does not win and then draw nothing.
 pub(super) fn fallback_for_character(character: char) -> Option<LoadedFont> {
     let cache = FALLBACK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache.lock().unwrap().get(&character).cloned() {
@@ -249,7 +305,22 @@ fn lookup_fallback(character: char) -> Option<LoadedFont> {
     {
         return Some(font);
     }
+    // Tests consult the bundled subset before any platform matcher so macOS
+    // layout metrics stay pinned to that face.
     #[cfg(test)]
+    if is_cjk(character)
+        && let Some(font) = bundled_cjk_face()
+        && inks(&font, character)
+    {
+        return Some(font);
+    }
+    #[cfg(not(test))]
+    if let Some(path) = platform_fonts::font_file_for_character(character)
+        && let Some(font) = load_file_covering(&path, character)
+    {
+        return Some(font);
+    }
+    #[cfg(all(not(test), feature = "embed-cjk-font"))]
     if is_cjk(character)
         && let Some(font) = bundled_cjk_face()
         && inks(&font, character)
@@ -263,7 +334,24 @@ fn lookup_fallback(character: char) -> Option<LoadedFont> {
             return Some(font);
         }
     }
-    scan_installed(character)
+    if let Some(font) = scan_installed(character) {
+        return Some(font);
+    }
+    if is_cjk(character) {
+        warn_missing_cjk(character);
+    }
+    None
+}
+
+fn warn_missing_cjk(character: char) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[W3C OS] no system font covers U+{code:04X}; CJK text cannot be drawn. Install a CJK font or rebuild with the embed-cjk-font feature.",
+        code = character as u32
+    );
 }
 
 fn inks(font: &LoadedFont, character: char) -> bool {
@@ -422,8 +510,162 @@ pub(super) fn preferred_host_face() -> Option<PreferredHostFace> {
         let (path, _) = fontconfig_match_named(
             "PingFang SC,Microsoft YaHei,Noto Sans CJK SC,Noto Sans SC,Noto Sans,Roboto,sans-serif:weight=regular:slant=0",
         )?;
+        return single_file_host_face(&[path]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_pingfang_files().and_then(|files| single_file_host_face(&files));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_message_face();
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        return platform_fonts::ui_font_file().and_then(|path| any_regular_face(&[path]));
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android",
+        target_os = "ios"
+    )))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_message_face() -> Option<PreferredHostFace> {
+    let name = platform_fonts::ui_message_font_name()?;
+    static NAME: OnceLock<String> = OnceLock::new();
+    let name = NAME.get_or_init(|| name);
+    let database = database();
+    let id = database.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(name)],
+        weight: fontdb::Weight::NORMAL,
+        ..fontdb::Query::default()
+    })?;
+    let face = database.face(id)?;
+    if !(350..=450).contains(&face.weight.0) {
+        return None;
+    }
+    let family = face
+        .families
+        .first()
+        .map(|(family, _)| family.clone())
+        .unwrap_or_else(|| name.clone());
+    let index = face.index;
+    let bytes = database.with_face_data(id, |data, _| Arc::new(data.to_vec()))?;
+    Some(PreferredHostFace {
+        bytes,
+        index,
+        family,
+    })
+}
+
+/// Accept a platform UI file even when its family is not in the desktop
+/// host-UI allowlist (Roboto, SF Pro, and the Android Noto files).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn any_regular_face(paths: &[std::path::PathBuf]) -> Option<PreferredHostFace> {
+    let mut database = fontdb::Database::new();
+    for path in paths {
+        database.load_font_file(path).ok()?;
+    }
+    let id = database.faces().find_map(|face| {
+        ((350..=450).contains(&face.weight.0) && face.style == fontdb::Style::Normal)
+            .then_some(face.id)
+    })?;
+    let face = database.face(id)?;
+    if !(350..=450).contains(&face.weight.0) {
+        return None;
+    }
+    let family = face.families.first()?.0.clone();
+    let index = face.index;
+    let bytes = database.with_face_data(id, |data, _| Arc::new(data.to_vec()))?;
+    Some(PreferredHostFace {
+        bytes,
+        index,
+        family,
+    })
+}
+
+/// macOS ships PingFang SC, the first host UI family, as a downloadable
+/// asset. fontdb's `load_system_fonts` walks `/Library/Fonts`,
+/// `/System/Library/Fonts`, every `AssetsV2/com_apple_MobileAsset_Font*`
+/// and `~/Library/Fonts`; its query picks the first listed family that has
+/// faces. When PingFang only lives in the asset directories, loading just
+/// those files selects the same face without parsing every installed font.
+#[cfg(target_os = "macos")]
+fn macos_pingfang_files() -> Option<Vec<std::path::PathBuf>> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, any_pingfang: &mut bool) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out, any_pingfang);
+            } else if path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("pingfang")
+            }) {
+                *any_pingfang = true;
+                out.push(path);
+            }
+        }
+    }
+    // A PingFang file in a directory fontdb scans first would win ties.
+    let home_fonts = std::env::var("HOME")
+        .map(|home| std::path::Path::new(&home).join("Library/Fonts"))
+        .ok();
+    for dir in [
+        "/Library/Fonts",
+        "/System/Library/Fonts",
+        "/Network/Library/Fonts",
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .chain(home_fonts)
+    {
+        let mut found = Vec::new();
+        let mut any = false;
+        walk(&dir, &mut found, &mut any);
+        if any {
+            return None;
+        }
+    }
+    let mut files = Vec::new();
+    let mut any = false;
+    for entry in std::fs::read_dir("/System/Library/AssetsV2")
+        .ok()?
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("com_apple_MobileAsset_Font")
+        {
+            walk(&entry.path(), &mut files, &mut any);
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+/// Accept a one-file match only when its query selects a regular face of a
+/// named host UI family — the same face the full database query returns.
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos"
+))]
+fn single_file_host_face(paths: &[std::path::PathBuf]) -> Option<PreferredHostFace> {
+    {
         let mut database = fontdb::Database::new();
-        database.load_font_file(&path).ok()?;
+        for path in paths {
+            database.load_font_file(path).ok()?;
+        }
         let families = [
             fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[0]),
             fontdb::Family::Name(HOST_UI_NAMED_FAMILIES[1]),
@@ -454,15 +696,11 @@ pub(super) fn preferred_host_face() -> Option<PreferredHostFace> {
             .clone();
         let index = face.index;
         let bytes = database.with_face_data(id, |data, _| Arc::new(data.to_vec()))?;
-        return Some(PreferredHostFace {
+        Some(PreferredHostFace {
             bytes,
             index,
             family,
-        });
-    }
-    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
-    {
-        None
+        })
     }
 }
 
@@ -705,6 +943,28 @@ fn fontconfig_match(character: char) -> Option<(std::path::PathBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_single_file_host_face_matches_the_full_database_query() {
+        let Some(files) = macos_pingfang_files() else {
+            return;
+        };
+        let fast = single_file_host_face(&files).expect("PingFang regular face");
+        let database = database();
+        let id = database
+            .query(&fontdb::Query {
+                families: &host_ui_families(),
+                ..fontdb::Query::default()
+            })
+            .expect("full query");
+        let face = database.face(id).unwrap();
+        let family = &face.families.first().unwrap().0;
+        assert_eq!(family, &fast.family);
+        assert_eq!(face.index, fast.index);
+        let bytes = database.with_face_data(id, |data, _| data.len()).unwrap();
+        assert_eq!(bytes, fast.bytes.len());
+    }
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     #[test]

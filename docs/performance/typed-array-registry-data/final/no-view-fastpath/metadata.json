@@ -1,0 +1,30 @@
+{
+  "pairs": 11,
+  "iterations": 1000000,
+  "views": 0,
+  "allowed_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "selected_cpu": 0,
+  "effective_cpus": [
+    0
+  ],
+  "binaries": {
+    "baseline": {
+      "path": "lifecycle-baseline",
+      "sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84"
+    },
+    "candidate": {
+      "path": "fastpath-candidate",
+      "sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2"
+    }
+  }
+}

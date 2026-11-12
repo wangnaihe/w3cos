@@ -463,6 +463,7 @@ fn finish_module(mut builder: Builder, specifier: &str, name: &str) -> Result<Mo
         is_generator: builder.is_generator,
         source_span: None,
         types: Default::default(),
+        own_name_length: None,
     }];
     functions.extend(builder.functions);
     let mut module = Module::new(specifier, FunctionId(0), functions);
@@ -783,6 +784,12 @@ struct Builder {
     /// Name an anonymous function/arrow takes from its object-literal key
     /// (`{ f: () => 1 }.f.name === "f"`); consumed by the next one lowered.
     pending_function_name: Option<String>,
+    /// Inside a class constructor (or an arrow nested in one): `new.target`
+    /// is the constructor that created `this`.
+    class_constructor_scope: bool,
+    /// Set just before lowering a class constructor body; consumed by
+    /// `lower_nested_function`.
+    pending_class_constructor: bool,
 }
 
 impl Builder {
@@ -836,6 +843,8 @@ impl Builder {
             type_names: Default::default(),
             pending_return_hint: None,
             pending_function_name: None,
+            class_constructor_scope: false,
+            pending_class_constructor: false,
         }
     }
 
@@ -893,6 +902,8 @@ impl Builder {
             type_names: Default::default(),
             pending_return_hint: None,
             pending_function_name: None,
+            class_constructor_scope: false,
+            pending_class_constructor: false,
         }
     }
 
@@ -1629,17 +1640,30 @@ impl Builder {
     fn declare_parameter(&mut self, pattern: &Pat, index: usize) -> Result<Option<BindingId>> {
         let source = self.declare_hidden_parameter(index);
         if let Pat::Rest(rest) = pattern {
-            let Pat::Ident(identifier) = rest.arg.as_ref() else {
-                return Err(anyhow!(
-                    "runtime W3IR rest parameters currently require identifier patterns"
-                ));
-            };
             if self.rest_parameter.is_some() {
                 return Err(anyhow!(
                     "runtime W3IR function has multiple rest parameters"
                 ));
             }
-            self.declare_local_with_kind(identifier.id.sym.as_ref(), BindingKind::Let, true)?;
+            match rest.arg.as_ref() {
+                Pat::Ident(identifier) => {
+                    self.declare_local_with_kind(
+                        identifier.id.sym.as_ref(),
+                        BindingKind::Let,
+                        true,
+                    )?;
+                }
+                // `...[a, b]` / `...{ length }`: the rest array is
+                // destructured by `initialize_parameter`.
+                Pat::Array(_) | Pat::Object(_) => {
+                    self.declare_parameter_pattern_bindings(&rest.arg)?;
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "runtime W3IR does not yet support this rest parameter pattern"
+                    ));
+                }
+            }
             self.rest_parameter = Some(source);
             return Ok(Some(source));
         }
@@ -1806,6 +1830,14 @@ impl Builder {
                 let binding = self
                     .find_binding(&name)
                     .ok_or_else(|| anyhow!("missing runtime pattern binding {name:?}"))?;
+                // An assignment pattern may write an enclosing function's
+                // binding (`({ a } = v)` in a closure): capture it like a
+                // plain `a = v` does.
+                let binding = if assignment {
+                    self.resolve_binding(&name)
+                } else {
+                    binding
+                };
                 if assignment {
                     self.ensure_mutable_binding(&name, binding)?;
                     self.emit(Instruction::StoreBinding { binding, value });
@@ -2008,6 +2040,12 @@ impl Builder {
 
     fn declare_this_binding(&mut self) -> Result<BindingId> {
         self.declare_local_with_kind("*this*", BindingKind::Parameter, false)
+    }
+
+    /// A derived constructor's `this` is rebound by `super(...)` when the
+    /// parent constructor returns an object, so its binding is assignable.
+    fn declare_derived_constructor_this_binding(&mut self) -> Result<BindingId> {
+        self.declare_local_with_kind("*this*", BindingKind::Parameter, true)
     }
 
     fn declare_arguments_binding(&mut self) -> Result<()> {
@@ -3922,6 +3960,12 @@ impl Builder {
                     let key = self.constant(Constant::String("__w3cos_super_ctor".into()));
                     let dst = self.register();
                     self.emit_method_call(dst, parent, key, arguments);
+                    // `super(...)` yields the bound `this`: the parent's
+                    // returned object when it substituted one.
+                    self.emit(Instruction::StoreBinding {
+                        binding: this_binding,
+                        value: dst,
+                    });
                     return Ok(dst);
                 }
                 if let Callee::Expr(callee) = &call.callee
@@ -4003,6 +4047,25 @@ impl Builder {
                     self.lower_arguments(expression.args.as_deref().unwrap_or_default(), &[])?;
                 let dst = self.register();
                 self.emit_construct(dst, constructor, arguments);
+                Ok(dst)
+            }
+            // `new.target` in a class constructor: the runtime creates `this`
+            // from the constructed class's prototype, so (as Babel's
+            // transform-new-target) it is `this.constructor`.
+            Expr::MetaProp(meta)
+                if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget
+                    && self.class_constructor_scope
+                    && self.find_binding("*this*").is_some() =>
+            {
+                let binding = self.resolve_binding("*this*");
+                let this_value = self.load_binding(binding);
+                let key = self.constant(Constant::String("constructor".into()));
+                let dst = self.register();
+                self.emit(Instruction::GetProperty {
+                    dst,
+                    object: this_value,
+                    key,
+                });
                 Ok(dst)
             }
             Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::ImportMeta => {
@@ -4351,7 +4414,23 @@ impl Builder {
                     );
                 }
 
-                let callee = self.lower_expression(&call.callee)?;
+                // `super.method?.(...)` calls the parent's method with the
+                // current `this` as receiver, like `super.method(...)`.
+                let mut super_callee = call.callee.as_ref();
+                while let Expr::Paren(paren) = super_callee {
+                    super_callee = paren.expr.as_ref();
+                }
+                let super_receiver = if let Expr::SuperProp(property) = super_callee {
+                    let callee = self.lower_super_property(property)?;
+                    let this_binding = self.resolve_binding("*this*");
+                    Some((callee, self.load_binding(this_binding)))
+                } else {
+                    None
+                };
+                let callee = match super_receiver {
+                    Some((callee, _)) => callee,
+                    None => self.lower_expression(&call.callee)?,
+                };
                 let null = self.constant(Constant::Null);
                 let is_nullish = self.register();
                 self.emit(Instruction::Binary {
@@ -4365,7 +4444,10 @@ impl Builder {
                     |builder| Ok(builder.constant(Constant::Undefined)),
                     |builder| {
                         let arguments = builder.lower_arguments(&call.args, &[])?;
-                        let this_value = builder.constant(Constant::Undefined);
+                        let this_value = match super_receiver {
+                            Some((_, receiver)) => receiver,
+                            None => builder.constant(Constant::Undefined),
+                        };
                         let dst = builder.register();
                         builder.emit_call(dst, callee, this_value, arguments);
                         Ok(dst)
@@ -4721,6 +4803,7 @@ impl Builder {
                         statements = parameter_properties;
                     }
                 }
+                self.pending_class_constructor = true;
                 constructor = Some(self.lower_nested_function(
                     parameters,
                     &statements,
@@ -4752,6 +4835,31 @@ impl Builder {
             object: class_value,
             key: prototype_key,
         });
+        // `class A {}` owns a non-enumerable `name` ("A"); a static `name`
+        // member defined below replaces it.
+        let has_static_name = class.body.iter().any(|member| {
+            let key = match member {
+                ClassMember::Method(method) if method.is_static => &method.key,
+                ClassMember::ClassProp(field) if field.is_static => &field.key,
+                _ => return false,
+            };
+            match key {
+                PropName::Ident(identifier) => identifier.sym == *"name",
+                PropName::Str(value) => value.value == *"name",
+                _ => true,
+            }
+        });
+        if let Some(class_name) = name.as_deref()
+            && !has_static_name
+        {
+            let key = self.constant(Constant::String("name".into()));
+            let value = self.constant(Constant::String(class_name.into()));
+            self.emit(Instruction::DefineMethod {
+                object: class_value,
+                key,
+                value,
+            });
+        }
 
         for (member_index, member) in class.body.iter().enumerate() {
             match member {
@@ -4815,7 +4923,7 @@ impl Builder {
                         .get(&member_index)
                         .copied()
                         .ok_or_else(|| anyhow!("runtime W3IR class method key was not prepared"))?;
-                    self.emit(Instruction::SetProperty {
+                    self.emit(Instruction::DefineMethod {
                         object: if method.is_static {
                             class_value
                         } else {
@@ -4823,7 +4931,6 @@ impl Builder {
                         },
                         key,
                         value,
-                        strict: true,
                     });
                 }
                 ClassMember::PrivateMethod(method) => {
@@ -4996,6 +5103,7 @@ impl Builder {
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -5077,6 +5185,7 @@ impl Builder {
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -5125,6 +5234,7 @@ impl Builder {
     ) -> Result<Register> {
         let function_id = FunctionId(self.next_function);
         self.next_function += 1;
+        let class_constructor = std::mem::take(&mut self.pending_class_constructor);
         let strict_mode = self.strict_mode
             || class_super_is_static.is_some()
             || statements_have_use_strict_directive(statements.iter());
@@ -5140,6 +5250,8 @@ impl Builder {
         );
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
+        child.class_constructor_scope =
+            class_constructor || (!bind_this && self.class_constructor_scope);
         child.type_names = std::rc::Rc::clone(&self.type_names);
         let return_hint = self.pending_return_hint.take().unwrap_or_default();
         let parameter_hints = parameters
@@ -5147,7 +5259,11 @@ impl Builder {
             .map(|parameter| parameter_hint(parameter, &self.type_names))
             .collect::<Vec<_>>();
         let this_binding = if bind_this {
-            Some(child.declare_this_binding()?)
+            if class_constructor && child.find_binding("*super*").is_some() {
+                Some(child.declare_derived_constructor_this_binding()?)
+            } else {
+                Some(child.declare_this_binding()?)
+            }
         } else {
             None
         };
@@ -5226,6 +5342,7 @@ impl Builder {
                 parameters: parameter_hints,
                 returns: return_hint,
             },
+            own_name_length: None,
         };
         self.functions.extend(child.functions);
         self.functions.push(function);

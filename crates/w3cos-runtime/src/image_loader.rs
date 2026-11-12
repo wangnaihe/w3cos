@@ -392,6 +392,7 @@ fn unpremultiply_rgba(rgba: &mut [u8]) {
     }
 }
 
+#[cfg(feature = "image-gif")]
 fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(image::RgbaImage, Duration)>, image::ImageError> {
     let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))?;
     decoder.into_frames().collect_frames().map(|frames| {
@@ -404,6 +405,17 @@ fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(image::RgbaImage, Duration)>, 
             })
             .collect()
     })
+}
+
+#[cfg(not(feature = "image-gif"))]
+fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(image::RgbaImage, Duration)>, image::ImageError> {
+    let _ = bytes;
+    Err(image::ImageError::Decoding(
+        image::error::DecodingError::new(
+            image::error::ImageFormatHint::Name("gif".into()),
+            "GIF decoding requires the image-gif feature",
+        ),
+    ))
 }
 
 fn current_animation_frame(src: &str) -> Option<DecodedImage> {

@@ -1,0 +1,30 @@
+[
+  {
+    "original": "lifecycle-baseline",
+    "verified": "verified-baseline",
+    "original_sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84",
+    "verified_sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84",
+    "bit_identical": true
+  },
+  {
+    "original": "fastpath-candidate",
+    "verified": "verified-candidate",
+    "original_sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2",
+    "verified_sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2",
+    "bit_identical": true
+  },
+  {
+    "original": "memory-baseline",
+    "verified": "verified-memory-baseline",
+    "original_sha256": "7a854065cc65a48f749c8e1d3831611cc33d2f4fec2b36ea2c964db1385abeea",
+    "verified_sha256": "3085348aae32efd3f4d17941975dec2656126e62d4b0cdd13eecb7fdc9766b19",
+    "bit_identical": false
+  },
+  {
+    "original": "memory-fastpath-candidate",
+    "verified": "verified-memory-candidate",
+    "original_sha256": "d642a94a147b9f321e9394b58cd354f505e72bf8df5877d46e233f46029365b4",
+    "verified_sha256": "d642a94a147b9f321e9394b58cd354f505e72bf8df5877d46e233f46029365b4",
+    "bit_identical": true
+  }
+]

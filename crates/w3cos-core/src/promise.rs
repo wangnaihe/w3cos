@@ -16,9 +16,13 @@
 //! (`new`'s executor, reaction handlers) catches such panics with
 //! `catch_unwind` and turns the payload back into a rejection.
 //!
-//! v1 limitations: unhandled rejections are tracked as a no-op (nothing
-//! reports them), and `finally` does not await a promise returned from its
-//! callback.
+//! Unhandled rejections follow HTML's HostPromiseRejectionTracker shape:
+//! a promise rejected with no reactions joins an "about to be notified"
+//! list, a later `then` removes it, and the microtask checkpoint reports
+//! what is left. Reporting is the `W3COS_JS_CONSOLE=1` debug channel
+//! (`[js.unhandledrejection] ...` on stderr, like `[js.throw]`); tracking
+//! is off (zero cost) otherwise. v1 limitation: `finally` does not await a
+//! promise returned from its callback.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -72,7 +76,80 @@ thread_local! {
     static PROMISE_STATES: RefCell<HashMap<u64, Weak<RefCell<PromiseState>>>> =
         RefCell::new(HashMap::new());
     static NEXT_PROMISE_ID: Cell<u64> = const { Cell::new(1) };
+    /// Registry size at which the next sweep of dead entries runs.
+    static PROMISE_SWEEP_AT: Cell<usize> = const { Cell::new(PROMISE_SWEEP_MIN) };
+    /// Rejected promises with no reaction yet, with their reasons
+    /// (HTML's "about to be notified rejected promises list").
+    static UNHANDLED_REJECTIONS: RefCell<Vec<(Weak<RefCell<PromiseState>>, Value)>> =
+        const { RefCell::new(Vec::new()) };
+    /// Whether rejection tracking is on: `W3COS_JS_CONSOLE` (read once).
+    static TRACK_REJECTIONS: Cell<Option<bool>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static REPORTED_REJECTIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
+
+fn tracking_rejections() -> bool {
+    TRACK_REJECTIONS.with(|flag| match flag.get() {
+        Some(on) => on,
+        None => {
+            let on = std::env::var_os("W3COS_JS_CONSOLE").is_some();
+            flag.set(Some(on));
+            on
+        }
+    })
+}
+
+/// A reaction was added to `state`: it is no longer unhandled.
+fn mark_rejection_handled(state: &Rc<RefCell<PromiseState>>) {
+    if !tracking_rejections() {
+        return;
+    }
+    UNHANDLED_REJECTIONS.with(|list| {
+        list.borrow_mut()
+            .retain(|(tracked, _)| !std::ptr::eq(tracked.as_ptr(), Rc::as_ptr(state)))
+    });
+}
+
+/// Microtask checkpoint: report rejections that are still unhandled.
+fn report_unhandled_rejections() {
+    if !tracking_rejections() {
+        return;
+    }
+    let pending = UNHANDLED_REJECTIONS.with(|list| std::mem::take(&mut *list.borrow_mut()));
+    for (_, reason) in pending {
+        let stack = if reason.is_object() {
+            reason.get_property("stack")
+        } else {
+            Value::Undefined
+        };
+        let message = if reason.is_object() {
+            reason.get_property("message")
+        } else {
+            Value::Undefined
+        };
+        let detail = if stack.is_string() {
+            stack.to_js_string()
+        } else if !message.is_undefined() {
+            message.to_js_string()
+        } else if reason.is_object() && !reason.is_function() {
+            // A plain object reason (`reject({ code })`): show its fields,
+            // not "[object Object]".
+            let json = crate::value::catch_js(|| crate::json::stringify(vec![reason.clone()]));
+            match json {
+                Ok(json) if json.is_string() => json.to_js_string(),
+                _ => reason.to_js_string(),
+            }
+        } else {
+            reason.to_js_string()
+        };
+        eprintln!("[js.unhandledrejection] Uncaught (in promise) {detail}");
+        #[cfg(test)]
+        REPORTED_REJECTIONS.with(|reported| reported.borrow_mut().push(detail));
+    }
+}
+
+/// Smallest registry size that triggers a sweep of dead entries.
+const PROMISE_SWEEP_MIN: usize = 1024;
 
 fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
     let id = NEXT_PROMISE_ID.with(|counter| {
@@ -82,7 +159,15 @@ fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
     });
     PROMISE_STATES.with(|registry| {
         let mut registry = registry.borrow_mut();
-        registry.retain(|_, state| state.strong_count() != 0);
+        // Sweeping dead entries on every registration made creating N live
+        // promises O(N^2) (a boot with thousands of pending promises kept the
+        // main thread saturated). Sweep when the registry has doubled since
+        // the last sweep instead: amortized O(1), and dead entries are
+        // harmless meanwhile (`Weak::upgrade` fails for them).
+        if registry.len() >= PROMISE_SWEEP_AT.with(Cell::get) {
+            registry.retain(|_, state| state.strong_count() != 0);
+            PROMISE_SWEEP_AT.with(|at| at.set((registry.len() * 2).max(PROMISE_SWEEP_MIN)));
+        }
         registry.insert(id, Rc::downgrade(&state));
     });
     id
@@ -203,6 +288,12 @@ fn settle(state: &Rc<RefCell<PromiseState>>, outcome: Result<Value, Value>) {
         Ok(value) => (true, value),
         Err(reason) => (false, reason),
     };
+    if !is_fulfilled && callbacks.is_empty() && tracking_rejections() {
+        UNHANDLED_REJECTIONS.with(|list| {
+            list.borrow_mut()
+                .push((Rc::downgrade(state), value.clone()))
+        });
+    }
     for reaction in callbacks {
         schedule_reaction(reaction, is_fulfilled, value.clone());
     }
@@ -278,7 +369,12 @@ fn subscribe(
         }
     };
     match settled {
-        Some((is_fulfilled, value)) => schedule_reaction(reaction, is_fulfilled, value),
+        Some((is_fulfilled, value)) => {
+            if !is_fulfilled {
+                mark_rejection_handled(state);
+            }
+            schedule_reaction(reaction, is_fulfilled, value)
+        }
         None => {
             if let PromiseState::Pending { callbacks } = &mut *state.borrow_mut() {
                 callbacks.push(reaction);
@@ -398,20 +494,9 @@ pub fn reject(args: Vec<Value>) -> Value {
 /// `Promise.all(iterable)` — fulfilled with the results array once every
 /// item fulfills, or rejected with the first rejection. Empty → `[]`.
 pub fn all(args: Vec<Value>) -> Value {
-    let items = match args.first() {
-        None => Vec::new(),
-        Some(v) if v.is_nullish() => Vec::new(),
-        Some(items) if items.as_array().is_some() => items
-            .as_array()
-            .expect("array")
-            .borrow()
-            .iter()
-            .cloned()
-            .map(crate::value::array_slot_value)
-            .collect(),
-        Some(_) => {
-            return reject(vec![js_error("TypeError: Promise.all expects an array")]);
-        }
+    let items = match combinator_items(&args, "Promise.all expects an iterable") {
+        Ok(items) => items,
+        Err(error) => return reject(vec![error]),
     };
     let state = pending_state();
     let promise = promise_value_from_state(&state);
@@ -451,16 +536,9 @@ pub fn all(args: Vec<Value>) -> Value {
 
 /// `Promise.race(iterable)` — settles with the first item that settles.
 pub fn race(args: Vec<Value>) -> Value {
-    let items = match args.first() {
-        Some(items) if items.as_array().is_some() => items
-            .as_array()
-            .expect("array")
-            .borrow()
-            .iter()
-            .cloned()
-            .map(crate::value::array_slot_value)
-            .collect(),
-        _ => Vec::new(),
+    let items = match combinator_items(&args, "Promise.race expects an iterable") {
+        Ok(items) => items,
+        Err(error) => return reject(vec![error]),
     };
     let state = pending_state();
     let promise = promise_value_from_state(&state);
@@ -484,6 +562,147 @@ pub fn race(args: Vec<Value>) -> Value {
         subscribe(&item_state, on_fulfilled, on_rejected);
     }
     promise
+}
+
+/// The items of a `Promise.<combinator>(array)` argument (`None` when it is
+/// not an array; nullish counts as empty, like [`all`]).
+/// Items of a combinator's `iterable` argument: arrays read their slots
+/// directly; any other iterable (Set, Map, generators, typed arrays,
+/// strings, `__w3cos_symbol_iterator` objects) is iterated, as
+/// `Promise.all(new Set(promises))` does in Node.
+///
+/// An abrupt completion while iterating (a throwing `next` or `done`
+/// getter) is returned as `Err` so the combinator rejects instead of
+/// throwing synchronously (IfAbruptRejectPromise); the iterator is not
+/// closed, as the step itself failed. Non-iterables give a `TypeError`.
+fn combinator_items(args: &[Value], not_iterable: &str) -> Result<Vec<Value>, Value> {
+    match args.first() {
+        None => Ok(Vec::new()),
+        Some(v) if v.is_nullish() => Ok(Vec::new()),
+        Some(items) if items.as_array().is_some() => Ok(items
+            .as_array()
+            .expect("array")
+            .borrow()
+            .iter()
+            .cloned()
+            .map(crate::value::array_slot_value)
+            .collect()),
+        Some(items) if items.is_iterable() => {
+            crate::value::catch_js_result(|| Ok(items.iter().collect()))
+        }
+        Some(_) => Err(crate::value::type_error(not_iterable)),
+    }
+}
+
+fn settled_record(status: &str, key: &str, value: Value) -> Value {
+    let record = Value::object(HashMap::new());
+    record.set_property("status", Value::string(status));
+    record.set_property(key, value);
+    record
+}
+
+/// `Promise.allSettled(iterable)` — fulfilled, once every item settles,
+/// with `{ status: "fulfilled", value }` / `{ status: "rejected", reason }`
+/// records in input order. Never rejects for settled inputs.
+pub fn all_settled(args: Vec<Value>) -> Value {
+    let items = match combinator_items(&args, "Promise.allSettled expects an iterable") {
+        Ok(items) => items,
+        Err(error) => return reject(vec![error]),
+    };
+    let state = pending_state();
+    let promise = promise_value_from_state(&state);
+    if items.is_empty() {
+        fulfill_state(&state, Value::array(Vec::new()));
+        return promise;
+    }
+    let results = Rc::new(RefCell::new(vec![Value::Undefined; items.len()]));
+    let remaining = Rc::new(Cell::new(items.len()));
+    for (index, item) in items.into_iter().enumerate() {
+        let item_state = pending_state();
+        fulfill_state(&item_state, item);
+        let record = |status: &'static str, key: &'static str| {
+            let results = results.clone();
+            let remaining = remaining.clone();
+            let state = state.clone();
+            Value::function(move |_, args| {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                results.borrow_mut()[index] = settled_record(status, key, value);
+                remaining.set(remaining.get() - 1);
+                if remaining.get() == 0 {
+                    fulfill_state(&state, Value::array(results.borrow().clone()));
+                }
+                Value::Undefined
+            })
+        };
+        let on_fulfilled = record("fulfilled", "value");
+        let on_rejected = record("rejected", "reason");
+        subscribe(&item_state, on_fulfilled, on_rejected);
+    }
+    promise
+}
+
+fn all_rejected_error(errors: Vec<Value>) -> Value {
+    crate::builtins::error_instance(
+        "AggregateError",
+        vec![
+            Value::array(errors),
+            Value::string("All promises were rejected"),
+        ],
+    )
+}
+
+/// `Promise.any(iterable)` — fulfilled with the first item that fulfills;
+/// rejected with an `AggregateError` of every reason (input order) when all
+/// of them reject, or immediately for an empty input.
+pub fn any(args: Vec<Value>) -> Value {
+    let items = match combinator_items(&args, "Promise.any expects an iterable") {
+        Ok(items) => items,
+        Err(error) => return reject(vec![error]),
+    };
+    let state = pending_state();
+    let promise = promise_value_from_state(&state);
+    if items.is_empty() {
+        reject_state(&state, all_rejected_error(Vec::new()));
+        return promise;
+    }
+    let errors = Rc::new(RefCell::new(vec![Value::Undefined; items.len()]));
+    let remaining = Rc::new(Cell::new(items.len()));
+    for (index, item) in items.into_iter().enumerate() {
+        let item_state = pending_state();
+        fulfill_state(&item_state, item);
+        let on_fulfilled = {
+            let state = state.clone();
+            Value::function(move |_, args| {
+                fulfill_state(&state, args.first().cloned().unwrap_or(Value::Undefined));
+                Value::Undefined
+            })
+        };
+        let on_rejected = {
+            let errors = errors.clone();
+            let remaining = remaining.clone();
+            let state = state.clone();
+            Value::function(move |_, args| {
+                errors.borrow_mut()[index] = args.first().cloned().unwrap_or(Value::Undefined);
+                remaining.set(remaining.get() - 1);
+                if remaining.get() == 0 {
+                    reject_state(&state, all_rejected_error(errors.borrow().clone()));
+                }
+                Value::Undefined
+            })
+        };
+        subscribe(&item_state, on_fulfilled, on_rejected);
+    }
+    promise
+}
+
+/// `Promise.withResolvers()` — `{ promise, resolve, reject }`.
+pub fn with_resolvers(_args: Vec<Value>) -> Value {
+    let state = pending_state();
+    let result = Value::object(HashMap::new());
+    result.set_property("promise", promise_value_from_state(&state));
+    result.set_property("resolve", make_resolve(state.clone()));
+    result.set_property("reject", make_reject(state));
+    result
 }
 
 // ── Microtask queue ────────────────────────────────────────────────────
@@ -512,6 +731,7 @@ pub fn drain_microtasks() -> usize {
             // targets released so far, then drain whatever they queued.
             let finalized = crate::weak::run_pending_finalizers();
             if finalized == 0 {
+                report_unhandled_rejections();
                 break;
             }
             ran += finalized;
@@ -569,6 +789,88 @@ pub fn status(value: &Value) -> Option<PromiseStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn promise_registry_is_swept_in_amortized_batches() {
+        PROMISE_STATES.with(|registry| registry.borrow_mut().clear());
+        PROMISE_SWEEP_AT.with(|at| at.set(PROMISE_SWEEP_MIN));
+        // Dead promises are dropped once the registry reaches the threshold.
+        for _ in 0..(PROMISE_SWEEP_MIN * 3) {
+            drop(pending_state_registered());
+        }
+        let len = PROMISE_STATES.with(|registry| registry.borrow().len());
+        assert!(len <= PROMISE_SWEEP_MIN, "dead entries swept, len {len}");
+        // Live promises stay resolvable.
+        let live: Vec<_> = (0..50).map(|_| pending_state_registered()).collect();
+        for (state, id) in &live {
+            let found = PROMISE_STATES
+                .with(|registry| registry.borrow().get(id).and_then(Weak::upgrade))
+                .expect("live promise registered");
+            assert!(Rc::ptr_eq(&found, state));
+        }
+    }
+
+    fn pending_state_registered() -> (Rc<RefCell<PromiseState>>, u64) {
+        let state = pending_state();
+        let id = register_state(state.clone());
+        (state, id)
+    }
+
+    #[test]
+    fn unhandled_rejections_are_reported_at_the_microtask_checkpoint() {
+        TRACK_REJECTIONS.with(|flag| flag.set(Some(true)));
+        REPORTED_REJECTIONS.with(|reported| reported.borrow_mut().clear());
+        let call = |target: &Value, method: &str, args: Vec<Value>| {
+            crate::intrinsics::call_method(target, &Value::string(method), args)
+        };
+        // Unhandled: rejected and never observed.
+        let _lost = reject(vec![Value::string("lost")]);
+        // Handled before the checkpoint: no report.
+        let caught = reject(vec![Value::string("caught")]);
+        let _ = call(
+            &caught,
+            "catch",
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+        // `then` without a rejection handler hands the rejection on to the
+        // derived promise, which is the unhandled one.
+        let passed = reject(vec![Value::string("passed on")]);
+        let _derived = call(
+            &passed,
+            "then",
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+        // A handler throwing inside a reaction rejects its derived promise.
+        let thrown = resolve(vec![Value::Number(1.0)]);
+        let _thrown_derived = call(
+            &thrown,
+            "then",
+            vec![Value::function(|_, _| {
+                crate::throw_value(Value::string("thrown"))
+            })],
+        );
+        // Objects without a stack show their message, or else their JSON.
+        let with_message = Value::object(HashMap::new());
+        with_message.set_property("message", Value::string("has message"));
+        let _message = reject(vec![with_message]);
+        let plain = Value::object(HashMap::new());
+        plain.set_property("code", Value::string("E1"));
+        let _plain = reject(vec![plain]);
+        drain_microtasks();
+        let mut reported = REPORTED_REJECTIONS.with(|reported| reported.take());
+        reported.sort();
+        assert_eq!(
+            reported,
+            [
+                "has message",
+                "lost",
+                "passed on",
+                "thrown",
+                r#"{"code":"E1"}"#
+            ]
+        );
+        TRACK_REJECTIONS.with(|flag| flag.set(None));
+    }
+
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -770,6 +1072,106 @@ mod tests {
         let promise = resolve(vec![Value::Number(9.0)]);
         let again = resolve(vec![promise.clone()]);
         assert_eq!(promise, again);
+    }
+
+    #[test]
+    fn combinators_reject_when_iteration_throws() {
+        // test262 Promise/*/iter-step-err-no-close: a throwing `next`
+        // rejects the combinator's promise instead of throwing.
+        let poisoned = || {
+            let iterable = Value::object(HashMap::new());
+            iterable.set_property(
+                "__w3cos_symbol_iterator",
+                Value::function(|_, _| {
+                    let iterator = Value::object(HashMap::new());
+                    iterator.set_property(
+                        "next",
+                        Value::function(|_, _| crate::throw_value(Value::string("step"))),
+                    );
+                    iterator
+                }),
+            );
+            iterable
+        };
+        let log = Rc::new(RefCell::new(Vec::new()));
+        for promise in [
+            all(vec![poisoned()]),
+            race(vec![poisoned()]),
+            any(vec![poisoned()]),
+            all_settled(vec![poisoned()]),
+        ] {
+            let log = log.clone();
+            promise.call_method(
+                "catch",
+                vec![Value::function(move |_, args| {
+                    log.borrow_mut().push(
+                        args.first()
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
+                            .to_js_string(),
+                    );
+                    Value::Undefined
+                })],
+            );
+        }
+        drain_microtasks();
+        assert_eq!(*log.borrow(), vec!["step"; 4]);
+    }
+
+    #[test]
+    fn combinators_accept_non_array_iterables() {
+        let set = || {
+            crate::intrinsics::construct(
+                &crate::collections::set_class(),
+                vec![Value::array(vec![Value::Number(1.0), Value::Number(2.0)])],
+            )
+        };
+        let log = Rc::new(RefCell::new(Vec::new()));
+        all(vec![set()]).call_method("then", vec![recorder(log.clone())]);
+        race(vec![set()]).call_method("then", vec![recorder(log.clone())]);
+        any(vec![set()]).call_method("then", vec![recorder(log.clone())]);
+        let settled = all_settled(vec![set()]);
+        settled.call_method(
+            "then",
+            vec![{
+                let log = log.clone();
+                Value::function(move |_, args| {
+                    let records = args.first().cloned().unwrap_or(Value::Undefined);
+                    let first = records.get_property("0");
+                    log.borrow_mut().push(format!(
+                        "settled {} {}",
+                        records.get_property("length").to_js_string(),
+                        first.get_property("status").to_js_string()
+                    ));
+                    Value::Undefined
+                })
+            }],
+        );
+        all(vec![Value::Number(3.0)]).call_method(
+            "catch",
+            vec![{
+                let log = log.clone();
+                Value::function(move |_, args| {
+                    let error = args.first().cloned().unwrap_or(Value::Undefined);
+                    log.borrow_mut()
+                        .push(error.get_property("message").to_js_string());
+                    Value::Undefined
+                })
+            }],
+        );
+        drain_microtasks();
+        let mut got = log.borrow().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "1".to_string(),
+                "1".to_string(),
+                "1,2".to_string(),
+                "Promise.all expects an iterable".to_string(),
+                "settled 2 fulfilled".to_string(),
+            ]
+        );
     }
 
     #[test]

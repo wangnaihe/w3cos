@@ -2,6 +2,7 @@
 name = "w3cos-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "W3C OS core — JS value types, Proxy, and reactive primitives"
 
@@ -20,8 +21,11 @@ serde_json = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 chrono-tz = { workspace = true }
 base64 = "0.22"
+# Fast non-DoS-resistant hasher for the interpreter's own key tables.
+rustc-hash = "2"
 regex = "1"
 fancy-regex = "0.18"
+regex-syntax = "0.8"
 num-bigint = "0.4"
 num-traits = "0.2"
 # `w3cos-node` crypto / zlib host functions.
@@ -30,6 +34,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 flate2 = "1"
+
+stacker = "0.1"
 
 [[example]]
 name = "leak_report_demo"

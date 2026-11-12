@@ -1,0 +1,58 @@
+{
+  "status": "passed",
+  "timing_variants": [
+    {
+      "variant": "main-baseline",
+      "original_binary": "bin/lifecycle-baseline",
+      "verified_binary": "bin/verified-baseline",
+      "original_sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84",
+      "verified_sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84",
+      "bit_identical": true,
+      "build_log": "verified-baseline-build.log",
+      "expected_core_compile_path_verified": true
+    },
+    {
+      "variant": "main-final",
+      "original_binary": "bin/fastpath-candidate",
+      "verified_binary": "bin/verified-candidate",
+      "original_sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2",
+      "verified_sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2",
+      "bit_identical": true,
+      "build_log": "verified-candidate-build.log",
+      "expected_core_compile_path_verified": true
+    },
+    {
+      "variant": "pr200-baseline",
+      "original_binary": "bin/pr200",
+      "verified_binary": "bin/verified-pr200-baseline",
+      "original_sha256": "49fd880e1822fa69424c691ea531d9738dab5892385b2ed83f3b06875514952d",
+      "verified_sha256": "49fd880e1822fa69424c691ea531d9738dab5892385b2ed83f3b06875514952d",
+      "bit_identical": true,
+      "build_log": "verified-pr200-baseline-build.log",
+      "expected_core_compile_path_verified": true
+    },
+    {
+      "variant": "pr200-final",
+      "original_binary": "bin/fastpath-pr200-index",
+      "verified_binary": "bin/verified-pr200-candidate",
+      "original_sha256": "092a3c3b3e9aabcaf54ced2fcbbabe4f2561c08e13d6a0eba807f48ce09163e4",
+      "verified_sha256": "092a3c3b3e9aabcaf54ced2fcbbabe4f2561c08e13d6a0eba807f48ce09163e4",
+      "bit_identical": true,
+      "build_log": "verified-pr200-candidate-build.log",
+      "expected_core_compile_path_verified": true
+    }
+  ],
+  "timing_recollection_required": false,
+  "isolated_target_policy": "Each of 4 timing and 2 allocation-counting variants has a separate target directory; dependencies seeded, core and harness explicitly cargo-cleaned before rebuilding.",
+  "memory": {
+    "fresh_csv": "verified-memory.csv",
+    "comparisons": "verified-memory-comparison.json",
+    "all_14_held_and_after_reset_deltas_reproduced": true,
+    "memory_candidate_binary_bit_identical": true,
+    "memory_baseline_binary_changed_reason": "Original memory baseline predates lifecycle benchmark mode; isolated rebuild includes that mode. All measured held/after-reset allocation deltas reproduce exactly."
+  },
+  "compiler_and_profile_metadata": "isolated-verification-metadata.json",
+  "main_core_sha256": "fe739d95345907fdcf93a9b7719ac2c94f103e72870faaaa0b012a5c6afdfb57",
+  "pr200_composition_core_sha256": "deba0e631cf39c534d4e061362cd188799cca65eec5b1c1f569eddbfcfe8fe15",
+  "active_processes": false
+}

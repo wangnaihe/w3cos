@@ -32,7 +32,10 @@ fn validate(source: &str, flags: &str) {
             "The 'u' and 'v' regular expression flags cannot be used together",
         ));
     }
-    if build_regex(source, flags).is_none() {
+    // Only parse here: compiling the delegate automata is deferred to the
+    // first exec/test/replace (as V8 does), so module-level regex literals
+    // that startup never runs cost no compile time.
+    if !pattern_parses(source, flags) {
         crate::throw_value(syntax_error(&format!(
             "Invalid or unsupported regular expression: /{source}/{flags}"
         )));
@@ -662,18 +665,71 @@ fn translate_javascript_escapes(source: &str) -> String {
     output
 }
 
-fn build_regex(source: &str, flags: &str) -> Option<Regex> {
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<(String, String), Option<Rc<Regex>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Compiled-regex cache entries kept per thread before the cache is reset.
+const REGEX_CACHE_LIMIT: usize = 4096;
+
+/// Compile `source`/`flags`, reusing the program from an earlier call.
+///
+/// Every `exec`/`test`/`replace` goes through here, and compiling a Unicode
+/// case-insensitive pattern costs milliseconds (far more in debug builds), so
+/// recompiling per call turned regex-heavy startup code into a multi-minute
+/// stall. `Regex` is immutable, so sharing it is safe; failures are cached too.
+fn build_regex(source: &str, flags: &str) -> Option<Rc<Regex>> {
+    let key = (source.to_string(), flags.to_string());
+    if let Some(hit) = REGEX_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let built = build_regex_uncached(source, flags).map(Rc::new);
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= REGEX_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, built.clone());
+    });
+    built
+}
+
+/// Translate a JavaScript `source`/`flags` pair into fancy-regex syntax.
+fn js_pattern(source: &str, flags: &str) -> String {
     let source = translate_javascript_escapes(source);
     let source = translate_unicode_sets(&source, flags.contains('v'));
     let modifiers = ['i', 'm', 's']
         .into_iter()
         .filter(|flag| flags.contains(*flag))
         .collect::<String>();
-    let pattern = if modifiers.is_empty() {
+    if modifiers.is_empty() {
         source
     } else {
         format!("(?{modifiers}:{source})")
-    };
+    }
+}
+
+/// Cheap syntax check used at construction time; no automaton is built.
+///
+/// When fancy-regex's parse tree and the regex-syntax AST both accept the
+/// pattern it is valid. Anything the AST parser rejects (lookaround,
+/// backreferences, duplicate group names, ...) falls back to a real compile,
+/// so construction-time SyntaxErrors match the eager behaviour exactly.
+fn pattern_parses(source: &str, flags: &str) -> bool {
+    let pattern = js_pattern(source, flags);
+    // Fast accept only: a pattern both parsers take is valid. Every other
+    // verdict (e.g. fancy-regex's parse_tree rejects the literal brace in
+    // `{(\d+)}` that the full builder accepts) comes from a real compile.
+    let fast_ok = fancy_regex::Expr::parse_tree(&pattern).is_ok()
+        && regex_syntax::ast::parse::Parser::new()
+            .parse(&pattern)
+            .is_ok();
+    fast_ok || build_regex(source, flags).is_some()
+}
+
+fn build_regex_uncached(source: &str, flags: &str) -> Option<Regex> {
+    let pattern = js_pattern(source, flags);
     // Real-world patterns (e.g. semver's composed grammar regexes) exceed
     // the regex crate's 10 MiB default NFA budget; V8 has no such limit.
     fancy_regex::RegexBuilder::new(&pattern)
@@ -791,6 +847,74 @@ mod tests {
             "pattern no longer exercises the limit"
         );
         assert!(build_regex(source, "").is_some());
+    }
+
+    fn compiled(source: &str, flags: &str) -> bool {
+        REGEX_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .contains_key(&(source.to_string(), flags.to_string()))
+        })
+    }
+
+    #[test]
+    fn construction_parses_without_compiling() {
+        let source = r"lazy-compile-probe-(\d+)-[a-z]+";
+        let value = create(source, "i");
+        assert!(!compiled(source, "i"), "literal compiled before first use");
+        let input = Value::from("LAZY-compile-probe-42-ab");
+        let matched = value.get_property("exec").call(value.clone(), vec![input]);
+        assert!(!matched.is_null());
+        assert!(compiled(source, "i"));
+    }
+
+    #[test]
+    fn construction_still_rejects_bad_syntax() {
+        assert!(!pattern_parses("(", ""));
+        assert!(!pattern_parses("a{2,1}", ""));
+        assert!(pattern_parses(r"(?<=a)b(c)\1?", ""));
+        assert!(pattern_parses(r"[\p{L}--[a-z]]", "v"));
+        assert!(pattern_parses("(?<x>a)|(?<x>b)", ""));
+        // Accepted by the full builder even though parse_tree rejects it.
+        assert!(pattern_parses(r"{(\d+)}", "g"));
+        assert!(build_regex(r"{(\d+)}", "g").is_some());
+    }
+
+    /// Every unique regex literal in the Code-OSS `out/` bundle (one JSON
+    /// `[source, flags]` pair per line): the lazy construction-time verdict
+    /// must equal eager full compilation for each one.
+    #[test]
+    fn code_oss_regex_literals_lazy_verdict_matches_eager_compile() {
+        let corpus = include_str!("../tests/fixtures/code_oss_regex_literals.txt");
+        let mut mismatches = Vec::new();
+        let mut total = 0;
+        for line in corpus.lines().filter(|line| !line.is_empty()) {
+            let (source, flags): (String, String) = serde_json::from_str(line).unwrap();
+            total += 1;
+            let eager = build_regex_uncached(&source, &flags).is_some();
+            if pattern_parses(&source, &flags) != eager {
+                mismatches.push(format!("/{source}/{flags} eager={eager}"));
+            }
+        }
+        assert!(total > 4000, "corpus truncated: {total}");
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn repeated_builds_share_one_compiled_program() {
+        let first = build_regex(r"(?:\p{L}+)\s*(\d+)", "iu").unwrap();
+        let second = build_regex(r"(?:\p{L}+)\s*(\d+)", "iu").unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        let other_flags = build_regex(r"(?:\p{L}+)\s*(\d+)", "u").unwrap();
+        assert!(!Rc::ptr_eq(&first, &other_flags));
+        // Invalid patterns stay invalid on every call.
+        assert!(build_regex("(", "").is_none());
+        assert!(build_regex("(", "").is_none());
     }
 
     #[test]

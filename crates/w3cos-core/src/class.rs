@@ -86,11 +86,25 @@ pub fn create_class_with_initializer(
         let instance = Value::object(HashMap::new());
         set_prototype_of(&instance, &instance_prototype);
         let result = call_constructor.call(instance.clone(), arguments);
-        if result.is_object() { result } else { instance }
+        if result.is_object() && !result.strict_eq(&instance) {
+            return result;
+        }
+        construct_replacement(&instance).unwrap_or(instance)
     });
     prototype.set_property("constructor", class.clone());
+    let prototype_for_marks = prototype.clone();
     class.set_property("prototype", prototype);
     class.set_property("__w3cos_ctor", raw_constructor);
+    // `C.prototype` and `C.prototype.constructor` are non-enumerable
+    // (ClassDefinitionEvaluation); the internal ctor slot is never visible.
+    if let Some(object) = prototype_for_marks.as_object() {
+        object.borrow_mut().mark_non_enumerable("constructor");
+    }
+    if let Some(object) = class.as_object() {
+        let mut object = object.borrow_mut();
+        object.mark_non_enumerable("prototype");
+        object.mark_non_enumerable("__w3cos_ctor");
+    }
     if let Some(parent) = super_class {
         set_prototype_of(&class, parent);
     }
@@ -139,6 +153,38 @@ pub fn construct_slice(class_value: &Value, args: &[Value]) -> Value {
     construct_slow(class_value, args.to_vec())
 }
 
+thread_local! {
+    /// [[Construct]] in flight for an AOT function: (code entry address,
+    /// new.target). The callee's `NewTarget` instruction, which lowering
+    /// places before any other code of the function, takes it when its own
+    /// code entry matches; every other function observes undefined.
+    static PENDING_NEW_TARGET: std::cell::RefCell<Option<(usize, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `new.target` for the AOT function whose factory address is `factory`.
+pub fn take_new_target(factory: usize) -> Value {
+    PENDING_NEW_TARGET.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        match pending.as_ref() {
+            Some((entry, _)) if *entry == factory => pending
+                .take()
+                .map_or(Value::Undefined, |(_, target)| target),
+            _ => Value::Undefined,
+        }
+    })
+}
+
+struct RestoreNewTarget(Option<Option<(usize, Value)>>);
+
+impl Drop for RestoreNewTarget {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            PENDING_NEW_TARGET.with(|pending| *pending.borrow_mut() = previous);
+        }
+    }
+}
+
 fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
     if crate::builtins::is_string_constructor(class_value) {
         return crate::builtins::string_wrapper(&args);
@@ -159,6 +205,12 @@ fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
         if prototype.is_object() {
             set_prototype_of(&instance, &prototype);
         }
+        let _restore = function.aot_factory_address().map(|entry| {
+            RestoreNewTarget(Some(
+                PENDING_NEW_TARGET
+                    .with(|pending| pending.replace(Some((entry, class_value.clone())))),
+            ))
+        });
         let result = function.call(instance.clone(), args);
         if result.is_object() || result.is_array() || result.is_function() {
             return result;
@@ -220,17 +272,52 @@ pub const FUNCTION_CONSTRUCTOR_MARKER: &str = "__w3cos_function_ctor";
 
 pub fn super_ctor(this: &Value, parent_class: &Value, args: Vec<Value>) -> Value {
     let ctor = parent_class.get_property("__w3cos_ctor");
-    if ctor.is_callable() {
-        ctor.call(this.clone(), args);
+    let result = if ctor.is_callable() {
+        ctor.call(this.clone(), args)
     } else if parent_class.is_ordinary_constructor_function() {
         // `class X extends F` with an ES5 constructor `function F() {...}`:
         // F's body initializes the already-allocated instance (its
         // prototype chain includes F.prototype, so `this instanceof F`
         // guards hold).
-        parent_class.call(this.clone(), args);
+        parent_class.call(this.clone(), args)
+    } else {
+        Value::Undefined
+    };
+    // A parent constructor that returns an object makes that object the
+    // derived `this` (and the result of `new`), as in ECMAScript.
+    let receiver = match construct_replacement(this) {
+        Some(replacement) => replacement,
+        None if is_constructed_object(&result) && !result.strict_eq(this) => {
+            set_construct_replacement(this, &result);
+            result
+        }
+        None => this.clone(),
+    };
+    run_pending_class_initializer(this, &receiver);
+    receiver
+}
+
+fn is_constructed_object(value: &Value) -> bool {
+    value.is_object() || value.is_array() || value.is_function()
+}
+
+/// The object a base constructor substituted for `instance`, if any.
+pub(crate) fn construct_replacement(instance: &Value) -> Option<Value> {
+    instance.as_object().and_then(|object| {
+        object
+            .borrow()
+            .rare
+            .as_ref()
+            .and_then(|rare| rare.construct_replacement.clone())
+    })
+}
+
+fn set_construct_replacement(instance: &Value, replacement: &Value) {
+    if let Some(object) = instance.as_object() {
+        let mut object = object.borrow_mut();
+        object.ensure_rare().construct_replacement = Some(replacement.clone());
+        object.refresh_heap_accounting();
     }
-    run_pending_class_initializer(this);
-    this.clone()
 }
 
 fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: Value) {
@@ -244,7 +331,7 @@ fn queue_class_initializer(this: &Value, brand: u64, class: Value, initializer: 
     }
 }
 
-fn run_pending_class_initializer(this: &Value) {
+fn run_pending_class_initializer(this: &Value, receiver: &Value) {
     let pending = this.as_object().and_then(|object| {
         object
             .borrow_mut()
@@ -253,9 +340,9 @@ fn run_pending_class_initializer(this: &Value) {
             .and_then(|rare| rare.pending_class_initializers.pop())
     });
     if let Some((brand, class, initializer)) = pending {
-        install_private_brand(this, brand);
+        install_private_brand(receiver, brand);
         if !initializer.is_undefined() {
-            initializer.call(this.clone(), vec![class]);
+            initializer.call(receiver.clone(), vec![class]);
         }
     }
 }

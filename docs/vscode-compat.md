@@ -144,7 +144,7 @@ These have no W3C equivalent but are necessary for desktop applications. Designe
 | w3cos.ipc.on() | IPC event listener | Electron ipcMain.on | Done | P1 |
 | w3cos.menu.setApp() | Application menu bar | Electron Menu.setApplicationMenu | Done (self-drawn) | P2 |
 | w3cos.menu.showContext() | Context menu | Electron Menu.popup | Done | P2 |
-| w3cos.tray.create() | System tray icon | Electron Tray | None | P3 |
+| w3cos.tray.create() | System tray icon | Electron Tray | Partial — `navigator.w3cos.tray.show` (not the Electron `Tray` class) | P3 |
 | w3cos.env.get() | Environment variables | Node.js process.env | Done | P1 |
 | w3cos.path.join() | Path manipulation | Node.js path | Done | P1 |
 | w3cos.os.platform() | OS information | Node.js os | Partial (sysinfo in process.rs) | P2 |

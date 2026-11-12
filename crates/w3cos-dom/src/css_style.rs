@@ -6,8 +6,171 @@ use w3cos_std::style::{
     TextDirection, UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
+/// Computed `tab-size`: `n<number>` (multiples of the space advance) or
+/// `l<px>`. Inherited; absent is the initial `8`.
+pub const TAB_SIZE_PROPERTY: &str = "--w3cos-internal-tab-size";
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
+/// `contain` with a real `size` (or `strict`) token: size containment
+/// (CSS Contain 2 3.1; `inline-size` alone is not). `Contain` folds tokens.
+pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
+/// `contain-intrinsic-size`: "<width> <height>" in px, `none` per axis.
+pub const CONTAIN_INTRINSIC_SIZE_PROPERTY: &str = "--w3cos-internal-contain-intrinsic-size";
+/// `width: max-content | min-content | fit-content` (width stays auto).
+pub const WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-width-keyword";
+/// `height` / `min-height` / `max-height` intrinsic keyword. The dimension
+/// is left untouched so legacy layout keeps the value it already stored.
+pub const HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-height-keyword";
+/// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
+/// `left`, and `right` into `flex-start`; grid needs the keyword.
+pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
+/// Authored `align-items` / `justify-items: stretch`. The enum folds
+/// `normal` into `stretch`, but a replaced grid item behaves as `start`
+/// for `normal` and stretches only for the explicit keyword. Present only
+/// when the keyword is exactly `stretch`.
+/// `last baseline` alignment of the named property (`align-items`,
+/// `justify-items`, `align-self`, `justify-self`). The typed enums keep
+/// their old fallback value; the layout engines that implement the keyword
+/// read this marker.
+pub const LAST_BASELINE_PREFIX: &str = "--w3cos-internal-last-baseline-";
+pub const ALIGN_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-align-items-stretch";
+pub const JUSTIFY_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-justify-items-stretch";
+/// A display keyword this engine does not model (`inline-grid`,
+/// `-webkit-box`, …). The used display falls through to `flex`; LayoutNG
+/// must not treat that box as an author flex container.
+pub const UNRECOGNIZED_DISPLAY_PROPERTY: &str = "--w3cos-internal-unrecognized-display";
+/// `display: grid-lanes`. Legacy keeps `flex` (the same box NG-off lays
+/// out). LayoutNG treats the marker as a grid when the subset matches an
+/// ordinary grid reference.
+pub const GRID_LANES_PROPERTY: &str = "--w3cos-internal-grid-lanes";
+/// `flow-tolerance`, `grid-lanes-direction` and `grid-lanes-pack`: read only
+/// by LayoutNG's grid-lanes placement (legacy lays the box out as flex and
+/// ignores them). The value is the lower-cased declaration, `initial` and the
+/// other CSS-wide keywords removing the marker.
+pub const FLOW_TOLERANCE_PROPERTY: &str = "--w3cos-internal-flow-tolerance";
+pub const GRID_LANES_DIRECTION_PROPERTY: &str = "--w3cos-internal-grid-lanes-direction";
+pub const GRID_LANES_PACK_PROPERTY: &str = "--w3cos-internal-grid-lanes-pack";
+/// `display: run-in` over an earlier `block`. Chrome rejects `run-in` as an
+/// invalid declaration, so the earlier value applies. Legacy keeps the
+/// unrecognized `flex`; LayoutNG reads this and lays the box out as a block.
+pub const RUN_IN_BLOCK_PROPERTY: &str = "--w3cos-internal-run-in-block";
+/// `gap` / `row-gap` / `column-gap` contains a percentage. The used gap
+/// stays unset (legacy ignores it). Value is `row`, `column`, or `both`.
+pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
+/// `flex-wrap` keyword this engine does not model (`balance`, …). The used
+/// value falls through to `nowrap`.
+pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
+/// `aspect-ratio` as a width/height number. The dimension fields stay
+/// untouched, so legacy layout never consults it. LayoutNG reads it only
+/// as a column flex container's definite block size.
+pub const ASPECT_RATIO_PROPERTY: &str = "--w3cos-internal-aspect-ratio";
+/// `-webkit-box-orient`: `vertical` (`block-axis`) or `horizontal`
+/// (`inline-axis`). Legacy keeps the `-webkit-box` row it already lays out;
+/// LayoutNG reads this for a block-flow `-webkit-box`.
+pub const WEBKIT_BOX_ORIENT_PROPERTY: &str = "--w3cos-internal-webkit-box-orient";
+/// `transform: translate*(<percentage>)` as `"x,y"` percentages of the
+/// border box. Set when LayoutNG is on (the default; `W3COS_LAYOUT_NG=0`
+/// leaves it unset). The paint tree resolves it
+/// against the laid-out box (the pixel part stays in `Style::transform`).
+pub const TRANSLATE_PERCENT_PROPERTY: &str = "--w3cos-internal-translate-percent";
+/// `-webkit-line-clamp`: a positive line count. Legacy ignores it.
+/// (The standard `line-clamp` is not stored: NG does not model it.)
+pub const WEBKIT_LINE_CLAMP_PROPERTY: &str = "--w3cos-internal-webkit-line-clamp";
+
+fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>) {
+    let current = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(PERCENT_GAP_PROPERTY))
+        .map(String::as_str)
+        .unwrap_or("");
+    let mut has_row = current == "row" || current == "both";
+    let mut has_column = current == "column" || current == "both";
+    if let Some(row) = row {
+        has_row = row;
+    }
+    if let Some(column) = column {
+        has_column = column;
+    }
+    let value = match (has_row, has_column) {
+        (true, true) => Some("both".to_string()),
+        (true, false) => Some("row".to_string()),
+        (false, true) => Some("column".to_string()),
+        (false, false) => None,
+    };
+    set_marker(style, PERCENT_GAP_PROPERTY, value);
+}
+
+/// `None` drops an invalid declaration. `Some(None)` is `auto` (no ratio).
+/// `Some(Some(w/h))` is a positive ratio. `0` and a zero denominator are
+/// invalid. `auto && <ratio>` is the ratio.
+fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if matches!(
+        value.as_str(),
+        "auto" | "initial" | "unset" | "revert" | "inherit"
+    ) {
+        return Some(None);
+    }
+    let value = value.strip_prefix("auto").unwrap_or(&value).trim();
+    if value.is_empty() {
+        return Some(None);
+    }
+    let ratio = if let Some((width, height)) = value.split_once('/') {
+        let width = width.trim().parse::<f32>().ok()?;
+        let height = height.trim().parse::<f32>().ok()?;
+        if height == 0.0 {
+            return None;
+        }
+        width / height
+    } else {
+        value.parse::<f32>().ok()?
+    };
+    (ratio.is_finite() && ratio > 0.0).then_some(Some(ratio))
+}
+
+fn set_last_baseline(style: &mut Style, property: &str, value: &str) {
+    let last = value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        == ["last", "baseline"];
+    set_marker(
+        style,
+        &format!("{LAST_BASELINE_PREFIX}{property}"),
+        last.then(|| "1".to_string()),
+    );
+}
+
+fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
+    match value {
+        Some(value) => {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(key.to_string(), value);
+        }
+        None => {
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove(key);
+            }
+        }
+    }
+}
+
+/// One `contain-intrinsic-*` axis value: `none`, `<length>` or
+/// `auto <length>` (no remembered sizes here, so the length is used).
+fn contain_intrinsic_axis(value: &str) -> Option<String> {
+    let v = value.trim().to_ascii_lowercase();
+    let v = v.strip_prefix("auto").map(str::trim).unwrap_or(&v);
+    if v == "none" {
+        return Some("none".into());
+    }
+    parse_px(v).filter(|px| *px >= 0.0).map(|px| px.to_string())
+}
 pub const TEXT_DECORATION_COLOR_PROPERTY: &str = w3cos_std::inline_text::DECORATION_COLOR;
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -179,7 +342,7 @@ impl CSSStyleDeclaration {
         }
         // An empty custom property write is CSSOM removal: drop the inline
         // declaration so the inherited / author value shows through again.
-        if name.starts_with("--") && value.trim().is_empty() {
+        if name.starts_with("--") && value.is_empty() {
             self.inline_declarations
                 .retain(|(existing, _)| existing != name);
             if let Some(properties) = self.inner.custom_properties.as_mut() {
@@ -245,7 +408,46 @@ impl CSSStyleDeclaration {
                         .insert(LIST_IMAGE_PROPERTY.into(), image);
                 }
             }
-            "display" => self.inner.display = parse_display(value),
+            "display" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                let custom = self.inner.custom_properties.as_ref();
+                let run_in_block = keyword == "run-in"
+                    && (custom.is_some_and(|props| props.contains_key(RUN_IN_BLOCK_PROPERTY))
+                        || self.inner.display == Display::Block
+                            && custom.is_none_or(|props| {
+                                !props.contains_key(UNRECOGNIZED_DISPLAY_PROPERTY)
+                            }));
+                set_marker(
+                    &mut self.inner,
+                    RUN_IN_BLOCK_PROPERTY,
+                    run_in_block.then(|| "1".to_string()),
+                );
+                self.inner.display = parse_display(value);
+                let grid_lanes = keyword == "grid-lanes";
+                set_marker(
+                    &mut self.inner,
+                    UNRECOGNIZED_DISPLAY_PROPERTY,
+                    (!css_wide_keyword(&keyword) && !is_known_display(&keyword)).then_some(keyword),
+                );
+                set_marker(
+                    &mut self.inner,
+                    GRID_LANES_PROPERTY,
+                    grid_lanes.then_some("1".to_string()),
+                );
+            }
+            "flow-tolerance" | "grid-lanes-direction" | "grid-lanes-pack" => {
+                let key = match name {
+                    "flow-tolerance" => FLOW_TOLERANCE_PROPERTY,
+                    "grid-lanes-direction" => GRID_LANES_DIRECTION_PROPERTY,
+                    _ => GRID_LANES_PACK_PROPERTY,
+                };
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    key,
+                    (!keyword.is_empty() && !css_wide_keyword(&keyword)).then_some(keyword),
+                );
+            }
             "position" => self.inner.position = parse_position(value),
             "float" | "cssFloat" => self.inner.float = parse_float(value),
             "clear" => self.inner.clear = parse_clear(value),
@@ -254,10 +456,72 @@ impl CSSStyleDeclaration {
                 self.inner.flex_direction = parse_flex_direction(value)
             }
             "justify-content" | "justifyContent" => {
-                self.inner.justify_content = parse_justify_content(value)
+                self.inner.justify_content = parse_justify_content(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    JUSTIFY_CONTENT_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
             }
-            "align-items" | "alignItems" => self.inner.align_items = parse_align_items(value),
-            "flex-wrap" | "flexWrap" => self.inner.flex_wrap = parse_flex_wrap(value),
+            "align-items" | "alignItems" => {
+                self.inner.align_items = parse_align_items(value);
+                set_last_baseline(&mut self.inner, "align-items", value);
+                set_marker(
+                    &mut self.inner,
+                    ALIGN_ITEMS_STRETCH_PROPERTY,
+                    (value.trim() == "stretch").then(|| "stretch".to_string()),
+                );
+            }
+            "flex-flow" | "flexFlow" => {
+                // CSS Flexbox 3: `<flex-direction> || <flex-wrap>`. An omitted
+                // part resets to its initial value; an invalid declaration is
+                // dropped whole. CSS-wide keywords reset both parts.
+                if let Some((direction, wrap)) = parse_flex_flow(value) {
+                    self.set_property("flex-direction", direction);
+                    self.set_property("flex-wrap", wrap);
+                }
+            }
+            "flex-wrap" | "flexWrap" => {
+                self.inner.flex_wrap = parse_flex_wrap(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    UNRECOGNIZED_FLEX_WRAP_PROPERTY,
+                    (!css_wide_keyword(&keyword) && !is_known_flex_wrap(&keyword))
+                        .then_some(keyword),
+                );
+            }
+            "-webkit-box-orient" | "webkit-box-orient" | "webkitBoxOrient" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                match keyword.as_str() {
+                    "vertical" | "block-axis" => set_marker(
+                        &mut self.inner,
+                        WEBKIT_BOX_ORIENT_PROPERTY,
+                        Some("vertical".into()),
+                    ),
+                    "horizontal" | "inline-axis" => set_marker(
+                        &mut self.inner,
+                        WEBKIT_BOX_ORIENT_PROPERTY,
+                        Some("horizontal".into()),
+                    ),
+                    _ if css_wide_keyword(&keyword) => {
+                        set_marker(&mut self.inner, WEBKIT_BOX_ORIENT_PROPERTY, None)
+                    }
+                    _ => {}
+                }
+            }
+            "-webkit-line-clamp" | "webkit-line-clamp" | "webkitLineClamp" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                let marker = match keyword.parse::<u32>() {
+                    Ok(lines) if lines > 0 => Some(Some(lines.to_string())),
+                    _ if keyword == "none" || css_wide_keyword(&keyword) => Some(None),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    set_marker(&mut self.inner, WEBKIT_LINE_CLAMP_PROPERTY, marker);
+                }
+            }
             "flex-grow" | "flexGrow" => {
                 if let Ok(v) = value.parse() {
                     self.inner.flex_grow = v
@@ -272,6 +536,12 @@ impl CSSStyleDeclaration {
 
             "gap" => {
                 let parts = split_css_whitespace(value);
+                let row_pct = parts.first().is_some_and(|part| part.contains('%'));
+                let column_pct = parts
+                    .get(1)
+                    .map(|part| part.contains('%'))
+                    .unwrap_or(row_pct);
+                update_percent_gap(&mut self.inner, Some(row_pct), Some(column_pct));
                 if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
                     self.inner.row_gap = Some(v);
                     self.inner.column_gap =
@@ -279,8 +549,14 @@ impl CSSStyleDeclaration {
                     self.inner.gap = v;
                 }
             }
-            "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
-            "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
+            "row-gap" | "rowGap" => {
+                update_percent_gap(&mut self.inner, Some(value.contains('%')), None);
+                self.inner.row_gap = parse_px(value);
+            }
+            "column-gap" | "columnGap" => {
+                update_percent_gap(&mut self.inner, None, Some(value.contains('%')));
+                self.inner.column_gap = parse_px(value);
+            }
             "column-width" | "columnWidth" => {
                 if let Some(width) = parse_column_width(value) {
                     self.inner.column_width = width;
@@ -471,23 +747,37 @@ impl CSSStyleDeclaration {
                 }
             }
             "width" => {
-                if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
+                let keyword = value.trim().to_ascii_lowercase();
+                if matches!(
+                    keyword.as_str(),
+                    "max-content" | "min-content" | "fit-content"
+                ) {
+                    self.inner.width = Dimension::Auto;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
                 } else if let Some(width) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.width = width;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "height" => {
-                if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
+                let keyword = value.trim().to_ascii_lowercase();
+                if is_intrinsic_size_keyword(&keyword) {
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
                     self.inner.max_height = max_height;
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                 } else if let Some(height) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.height = height;
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "min-width" | "minWidth" => {
@@ -520,6 +810,15 @@ impl CSSStyleDeclaration {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.max_height = value;
+                }
+            }
+            "aspect-ratio" | "aspectRatio" => {
+                if let Some(ratio) = parse_aspect_ratio(value) {
+                    set_marker(
+                        &mut self.inner,
+                        ASPECT_RATIO_PROPERTY,
+                        ratio.map(|ratio| ratio.to_string()),
+                    );
                 }
             }
 
@@ -844,6 +1143,12 @@ impl CSSStyleDeclaration {
             // Transform
             "transform" => {
                 self.inner.transform = parse_transform(value);
+                // LayoutNG only: percentages resolve against the border box,
+                // known after layout (paint reads the marker).
+                let percent = crate::document::layout_ng_requested()
+                    .then(|| parse_translate_percent(value))
+                    .flatten();
+                set_marker(&mut self.inner, TRANSLATE_PERCENT_PROPERTY, percent);
             }
 
             // Compositor hints (standard CSS — UA picks GPU/CPU internally)
@@ -852,6 +1157,49 @@ impl CSSStyleDeclaration {
             }
             "contain" => {
                 self.inner.contain = Contain::from_css(value);
+                let size = value
+                    .split_ascii_whitespace()
+                    .any(|token| matches!(token.to_ascii_lowercase().as_str(), "size" | "strict"));
+                set_marker(
+                    &mut self.inner,
+                    SIZE_CONTAINMENT_PROPERTY,
+                    size.then(|| "1".to_string()),
+                );
+            }
+            "contain-intrinsic-size" | "containIntrinsicSize" => {
+                let v = value.trim().to_ascii_lowercase();
+                // Split "[auto] <a> [auto] <b>" into per-axis values.
+                let mut axes = Vec::new();
+                let mut auto = false;
+                for token in v.split_ascii_whitespace() {
+                    if token == "auto" {
+                        auto = true;
+                        continue;
+                    }
+                    axes.push(if auto {
+                        format!("auto {token}")
+                    } else {
+                        token.to_string()
+                    });
+                    auto = false;
+                }
+                let parsed: Option<Vec<String>> = axes
+                    .iter()
+                    .map(|axis| contain_intrinsic_axis(axis))
+                    .collect();
+                match parsed.as_deref() {
+                    Some([both]) => set_marker(
+                        &mut self.inner,
+                        CONTAIN_INTRINSIC_SIZE_PROPERTY,
+                        (both != "none").then(|| format!("{both} {both}")),
+                    ),
+                    Some([w, h]) => set_marker(
+                        &mut self.inner,
+                        CONTAIN_INTRINSIC_SIZE_PROPERTY,
+                        Some(format!("{w} {h}")),
+                    ),
+                    _ => {}
+                }
             }
             "filter" => {
                 let v = value.trim();
@@ -877,11 +1225,83 @@ impl CSSStyleDeclaration {
 
             // Animation shorthand and the longhand used by browser pages.
             "animation" => self.inner.animation = parse_animation(value),
+            // Longhands (CSS Animations 1 §4). A longhand without a prior
+            // shorthand creates the animation with initial values; with a
+            // name of `none` it stays inert.
             "animation-delay" | "animationDelay" => {
-                if let Some(animation) = self.inner.animation.as_mut()
-                    && let Some(delay_ms) = parse_time_ms(value)
-                {
-                    animation.delay_ms = delay_ms;
+                if let Some(delay_ms) = parse_signed_time_ms(value) {
+                    animation_longhand(&mut self.inner.animation).delay_ms = delay_ms;
+                }
+            }
+            "animation-name" | "animationName" => {
+                let name = value.trim();
+                if !name.is_empty() {
+                    animation_longhand(&mut self.inner.animation).name = name.to_string();
+                }
+            }
+            "animation-duration" | "animationDuration" => {
+                if let Some(duration_ms) = parse_time_ms(value) {
+                    animation_longhand(&mut self.inner.animation).duration_ms = duration_ms;
+                }
+            }
+            "animation-timing-function" | "animationTimingFunction" => {
+                if let Some(easing) = parse_easing(value.trim()) {
+                    animation_longhand(&mut self.inner.animation).easing = easing;
+                }
+            }
+            "animation-play-state" | "animationPlayState" => {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "paused" => animation_longhand(&mut self.inner.animation).paused = true,
+                    "running" => animation_longhand(&mut self.inner.animation).paused = false,
+                    _ => {}
+                }
+            }
+            "animation-fill-mode" | "animationFillMode" => {
+                use w3cos_std::style::AnimationFillMode;
+                let fill = match value.trim().to_ascii_lowercase().as_str() {
+                    "none" => Some(AnimationFillMode::None),
+                    "forwards" => Some(AnimationFillMode::Forwards),
+                    "backwards" => Some(AnimationFillMode::Backwards),
+                    "both" => Some(AnimationFillMode::Both),
+                    _ => None,
+                };
+                if let Some(fill) = fill {
+                    animation_longhand(&mut self.inner.animation).fill_mode = fill;
+                }
+            }
+            "animation-direction" | "animationDirection" => {
+                use w3cos_std::style::AnimationDirection;
+                let direction = match value.trim().to_ascii_lowercase().as_str() {
+                    "normal" => Some(AnimationDirection::Normal),
+                    "reverse" => Some(AnimationDirection::Reverse),
+                    "alternate" => Some(AnimationDirection::Alternate),
+                    "alternate-reverse" => Some(AnimationDirection::AlternateReverse),
+                    _ => None,
+                };
+                if let Some(direction) = direction {
+                    animation_longhand(&mut self.inner.animation).direction = direction;
+                }
+            }
+            "animation-iteration-count" | "animationIterationCount" => {
+                use w3cos_std::style::AnimationIterationCount;
+                let value = value.trim();
+                let count = if value.eq_ignore_ascii_case("infinite") {
+                    Some(AnimationIterationCount::Infinite)
+                } else {
+                    value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|count| *count >= 0.0)
+                        .map(|count| {
+                            if count == 1.0 {
+                                AnimationIterationCount::Once
+                            } else {
+                                AnimationIterationCount::Count(count as u32)
+                            }
+                        })
+                };
+                if let Some(count) = count {
+                    animation_longhand(&mut self.inner.animation).iteration_count = count;
                 }
             }
 
@@ -896,9 +1316,53 @@ impl CSSStyleDeclaration {
                         value.trim().to_ascii_lowercase(),
                     );
             }
+            "tab-size" | "tabSize" | "-moz-tab-size" => {
+                // CSS Text 3 tab-size: <number [0,)> | <length [0,)>. A number
+                // multiplies the space advance (`n<number>`); a length is
+                // absolute (`l<px>`, em resolved against this element's
+                // font-size, which inherits as an absolute length). Anything
+                // else (negative, percentage) is invalid and ignored.
+                let value = value.trim().to_ascii_lowercase();
+                let marker = if matches!(value.as_str(), "initial" | "revert" | "revert-layer") {
+                    if let Some(properties) = self.inner.custom_properties.as_mut() {
+                        properties.remove(TAB_SIZE_PROPERTY);
+                    }
+                    None
+                } else if value == "inherit" || value == "unset" {
+                    None
+                } else if let Ok(number) = value.parse::<f32>() {
+                    (number.is_finite() && number >= 0.0).then(|| format!("n{number}"))
+                } else {
+                    let length = if let Some(number) = value.strip_suffix("rem") {
+                        number.trim().parse::<f32>().ok().map(|n| n * 16.0)
+                    } else if let Some(number) = value.strip_suffix("em") {
+                        number
+                            .trim()
+                            .parse::<f32>()
+                            .ok()
+                            .map(|n| n * self.inner.font_size)
+                    } else {
+                        parse_px(&value)
+                    };
+                    length
+                        .filter(|length| length.is_finite() && *length >= 0.0)
+                        .map(|length| format!("l{length}"))
+                };
+                if let Some(marker) = marker {
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(TAB_SIZE_PROPERTY.to_string(), marker);
+                }
+            }
             "white-space" | "whiteSpace" => {
-                if let Some(white_space) = parse_white_space(value) {
+                if value.trim().eq_ignore_ascii_case("break-spaces") {
+                    // Only the break-after-every-space opportunities are
+                    // modelled; space preservation keeps the previous value.
+                    self.inner.break_spaces = true;
+                } else if let Some(white_space) = parse_white_space(value) {
                     self.inner.white_space = white_space;
+                    self.inner.break_spaces = false;
                 }
             }
             "line-height" | "lineHeight" => {
@@ -1052,6 +1516,21 @@ impl CSSStyleDeclaration {
                 self.inner.font_feature_kern = parse_kern_feature_override(value);
             }
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+            "hanging-punctuation" | "hangingPunctuation" => {
+                self.inner.hanging_punctuation_last = value
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("last"));
+            }
+            "line-break" | "lineBreak" => {
+                use w3cos_std::style::LineBreak;
+                self.inner.line_break = match value.trim().to_ascii_lowercase().as_str() {
+                    "loose" => LineBreak::Loose,
+                    "normal" => LineBreak::Normal,
+                    "strict" => LineBreak::Strict,
+                    "anywhere" => LineBreak::Anywhere,
+                    _ => LineBreak::Auto,
+                };
+            }
             "direction" => {
                 self.inner.direction = if value.trim().eq_ignore_ascii_case("rtl") {
                     TextDirection::Rtl
@@ -1070,7 +1549,14 @@ impl CSSStyleDeclaration {
                 };
             }
             "overflow-wrap" | "overflowWrap" | "word-wrap" | "wordWrap" => {
-                self.inner.word_break = parse_overflow_wrap(value)
+                // overflow-wrap and word-break share one field: `normal` must
+                // not undo `word-break: break-word / break-all / keep-all`.
+                let wrap = parse_overflow_wrap(value);
+                if wrap == w3cos_std::style::WordBreak::BreakWord
+                    && self.inner.word_break == w3cos_std::style::WordBreak::Normal
+                {
+                    self.inner.word_break = wrap;
+                }
             }
 
             // Interaction
@@ -1090,7 +1576,10 @@ impl CSSStyleDeclaration {
                     self.inner.order = v
                 }
             }
-            "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "align-self" | "alignSelf" => {
+                self.inner.align_self = parse_align_self(value);
+                set_last_baseline(&mut self.inner, "align-self", value);
+            }
             "vertical-align" | "verticalAlign" => {
                 let value = value.trim();
                 const KEYWORD_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
@@ -1136,10 +1625,31 @@ impl CSSStyleDeclaration {
                 }
             }
             "align-content" | "alignContent" => {
-                self.inner.align_content = parse_align_content(value)
+                self.inner.align_content = parse_align_content(value);
+                // `safe` changes overflow alignment (CSS Align §4.4). The
+                // used keyword stays the legacy parse; NG reads the marker.
+                let safe = value
+                    .split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("safe"));
+                set_marker(
+                    &mut self.inner,
+                    "--w3cos-internal-safe-align-content",
+                    safe.then(|| "1".to_string()),
+                );
             }
-            "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
-            "justify-items" | "justifyItems" => self.inner.justify_items = parse_align_items(value),
+            "justify-self" | "justifySelf" => {
+                self.inner.justify_self = parse_align_self(value);
+                set_last_baseline(&mut self.inner, "justify-self", value);
+            }
+            "justify-items" | "justifyItems" => {
+                self.inner.justify_items = parse_align_items(value);
+                set_last_baseline(&mut self.inner, "justify-items", value);
+                set_marker(
+                    &mut self.inner,
+                    JUSTIFY_ITEMS_STRETCH_PROPERTY,
+                    (value.trim() == "stretch").then(|| "stretch".to_string()),
+                );
+            }
             "place-items" | "placeItems" => {
                 let mut values = value.split_whitespace();
                 if let Some(align) = values.next() {
@@ -1148,9 +1658,43 @@ impl CSSStyleDeclaration {
                 }
             }
             "grid-template-columns" | "gridTemplateColumns" => {
-                self.inner.grid_template_columns = Some(value.trim().to_string())
+                let value = value.trim().to_string();
+                self.inner.grid_template_columns = Some(value.clone());
+                let ng = self.inner.grid_ng_mut();
+                ng.grid_columns_used = Some(value);
+                ng.grid_columns_cascaded = true;
             }
-            "grid-column" | "gridColumn" => self.inner.grid_column = Some(value.trim().to_string()),
+            "grid-template-rows" | "gridTemplateRows" => {
+                self.inner.grid_ng_mut().grid_template_rows = Some(value.trim().to_string());
+            }
+            "grid-column" | "gridColumn" => {
+                remember_grid_placement(&mut self.inner);
+                let value = value.trim().to_string();
+                self.inner.grid_column = Some(value.clone());
+                self.inner.grid_ng_mut().grid_column_used = Some(value);
+            }
+            "grid-row" | "gridRow" => {
+                remember_grid_placement(&mut self.inner);
+                let value = value.trim().to_string();
+                let ng = self.inner.grid_ng_mut();
+                ng.grid_row = Some(value.clone());
+                ng.grid_row_used = Some(value);
+            }
+            "grid-template" | "gridTemplate" => apply_grid_template(&mut self.inner, value),
+            "grid" => apply_grid_shorthand(&mut self.inner, value),
+            "grid-auto-flow" | "gridAutoFlow" => {
+                self.inner.grid_ng_mut().grid_auto_flow = Some(value.trim().to_string());
+            }
+            "grid-auto-rows" | "gridAutoRows" => {
+                self.inner.grid_ng_mut().grid_auto_rows = Some(value.trim().to_string());
+            }
+            "grid-auto-columns" | "gridAutoColumns" => {
+                self.inner.grid_ng_mut().grid_auto_columns = Some(value.trim().to_string());
+            }
+            "grid-template-areas" | "gridTemplateAreas" => {
+                self.inner.grid_ng_mut().grid_template_areas = Some(value.trim().to_string());
+            }
+            "grid-area" | "gridArea" => apply_grid_area(&mut self.inner, value),
 
             // Outline
             "outline" => {
@@ -1203,6 +1747,21 @@ impl CSSStyleDeclaration {
 
             _ => {}
         }
+    }
+
+    /// Store a parsed custom-property declaration. Unlike CSSOM
+    /// `setProperty(name, "")`, an empty value in declaration text is a valid
+    /// empty token stream and must not remove the declaration.
+    pub fn set_parsed_empty_custom_property(&mut self, name: &str) {
+        debug_assert!(name.starts_with("--"));
+        self.inline_declarations
+            .retain(|(existing, _)| existing != name);
+        self.inline_declarations
+            .push((name.to_string(), String::new()));
+        self.inner
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(name.to_string(), String::new());
     }
 
     /// Move a shorthand to the end of the declaration list and drop the
@@ -1483,9 +2042,6 @@ impl CSSStyleDeclaration {
         }
     }
 
-    /// Computed values of the box-model, font and interaction longhands
-    /// (Code-OSS sizes views from `getComputedStyle()` padding / border /
-    /// margin widths) and of custom properties.
     fn box_and_text_property(&self, name: &str) -> Option<String> {
         let style = &self.inner;
         if let Some(custom) = name.strip_prefix("--") {
@@ -2000,6 +2556,16 @@ fn parse_spacing(value: &str) -> Option<Spacing> {
             return Some(constructor(number));
         }
     }
+    if let Some(calc) = crate::css_calc::parse_calc_length(value) {
+        return match crate::css_calc::calc_to_dimension(calc) {
+            Dimension::Px(v) => Some(Spacing::Px(v)),
+            Dimension::Percent(v) => Some(Spacing::Percent(v)),
+            Dimension::Em(v) => Some(Spacing::Em(v)),
+            Dimension::Vw(v) => Some(Spacing::Vw(v)),
+            Dimension::Vh(v) => Some(Spacing::Vh(v)),
+            _ => None,
+        };
+    }
     parse_px(value).map(Spacing::Px)
 }
 
@@ -2074,6 +2640,39 @@ pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
+        w3cos_std::style::Dimension::Calc(calc) => {
+            let mut terms = Vec::new();
+            for (value, unit) in [
+                (calc.percent, "%"),
+                (calc.px, "px"),
+                (calc.em, "em"),
+                (calc.vw, "vw"),
+                (calc.vh, "vh"),
+            ] {
+                if value != 0.0 {
+                    terms.push(format!("{value}{unit}"));
+                }
+            }
+            let mut out = String::from("calc(");
+            for (index, term) in terms.iter().enumerate() {
+                match (index, term.strip_prefix('-')) {
+                    (0, _) => out.push_str(term),
+                    (_, Some(negative)) => {
+                        out.push_str(" - ");
+                        out.push_str(negative);
+                    }
+                    _ => {
+                        out.push_str(" + ");
+                        out.push_str(term);
+                    }
+                }
+            }
+            if terms.is_empty() {
+                out.push_str("0px");
+            }
+            out.push(')');
+            out
+        }
     }
 }
 
@@ -2136,10 +2735,63 @@ fn contain_to_css(c: Contain) -> String {
     }
 }
 
+fn css_wide_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+fn is_known_display(value: &str) -> bool {
+    matches!(
+        value,
+        "flex"
+            | "grid"
+            | "grid-lanes"
+            | "block"
+            | "inline"
+            | "inline-block"
+            | "inline-flex"
+            | "flow-root"
+            | "table"
+            | "inline-table"
+            | "table-row-group"
+            | "table-header-group"
+            | "table-footer-group"
+            | "table-row"
+            | "table-column-group"
+            | "table-column"
+            | "table-cell"
+            | "table-caption"
+            | "list-item"
+            | "contents"
+            | "none"
+    )
+}
+
+fn is_known_flex_wrap(value: &str) -> bool {
+    matches!(value, "nowrap" | "wrap" | "wrap-reverse")
+}
+
 fn parse_display(value: &str) -> Display {
     match value.trim() {
         "flex" => Display::Flex,
+        // The same formatting context as `grid` for the pages whose
+        // reference is an ordinary grid. `inline-grid` stays unrecognized
+        // so both sides of those reftests keep falling back together.
         "grid" => Display::Grid,
+        // Legacy stays `flex`, matching NG-off. The grid-lanes marker tells
+        // LayoutNG to lay the box out as a grid when that matches the
+        // reference. `inline-grid`, `run-in`, and `-webkit-box` stay
+        // unrecognized flex boxes. NG blockifies `inline-grid` as a flex
+        // or grid item, and also lays a definite top-level `inline-grid`
+        // out on a line, including an auto-sized box whose tracks are
+        // definite px lengths. A definite `run-in` is that flex box.
+        // `-webkit-box` and `-webkit-inline-box` use that flex box when
+        // the flex line accepts the tree. A text item keeps the marker
+        // so a line-clamp reference does not switch engines alone.
+        // `-webkit-box-orient` is not stored.
+        "grid-lanes" => Display::Flex,
         "block" => Display::Block,
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
@@ -2190,6 +2842,41 @@ fn parse_clear(value: &str) -> Clear {
     }
 }
 
+/// `flex-flow` longhands as `(flex-direction, flex-wrap)`, `None` when the
+/// value is not `<flex-direction> || <flex-wrap>`.
+fn parse_flex_flow(value: &str) -> Option<(&'static str, &'static str)> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if css_wide_keyword(&lowered) {
+        return Some(("row", "nowrap"));
+    }
+    let mut direction = None;
+    let mut wrap = None;
+    for token in lowered.split_whitespace() {
+        match token {
+            "row" | "row-reverse" | "column" | "column-reverse" if direction.is_none() => {
+                direction = Some(match token {
+                    "row" => "row",
+                    "row-reverse" => "row-reverse",
+                    "column" => "column",
+                    _ => "column-reverse",
+                });
+            }
+            "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => {
+                wrap = Some(match token {
+                    "nowrap" => "nowrap",
+                    "wrap" => "wrap",
+                    _ => "wrap-reverse",
+                });
+            }
+            _ => return None,
+        }
+    }
+    if direction.is_none() && wrap.is_none() {
+        return None;
+    }
+    Some((direction.unwrap_or("row"), wrap.unwrap_or("nowrap")))
+}
+
 fn parse_flex_direction(value: &str) -> FlexDirection {
     match value.trim() {
         "row" => FlexDirection::Row,
@@ -2198,6 +2885,175 @@ fn parse_flex_direction(value: &str) -> FlexDirection {
         "column-reverse" => FlexDirection::ColumnReverse,
         _ => FlexDirection::Column,
     }
+}
+
+fn is_intrinsic_size_keyword(value: &str) -> bool {
+    matches!(value, "max-content" | "min-content" | "fit-content")
+        || value.starts_with("fit-content(")
+}
+
+fn remember_grid_placement(style: &mut Style) {
+    if style.grid_placement_cascaded() {
+        return;
+    }
+    let column = style.grid_column.clone();
+    let row = style.grid_row_spec().map(str::to_string);
+    let ng = style.grid_ng_mut();
+    ng.grid_column_used = column;
+    ng.grid_row_used = row;
+    ng.grid_placement_cascaded = true;
+}
+
+fn split_grid_slash(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = value;
+    while let Some((head, tail)) = split_top_level_once(rest, '/') {
+        parts.push(head.trim());
+        rest = tail;
+    }
+    parts.push(rest.trim());
+    parts
+}
+
+/// `grid-template` expands into the NG column/row fields. The legacy
+/// `grid_template_columns` string stays the longhand, so Taffy does not
+/// see a shorthand it used to drop.
+fn apply_grid_template(style: &mut Style, value: &str) {
+    let value = value.trim();
+    let ng = style.grid_ng_mut();
+    ng.grid_template = Some(value.to_string());
+    ng.grid_columns_cascaded = true;
+    if value.eq_ignore_ascii_case("none") {
+        ng.grid_template_rows = None;
+        ng.grid_columns_used = None;
+        ng.grid_template_areas = None;
+        return;
+    }
+    if value.contains('"') || value.contains('\'') {
+        ng.grid_template_areas = Some(value.to_string());
+        return;
+    }
+    ng.grid_template_areas = None;
+    let parts = split_grid_slash(value);
+    match parts.as_slice() {
+        [rows, cols] => {
+            ng.grid_template_rows = Some((*rows).to_string());
+            ng.grid_columns_used = Some((*cols).to_string());
+        }
+        _ => {
+            ng.grid_template_rows = Some(value.to_string());
+            ng.grid_columns_used = None;
+        }
+    }
+}
+
+struct AutoFlowSide {
+    dense: bool,
+    tracks: Option<String>,
+}
+
+fn auto_flow_side(value: &str) -> Option<AutoFlowSide> {
+    let tokens = split_css_whitespace(value);
+    let mut dense = false;
+    let mut saw_flow = false;
+    let mut tracks = Vec::new();
+    for token in &tokens {
+        if token.eq_ignore_ascii_case("auto-flow") {
+            saw_flow = true;
+        } else if token.eq_ignore_ascii_case("dense") {
+            dense = true;
+        } else {
+            tracks.push(token.as_str());
+        }
+    }
+    if !saw_flow {
+        return None;
+    }
+    Some(AutoFlowSide {
+        dense,
+        tracks: if tracks.is_empty() {
+            None
+        } else {
+            Some(tracks.join(" "))
+        },
+    })
+}
+
+fn flow_keyword(column: bool, dense: bool) -> String {
+    match (column, dense) {
+        (false, false) => "row".to_string(),
+        (false, true) => "row dense".to_string(),
+        (true, false) => "column".to_string(),
+        (true, true) => "column dense".to_string(),
+    }
+}
+
+/// `grid` resets the template and the auto tracks. Column text is stored
+/// for LayoutNG only.
+fn apply_grid_shorthand(style: &mut Style, value: &str) {
+    let value = value.trim();
+    let ng = style.grid_ng_mut();
+    ng.grid_shorthand = Some(value.to_string());
+    ng.grid_template = None;
+    ng.grid_template_areas = None;
+    ng.grid_template_rows = None;
+    ng.grid_columns_used = None;
+    ng.grid_columns_cascaded = true;
+    ng.grid_auto_flow = None;
+    ng.grid_auto_rows = None;
+    ng.grid_auto_columns = None;
+    if value.eq_ignore_ascii_case("none") || value.contains('"') || value.contains('\'') {
+        if value.contains('"') || value.contains('\'') {
+            ng.grid_template_areas = Some(value.to_string());
+        }
+        return;
+    }
+    let parts = split_grid_slash(value);
+    if parts.len() != 2 {
+        ng.grid_template_rows = Some(value.to_string());
+        return;
+    }
+    let [left, right] = [parts[0], parts[1]];
+    if let Some(flow) = auto_flow_side(left) {
+        ng.grid_auto_flow = Some(flow_keyword(false, flow.dense));
+        ng.grid_auto_rows = flow.tracks;
+        ng.grid_columns_used = Some(right.to_string());
+    } else if let Some(flow) = auto_flow_side(right) {
+        ng.grid_template_rows = Some(left.to_string());
+        ng.grid_auto_flow = Some(flow_keyword(true, flow.dense));
+        ng.grid_auto_columns = flow.tracks;
+    } else {
+        ng.grid_template_rows = Some(left.to_string());
+        ng.grid_columns_used = Some(right.to_string());
+    }
+}
+
+fn apply_grid_area(style: &mut Style, value: &str) {
+    let value = value.trim();
+    style.grid_ng_mut().grid_area = Some(value.to_string());
+    remember_grid_placement(style);
+    let parts = split_grid_slash(value);
+    let (row, column) = match parts.as_slice() {
+        [only] => ((*only).to_string(), "auto".to_string()),
+        [row_start, column_start] => ((*row_start).to_string(), (*column_start).to_string()),
+        [row_start, column_start, row_end] => (
+            format!("{row_start} / {row_end}"),
+            (*column_start).to_string(),
+        ),
+        [row_start, column_start, row_end, column_end] => (
+            format!("{row_start} / {row_end}"),
+            format!("{column_start} / {column_end}"),
+        ),
+        _ => {
+            let ng = style.grid_ng_mut();
+            ng.grid_row_used = Some(value.to_string());
+            ng.grid_column_used = None;
+            return;
+        }
+    };
+    let ng = style.grid_ng_mut();
+    ng.grid_row_used = Some(row);
+    ng.grid_column_used = Some(column);
 }
 
 fn parse_justify_content(value: &str) -> JustifyContent {
@@ -2446,6 +3302,9 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     if let Some(px) = parse_px(v) {
         return Some(Dimension::Px(px));
     }
+    if let Some(calc) = crate::css_calc::parse_calc_length(v) {
+        return Some(crate::css_calc::calc_to_dimension(calc));
+    }
     None
 }
 
@@ -2459,6 +3318,9 @@ fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
         | Dimension::Ch(value)
         | Dimension::Vw(value)
         | Dimension::Vh(value) => value >= 0.0,
+        // A negative used size clamps to zero, so a calc that may go
+        // negative is still a valid declaration.
+        Dimension::Calc(_) => true,
     }
 }
 
@@ -2937,6 +3799,32 @@ fn apply_border_side_shorthand(style: &mut Style, value: &str, side: BorderSide)
             style.border_left_color = color;
         }
     }
+}
+
+/// `translate`/`translateX`/`translateY` percentages of a `transform`
+/// value as `"x,y"` (percent of the border-box width and height). `None`
+/// when the value has none.
+fn parse_translate_percent(value: &str) -> Option<String> {
+    let percent = |part: Option<&str>| {
+        part.and_then(|p| p.trim().strip_suffix('%'))
+            .and_then(|p| p.trim().parse::<f32>().ok())
+    };
+    let (mut x, mut y) = (None, None);
+    let v = value.trim();
+    if let Some(inner) = extract_fn(v, "translateX") {
+        x = percent(Some(inner));
+    }
+    if let Some(inner) = extract_fn(v, "translateY") {
+        y = percent(Some(inner));
+    }
+    if let Some(start) = v.find("translate(") {
+        let rest = &v[start + "translate(".len()..];
+        let inner = rest.split(')').next().unwrap_or("");
+        let mut parts = inner.split(',');
+        x = percent(parts.next()).or(x);
+        y = percent(parts.next()).or(y);
+    }
+    (x.is_some() || y.is_some()).then(|| format!("{},{}", x.unwrap_or(0.0), y.unwrap_or(0.0)))
 }
 
 fn parse_transform(value: &str) -> w3cos_std::style::Transform2D {
@@ -4459,8 +5347,9 @@ fn parse_animation(value: &str) -> Option<w3cos_std::style::Animation> {
     if parts.is_empty() || value.trim().eq_ignore_ascii_case("none") {
         return None;
     }
-    let mut times = parts.iter().filter_map(|part| parse_time_ms(part));
-    let duration_ms = times.next().unwrap_or(0);
+    // The first <time> is the duration, the second the (signed) delay.
+    let mut times = parts.iter().filter_map(|part| parse_signed_time_ms(part));
+    let duration_ms = times.next().unwrap_or(0).max(0) as u32;
     let delay_ms = times.next().unwrap_or(0);
     let easing = parts
         .iter()
@@ -4524,7 +5413,39 @@ fn parse_animation(value: &str) -> Option<w3cos_std::style::Animation> {
         iteration_count,
         direction,
         fill_mode,
+        paused: parts.iter().any(|part| part.eq_ignore_ascii_case("paused")),
     })
+}
+
+fn animation_longhand(
+    slot: &mut Option<w3cos_std::style::Animation>,
+) -> &mut w3cos_std::style::Animation {
+    use w3cos_std::style::{
+        Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, Easing,
+    };
+    slot.get_or_insert_with(|| Animation {
+        name: "none".to_string(),
+        duration_ms: 0,
+        easing: Easing::Ease,
+        delay_ms: 0,
+        iteration_count: AnimationIterationCount::Once,
+        direction: AnimationDirection::Normal,
+        fill_mode: AnimationFillMode::None,
+        paused: false,
+    })
+}
+
+fn parse_signed_time_ms(value: &str) -> Option<i32> {
+    let value = value.trim();
+    let ms = if let Some(ms) = value.strip_suffix("ms") {
+        ms.parse::<f64>().ok()?
+    } else if let Some(seconds) = value.strip_suffix('s') {
+        seconds.parse::<f64>().ok()? * 1000.0
+    } else {
+        return None;
+    };
+    ms.is_finite()
+        .then(|| ms.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32)
 }
 
 fn parse_time_ms(value: &str) -> Option<u32> {
@@ -4541,7 +5462,7 @@ fn parse_time_ms(value: &str) -> Option<u32> {
     }
 }
 
-fn parse_easing(value: &str) -> Option<w3cos_std::style::Easing> {
+pub(crate) fn parse_easing(value: &str) -> Option<w3cos_std::style::Easing> {
     use w3cos_std::style::{Easing, StepPosition};
     match value.trim() {
         "linear" => Some(Easing::Linear),
@@ -4649,8 +5570,65 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
     }
 }
 
+/// `PreWrap` -> `pre-wrap`, `NotAllowed` -> `not-allowed`.
+fn debug_kebab(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len() + 4);
+    for (index, c) in debug.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn camel_to_kebab_name(name: &str) -> String {
+    if name.contains('-') {
+        return name.to_string();
+    }
+    debug_kebab(name)
+}
+
+fn color_to_hex(color: Color) -> String {
+    if color.a == 255 {
+        format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+    } else {
+        format!(
+            "rgba({}, {}, {}, {})",
+            color.r,
+            color.g,
+            color.b,
+            (f32::from(color.a) / 255.0 * 1000.0).round() / 1000.0
+        )
+    }
+}
+
+fn gap_to_css(gap: f32) -> String {
+    if gap == 0.0 {
+        "normal".to_string()
+    } else {
+        format!("{gap}px")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn translate_percentages_are_split_from_the_pixel_translation() {
+        use super::parse_translate_percent as pct;
+        assert_eq!(pct("translateX(-50%)").as_deref(), Some("-50,0"));
+        assert_eq!(pct("translateY(25%)").as_deref(), Some("0,25"));
+        assert_eq!(pct("translate(-100%, 10%)").as_deref(), Some("-100,10"));
+        assert_eq!(pct("translate(50%, 3px)").as_deref(), Some("50,0"));
+        assert_eq!(pct("translate(5px)"), None);
+        assert_eq!(pct("translateX(10px) scale(2)"), None);
+        assert_eq!(pct("none"), None);
+    }
+
     #[test]
     fn resize_keywords_round_trip_and_invalid_values_keep_the_valid_declaration() {
         let mut declaration = super::CSSStyleDeclaration::new();
@@ -5867,6 +6845,27 @@ mod tests {
     }
 }
 #[test]
+fn aspect_ratio_is_stored_as_a_width_over_height_marker() {
+    let ratio = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(ASPECT_RATIO_PROPERTY))
+            .cloned()
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("aspect-ratio", "1 / 1");
+    assert_eq!(ratio(&declaration).as_deref(), Some("1"));
+    declaration.set_property("aspect-ratio", "auto 2 / 1");
+    assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    declaration.set_property("aspect-ratio", "1/0");
+    assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    declaration.set_property("aspect-ratio", "auto");
+    assert_eq!(ratio(&declaration), None);
+}
+
+#[test]
 fn max_size_none_overrides_an_earlier_constraint() {
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("max-width", "10px");
@@ -5904,6 +6903,179 @@ fn flow_root_preserves_its_block_formatting_context_display() {
 }
 
 #[test]
+fn grid_lanes_stays_flex_and_percent_gaps_are_marked() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "grid-lanes");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(GRID_LANES_PROPERTY))
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(UNRECOGNIZED_DISPLAY_PROPERTY))
+    );
+    declaration.set_property("display", "grid");
+    assert_eq!(declaration.inner.display, Display::Grid);
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(GRID_LANES_PROPERTY))
+    );
+    declaration.set_property("row-gap", "10%");
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(PERCENT_GAP_PROPERTY))
+            .map(String::as_str),
+        Some("row")
+    );
+    declaration.set_property("gap", "8px");
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(PERCENT_GAP_PROPERTY))
+    );
+}
+
+#[test]
+fn run_in_records_an_earlier_block() {
+    let run_in_block = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key(RUN_IN_BLOCK_PROPERTY))
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "run-in");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert!(!run_in_block(&declaration));
+    declaration.set_property("display", "block");
+    declaration.set_property("display", "run-in");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert!(run_in_block(&declaration));
+    declaration.set_property("display", "run-in");
+    assert!(run_in_block(&declaration));
+    declaration.set_property("display", "flex");
+    assert!(!run_in_block(&declaration));
+    declaration.set_property("display", "inline-grid");
+    declaration.set_property("display", "run-in");
+    assert!(!run_in_block(&declaration));
+}
+
+#[test]
+fn webkit_box_orient_and_line_clamp_keep_markers() {
+    let marker = |declaration: &CSSStyleDeclaration, key: &str| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(key))
+            .cloned()
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("-webkit-box-orient", "vertical");
+    declaration.set_property("-webkit-line-clamp", "3");
+    assert_eq!(
+        marker(&declaration, WEBKIT_BOX_ORIENT_PROPERTY).as_deref(),
+        Some("vertical")
+    );
+    assert_eq!(
+        marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY).as_deref(),
+        Some("3")
+    );
+    // Invalid values keep the declared one; `none` and `initial` clear it.
+    for invalid in ["0", "-5", "auto", "1 ~", "2.5"] {
+        declaration.set_property("-webkit-line-clamp", invalid);
+        assert_eq!(
+            marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY).as_deref(),
+            Some("3")
+        );
+    }
+    declaration.set_property("-webkit-box-orient", "inline-axis");
+    assert_eq!(
+        marker(&declaration, WEBKIT_BOX_ORIENT_PROPERTY).as_deref(),
+        Some("horizontal")
+    );
+    declaration.set_property("-webkit-line-clamp", "none");
+    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
+    declaration.set_property("-webkit-line-clamp", "2");
+    declaration.set_property("-webkit-line-clamp", "initial");
+    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
+    // The standard `line-clamp` is not modeled and leaves no marker.
+    declaration.set_property("line-clamp", "2");
+    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
+}
+
+#[test]
+fn unrecognized_display_and_flex_wrap_keep_a_marker() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "-webkit-box");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY))
+            .map(String::as_str),
+        Some("-webkit-box")
+    );
+    declaration.set_property("display", "flex");
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(UNRECOGNIZED_DISPLAY_PROPERTY))
+    );
+    declaration.set_property("display", "inline-grid");
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY))
+            .map(String::as_str),
+        Some("inline-grid")
+    );
+    declaration.set_property("flex-wrap", "balance");
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
+            .map(String::as_str),
+        Some("balance")
+    );
+    declaration.set_property("flex-wrap", "nowrap");
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
+    );
+}
+
+#[test]
 fn table_display_values_round_trip_without_falling_back_to_flex() {
     for (value, expected) in [
         ("table", Display::Table),
@@ -5920,47 +7092,89 @@ fn table_display_values_round_trip_without_falling_back_to_flex() {
     }
 }
 
-/// `PreWrap` -> `pre-wrap`, `NotAllowed` -> `not-allowed`.
-fn debug_kebab(debug: &str) -> String {
-    let mut out = String::with_capacity(debug.len() + 4);
-    for (index, c) in debug.chars().enumerate() {
-        if c.is_ascii_uppercase() {
-            if index > 0 {
-                out.push('-');
-            }
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
+#[test]
+fn last_baseline_alignment_sets_a_layout_marker() {
+    let marker = |declaration: &CSSStyleDeclaration, property: &str| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(&format!("{LAST_BASELINE_PREFIX}{property}")))
+            .map(|value| value.to_string())
+    };
+    let mut d = CSSStyleDeclaration::new();
+    for (property, key) in [
+        ("align-items", "align-items"),
+        ("align-self", "align-self"),
+        ("justify-self", "justify-self"),
+        ("justify-items", "justify-items"),
+    ] {
+        assert_eq!(marker(&d, key), None);
+        d.set_property(property, "last baseline");
+        assert_eq!(marker(&d, key).as_deref(), Some("1"), "{property}");
+        // Whitespace and case do not matter; any other value clears it.
+        d.set_property(property, "  LAST   Baseline ");
+        assert_eq!(marker(&d, key).as_deref(), Some("1"), "{property}");
+        d.set_property(property, "baseline");
+        assert_eq!(marker(&d, key), None, "{property}");
+        d.set_property(property, "last baseline");
+        d.set_property(property, "first baseline");
+        assert_eq!(marker(&d, key), None, "{property}");
     }
-    out
+    // The typed fields are unchanged by the marker.
+    d.set_property("align-items", "last baseline");
+    assert_eq!(d.inner.align_items, parse_align_items("last baseline"));
 }
 
-fn camel_to_kebab_name(name: &str) -> String {
-    if name.contains('-') {
-        return name.to_string();
-    }
-    debug_kebab(name)
-}
-
-fn color_to_hex(color: Color) -> String {
-    if color.a == 255 {
-        format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
-    } else {
-        format!(
-            "rgba({}, {}, {}, {})",
-            color.r,
-            color.g,
-            color.b,
-            (f32::from(color.a) / 255.0 * 1000.0).round() / 1000.0
+#[test]
+fn flex_flow_shorthand_expands_to_direction_and_wrap() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let apply = |declaration: &mut CSSStyleDeclaration, value: &str| {
+        declaration.set_property("flex-flow", value);
+        (
+            declaration.inner.flex_direction,
+            declaration.inner.flex_wrap,
         )
+    };
+    let mut d = CSSStyleDeclaration::new();
+    assert_eq!(
+        apply(&mut d, "column wrap"),
+        (FlexDirection::Column, FlexWrap::Wrap)
+    );
+    // Either order; an omitted part resets to its initial value.
+    assert_eq!(
+        apply(&mut d, "wrap-reverse row-reverse"),
+        (FlexDirection::RowReverse, FlexWrap::WrapReverse)
+    );
+    assert_eq!(
+        apply(&mut d, "column"),
+        (FlexDirection::Column, FlexWrap::NoWrap)
+    );
+    assert_eq!(apply(&mut d, "wrap"), (FlexDirection::Row, FlexWrap::Wrap));
+    assert_eq!(
+        apply(&mut d, "COLUMN-REVERSE NOWRAP"),
+        (FlexDirection::ColumnReverse, FlexWrap::NoWrap)
+    );
+    // CSS-wide keywords reset both parts.
+    apply(&mut d, "column wrap");
+    assert_eq!(
+        apply(&mut d, "initial"),
+        (FlexDirection::Row, FlexWrap::NoWrap)
+    );
+    // Invalid declarations (duplicate or unknown parts) are ignored whole.
+    apply(&mut d, "column wrap");
+    for bad in ["column row", "wrap nowrap", "foo", "column wrap extra", ""] {
+        assert_eq!(
+            apply(&mut d, bad),
+            (FlexDirection::Column, FlexWrap::Wrap),
+            "{bad:?}"
+        );
     }
-}
-
-fn gap_to_css(gap: f32) -> String {
-    if gap == 0.0 {
-        "normal".to_string()
-    } else {
-        format!("{gap}px")
-    }
+    // The camelCase CSSOM name and the longhands keep working.
+    d.set_property("flexFlow", "row-reverse wrap");
+    assert_eq!(d.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
+    d.set_property("flex-direction", "column");
+    assert_eq!(d.inner.flex_direction, FlexDirection::Column);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
 }

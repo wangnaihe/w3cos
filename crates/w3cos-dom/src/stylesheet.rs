@@ -28,7 +28,10 @@ mod selector_filter;
 mod selector_parse_cache;
 
 use rule_set::RuleSet;
-use selector_filter::{AncestorBloom, LazyAncestorBloom};
+pub(crate) use rule_set::{FollowingPosition, FollowingScan};
+pub(crate) use selector_filter::AncestorBloom;
+use selector_filter::LazyAncestorBloom;
+pub use selector_filter::StyleRecalcScope;
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
 #[derive(Debug, Clone, Default)]
@@ -187,7 +190,7 @@ struct CompoundSelector {
 }
 
 impl CompoundSelector {
-    fn matches(&self, ctx: &SelectorContext) -> bool {
+    fn matches_without_pseudo_classes(&self, ctx: &SelectorContext) -> bool {
         if self.unsupported {
             return false;
         }
@@ -272,6 +275,10 @@ impl CompoundSelector {
                         })
                 }
             })
+    }
+
+    fn matches(&self, ctx: &SelectorContext) -> bool {
+        self.matches_without_pseudo_classes(ctx)
             && self.pseudo_classes.iter().all(|pseudo| match pseudo {
                 PseudoClass::FirstChild => ctx.is_first_child,
                 PseudoClass::Root => ctx.is_root,
@@ -280,6 +287,59 @@ impl CompoundSelector {
                 PseudoClass::FocusWithin => ctx.is_focus_within,
                 _ => false,
             })
+    }
+
+    /// Same answer as `matches_without_pseudo_classes` on the node's selector
+    /// context, read straight from the node. Returns `None` when the compound
+    /// has attribute selectors, which need the full context. Building that
+    /// context copies every class and attribute into fresh strings, so the
+    /// common tag/id/class compound skips it.
+    fn matches_node_directly(&self, document: &Document, node: NodeId) -> Option<bool> {
+        if self.unsupported {
+            return Some(false);
+        }
+        let dom_node = document.get_node(node);
+        if let Some(tag) = &self.tag {
+            let node_tag = dom_node.tag.as_static();
+            let actual_tag = if self.any_namespace || !tag.contains(':') {
+                node_tag
+                    .rsplit_once(':')
+                    .map_or(node_tag, |(_, local)| local)
+            } else {
+                node_tag
+            };
+            let tag_matches = if document.is_html_document() && dom_node.is_html_element {
+                tag.eq_ignore_ascii_case(actual_tag)
+            } else {
+                tag == actual_tag
+            };
+            if !tag_matches {
+                return Some(false);
+            }
+        }
+        if let Some(id) = &self.id {
+            let node_id = dom_node
+                .attributes
+                .iter()
+                .find(|(name, _)| name.as_static() == "id")
+                .map(|(_, value)| value.as_str());
+            if node_id != Some(id.as_str()) {
+                return Some(false);
+            }
+        }
+        if !self.classes.iter().all(|class| {
+            dom_node
+                .class_list
+                .iter()
+                .any(|have| have.as_static() == class.as_str())
+        }) {
+            return Some(false);
+        }
+        Some(compound_attributes_match_node(
+            document,
+            dom_node,
+            &self.attributes,
+        ))
     }
 
     fn specificity(&self) -> u32 {
@@ -296,17 +356,21 @@ impl CompoundSelector {
 }
 
 fn attribute_name_eq(ctx: &SelectorContext, actual: &str, expected: &str) -> bool {
+    attribute_name_eq_for(ctx.html_element, actual, expected)
+}
+
+fn attribute_name_eq_for(html_element: bool, actual: &str, expected: &str) -> bool {
     if let Some(local_name) = expected.strip_prefix("*|") {
         let actual_local_name = actual
             .rsplit_once(':')
             .map_or(actual, |(_, actual_local_name)| actual_local_name);
-        return if ctx.html_element {
+        return if html_element {
             actual_local_name.eq_ignore_ascii_case(local_name)
         } else {
             actual_local_name == local_name
         };
     }
-    if ctx.html_element {
+    if html_element {
         actual.eq_ignore_ascii_case(expected)
     } else {
         actual == expected
@@ -320,7 +384,23 @@ fn attribute_value_eq(
     expected: &str,
     insensitive: bool,
 ) -> bool {
-    if insensitive || ctx.html_document && attribute_name.eq_ignore_ascii_case("lang") {
+    attribute_value_eq_for(
+        ctx.html_document,
+        attribute_name,
+        actual,
+        expected,
+        insensitive,
+    )
+}
+
+fn attribute_value_eq_for(
+    html_document: bool,
+    attribute_name: &str,
+    actual: &str,
+    expected: &str,
+    insensitive: bool,
+) -> bool {
+    if insensitive || html_document && attribute_name.eq_ignore_ascii_case("lang") {
         actual.eq_ignore_ascii_case(expected)
     } else {
         actual == expected
@@ -334,10 +414,26 @@ fn attribute_value_dash_prefix(
     expected: &str,
     insensitive: bool,
 ) -> bool {
+    attribute_value_dash_prefix_for(
+        ctx.html_document,
+        attribute_name,
+        actual,
+        expected,
+        insensitive,
+    )
+}
+
+fn attribute_value_dash_prefix_for(
+    html_document: bool,
+    attribute_name: &str,
+    actual: &str,
+    expected: &str,
+    insensitive: bool,
+) -> bool {
     let Some(prefix) = actual.get(..expected.len()) else {
         return false;
     };
-    attribute_value_eq(ctx, attribute_name, prefix, expected, insensitive)
+    attribute_value_eq_for(html_document, attribute_name, prefix, expected, insensitive)
         && actual
             .get(expected.len()..)
             .is_some_and(|suffix| suffix.starts_with('-'))
@@ -399,7 +495,7 @@ struct Rule {
 thread_local! {
     static RULES: RefCell<RuleSet> = RefCell::new(RuleSet::default());
     static STYLE_GENERATION: Cell<u64> = const { Cell::new(1) };
-    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural.
+    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural. Bit 4: sibling-scoped :has(). Bit 5: `style` attribute selector.
     /// Hot DOM mutations read this cell instead of borrowing `RULES`.
     static RULE_FLAGS: Cell<u8> = const { Cell::new(0) };
 }
@@ -418,6 +514,12 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     if rules.has_structural_dependencies() {
         flags |= 8;
     }
+    if rules.has_sibling_scoped_relational() {
+        flags |= 16;
+    }
+    if rules.has_style_attribute_dependencies() {
+        flags |= 32;
+    }
     flags
 }
 
@@ -430,12 +532,26 @@ fn bump_generation() {
     STYLE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
 }
 
+/// `@keyframes` changed: computed styles depending on them are stale.
+pub(crate) fn note_animation_rules_changed() {
+    bump_generation();
+}
+
 pub fn generation() -> u64 {
     STYLE_GENERATION.with(Cell::get)
 }
 
 pub(crate) fn has_sibling_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 2 != 0)
+}
+/// `+`/`~` combinators: an attribute edit can restyle following siblings.
+pub fn has_sibling_selectors() -> bool {
+    has_sibling_dependencies()
+}
+
+/// `:has()`-style selectors: a mutation can restyle any ancestor.
+pub fn has_relational_selectors() -> bool {
+    has_relational_dependencies()
 }
 
 pub(crate) fn has_relational_dependencies() -> bool {
@@ -445,6 +561,90 @@ pub(crate) fn has_relational_dependencies() -> bool {
 /// Sibling, structural, and relational selectors can change when a node moves.
 pub fn tree_order_affects_matching() -> bool {
     has_sibling_dependencies() || has_structural_dependencies() || has_relational_dependencies()
+}
+
+/// A `:has()` argument starts with a sibling combinator, so preceding siblings
+/// of a mutated node (and of its ancestors) can change.
+pub(crate) fn has_sibling_scoped_relational() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 16 != 0)
+}
+
+/// Whether `ctx` can anchor a `:has()` compound; see `RuleSet::relational_anchor`.
+pub(crate) fn relational_anchor(ctx: &SelectorContext) -> Option<u8> {
+    RULES.with(|rules| rules.borrow().relational_anchor(ctx))
+}
+
+pub(crate) fn positional_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    ancestors: AncestorBloom,
+    siblings_only: bool,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .positional_anchor_matches(ctx, parent, ancestors, siblings_only)
+    })
+}
+
+pub(crate) fn following_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    ancestors: AncestorBloom,
+    position: FollowingPosition,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .following_anchor_matches(ctx, parent, ancestors, position)
+    })
+}
+
+pub(crate) fn removal_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    ancestors: AncestorBloom,
+    later: bool,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .removal_anchor_matches(ctx, parent, ancestors, later)
+    })
+}
+
+pub(crate) fn following_of_type_needed(parent: &SelectorContext, ancestors: AncestorBloom) -> bool {
+    RULES.with(|rules| rules.borrow().following_of_type_needed(parent, ancestors))
+}
+
+pub(crate) fn following_scan(parent: &SelectorContext, ancestors: AncestorBloom) -> FollowingScan {
+    RULES.with(|rules| rules.borrow().following_scan(parent, ancestors))
+}
+
+pub(crate) fn sibling_any_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    ancestors: AncestorBloom,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .sibling_any_anchor_matches(ctx, parent, ancestors)
+    })
+}
+
+/// Features on the ancestor chain shared by the children of `parent`.
+pub(crate) fn children_ancestor_bloom(document: &Document, parent: NodeId) -> AncestorBloom {
+    AncestorBloom::for_children_of(document, parent)
+}
+
+pub(crate) fn empty_anchor_matches(ctx: &SelectorContext) -> bool {
+    RULES.with(|rules| rules.borrow().empty_anchor_matches(ctx))
+}
+
+/// Whether any selector observes the `style` attribute.
+pub(crate) fn has_style_attribute_dependencies() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 32 != 0)
 }
 
 pub(crate) fn has_structural_dependencies() -> bool {
@@ -717,6 +917,52 @@ pub fn rule_count() -> usize {
     RULES.with(|rules| rules.borrow().rules.len())
 }
 
+/// Whether a declaration can give an element a `transition` the runtime
+/// samples (`left` or `transform`). `parse_transition` reads only the first
+/// token of the shorthand, so this mirrors that and stays conservative for
+/// anything it cannot resolve statically (`var()`, CSS-wide keywords).
+pub(crate) fn declares_sampled_transition(property: &str, value: &str) -> bool {
+    if !property.eq_ignore_ascii_case("transition") {
+        return false;
+    }
+    let (value, _) = declaration_value_and_importance(value);
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    if value.contains("var(") || value.contains("VAR(") {
+        return true;
+    }
+    let first = value.split_whitespace().next().unwrap_or("");
+    ["all", "transform", "left"]
+        .iter()
+        .any(|name| first.eq_ignore_ascii_case(name))
+        || ["inherit", "initial", "unset", "revert", "revert-layer"]
+            .iter()
+            .any(|keyword| value.eq_ignore_ascii_case(keyword))
+}
+
+/// Whether some registered rule that declares a sampled transition matches
+/// `node` (as the element itself or as the origin of a generated pseudo
+/// element). Cheaper than a computed style, and never a false negative.
+pub(crate) fn node_matches_motion_rule(document: &Document, node: NodeId) -> bool {
+    RULES.with(|rules| {
+        let rules = rules.borrow();
+        rules.has_motion_rules()
+            && rules.motion_rules().any(|rule| {
+                matches_chain_node(
+                    document,
+                    node,
+                    &rule.chain,
+                    &rule.combinators,
+                    rule.chain.len() - 1,
+                    None,
+                    None,
+                )
+            })
+    })
+}
+
 /// Whether any rules are registered — fast path for the DOM walk.
 pub fn has_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 1 != 0)
@@ -959,6 +1205,7 @@ pub fn matching_declarations_for_node(
         .collect()
 }
 
+#[derive(Clone)]
 pub(crate) struct CascadeDeclaration {
     pub origin: StylesheetOrigin,
     pub property: String,
@@ -971,14 +1218,35 @@ pub(crate) fn matching_cascade_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<CascadeDeclaration> {
+    matching_cascade_declarations_with_stability(document, node).0
+}
+
+/// The cascade declarations plus whether they depend only on the node's own
+/// style revision and the stylesheet generation. A candidate rule guarded by a
+/// container query depends on layout, so its result must not be reused.
+pub(crate) fn matching_cascade_declarations_with_stability(
+    document: &Document,
+    node: NodeId,
+) -> (Vec<CascadeDeclaration>, bool) {
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
-    RULES.with(|rules| {
+    let mut stable = true;
+    let declarations = RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
             .candidate_indices_for_node(document, node)
             .into_iter()
             .map(|index| &rules.rules[index])
+            .inspect(|rule| {
+                if rule.pseudo_element.is_none()
+                    && rule
+                        .declarations
+                        .iter()
+                        .any(|(property, _)| property == CONTAINER_QUERY_MARKER)
+                {
+                    stable = false;
+                }
+            })
             .filter(|rule| {
                 rule.pseudo_element.is_none()
                     && rule_matches_document_scope(rule, document_scope)
@@ -1017,7 +1285,8 @@ pub(crate) fn matching_cascade_declarations_for_node(
             }
         }
         buckets.into_iter().flatten().collect()
-    })
+    });
+    (declarations, stable)
 }
 
 /// Declarations matching one generated pseudo-element box. The selector is
@@ -1028,15 +1297,36 @@ pub fn matching_pseudo_declarations_for_node(
     node: NodeId,
     pseudo_element: &str,
 ) -> Vec<(String, String, u32)> {
+    matching_pseudo_declarations_with_stability(document, node, pseudo_element).0
+}
+
+/// Like `matching_pseudo_declarations_for_node`, plus whether the answer is a
+/// pure function of the node's style revision and the stylesheet generation.
+/// A candidate guarded by a container query depends on layout, so it is not.
+pub fn matching_pseudo_declarations_with_stability(
+    document: &Document,
+    node: NodeId,
+    pseudo_element: &str,
+) -> (Vec<(String, String, u32)>, bool) {
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
-    RULES.with(|rules| {
+    let mut stable = true;
+    let declarations = RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
-            .candidate_indices_for_node(document, node)
+            .pseudo_candidate_indices_for_node(document, node)
             .into_iter()
             .map(|index| &rules.rules[index])
             .filter(|rule| rule.pseudo_element.as_deref() == Some(pseudo_element))
+            .inspect(|rule| {
+                if rule
+                    .declarations
+                    .iter()
+                    .any(|(property, _)| property == CONTAINER_QUERY_MARKER)
+                {
+                    stable = false;
+                }
+            })
             .filter(|rule| rule_matches_document_scope(rule, document_scope))
             .filter(|rule| ancestor_bloom.might_contain(rule.ancestor_filter))
             .filter(|rule| {
@@ -1067,7 +1357,8 @@ pub fn matching_pseudo_declarations_for_node(
             }
         }
         buckets.into_iter().flatten().collect()
-    })
+    });
+    (declarations, stable)
 }
 
 pub(crate) fn declaration_value_and_importance(value: &str) -> (&str, bool) {
@@ -1146,7 +1437,7 @@ pub fn selector_matches_node_with_target(
                 && node
                     .class_list
                     .iter()
-                    .any(|candidate| candidate.as_str() == class));
+                    .any(|candidate| candidate.as_static() == class));
         }
         return Ok(matches_chain_node(
             document,
@@ -1304,15 +1595,95 @@ fn node_is_descendant_of(document: &Document, node: NodeId, ancestor: NodeId) ->
     false
 }
 
+/// Attribute selectors read straight from the node (main #114): no owned
+/// `SelectorContext` copy of every class and attribute string.
+fn compound_attributes_match_node(
+    document: &Document,
+    node: &crate::node::DomNode,
+    attributes: &[AttributeSelector],
+) -> bool {
+    let html_document = document.is_html_document();
+    let html_element = html_document && node.is_html_element;
+    attributes.iter().all(|selector| match selector {
+        AttributeSelector::Present(name) => node
+            .attributes
+            .iter()
+            .any(|(actual, _)| attribute_name_eq_for(html_element, actual.as_static(), name)),
+        AttributeSelector::Equals(name, value, insensitive) => {
+            node.attributes.iter().any(|(actual_name, actual)| {
+                attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                    && attribute_value_eq_for(
+                        html_document,
+                        name,
+                        actual.as_str(),
+                        value,
+                        *insensitive,
+                    )
+            })
+        }
+        AttributeSelector::Includes(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && actual.as_str().split_ascii_whitespace().any(|token| {
+                            attribute_value_eq_for(html_document, name, token, value, *insensitive)
+                        })
+                })
+        }
+        AttributeSelector::DashMatch(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && (attribute_value_eq_for(
+                            html_document,
+                            name,
+                            actual.as_str(),
+                            value,
+                            *insensitive,
+                        ) || attribute_value_dash_prefix_for(
+                            html_document,
+                            name,
+                            actual.as_str(),
+                            value,
+                            *insensitive,
+                        ))
+                })
+        }
+        AttributeSelector::Prefix(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && attribute_value_starts_with(actual.as_str(), value, *insensitive)
+                })
+        }
+        AttributeSelector::Suffix(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && attribute_value_ends_with(actual.as_str(), value, *insensitive)
+                })
+        }
+        AttributeSelector::Substring(name, value, insensitive) => {
+            !value.is_empty()
+                && node.attributes.iter().any(|(actual_name, actual)| {
+                    attribute_name_eq_for(html_element, actual_name.as_static(), name)
+                        && attribute_value_contains(actual.as_str(), value, *insensitive)
+                })
+        }
+    })
+}
+
 fn compound_matches_node(
     document: &Document,
     node: NodeId,
     compound: &CompoundSelector,
     target_id: Option<&str>,
 ) -> bool {
-    let mut basic = compound.clone();
-    basic.pseudo_classes.clear();
-    if !basic.matches(&selector_context_for_node(document, node)) {
+    let basic_matches = match compound.matches_node_directly(document, node) {
+        Some(matched) => matched,
+        None => compound.matches_without_pseudo_classes(&selector_context_for_node(document, node)),
+    };
+    if !basic_matches {
         return false;
     }
     compound
@@ -1419,12 +1790,22 @@ fn pseudo_matches_node(
             selector_matches_node_with_target(selector, document, node, target_id)
                 .is_ok_and(|matched| matched)
         }
-        PseudoClass::NthChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, false)
-        }
-        PseudoClass::NthLastChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, true)
-        }
+        PseudoClass::NthChild(expression) => matches_nth_child(
+            document,
+            node,
+            element_siblings(),
+            expression,
+            false,
+            target_id,
+        ),
+        PseudoClass::NthLastChild(expression) => matches_nth_child(
+            document,
+            node,
+            element_siblings(),
+            expression,
+            true,
+            target_id,
+        ),
         PseudoClass::NthOfType(expression) => {
             matches_nth_position(&type_siblings(), node, expression, false)
         }
@@ -1565,6 +1946,53 @@ fn node_direction(document: &Document, mut node: NodeId) -> String {
     }
 }
 
+/// Splits `An+B of S` (Selectors 4) into the `An+B` part and the selector
+/// list `S`. Plain `An+B` yields no selector list.
+pub(crate) fn split_nth_of_selector(expression: &str) -> (&str, Option<&str>) {
+    let bytes = expression.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index..index + 2].eq_ignore_ascii_case(b"of")
+            && index > 0
+            && is_css_whitespace(bytes[index - 1] as char)
+            && bytes
+                .get(index + 2)
+                .is_none_or(|next| is_css_whitespace(*next as char))
+        {
+            return (
+                trim_css_whitespace(&expression[..index]),
+                Some(trim_css_whitespace(&expression[index + 2..])),
+            );
+        }
+        index += 1;
+    }
+    (trim_css_whitespace(expression), None)
+}
+
+/// `:nth-child(An+B [of S])` and `:nth-last-child(An+B [of S])`: with `S`, only
+/// siblings matching `S` are counted, and the subject must match it as well.
+fn matches_nth_child(
+    document: &Document,
+    node: NodeId,
+    siblings: Vec<NodeId>,
+    expression: &str,
+    from_end: bool,
+    target_id: Option<&str>,
+) -> bool {
+    let (an_plus_b, selector) = split_nth_of_selector(expression);
+    let Some(selector) = selector else {
+        return matches_nth_position(&siblings, node, an_plus_b, from_end);
+    };
+    let counted = siblings
+        .into_iter()
+        .filter(|sibling| {
+            selector_matches_node_with_target(selector, document, *sibling, target_id)
+                .is_ok_and(|matched| matched)
+        })
+        .collect::<Vec<_>>();
+    matches_nth_position(&counted, node, an_plus_b, from_end)
+}
+
 fn matches_nth_position(
     siblings: &[NodeId],
     node: NodeId,
@@ -1627,6 +2055,8 @@ fn previous_element_sibling(document: &Document, node: NodeId) -> Option<NodeId>
 }
 
 fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext {
+    #[cfg(test)]
+    NODE_SELECTOR_CONTEXT_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     let node = document.get_node(id);
     let id_attribute = node
         .attributes
@@ -1664,6 +2094,35 @@ fn selector_context_for_node(document: &Document, id: NodeId) -> SelectorContext
         )
         .with_html_document(document.is_html_document())
         .with_html_element(document.is_html_document() && node.is_html_element)
+}
+
+#[cfg(test)]
+thread_local! {
+    static NODE_SELECTOR_CONTEXT_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_node_selector_context_constructions() {
+    NODE_SELECTOR_CONTEXT_CONSTRUCTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn node_selector_context_constructions() -> usize {
+    NODE_SELECTOR_CONTEXT_CONSTRUCTIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn compound_matches_node_via_owned_context(
+    document: &Document,
+    node: NodeId,
+    compound: &CompoundSelector,
+    target_id: Option<&str>,
+) -> bool {
+    compound.matches_without_pseudo_classes(&selector_context_for_node(document, node))
+        && compound
+            .pseudo_classes
+            .iter()
+            .all(|pseudo| pseudo_matches_node(document, node, pseudo, target_id))
 }
 
 fn rule_matches(rule: &Rule, ctx: &SelectorContext, ancestors: &[SelectorContext]) -> bool {
@@ -2267,12 +2726,26 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                                 .push(PseudoClass::Is(valid.join(", ")))
                         }
                     }
-                    (false, true, "nth-child") => compound
-                        .pseudo_classes
-                        .push(PseudoClass::NthChild(argument)),
-                    (false, true, "nth-last-child") => compound
-                        .pseudo_classes
-                        .push(PseudoClass::NthLastChild(argument)),
+                    (false, true, "nth-child" | "nth-last-child") => {
+                        let (an_plus_b, selector) = split_nth_of_selector(&argument);
+                        let valid_selector = selector.is_none_or(|selector| {
+                            !selector.is_empty()
+                                && split_selector_group(selector)
+                                    .into_iter()
+                                    .all(|single| parse_selector_chain(&single).is_some())
+                        });
+                        if parse_an_plus_b(an_plus_b).is_none() || !valid_selector {
+                            compound.unsupported = true;
+                        } else if name == "nth-child" {
+                            compound
+                                .pseudo_classes
+                                .push(PseudoClass::NthChild(argument))
+                        } else {
+                            compound
+                                .pseudo_classes
+                                .push(PseudoClass::NthLastChild(argument))
+                        }
+                    }
                     (false, true, "nth-of-type") => compound
                         .pseudo_classes
                         .push(PseudoClass::NthOfType(argument)),
@@ -2454,6 +2927,100 @@ mod tests {
     }
 
     #[test]
+    fn direct_compound_match_agrees_with_selector_context_match() {
+        setup();
+        let selectors = [
+            "div", "DIV", "span", "*", "*|div", ".a", ".a.b", ".b.a", ".missing", "div.a",
+            "div.a.b", "#x", "div#x", "#y", "span#y.c", "svg|rect", "x|item", "item", "ns:item",
+            "*|item", ".A", "#X",
+        ];
+        let compounds: Vec<CompoundSelector> = selectors
+            .iter()
+            .filter_map(|selector| {
+                let chars: Vec<char> = selector.chars().collect();
+                parse_compound(&chars, 0).map(|(compound, _)| compound)
+            })
+            .collect();
+        assert!(compounds.len() >= 18);
+        for html_document in [true, false] {
+            let mut document = Document::new();
+            document.set_html_document(html_document);
+            let body = document.body().id;
+            let mut nodes = Vec::new();
+            for (tag, id, class) in [
+                ("div", Some("x"), Some("a b")),
+                ("DIV", None, Some("a")),
+                ("span", Some("y"), Some("c a")),
+                ("ns:item", None, None),
+                ("item", Some("x"), Some("A")),
+                ("rect", None, Some("b a b")),
+            ] {
+                let element = document.create_element(tag);
+                if let Some(id) = id {
+                    element.set_attribute(&mut document, "id", id);
+                }
+                if let Some(class) = class {
+                    element.set_attribute(&mut document, "class", class);
+                }
+                document.append_child(body, element.id);
+                nodes.push(element.id);
+            }
+            let mut compared = 0;
+            let mut matched = 0;
+            for compound in &compounds {
+                for node in &nodes {
+                    let direct = compound.matches_node_directly(&document, *node);
+                    let via_context = compound.matches_without_pseudo_classes(
+                        &selector_context_for_node(&document, *node),
+                    );
+                    assert_eq!(
+                        direct,
+                        Some(via_context),
+                        "html_document={html_document} compound={compound:?} tag={}",
+                        document.get_node(*node).tag.as_str()
+                    );
+                    compared += 1;
+                    matched += usize::from(via_context);
+                }
+            }
+            assert_eq!(compared, compounds.len() * nodes.len());
+            assert!(matched > 8, "the probe set must exercise matches");
+            assert!(matched < compared, "the probe set must exercise misses");
+        }
+    }
+
+    #[test]
+    fn attribute_compounds_match_directly_without_owned_context() {
+        setup();
+        let chars: Vec<char> = "div[data-x=\"1\"]".chars().collect();
+        let (compound, _) = parse_compound(&chars, 0).expect("parse");
+        let mut document = Document::new();
+        let element = document.create_element("div");
+        document.append_child(document.body().id, element.id);
+        reset_node_selector_context_constructions();
+        assert_eq!(
+            compound.matches_node_directly(&document, element.id),
+            Some(false)
+        );
+        assert!(!compound_matches_node(
+            &document, element.id, &compound, None
+        ));
+        element.set_attribute(&mut document, "data-x", "1");
+        assert_eq!(
+            compound.matches_node_directly(&document, element.id),
+            Some(true)
+        );
+        assert!(compound_matches_node(
+            &document, element.id, &compound, None
+        ));
+        assert_eq!(
+            node_selector_context_constructions(),
+            0,
+            "attribute compounds must not build an owned selector context"
+        );
+    }
+
+    #[test]
     fn lazy_ancestor_filter_observes_mutations_in_node_and_pseudo_cascades() {
         setup();
         register_rule("span", &[("color", "blue")]);
@@ -2511,56 +3078,6 @@ mod tests {
     }
 
     #[test]
-    fn node_matches_single_class_fast_path_preserves_parser_and_fallback_semantics() {
-        selector_parse_cache::clear_for_test();
-        let mut document = Document::new();
-        let element = document.create_element("div");
-        element.set_attribute(&mut document, "class", "active other");
-        document.append_child(document.body().id, element.id);
-
-        assert_eq!(
-            selector_matches_node(".active", &document, element.id),
-            Ok(true)
-        );
-        assert_eq!(
-            selector_matches_node(r".act\69 ve", &document, element.id),
-            Ok(true),
-            "the fast path must use the parser's decoded class token"
-        );
-        assert_eq!(
-            selector_matches_node(".inactive", &document, element.id),
-            Ok(false)
-        );
-        assert_eq!(
-            selector_matches_node(".active.other", &document, element.id),
-            Ok(true),
-            "multi-class compounds must retain the general matcher"
-        );
-        assert_eq!(
-            selector_matches_node("div.active", &document, element.id),
-            Ok(true),
-            "tag/class compounds must retain the general matcher"
-        );
-        assert_eq!(
-            selector_matches_node("[class~=active]", &document, element.id),
-            Ok(true),
-            "attribute selectors must retain the general matcher"
-        );
-        assert_eq!(selector_matches_node(".", &document, element.id), Err(()));
-
-        let parsed = parse_selector_chain_cached(".active").unwrap();
-        assert_eq!(
-            single_class_selector(&parsed.chain, &parsed.combinators),
-            Some("active")
-        );
-        let compound = parse_selector_chain_cached(".active.other").unwrap();
-        assert_eq!(
-            single_class_selector(&compound.chain, &compound.combinators),
-            None
-        );
-    }
-
-    #[test]
     fn selector_parse_cache_is_bounded_and_evicts_the_least_recently_used_entry() {
         selector_parse_cache::clear_for_test();
         let target = SelectorContext::new("span", None, &[]);
@@ -2603,6 +3120,170 @@ mod tests {
         register_rule("li:first-child", &[("color", "blue")]);
         assert!(has_structural_dependencies());
         assert!(!has_sibling_dependencies());
+    }
+
+    #[test]
+    fn style_attribute_dependency_needs_an_attribute_selector() {
+        setup();
+        assert!(!has_style_attribute_dependencies());
+        for selector in [
+            ".monaco-style",
+            "div:not(.inline-style)",
+            ":is(.a-style, .b)",
+            ":where(styled-box)",
+            "li:not([data-style])",
+            "li:not([styles])",
+        ] {
+            register_rule(selector, &[("color", "red")]);
+            assert!(
+                !has_style_attribute_dependencies(),
+                "{selector} cannot observe the style attribute"
+            );
+        }
+        for selector in [
+            "[style]",
+            "div[style*=\"x\"]",
+            "div:not([ STYLE ])",
+            ":is(p, [style^=a])",
+            "div:has([style=\"a\"])",
+        ] {
+            setup();
+            register_rule(selector, &[("color", "red")]);
+            assert!(
+                has_style_attribute_dependencies(),
+                "{selector} observes the style attribute"
+            );
+        }
+    }
+
+    fn nth_of_fixture() -> (Document, Vec<NodeId>) {
+        let mut document = Document::new();
+        let list = document.create_element("ul");
+        document.body().append_child(&mut document, list);
+        // li.a, li.b, li.a, li.b, li.a
+        let items = ["a", "b", "a", "b", "a"]
+            .into_iter()
+            .map(|class| {
+                let item = document.create_element("li");
+                item.class_list_add(&mut document, class);
+                list.append_child(&mut document, item);
+                item.id
+            })
+            .collect();
+        (document, items)
+    }
+
+    fn nth_of_matches(document: &Document, items: &[NodeId], selector: &str) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| selector_matches_node(selector, document, **item) == Ok(true))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn nth_child_of_selector_counts_only_matching_siblings() {
+        let (document, items) = nth_of_fixture();
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2 of .a)"),
+            [2]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(1 of .b)"),
+            [1]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(odd of .a)"),
+            [0, 4]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2n+1 OF .a)"),
+            [0, 4]
+        );
+        // The subject itself must match the selector list.
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(1 of .b)"),
+            [1]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(n of .b)"),
+            [1, 3]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2 of .a, .b)"),
+            [1]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2 of :not(.b))"),
+            [2]
+        );
+    }
+
+    #[test]
+    fn nth_last_child_of_selector_counts_from_the_end_among_matching_siblings() {
+        let (document, items) = nth_of_fixture();
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1 of .a)"),
+            [4]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1 of .b)"),
+            [3]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(2 of .a)"),
+            [2]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1 of :not(.a))"),
+            [3]
+        );
+    }
+
+    #[test]
+    fn nth_child_without_of_still_counts_every_element_sibling() {
+        let (document, items) = nth_of_fixture();
+        assert_eq!(nth_of_matches(&document, &items, "li:nth-child(2)"), [1]);
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2n)"),
+            [1, 3]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1)"),
+            [4]
+        );
+    }
+
+    #[test]
+    fn nth_child_of_selector_rejects_invalid_arguments() {
+        let (document, items) = nth_of_fixture();
+        for selector in [
+            "li:nth-child(2 of)",
+            "li:nth-child(2 of ,)",
+            "li:nth-child(banana of .a)",
+            "li:nth-last-child(1 of [)",
+        ] {
+            assert!(
+                nth_of_matches(&document, &items, selector).is_empty(),
+                "{selector}"
+            );
+        }
+        // `of S` is not part of the `-of-type` forms.
+        assert!(nth_of_matches(&document, &items, "li:nth-of-type(1 of .a)").is_empty());
+    }
+
+    #[test]
+    fn split_nth_of_selector_requires_whitespace_around_of() {
+        assert_eq!(split_nth_of_selector("2n+1 of .a"), ("2n+1", Some(".a")));
+        assert_eq!(
+            split_nth_of_selector(" odd\tOf\n.a, .b "),
+            ("odd", Some(".a, .b"))
+        );
+        assert_eq!(split_nth_of_selector("2n+1"), ("2n+1", None));
+        assert_eq!(split_nth_of_selector("2 of"), ("2", Some("")));
+        assert_eq!(split_nth_of_selector("of"), ("of", None));
+        assert_eq!(split_nth_of_selector("2 offset"), ("2 offset", None));
     }
 
     #[test]
@@ -2807,6 +3488,81 @@ mod tests {
     }
 
     #[test]
+    fn node_matches_single_class_fast_path_preserves_parser_and_fallback_semantics() {
+        selector_parse_cache::clear_for_test();
+        let mut document = Document::new();
+        let element = document.create_element("div");
+        element.set_attribute(&mut document, "class", "active other");
+        element.set_attribute(&mut document, "data-value", ",");
+        document.append_child(document.body().id, element.id);
+
+        assert_eq!(
+            selector_matches_node(".active", &document, element.id),
+            Ok(true)
+        );
+        assert_eq!(
+            selector_matches_node(r".act\69 ve", &document, element.id),
+            Ok(true),
+            "the fast path must use the parser's decoded class token"
+        );
+        assert_eq!(
+            selector_matches_node(".inactive", &document, element.id),
+            Ok(false)
+        );
+        assert_eq!(
+            selector_matches_node(".active.other", &document, element.id),
+            Ok(true),
+            "multi-class compounds must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("div.active", &document, element.id),
+            Ok(true),
+            "tag/class compounds must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("[class~=active]", &document, element.id),
+            Ok(true),
+            "attribute selectors must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("[data-value=',']", &document, element.id),
+            Ok(true),
+            "commas nested in attributes must retain the group-aware matcher"
+        );
+        assert_eq!(
+            selector_matches_node(".inactive, .active", &document, element.id),
+            Ok(true),
+            "selector lists must retain parsing and short-circuit semantics"
+        );
+        assert_eq!(
+            selector_matches_node(":is(.inactive, .active)", &document, element.id),
+            Ok(true),
+            "commas nested in functional pseudo-classes must retain the group-aware matcher"
+        );
+        assert_eq!(
+            selector_matches_node(":is(.inactive)", &document, element.id),
+            Ok(false),
+            "functional pseudo-classes must not be mistaken for a bare class selector"
+        );
+        assert_eq!(selector_matches_node(".", &document, element.id), Err(()));
+        assert_eq!(
+            selector_matches_node("div >", &document, element.id),
+            Err(())
+        );
+
+        let parsed = parse_selector_chain_cached(".active").unwrap();
+        assert_eq!(
+            single_class_selector(&parsed.chain, &parsed.combinators),
+            Some("active")
+        );
+        let compound = parse_selector_chain_cached(".active.other").unwrap();
+        assert_eq!(
+            single_class_selector(&compound.chain, &compound.combinators),
+            None
+        );
+    }
+
+    #[test]
     fn foreign_element_type_and_attribute_names_are_case_sensitive() {
         setup();
         register_rule("lineargradient[viewbox]", &[("wrong-case", "yes")]);
@@ -2819,6 +3575,236 @@ mod tests {
         assert_eq!(
             (declarations[0].0.as_str(), declarations[0].1.as_str()),
             ("exact-case", "yes")
+        );
+    }
+
+    #[test]
+    fn node_matcher_stays_equivalent_to_owned_context_reference() {
+        setup();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let target = document.create_element("span");
+        let child = document.create_element("em");
+        let sibling = document.create_element("strong");
+        parent.set_attribute(&mut document, "class", "outer");
+        target.set_attribute(&mut document, "id", "target");
+        target.set_attribute(&mut document, "class", "button active");
+        target.set_attribute(&mut document, "lang", "en-GB");
+        target.set_attribute(&mut document, "data-id", "pre-middle-post");
+        target.set_attribute(&mut document, "name", "User");
+        child.set_attribute(&mut document, "class", "child");
+        document.append_child(document.body().id, parent.id);
+        document.append_child(parent.id, target.id);
+        document.append_child(target.id, child.id);
+        document.append_child(parent.id, sibling.id);
+        document.set_focus_state(Some(target.id), true);
+
+        for (selector, target_id, expected) in [
+            ("span", None, true),
+            ("SPAN", None, true),
+            ("#target", None, true),
+            (".active", None, true),
+            (".missing", None, false),
+            ("[CLASS]", None, true),
+            ("[class~=active]", None, true),
+            ("[lang|=EN]", None, true),
+            ("[data-id^=pre]", None, true),
+            ("[data-id$=post]", None, true),
+            ("[data-id*=middle]", None, true),
+            ("[name*=user i]", None, true),
+            ("[name=User s]", None, true),
+            ("[name=user s]", None, false),
+            ("[class~=ACTIVE i]", None, true),
+            ("[class~=ACTIVE s]", None, false),
+            ("[data-id|=PRE i]", None, true),
+            ("[data-id|=PRE s]", None, false),
+            ("[data-id^=PRE i]", None, true),
+            ("[data-id^=PRE s]", None, false),
+            ("[data-id$=POST i]", None, true),
+            ("[data-id$=POST s]", None, false),
+            ("[data-id*=MIDDLE i]", None, true),
+            ("[data-id*=MIDDLE s]", None, false),
+            (r#".\61 ctive"#, None, true),
+            ("span:first-child", None, true),
+            ("span:last-child", None, false),
+            ("span:first-of-type", None, true),
+            ("span:last-of-type", None, true),
+            ("span:only-child", None, false),
+            ("span:only-of-type", None, true),
+            ("span:empty", None, false),
+            ("span:nth-child(1)", None, true),
+            ("span:nth-last-child(2)", None, true),
+            ("span:nth-of-type(1)", None, true),
+            ("span:nth-last-of-type(1)", None, true),
+            ("span:root", None, false),
+            ("span:focus", None, true),
+            ("span:focus-visible", None, true),
+            ("span:focus-within", None, true),
+            ("span:target", Some("target"), true),
+            ("span:not(.missing)", None, true),
+            ("span:has(> .child)", None, true),
+        ] {
+            let parsed = parse_selector_chain_cached(selector).expect("valid selector");
+            assert_eq!(parsed.chain.len(), 1, "selector={selector}");
+            let compound = &parsed.chain[0];
+            assert_eq!(
+                compound_matches_node_via_owned_context(&document, target.id, compound, target_id,),
+                expected,
+                "owned reference selector={selector}",
+            );
+            assert_eq!(
+                compound_matches_node(&document, target.id, compound, target_id),
+                expected,
+                "candidate selector={selector}",
+            );
+        }
+
+        for (selector, expected) in [
+            ("div > span.active", Ok(true)),
+            ("body span.active", Ok(true)),
+            ("span.active + em", Ok(false)),
+            ("span.active ~ strong", Ok(false)),
+            (".missing, span.active", Ok(true)),
+            (r#"[data-id='pre,middle'], span.active"#, Ok(true)),
+            ("span,,em", Err(())),
+        ] {
+            assert_eq!(
+                selector_matches_node(selector, &document, target.id),
+                expected,
+                "selector={selector}",
+            );
+        }
+        assert_eq!(
+            selector_matches_node("span.active ~ strong", &document, sibling.id),
+            Ok(true),
+        );
+        assert_eq!(
+            selector_matches_node(":root", &document, document.body().id),
+            Ok(true),
+        );
+        assert_eq!(
+            selector_matches_node_relative_to_scope(
+                ".active", &document, target.id, parent.id, None,
+            ),
+            Ok(true),
+        );
+    }
+
+    #[test]
+    fn node_matcher_keeps_foreign_and_xml_case_semantics() {
+        setup();
+        let mut document = Document::new();
+        document.set_html_document(false);
+        let target = document.create_element("svg:linearGradient");
+        document.set_html_element(target.id, false);
+        target.set_attribute_ns(
+            &mut document,
+            Some("http://www.w3.org/1999/xlink"),
+            "xlink:href",
+            Some("xlink"),
+            "href",
+            "Value",
+        );
+        document.append_child(document.body().id, target.id);
+
+        for (selector, expected) in [
+            ("linearGradient", true),
+            ("lineargradient", false),
+            ("*|linearGradient", true),
+            ("[*|href]", true),
+            ("[*|href=Value]", true),
+            ("[*|href=value]", false),
+            ("[*|HREF]", false),
+        ] {
+            let parsed = parse_selector_chain_cached(selector).expect("valid selector");
+            let compound = parsed.chain.last().expect("selector compound");
+            assert_eq!(
+                compound_matches_node_via_owned_context(&document, target.id, compound, None),
+                expected,
+                "owned reference selector={selector}",
+            );
+            assert_eq!(
+                compound_matches_node(&document, target.id, compound, None),
+                expected,
+                "candidate selector={selector}",
+            );
+        }
+    }
+
+    #[test]
+    fn node_matcher_keeps_foreign_element_case_semantics_in_html_documents() {
+        setup();
+        let mut document = Document::new();
+        let target = document.create_element("svg:linearGradient");
+        document.set_html_element(target.id, false);
+        target.set_attribute_ns(
+            &mut document,
+            Some("http://www.w3.org/1999/xlink"),
+            "xlink:href",
+            Some("xlink"),
+            "href",
+            "Value",
+        );
+        document.append_child(document.body().id, target.id);
+
+        for (selector, expected) in [
+            ("linearGradient", true),
+            ("lineargradient", false),
+            ("[*|href=Value s]", true),
+            ("[*|href=value s]", false),
+            ("[*|href=value i]", true),
+        ] {
+            let parsed = parse_selector_chain_cached(selector).expect("valid selector");
+            let compound = parsed.chain.last().expect("selector compound");
+            assert_eq!(
+                compound_matches_node_via_owned_context(&document, target.id, compound, None),
+                expected,
+                "owned reference selector={selector}",
+            );
+            assert_eq!(
+                compound_matches_node(&document, target.id, compound, None),
+                expected,
+                "candidate selector={selector}",
+            );
+        }
+    }
+
+    #[test]
+    fn node_matcher_reads_live_class_and_attribute_state() {
+        setup();
+        let mut document = Document::new();
+        let target = document.create_element("span");
+        document.append_child(document.body().id, target.id);
+        reset_node_selector_context_constructions();
+
+        target.set_class_name(&mut document, "active");
+        assert_eq!(
+            selector_matches_node(".active", &document, target.id),
+            Ok(true)
+        );
+        target.set_class_name(&mut document, "inactive");
+        assert_eq!(
+            selector_matches_node(".active", &document, target.id),
+            Ok(false)
+        );
+        assert_eq!(
+            selector_matches_node(".inactive", &document, target.id),
+            Ok(true)
+        );
+        target.set_attribute(&mut document, "data-state", "ready");
+        assert_eq!(
+            selector_matches_node("[data-state=ready]", &document, target.id),
+            Ok(true),
+        );
+        target.remove_attribute(&mut document, "data-state");
+        assert_eq!(
+            selector_matches_node("[data-state=ready]", &document, target.id),
+            Ok(false),
+        );
+        assert_eq!(
+            node_selector_context_constructions(),
+            0,
+            "node selector matching must not materialize owned SelectorContext values",
         );
     }
 
@@ -3395,6 +4381,55 @@ mod tests {
         assert_eq!(
             document.computed_pseudo_style_for(item.id, "::before").left,
             w3cos_std::style::Dimension::Px(40.0)
+        );
+    }
+
+    #[test]
+    fn pseudo_element_rules_are_indexed_apart_from_element_rules() {
+        setup();
+        let mut document = Document::new();
+        let item = document.create_element("div");
+        item.set_attribute(&mut document, "class", "icon icon");
+        document.append_child(document.body().id, item.id);
+        register_rule(".icon", &[("color", "red")]);
+        register_rule(".icon::before", &[("content", "\"x\"")]);
+        register_rule("div::after", &[("content", "\"y\"")]);
+        register_rule("::before", &[("content", "\"z\"")]);
+        for index in 0..64 {
+            register_rule(&format!(".other-{index}::before"), &[("content", "\"n\"")]);
+        }
+
+        RULES.with(|rules| {
+            let rules = rules.borrow();
+            let element = rules.candidate_indices_for_node(&document, item.id);
+            assert_eq!(
+                element.len(),
+                1,
+                "only the .icon element rule, no pseudo rules"
+            );
+            assert!(rules.rules[element[0]].pseudo_element.is_none());
+            let mut pseudo = rules.pseudo_candidate_indices_for_node(&document, item.id);
+            pseudo.sort_unstable();
+            let mut unique = pseudo.clone();
+            unique.dedup();
+            assert_eq!(pseudo, unique, "no duplicate candidates");
+            assert_eq!(pseudo.len(), 3, ".icon::before, div::after and ::before");
+            assert!(
+                pseudo
+                    .iter()
+                    .all(|index| rules.rules[*index].pseudo_element.is_some())
+            );
+        });
+        let before = matching_pseudo_declarations_for_node(&document, item.id, "::before");
+        assert_eq!(before.len(), 2);
+        let after = matching_pseudo_declarations_for_node(&document, item.id, "::after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            matching_declarations_for_node(&document, item.id)
+                .iter()
+                .filter(|declaration| declaration.0 == "content")
+                .count(),
+            0
         );
     }
 

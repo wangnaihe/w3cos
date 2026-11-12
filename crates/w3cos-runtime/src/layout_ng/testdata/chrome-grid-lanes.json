@@ -1,0 +1,9252 @@
+{
+ "browser": "Google Chrome 156.0.8078.79",
+ "cases": {
+  "cols-basic": {
+   "spec": {
+    "name": "cols-basic",
+    "container": {
+     "template": "50px 50px 50px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=cols-basic class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;width:200px'><div id=cols-basic-a style='height:30px'></div><div id=cols-basic-b style='height:10px'></div><div id=cols-basic-c style='height:20px'></div><div id=cols-basic-d style='height:40px'></div><div id=cols-basic-e style='height:10px'></div><div id=cols-basic-f style='height:10px'></div><div id=cols-basic-g style='height:25px'></div></div>",
+   "rects": {
+    "cols-basic": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "cols-basic-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "cols-basic-b": [
+     50,
+     0,
+     50,
+     10
+    ],
+    "cols-basic-c": [
+     100,
+     0,
+     50,
+     20
+    ],
+    "cols-basic-d": [
+     50,
+     10,
+     50,
+     40
+    ],
+    "cols-basic-e": [
+     100,
+     20,
+     50,
+     10
+    ],
+    "cols-basic-f": [
+     0,
+     30,
+     50,
+     10
+    ],
+    "cols-basic-g": [
+     100,
+     30,
+     50,
+     25
+    ]
+   }
+  },
+  "cols-gap": {
+   "spec": {
+    "name": "cols-gap",
+    "container": {
+     "template": "60px 60px 60px",
+     "gap": [
+      8,
+      5
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=cols-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:60px 60px 60px;row-gap:8px;column-gap:5px;width:200px'><div id=cols-gap-a style='height:30px'></div><div id=cols-gap-b style='height:10px'></div><div id=cols-gap-c style='height:20px'></div><div id=cols-gap-d style='height:40px'></div><div id=cols-gap-e style='height:10px'></div><div id=cols-gap-f style='height:10px'></div><div id=cols-gap-g style='height:25px'></div></div>",
+   "rects": {
+    "cols-gap": [
+     0,
+     0,
+     200,
+     71
+    ],
+    "cols-gap-a": [
+     0,
+     0,
+     60,
+     30
+    ],
+    "cols-gap-b": [
+     65,
+     0,
+     60,
+     10
+    ],
+    "cols-gap-c": [
+     130,
+     0,
+     60,
+     20
+    ],
+    "cols-gap-d": [
+     65,
+     18,
+     60,
+     40
+    ],
+    "cols-gap-e": [
+     130,
+     28,
+     60,
+     10
+    ],
+    "cols-gap-f": [
+     0,
+     38,
+     60,
+     10
+    ],
+    "cols-gap-g": [
+     130,
+     46,
+     60,
+     25
+    ]
+   }
+  },
+  "cols-tol0": {
+   "spec": {
+    "name": "cols-tol0",
+    "container": {
+     "template": "50px 50px 50px",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 25
+     },
+     {
+      "id": "c",
+      "h": 28
+     },
+     {
+      "id": "d",
+      "h": 5
+     },
+     {
+      "id": "e",
+      "h": 5
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=cols-tol0 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;flow-tolerance:0;width:200px'><div id=cols-tol0-a style='height:30px'></div><div id=cols-tol0-b style='height:25px'></div><div id=cols-tol0-c style='height:28px'></div><div id=cols-tol0-d style='height:5px'></div><div id=cols-tol0-e style='height:5px'></div><div id=cols-tol0-f style='height:5px'></div></div>",
+   "rects": {
+    "cols-tol0": [
+     0,
+     0,
+     200,
+     35
+    ],
+    "cols-tol0-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "cols-tol0-b": [
+     50,
+     0,
+     50,
+     25
+    ],
+    "cols-tol0-c": [
+     100,
+     0,
+     50,
+     28
+    ],
+    "cols-tol0-d": [
+     50,
+     25,
+     50,
+     5
+    ],
+    "cols-tol0-e": [
+     100,
+     28,
+     50,
+     5
+    ],
+    "cols-tol0-f": [
+     0,
+     30,
+     50,
+     5
+    ]
+   }
+  },
+  "cols-tol-default": {
+   "spec": {
+    "name": "cols-tol-default",
+    "container": {
+     "template": "50px 50px 50px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 25
+     },
+     {
+      "id": "c",
+      "h": 28
+     },
+     {
+      "id": "d",
+      "h": 5
+     },
+     {
+      "id": "e",
+      "h": 5
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=cols-tol-default class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;width:200px'><div id=cols-tol-default-a style='height:30px'></div><div id=cols-tol-default-b style='height:25px'></div><div id=cols-tol-default-c style='height:28px'></div><div id=cols-tol-default-d style='height:5px'></div><div id=cols-tol-default-e style='height:5px'></div><div id=cols-tol-default-f style='height:5px'></div></div>",
+   "rects": {
+    "cols-tol-default": [
+     0,
+     0,
+     200,
+     35
+    ],
+    "cols-tol-default-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "cols-tol-default-b": [
+     50,
+     0,
+     50,
+     25
+    ],
+    "cols-tol-default-c": [
+     100,
+     0,
+     50,
+     28
+    ],
+    "cols-tol-default-d": [
+     0,
+     30,
+     50,
+     5
+    ],
+    "cols-tol-default-e": [
+     50,
+     25,
+     50,
+     5
+    ],
+    "cols-tol-default-f": [
+     100,
+     28,
+     50,
+     5
+    ]
+   }
+  },
+  "cols-tol-20": {
+   "spec": {
+    "name": "cols-tol-20",
+    "container": {
+     "template": "50px 50px 50px",
+     "tolerance": "20px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 25
+     },
+     {
+      "id": "c",
+      "h": 28
+     },
+     {
+      "id": "d",
+      "h": 5
+     },
+     {
+      "id": "e",
+      "h": 5
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=cols-tol-20 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;flow-tolerance:20px;width:200px'><div id=cols-tol-20-a style='height:30px'></div><div id=cols-tol-20-b style='height:25px'></div><div id=cols-tol-20-c style='height:28px'></div><div id=cols-tol-20-d style='height:5px'></div><div id=cols-tol-20-e style='height:5px'></div><div id=cols-tol-20-f style='height:5px'></div></div>",
+   "rects": {
+    "cols-tol-20": [
+     0,
+     0,
+     200,
+     35
+    ],
+    "cols-tol-20-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "cols-tol-20-b": [
+     50,
+     0,
+     50,
+     25
+    ],
+    "cols-tol-20-c": [
+     100,
+     0,
+     50,
+     28
+    ],
+    "cols-tol-20-d": [
+     0,
+     30,
+     50,
+     5
+    ],
+    "cols-tol-20-e": [
+     50,
+     25,
+     50,
+     5
+    ],
+    "cols-tol-20-f": [
+     100,
+     28,
+     50,
+     5
+    ]
+   }
+  },
+  "cols-tol-inf": {
+   "spec": {
+    "name": "cols-tol-inf",
+    "container": {
+     "template": "50px 50px 50px",
+     "tolerance": "infinite"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 25
+     },
+     {
+      "id": "c",
+      "h": 28
+     },
+     {
+      "id": "d",
+      "h": 5
+     },
+     {
+      "id": "e",
+      "h": 5
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=cols-tol-inf class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;flow-tolerance:infinite;width:200px'><div id=cols-tol-inf-a style='height:30px'></div><div id=cols-tol-inf-b style='height:25px'></div><div id=cols-tol-inf-c style='height:28px'></div><div id=cols-tol-inf-d style='height:5px'></div><div id=cols-tol-inf-e style='height:5px'></div><div id=cols-tol-inf-f style='height:5px'></div></div>",
+   "rects": {
+    "cols-tol-inf": [
+     0,
+     0,
+     200,
+     35
+    ],
+    "cols-tol-inf-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "cols-tol-inf-b": [
+     50,
+     0,
+     50,
+     25
+    ],
+    "cols-tol-inf-c": [
+     100,
+     0,
+     50,
+     28
+    ],
+    "cols-tol-inf-d": [
+     0,
+     30,
+     50,
+     5
+    ],
+    "cols-tol-inf-e": [
+     50,
+     25,
+     50,
+     5
+    ],
+    "cols-tol-inf-f": [
+     100,
+     28,
+     50,
+     5
+    ]
+   }
+  },
+  "cols-span": {
+   "spec": {
+    "name": "cols-span",
+    "container": {
+     "template": "40px 40px 40px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=cols-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;width:200px'><div id=cols-span-a style='height:20px'></div><div id=cols-span-b style='height:30px;grid-column:span 2'></div><div id=cols-span-c style='height:10px'></div><div id=cols-span-d style='height:10px'></div><div id=cols-span-e style='height:15px;grid-column:span 2'></div><div id=cols-span-f style='height:5px'></div></div>",
+   "rects": {
+    "cols-span": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "cols-span-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "cols-span-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "cols-span-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "cols-span-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "cols-span-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "cols-span-f": [
+     80,
+     30,
+     40,
+     5
+    ]
+   }
+  },
+  "cols-explicit": {
+   "spec": {
+    "name": "cols-explicit",
+    "container": {
+     "template": "40px 40px 40px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "place": "3"
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 15,
+      "place": "1"
+     },
+     {
+      "id": "e",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=cols-explicit class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;width:200px'><div id=cols-explicit-a style='height:20px;grid-column:3'></div><div id=cols-explicit-b style='height:30px'></div><div id=cols-explicit-c style='height:10px'></div><div id=cols-explicit-d style='height:15px;grid-column:1'></div><div id=cols-explicit-e style='height:10px'></div></div>",
+   "rects": {
+    "cols-explicit": [
+     0,
+     0,
+     200,
+     45
+    ],
+    "cols-explicit-a": [
+     80,
+     0,
+     40,
+     20
+    ],
+    "cols-explicit-b": [
+     0,
+     0,
+     40,
+     30
+    ],
+    "cols-explicit-c": [
+     40,
+     0,
+     40,
+     10
+    ],
+    "cols-explicit-d": [
+     0,
+     30,
+     40,
+     15
+    ],
+    "cols-explicit-e": [
+     80,
+     20,
+     40,
+     10
+    ]
+   }
+  },
+  "cols-order": {
+   "spec": {
+    "name": "cols-order",
+    "container": {
+     "template": "50px 50px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "order": 2
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "order": 1
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "order": -1
+     }
+    ]
+   },
+   "html": "<div id=cols-order class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=cols-order-a style='height:20px;order:2'></div><div id=cols-order-b style='height:30px;order:1'></div><div id=cols-order-c style='height:10px'></div><div id=cols-order-d style='height:10px;order:-1'></div></div>",
+   "rects": {
+    "cols-order": [
+     0,
+     0,
+     200,
+     40
+    ],
+    "cols-order-a": [
+     50,
+     10,
+     50,
+     20
+    ],
+    "cols-order-b": [
+     0,
+     10,
+     50,
+     30
+    ],
+    "cols-order-c": [
+     50,
+     0,
+     50,
+     10
+    ],
+    "cols-order-d": [
+     0,
+     0,
+     50,
+     10
+    ]
+   }
+  },
+  "cols-auto": {
+   "spec": {
+    "name": "cols-auto",
+    "container": {
+     "template": "auto auto"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XX"
+     },
+     {
+      "id": "b",
+      "text": "XXXX"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "X"
+     }
+    ]
+   },
+   "html": "<div id=cols-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:auto auto;width:200px'><div id=cols-auto-a style=''>XX</div><div id=cols-auto-b style=''>XXXX</div><div id=cols-auto-c style=''>XXX</div><div id=cols-auto-d style=''>X</div></div>",
+   "rects": {
+    "cols-auto": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "cols-auto-a": [
+     0,
+     0,
+     100,
+     10
+    ],
+    "cols-auto-b": [
+     100,
+     0,
+     100,
+     10
+    ],
+    "cols-auto-c": [
+     0,
+     10,
+     100,
+     10
+    ],
+    "cols-auto-d": [
+     100,
+     10,
+     100,
+     10
+    ]
+   }
+  },
+  "cols-fr": {
+   "spec": {
+    "name": "cols-fr",
+    "container": {
+     "template": "1fr 2fr",
+     "width": 210
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10
+     },
+     {
+      "id": "b",
+      "h": 20
+     },
+     {
+      "id": "c",
+      "h": 30
+     },
+     {
+      "id": "d",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=cols-fr class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:1fr 2fr;width:210px'><div id=cols-fr-a style='height:10px'></div><div id=cols-fr-b style='height:20px'></div><div id=cols-fr-c style='height:30px'></div><div id=cols-fr-d style='height:5px'></div></div>",
+   "rects": {
+    "cols-fr": [
+     0,
+     0,
+     210,
+     40
+    ],
+    "cols-fr-a": [
+     0,
+     0,
+     70,
+     10
+    ],
+    "cols-fr-b": [
+     70,
+     0,
+     140,
+     20
+    ],
+    "cols-fr-c": [
+     0,
+     10,
+     70,
+     30
+    ],
+    "cols-fr-d": [
+     70,
+     20,
+     140,
+     5
+    ]
+   }
+  },
+  "cols-box": {
+   "spec": {
+    "name": "cols-box",
+    "container": {
+     "template": "60px 60px",
+     "gap": [
+      4,
+      4
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "margin": 5
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 15,
+      "margin": 3
+     },
+     {
+      "id": "d",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=cols-box class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:60px 60px;row-gap:4px;column-gap:4px;width:200px'><div id=cols-box-a style='height:20px;margin:5px;padding:2px;border:1px solid'></div><div id=cols-box-b style='height:10px'></div><div id=cols-box-c style='height:15px;margin:3px;padding:2px;border:1px solid'></div><div id=cols-box-d style='height:10px'></div></div>",
+   "rects": {
+    "cols-box": [
+     0,
+     0,
+     200,
+     50
+    ],
+    "cols-box-a": [
+     5,
+     5,
+     50,
+     26
+    ],
+    "cols-box-b": [
+     64,
+     0,
+     60,
+     10
+    ],
+    "cols-box-c": [
+     67,
+     17,
+     54,
+     21
+    ],
+    "cols-box-d": [
+     0,
+     40,
+     60,
+     10
+    ]
+   }
+  },
+  "cols-repeat": {
+   "spec": {
+    "name": "cols-repeat",
+    "container": {
+     "template": "repeat(auto-fill, 45px)"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=cols-repeat class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fill, 45px);width:200px'><div id=cols-repeat-a style='height:30px'></div><div id=cols-repeat-b style='height:10px'></div><div id=cols-repeat-c style='height:20px'></div><div id=cols-repeat-d style='height:40px'></div><div id=cols-repeat-e style='height:10px'></div></div>",
+   "rects": {
+    "cols-repeat": [
+     0,
+     0,
+     200,
+     40
+    ],
+    "cols-repeat-a": [
+     0,
+     0,
+     45,
+     30
+    ],
+    "cols-repeat-b": [
+     45,
+     0,
+     45,
+     10
+    ],
+    "cols-repeat-c": [
+     90,
+     0,
+     45,
+     20
+    ],
+    "cols-repeat-d": [
+     135,
+     0,
+     45,
+     40
+    ],
+    "cols-repeat-e": [
+     45,
+     10,
+     45,
+     10
+    ]
+   }
+  },
+  "cols-justify": {
+   "spec": {
+    "name": "cols-justify",
+    "container": {
+     "template": "70px 70px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     }
+    ]
+   },
+   "html": "<div id=cols-justify class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:70px 70px;width:200px'><div id=cols-justify-a style='width:30px;height:10px'></div><div id=cols-justify-b style='width:20px;height:10px'></div><div id=cols-justify-c style='width:40px;height:10px'></div></div>",
+   "rects": {
+    "cols-justify": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "cols-justify-a": [
+     0,
+     0,
+     30,
+     10
+    ],
+    "cols-justify-b": [
+     70,
+     0,
+     20,
+     10
+    ],
+    "cols-justify-c": [
+     0,
+     10,
+     40,
+     10
+    ]
+   }
+  },
+  "cols-height": {
+   "spec": {
+    "name": "cols-height",
+    "container": {
+     "template": "50px 50px",
+     "height": 100
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10
+     },
+     {
+      "id": "b",
+      "h": 20
+     }
+    ]
+   },
+   "html": "<div id=cols-height class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px;height:100px'><div id=cols-height-a style='height:10px'></div><div id=cols-height-b style='height:20px'></div></div>",
+   "rects": {
+    "cols-height": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "cols-height-a": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "cols-height-b": [
+     50,
+     0,
+     50,
+     20
+    ]
+   }
+  },
+  "rows-basic": {
+   "spec": {
+    "name": "rows-basic",
+    "container": {
+     "template": "30px 30px",
+     "rows": true
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 70
+     }
+    ]
+   },
+   "html": "<div id=rows-basic class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;width:200px'><div id=rows-basic-a style='width:60px;height:10px'></div><div id=rows-basic-b style='width:40px;height:10px'></div><div id=rows-basic-c style='width:50px;height:10px'></div><div id=rows-basic-d style='width:30px;height:10px'></div><div id=rows-basic-e style='width:70px;height:10px'></div></div>",
+   "rects": {
+    "rows-basic": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "rows-basic-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "rows-basic-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "rows-basic-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "rows-basic-d": [
+     60,
+     0,
+     30,
+     10
+    ],
+    "rows-basic-e": [
+     90,
+     30,
+     70,
+     10
+    ]
+   }
+  },
+  "rows-auto": {
+   "spec": {
+    "name": "rows-auto",
+    "container": {
+     "template": "auto auto",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XX"
+     },
+     {
+      "id": "b",
+      "text": "XXXX"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "X"
+     },
+     {
+      "id": "e",
+      "text": "XX"
+     }
+    ]
+   },
+   "html": "<div id=rows-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:auto auto;grid-lanes-direction:row;width:200px'><div id=rows-auto-a style=''>XX</div><div id=rows-auto-b style=''>XXXX</div><div id=rows-auto-c style=''>XXX</div><div id=rows-auto-d style=''>X</div><div id=rows-auto-e style=''>XX</div></div>",
+   "rects": {
+    "rows-auto": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "rows-auto-a": [
+     0,
+     0,
+     20,
+     10
+    ],
+    "rows-auto-b": [
+     0,
+     10,
+     40,
+     10
+    ],
+    "rows-auto-c": [
+     20,
+     0,
+     30,
+     10
+    ],
+    "rows-auto-d": [
+     40,
+     10,
+     10,
+     10
+    ],
+    "rows-auto-e": [
+     50,
+     0,
+     20,
+     10
+    ]
+   }
+  },
+  "rows-gap": {
+   "spec": {
+    "name": "rows-gap",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      6,
+      4
+     ],
+     "rows": true
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 80
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=rows-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;row-gap:6px;column-gap:4px;width:200px'><div id=rows-gap-a style='width:50px;height:10px'></div><div id=rows-gap-b style='width:80px;height:10px'></div><div id=rows-gap-c style='width:30px;height:10px'></div><div id=rows-gap-d style='width:60px;height:10px'></div><div id=rows-gap-e style='width:40px;height:10px'></div><div id=rows-gap-f style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "rows-gap": [
+     0,
+     0,
+     200,
+     72
+    ],
+    "rows-gap-a": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "rows-gap-b": [
+     0,
+     26,
+     80,
+     10
+    ],
+    "rows-gap-c": [
+     0,
+     52,
+     30,
+     10
+    ],
+    "rows-gap-d": [
+     34,
+     52,
+     60,
+     10
+    ],
+    "rows-gap-e": [
+     54,
+     0,
+     40,
+     10
+    ],
+    "rows-gap-f": [
+     84,
+     26,
+     20,
+     10
+    ]
+   }
+  },
+  "rows-span": {
+   "spec": {
+    "name": "rows-span",
+    "container": {
+     "template": "20px 20px 20px",
+     "rows": true
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 60
+     }
+    ]
+   },
+   "html": "<div id=rows-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;width:200px'><div id=rows-span-a style='width:50px;height:10px'></div><div id=rows-span-b style='width:40px;height:10px;grid-row:span 2'></div><div id=rows-span-c style='width:30px;height:10px'></div><div id=rows-span-d style='width:60px;height:10px'></div></div>",
+   "rects": {
+    "rows-span": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "rows-span-a": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "rows-span-b": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "rows-span-c": [
+     50,
+     0,
+     30,
+     10
+    ],
+    "rows-span-d": [
+     40,
+     20,
+     60,
+     10
+    ]
+   }
+  },
+  "rows-explicit": {
+   "spec": {
+    "name": "rows-explicit",
+    "container": {
+     "template": "20px 20px",
+     "rows": true
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50,
+      "place": "2"
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     }
+    ]
+   },
+   "html": "<div id=rows-explicit class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px;width:200px'><div id=rows-explicit-a style='width:50px;height:10px;grid-row:2'></div><div id=rows-explicit-b style='width:40px;height:10px'></div><div id=rows-explicit-c style='width:30px;height:10px'></div></div>",
+   "rects": {
+    "rows-explicit": [
+     0,
+     0,
+     200,
+     40
+    ],
+    "rows-explicit-a": [
+     0,
+     20,
+     50,
+     10
+    ],
+    "rows-explicit-b": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "rows-explicit-c": [
+     50,
+     20,
+     30,
+     10
+    ]
+   }
+  },
+  "rows-tol0": {
+   "spec": {
+    "name": "rows-tol0",
+    "container": {
+     "template": "20px 20px",
+     "tolerance": "0",
+     "rows": true
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 45
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=rows-tol0 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px;flow-tolerance:0;width:200px'><div id=rows-tol0-a style='width:50px;height:10px'></div><div id=rows-tol0-b style='width:45px;height:10px'></div><div id=rows-tol0-c style='width:20px;height:10px'></div><div id=rows-tol0-d style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "rows-tol0": [
+     0,
+     0,
+     200,
+     40
+    ],
+    "rows-tol0-a": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "rows-tol0-b": [
+     0,
+     20,
+     45,
+     10
+    ],
+    "rows-tol0-c": [
+     45,
+     20,
+     20,
+     10
+    ],
+    "rows-tol0-d": [
+     50,
+     0,
+     20,
+     10
+    ]
+   }
+  },
+  "rows-stretch": {
+   "spec": {
+    "name": "rows-stretch",
+    "container": {
+     "template": "auto auto",
+     "height": 80,
+     "rows": true
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 15,
+      "w": 30
+     },
+     {
+      "id": "c",
+      "w": 40
+     }
+    ]
+   },
+   "html": "<div id=rows-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:auto auto;width:200px;height:80px'><div id=rows-stretch-a style='width:50px'></div><div id=rows-stretch-b style='width:30px;height:15px'></div><div id=rows-stretch-c style='width:40px'></div></div>",
+   "rects": {
+    "rows-stretch": [
+     0,
+     0,
+     200,
+     80
+    ],
+    "rows-stretch-a": [
+     0,
+     0,
+     50,
+     40
+    ],
+    "rows-stretch-b": [
+     0,
+     40,
+     30,
+     15
+    ],
+    "rows-stretch-c": [
+     30,
+     40,
+     40,
+     40
+    ]
+   }
+  },
+  "rows-wrap-width": {
+   "spec": {
+    "name": "rows-wrap-width",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "width": 100
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XX XX XX"
+     },
+     {
+      "id": "b",
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "text": "XXXXXXXXXXXXXXXXXXXXXXXX"
+     }
+    ]
+   },
+   "html": "<div id=rows-wrap-width class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:100px'><div id=rows-wrap-width-a style=''>XX XX XX</div><div id=rows-wrap-width-b style=''>XX</div><div id=rows-wrap-width-c style=''>XXXXXXXXXXXXXXXXXXXXXXXX</div></div>",
+   "rects": {
+    "rows-wrap-width": [
+     0,
+     0,
+     100,
+     60
+    ],
+    "rows-wrap-width-a": [
+     0,
+     0,
+     80,
+     30
+    ],
+    "rows-wrap-width-b": [
+     0,
+     30,
+     20,
+     30
+    ],
+    "rows-wrap-width-c": [
+     20,
+     30,
+     240,
+     30
+    ]
+   }
+  },
+  "axis-row-cols": {
+   "spec": {
+    "name": "axis-row-cols",
+    "container": {
+     "template": "50px 50px",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     }
+    ]
+   },
+   "html": "<div id=axis-row-cols class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px;grid-lanes-direction:row;width:200px'><div id=axis-row-cols-a style='width:30px;height:10px'></div><div id=axis-row-cols-b style='width:40px;height:10px'></div></div>",
+   "rects": {
+    "axis-row-cols": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "axis-row-cols-a": [
+     0,
+     0,
+     30,
+     10
+    ],
+    "axis-row-cols-b": [
+     0,
+     50,
+     40,
+     10
+    ]
+   }
+  },
+  "rev-cols-fill": {
+   "spec": {
+    "name": "rev-cols-fill",
+    "container": {
+     "template": "50px 50px 50px",
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-fill class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;grid-lanes-direction:column fill-reverse;width:200px'><div id=rev-cols-fill-a style='height:30px'></div><div id=rev-cols-fill-b style='height:10px'></div><div id=rev-cols-fill-c style='height:20px'></div><div id=rev-cols-fill-d style='height:40px'></div><div id=rev-cols-fill-e style='height:10px'></div><div id=rev-cols-fill-f style='height:10px'></div><div id=rev-cols-fill-g style='height:25px'></div></div>",
+   "rects": {
+    "rev-cols-fill": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "rev-cols-fill-a": [
+     0,
+     25,
+     50,
+     30
+    ],
+    "rev-cols-fill-b": [
+     50,
+     45,
+     50,
+     10
+    ],
+    "rev-cols-fill-c": [
+     100,
+     35,
+     50,
+     20
+    ],
+    "rev-cols-fill-d": [
+     50,
+     5,
+     50,
+     40
+    ],
+    "rev-cols-fill-e": [
+     100,
+     25,
+     50,
+     10
+    ],
+    "rev-cols-fill-f": [
+     0,
+     15,
+     50,
+     10
+    ],
+    "rev-cols-fill-g": [
+     100,
+     0,
+     50,
+     25
+    ]
+   }
+  },
+  "rev-cols-fill-gap": {
+   "spec": {
+    "name": "rev-cols-fill-gap",
+    "container": {
+     "template": "60px 60px 60px",
+     "axis": "column fill-reverse",
+     "gap": [
+      8,
+      5
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-fill-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:60px 60px 60px;grid-lanes-direction:column fill-reverse;row-gap:8px;column-gap:5px;width:200px'><div id=rev-cols-fill-gap-a style='height:30px'></div><div id=rev-cols-fill-gap-b style='height:10px'></div><div id=rev-cols-fill-gap-c style='height:20px'></div><div id=rev-cols-fill-gap-d style='height:40px'></div><div id=rev-cols-fill-gap-e style='height:10px'></div><div id=rev-cols-fill-gap-f style='height:10px'></div><div id=rev-cols-fill-gap-g style='height:25px'></div></div>",
+   "rects": {
+    "rev-cols-fill-gap": [
+     0,
+     0,
+     200,
+     71
+    ],
+    "rev-cols-fill-gap-a": [
+     0,
+     41,
+     60,
+     30
+    ],
+    "rev-cols-fill-gap-b": [
+     65,
+     61,
+     60,
+     10
+    ],
+    "rev-cols-fill-gap-c": [
+     130,
+     51,
+     60,
+     20
+    ],
+    "rev-cols-fill-gap-d": [
+     65,
+     13,
+     60,
+     40
+    ],
+    "rev-cols-fill-gap-e": [
+     130,
+     33,
+     60,
+     10
+    ],
+    "rev-cols-fill-gap-f": [
+     0,
+     23,
+     60,
+     10
+    ],
+    "rev-cols-fill-gap-g": [
+     130,
+     0,
+     60,
+     25
+    ]
+   }
+  },
+  "rev-cols-fill-h": {
+   "spec": {
+    "name": "rev-cols-fill-h",
+    "container": {
+     "template": "50px 50px 50px",
+     "axis": "column fill-reverse",
+     "height": 120
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-fill-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;grid-lanes-direction:column fill-reverse;width:200px;height:120px'><div id=rev-cols-fill-h-a style='height:30px'></div><div id=rev-cols-fill-h-b style='height:10px'></div><div id=rev-cols-fill-h-c style='height:20px'></div><div id=rev-cols-fill-h-d style='height:40px'></div><div id=rev-cols-fill-h-e style='height:10px'></div></div>",
+   "rects": {
+    "rev-cols-fill-h": [
+     0,
+     0,
+     200,
+     120
+    ],
+    "rev-cols-fill-h-a": [
+     0,
+     90,
+     50,
+     30
+    ],
+    "rev-cols-fill-h-b": [
+     50,
+     110,
+     50,
+     10
+    ],
+    "rev-cols-fill-h-c": [
+     100,
+     100,
+     50,
+     20
+    ],
+    "rev-cols-fill-h-d": [
+     50,
+     70,
+     50,
+     40
+    ],
+    "rev-cols-fill-h-e": [
+     100,
+     90,
+     50,
+     10
+    ]
+   }
+  },
+  "rev-cols-track": {
+   "spec": {
+    "name": "rev-cols-track",
+    "container": {
+     "template": "40px 50px 60px",
+     "axis": "column track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-track class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 50px 60px;grid-lanes-direction:column track-reverse;width:200px'><div id=rev-cols-track-a style='height:30px'></div><div id=rev-cols-track-b style='height:10px'></div><div id=rev-cols-track-c style='height:20px'></div><div id=rev-cols-track-d style='height:40px'></div><div id=rev-cols-track-e style='height:10px'></div><div id=rev-cols-track-f style='height:10px'></div><div id=rev-cols-track-g style='height:25px'></div></div>",
+   "rects": {
+    "rev-cols-track": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "rev-cols-track-a": [
+     90,
+     0,
+     60,
+     30
+    ],
+    "rev-cols-track-b": [
+     40,
+     0,
+     50,
+     10
+    ],
+    "rev-cols-track-c": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "rev-cols-track-d": [
+     40,
+     10,
+     50,
+     40
+    ],
+    "rev-cols-track-e": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "rev-cols-track-f": [
+     90,
+     30,
+     60,
+     10
+    ],
+    "rev-cols-track-g": [
+     0,
+     30,
+     40,
+     25
+    ]
+   }
+  },
+  "rev-cols-both": {
+   "spec": {
+    "name": "rev-cols-both",
+    "container": {
+     "template": "40px 50px 60px",
+     "axis": "column fill-reverse track-reverse",
+     "gap": [
+      3,
+      7
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-both class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 50px 60px;grid-lanes-direction:column fill-reverse track-reverse;row-gap:3px;column-gap:7px;width:200px'><div id=rev-cols-both-a style='height:30px'></div><div id=rev-cols-both-b style='height:10px'></div><div id=rev-cols-both-c style='height:20px'></div><div id=rev-cols-both-d style='height:40px'></div><div id=rev-cols-both-e style='height:10px'></div><div id=rev-cols-both-f style='height:10px'></div><div id=rev-cols-both-g style='height:25px'></div></div>",
+   "rects": {
+    "rev-cols-both": [
+     0,
+     0,
+     200,
+     61
+    ],
+    "rev-cols-both-a": [
+     104,
+     31,
+     60,
+     30
+    ],
+    "rev-cols-both-b": [
+     47,
+     51,
+     50,
+     10
+    ],
+    "rev-cols-both-c": [
+     0,
+     41,
+     40,
+     20
+    ],
+    "rev-cols-both-d": [
+     47,
+     8,
+     50,
+     40
+    ],
+    "rev-cols-both-e": [
+     0,
+     28,
+     40,
+     10
+    ],
+    "rev-cols-both-f": [
+     104,
+     18,
+     60,
+     10
+    ],
+    "rev-cols-both-g": [
+     0,
+     0,
+     40,
+     25
+    ]
+   }
+  },
+  "rev-cols-span": {
+   "spec": {
+    "name": "rev-cols-span",
+    "container": {
+     "template": "40px 40px 40px",
+     "axis": "column fill-reverse track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-direction:column fill-reverse track-reverse;width:200px'><div id=rev-cols-span-a style='height:20px'></div><div id=rev-cols-span-b style='height:30px;grid-column:span 2'></div><div id=rev-cols-span-c style='height:10px'></div><div id=rev-cols-span-d style='height:10px'></div><div id=rev-cols-span-e style='height:15px;grid-column:span 2'></div><div id=rev-cols-span-f style='height:5px'></div></div>",
+   "rects": {
+    "rev-cols-span": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "rev-cols-span-a": [
+     80,
+     35,
+     40,
+     20
+    ],
+    "rev-cols-span-b": [
+     0,
+     25,
+     80,
+     30
+    ],
+    "rev-cols-span-c": [
+     80,
+     25,
+     40,
+     10
+    ],
+    "rev-cols-span-d": [
+     40,
+     15,
+     40,
+     10
+    ],
+    "rev-cols-span-e": [
+     40,
+     0,
+     80,
+     15
+    ],
+    "rev-cols-span-f": [
+     0,
+     20,
+     40,
+     5
+    ]
+   }
+  },
+  "rev-cols-explicit": {
+   "spec": {
+    "name": "rev-cols-explicit",
+    "container": {
+     "template": "40px 40px 40px",
+     "axis": "column track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "place": "3"
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 15,
+      "place": "1"
+     },
+     {
+      "id": "e",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-explicit class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-direction:column track-reverse;width:200px'><div id=rev-cols-explicit-a style='height:20px;grid-column:3'></div><div id=rev-cols-explicit-b style='height:30px'></div><div id=rev-cols-explicit-c style='height:10px'></div><div id=rev-cols-explicit-d style='height:15px;grid-column:1'></div><div id=rev-cols-explicit-e style='height:10px'></div></div>",
+   "rects": {
+    "rev-cols-explicit": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "rev-cols-explicit-a": [
+     80,
+     0,
+     40,
+     20
+    ],
+    "rev-cols-explicit-b": [
+     40,
+     0,
+     40,
+     30
+    ],
+    "rev-cols-explicit-c": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "rev-cols-explicit-d": [
+     0,
+     10,
+     40,
+     15
+    ],
+    "rev-cols-explicit-e": [
+     80,
+     20,
+     40,
+     10
+    ]
+   }
+  },
+  "rev-cols-justify": {
+   "spec": {
+    "name": "rev-cols-justify",
+    "container": {
+     "template": "70px 70px",
+     "axis": "column track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-justify class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:70px 70px;grid-lanes-direction:column track-reverse;width:200px'><div id=rev-cols-justify-a style='width:30px;height:10px'></div><div id=rev-cols-justify-b style='width:20px;height:10px'></div><div id=rev-cols-justify-c style='width:40px;height:10px'></div></div>",
+   "rects": {
+    "rev-cols-justify": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "rev-cols-justify-a": [
+     70,
+     0,
+     30,
+     10
+    ],
+    "rev-cols-justify-b": [
+     0,
+     0,
+     20,
+     10
+    ],
+    "rev-cols-justify-c": [
+     70,
+     10,
+     40,
+     10
+    ]
+   }
+  },
+  "rev-cols-box": {
+   "spec": {
+    "name": "rev-cols-box",
+    "container": {
+     "template": "60px 60px",
+     "gap": [
+      4,
+      4
+     ],
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "margin": 5
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 15,
+      "margin": 3
+     },
+     {
+      "id": "d",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=rev-cols-box class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:60px 60px;grid-lanes-direction:column fill-reverse;row-gap:4px;column-gap:4px;width:200px'><div id=rev-cols-box-a style='height:20px;margin:5px;padding:2px;border:1px solid'></div><div id=rev-cols-box-b style='height:10px'></div><div id=rev-cols-box-c style='height:15px;margin:3px;padding:2px;border:1px solid'></div><div id=rev-cols-box-d style='height:10px'></div></div>",
+   "rects": {
+    "rev-cols-box": [
+     0,
+     0,
+     200,
+     50
+    ],
+    "rev-cols-box-a": [
+     5,
+     19,
+     50,
+     26
+    ],
+    "rev-cols-box-b": [
+     64,
+     40,
+     60,
+     10
+    ],
+    "rev-cols-box-c": [
+     67,
+     12,
+     54,
+     21
+    ],
+    "rev-cols-box-d": [
+     0,
+     0,
+     60,
+     10
+    ]
+   }
+  },
+  "rev-rows-fill": {
+   "spec": {
+    "name": "rev-rows-fill",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 70
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-fill class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row fill-reverse;width:200px'><div id=rev-rows-fill-a style='width:60px;height:10px'></div><div id=rev-rows-fill-b style='width:40px;height:10px'></div><div id=rev-rows-fill-c style='width:50px;height:10px'></div><div id=rev-rows-fill-d style='width:30px;height:10px'></div><div id=rev-rows-fill-e style='width:70px;height:10px'></div></div>",
+   "rects": {
+    "rev-rows-fill": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "rev-rows-fill-a": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "rev-rows-fill-b": [
+     160,
+     30,
+     40,
+     10
+    ],
+    "rev-rows-fill-c": [
+     110,
+     30,
+     50,
+     10
+    ],
+    "rev-rows-fill-d": [
+     110,
+     0,
+     30,
+     10
+    ],
+    "rev-rows-fill-e": [
+     40,
+     30,
+     70,
+     10
+    ]
+   }
+  },
+  "rev-rows-fill-gap": {
+   "spec": {
+    "name": "rev-rows-fill-gap",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      6,
+      4
+     ],
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 80
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-fill-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row fill-reverse;row-gap:6px;column-gap:4px;width:200px'><div id=rev-rows-fill-gap-a style='width:50px;height:10px'></div><div id=rev-rows-fill-gap-b style='width:80px;height:10px'></div><div id=rev-rows-fill-gap-c style='width:30px;height:10px'></div><div id=rev-rows-fill-gap-d style='width:60px;height:10px'></div><div id=rev-rows-fill-gap-e style='width:40px;height:10px'></div><div id=rev-rows-fill-gap-f style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "rev-rows-fill-gap": [
+     0,
+     0,
+     200,
+     72
+    ],
+    "rev-rows-fill-gap-a": [
+     150,
+     0,
+     50,
+     10
+    ],
+    "rev-rows-fill-gap-b": [
+     120,
+     26,
+     80,
+     10
+    ],
+    "rev-rows-fill-gap-c": [
+     170,
+     52,
+     30,
+     10
+    ],
+    "rev-rows-fill-gap-d": [
+     106,
+     52,
+     60,
+     10
+    ],
+    "rev-rows-fill-gap-e": [
+     106,
+     0,
+     40,
+     10
+    ],
+    "rev-rows-fill-gap-f": [
+     96,
+     26,
+     20,
+     10
+    ]
+   }
+  },
+  "rev-rows-track": {
+   "spec": {
+    "name": "rev-rows-track",
+    "container": {
+     "template": "20px 30px",
+     "axis": "row track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 70
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-track class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 30px;grid-lanes-direction:row track-reverse;width:200px'><div id=rev-rows-track-a style='width:60px;height:10px'></div><div id=rev-rows-track-b style='width:40px;height:10px'></div><div id=rev-rows-track-c style='width:50px;height:10px'></div><div id=rev-rows-track-d style='width:30px;height:10px'></div><div id=rev-rows-track-e style='width:70px;height:10px'></div></div>",
+   "rects": {
+    "rev-rows-track": [
+     0,
+     0,
+     200,
+     50
+    ],
+    "rev-rows-track-a": [
+     0,
+     20,
+     60,
+     10
+    ],
+    "rev-rows-track-b": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "rev-rows-track-c": [
+     40,
+     0,
+     50,
+     10
+    ],
+    "rev-rows-track-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "rev-rows-track-e": [
+     90,
+     0,
+     70,
+     10
+    ]
+   }
+  },
+  "rev-rows-both": {
+   "spec": {
+    "name": "rev-rows-both",
+    "container": {
+     "template": "20px 30px",
+     "axis": "row fill-reverse track-reverse",
+     "gap": [
+      3,
+      7
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 70
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-both class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 30px;grid-lanes-direction:row fill-reverse track-reverse;row-gap:3px;column-gap:7px;width:200px'><div id=rev-rows-both-a style='width:60px;height:10px'></div><div id=rev-rows-both-b style='width:40px;height:10px'></div><div id=rev-rows-both-c style='width:50px;height:10px'></div><div id=rev-rows-both-d style='width:30px;height:10px'></div><div id=rev-rows-both-e style='width:70px;height:10px'></div></div>",
+   "rects": {
+    "rev-rows-both": [
+     0,
+     0,
+     200,
+     53
+    ],
+    "rev-rows-both-a": [
+     140,
+     23,
+     60,
+     10
+    ],
+    "rev-rows-both-b": [
+     160,
+     0,
+     40,
+     10
+    ],
+    "rev-rows-both-c": [
+     103,
+     0,
+     50,
+     10
+    ],
+    "rev-rows-both-d": [
+     103,
+     23,
+     30,
+     10
+    ],
+    "rev-rows-both-e": [
+     26,
+     0,
+     70,
+     10
+    ]
+   }
+  },
+  "rev-rows-auto": {
+   "spec": {
+    "name": "rev-rows-auto",
+    "container": {
+     "template": "auto auto",
+     "axis": "row track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XX"
+     },
+     {
+      "id": "b",
+      "text": "XXXX"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "X"
+     },
+     {
+      "id": "e",
+      "text": "XX"
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:auto auto;grid-lanes-direction:row track-reverse;width:200px'><div id=rev-rows-auto-a style=''>XX</div><div id=rev-rows-auto-b style=''>XXXX</div><div id=rev-rows-auto-c style=''>XXX</div><div id=rev-rows-auto-d style=''>X</div><div id=rev-rows-auto-e style=''>XX</div></div>",
+   "rects": {
+    "rev-rows-auto": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "rev-rows-auto-a": [
+     0,
+     10,
+     20,
+     10
+    ],
+    "rev-rows-auto-b": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "rev-rows-auto-c": [
+     20,
+     10,
+     30,
+     10
+    ],
+    "rev-rows-auto-d": [
+     40,
+     0,
+     10,
+     10
+    ],
+    "rev-rows-auto-e": [
+     50,
+     10,
+     20,
+     10
+    ]
+   }
+  },
+  "rev-rows-fill-h": {
+   "spec": {
+    "name": "rev-rows-fill-h",
+    "container": {
+     "template": "20px 20px",
+     "axis": "row fill-reverse",
+     "height": 80
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-fill-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px;grid-lanes-direction:row fill-reverse;width:200px;height:80px'><div id=rev-rows-fill-h-a style='width:50px;height:10px'></div><div id=rev-rows-fill-h-b style='width:40px;height:10px'></div><div id=rev-rows-fill-h-c style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "rev-rows-fill-h": [
+     0,
+     0,
+     200,
+     80
+    ],
+    "rev-rows-fill-h-a": [
+     150,
+     0,
+     50,
+     10
+    ],
+    "rev-rows-fill-h-b": [
+     160,
+     20,
+     40,
+     10
+    ],
+    "rev-rows-fill-h-c": [
+     130,
+     0,
+     20,
+     10
+    ]
+   }
+  },
+  "rev-rows-span": {
+   "spec": {
+    "name": "rev-rows-span",
+    "container": {
+     "template": "20px 20px 20px",
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 60
+     }
+    ]
+   },
+   "html": "<div id=rev-rows-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row fill-reverse;width:200px'><div id=rev-rows-span-a style='width:50px;height:10px'></div><div id=rev-rows-span-b style='width:40px;height:10px;grid-row:span 2'></div><div id=rev-rows-span-c style='width:30px;height:10px'></div><div id=rev-rows-span-d style='width:60px;height:10px'></div></div>",
+   "rects": {
+    "rev-rows-span": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "rev-rows-span-a": [
+     150,
+     0,
+     50,
+     10
+    ],
+    "rev-rows-span-b": [
+     160,
+     20,
+     40,
+     10
+    ],
+    "rev-rows-span-c": [
+     120,
+     0,
+     30,
+     10
+    ],
+    "rev-rows-span-d": [
+     100,
+     20,
+     60,
+     10
+    ]
+   }
+  },
+  "al-fwd-cols-start": {
+   "spec": {
+    "name": "al-fwd-cols-start",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "start",
+     "axis": "column"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-start class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:start;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-cols-start-a style='height:70px'></div><div id=al-fwd-cols-start-b style='height:40px'></div><div id=al-fwd-cols-start-c style='height:120px'></div><div id=al-fwd-cols-start-d style='height:60px'></div><div id=al-fwd-cols-start-e style='height:50px'></div><div id=al-fwd-cols-start-f style='height:80px'></div><div id=al-fwd-cols-start-g style=''></div><div id=al-fwd-cols-start-h style=''></div><div id=al-fwd-cols-start-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-start": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-fwd-cols-start-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-start-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-start-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-start-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-start-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-start-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-fwd-cols-start-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-start-h": [
+     0,
+     130,
+     80,
+     0
+    ],
+    "al-fwd-cols-start-i": [
+     170,
+     130,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-start-h": {
+   "spec": {
+    "name": "al-fwd-cols-start-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "start",
+     "axis": "column",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-start-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:start;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-fwd-cols-start-h-a style='height:70px'></div><div id=al-fwd-cols-start-h-b style='height:40px'></div><div id=al-fwd-cols-start-h-c style='height:120px'></div><div id=al-fwd-cols-start-h-d style='height:60px'></div><div id=al-fwd-cols-start-h-e style='height:50px'></div><div id=al-fwd-cols-start-h-f style='height:80px'></div><div id=al-fwd-cols-start-h-g style=''></div><div id=al-fwd-cols-start-h-h style=''></div><div id=al-fwd-cols-start-h-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-start-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-fwd-cols-start-h-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-start-h-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-start-h-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-start-h-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-start-h-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-start-h-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-fwd-cols-start-h-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-start-h-h": [
+     0,
+     130,
+     80,
+     0
+    ],
+    "al-fwd-cols-start-h-i": [
+     170,
+     130,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-center": {
+   "spec": {
+    "name": "al-fwd-cols-center",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "column"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-center class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:center;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-cols-center-a style='height:70px'></div><div id=al-fwd-cols-center-b style='height:40px'></div><div id=al-fwd-cols-center-c style='height:120px'></div><div id=al-fwd-cols-center-d style='height:60px'></div><div id=al-fwd-cols-center-e style='height:50px'></div><div id=al-fwd-cols-center-f style='height:80px'></div><div id=al-fwd-cols-center-g style=''></div><div id=al-fwd-cols-center-h style=''></div><div id=al-fwd-cols-center-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-center": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-fwd-cols-center-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-center-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-center-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-center-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-center-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-center-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-fwd-cols-center-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-center-h": [
+     0,
+     160,
+     80,
+     0
+    ],
+    "al-fwd-cols-center-i": [
+     170,
+     160,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-center-h": {
+   "spec": {
+    "name": "al-fwd-cols-center-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "column",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-center-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:center;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-fwd-cols-center-h-a style='height:70px'></div><div id=al-fwd-cols-center-h-b style='height:40px'></div><div id=al-fwd-cols-center-h-c style='height:120px'></div><div id=al-fwd-cols-center-h-d style='height:60px'></div><div id=al-fwd-cols-center-h-e style='height:50px'></div><div id=al-fwd-cols-center-h-f style='height:80px'></div><div id=al-fwd-cols-center-h-g style=''></div><div id=al-fwd-cols-center-h-h style=''></div><div id=al-fwd-cols-center-h-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-center-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-fwd-cols-center-h-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-center-h-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-center-h-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-center-h-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-center-h-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-center-h-f": [
+     85,
+     165,
+     80,
+     80
+    ],
+    "al-fwd-cols-center-h-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-center-h-h": [
+     0,
+     215,
+     80,
+     0
+    ],
+    "al-fwd-cols-center-h-i": [
+     170,
+     215,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-end": {
+   "spec": {
+    "name": "al-fwd-cols-end",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "end",
+     "axis": "column"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-end class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:end;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-cols-end-a style='height:70px'></div><div id=al-fwd-cols-end-b style='height:40px'></div><div id=al-fwd-cols-end-c style='height:120px'></div><div id=al-fwd-cols-end-d style='height:60px'></div><div id=al-fwd-cols-end-e style='height:50px'></div><div id=al-fwd-cols-end-f style='height:80px'></div><div id=al-fwd-cols-end-g style=''></div><div id=al-fwd-cols-end-h style=''></div><div id=al-fwd-cols-end-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-end": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-fwd-cols-end-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-end-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-end-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-end-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-end-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-end-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-fwd-cols-end-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-end-h": [
+     0,
+     190,
+     80,
+     0
+    ],
+    "al-fwd-cols-end-i": [
+     170,
+     190,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-end-h": {
+   "spec": {
+    "name": "al-fwd-cols-end-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "end",
+     "axis": "column",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-end-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:end;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-fwd-cols-end-h-a style='height:70px'></div><div id=al-fwd-cols-end-h-b style='height:40px'></div><div id=al-fwd-cols-end-h-c style='height:120px'></div><div id=al-fwd-cols-end-h-d style='height:60px'></div><div id=al-fwd-cols-end-h-e style='height:50px'></div><div id=al-fwd-cols-end-h-f style='height:80px'></div><div id=al-fwd-cols-end-h-g style=''></div><div id=al-fwd-cols-end-h-h style=''></div><div id=al-fwd-cols-end-h-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-end-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-fwd-cols-end-h-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-end-h-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-end-h-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-end-h-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-end-h-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-end-h-f": [
+     85,
+     220,
+     80,
+     80
+    ],
+    "al-fwd-cols-end-h-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-end-h-h": [
+     0,
+     300,
+     80,
+     0
+    ],
+    "al-fwd-cols-end-h-i": [
+     170,
+     300,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-stretch": {
+   "spec": {
+    "name": "al-fwd-cols-stretch",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "stretch",
+     "axis": "column"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:stretch;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-cols-stretch-a style='height:70px'></div><div id=al-fwd-cols-stretch-b style='height:40px'></div><div id=al-fwd-cols-stretch-c style='height:120px'></div><div id=al-fwd-cols-stretch-d style='height:60px'></div><div id=al-fwd-cols-stretch-e style='height:50px'></div><div id=al-fwd-cols-stretch-f style='height:80px'></div><div id=al-fwd-cols-stretch-g style=''></div><div id=al-fwd-cols-stretch-h style=''></div><div id=al-fwd-cols-stretch-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-stretch": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-fwd-cols-stretch-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-stretch-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-stretch-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-stretch-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-stretch-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-stretch-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-fwd-cols-stretch-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-stretch-h": [
+     0,
+     130,
+     80,
+     60
+    ],
+    "al-fwd-cols-stretch-i": [
+     170,
+     130,
+     80,
+     60
+    ]
+   }
+  },
+  "al-fwd-cols-stretch-h": {
+   "spec": {
+    "name": "al-fwd-cols-stretch-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "stretch",
+     "axis": "column",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-stretch-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:stretch;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-fwd-cols-stretch-h-a style='height:70px'></div><div id=al-fwd-cols-stretch-h-b style='height:40px'></div><div id=al-fwd-cols-stretch-h-c style='height:120px'></div><div id=al-fwd-cols-stretch-h-d style='height:60px'></div><div id=al-fwd-cols-stretch-h-e style='height:50px'></div><div id=al-fwd-cols-stretch-h-f style='height:80px'></div><div id=al-fwd-cols-stretch-h-g style=''></div><div id=al-fwd-cols-stretch-h-h style=''></div><div id=al-fwd-cols-stretch-h-i style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-stretch-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-fwd-cols-stretch-h-a": [
+     0,
+     0,
+     80,
+     70
+    ],
+    "al-fwd-cols-stretch-h-b": [
+     85,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-stretch-h-c": [
+     170,
+     0,
+     80,
+     120
+    ],
+    "al-fwd-cols-stretch-h-d": [
+     85,
+     45,
+     80,
+     60
+    ],
+    "al-fwd-cols-stretch-h-e": [
+     0,
+     75,
+     80,
+     50
+    ],
+    "al-fwd-cols-stretch-h-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-fwd-cols-stretch-h-g": [
+     170,
+     125,
+     80,
+     0
+    ],
+    "al-fwd-cols-stretch-h-h": [
+     0,
+     130,
+     80,
+     170
+    ],
+    "al-fwd-cols-stretch-h-i": [
+     170,
+     130,
+     80,
+     170
+    ]
+   }
+  },
+  "al-fwd-cols-span": {
+   "spec": {
+    "name": "al-fwd-cols-span",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "column",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40,
+      "place": "span 2"
+     },
+     {
+      "id": "b",
+      "h": 60
+     },
+     {
+      "id": "c",
+      "h": 50,
+      "place": "span 3"
+     },
+     {
+      "id": "d",
+      "h": 30
+     },
+     {
+      "id": "e",
+      "h": 60
+     },
+     {
+      "id": "f",
+      "place": "span 2"
+     },
+     {
+      "id": "g"
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;align-items:center;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-fwd-cols-span-a style='height:40px;grid-column:span 2'></div><div id=al-fwd-cols-span-b style='height:60px'></div><div id=al-fwd-cols-span-c style='height:50px;grid-column:span 3'></div><div id=al-fwd-cols-span-d style='height:30px'></div><div id=al-fwd-cols-span-e style='height:60px'></div><div id=al-fwd-cols-span-f style='grid-column:span 2'></div><div id=al-fwd-cols-span-g style=''></div></div>",
+   "rects": {
+    "al-fwd-cols-span": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-fwd-cols-span-a": [
+     0,
+     10,
+     165,
+     40
+    ],
+    "al-fwd-cols-span-b": [
+     170,
+     0,
+     80,
+     60
+    ],
+    "al-fwd-cols-span-c": [
+     0,
+     65,
+     250,
+     50
+    ],
+    "al-fwd-cols-span-d": [
+     0,
+     135,
+     80,
+     30
+    ],
+    "al-fwd-cols-span-e": [
+     85,
+     120,
+     80,
+     60
+    ],
+    "al-fwd-cols-span-f": [
+     0,
+     242.5,
+     165,
+     0
+    ],
+    "al-fwd-cols-span-g": [
+     170,
+     210,
+     80,
+     0
+    ]
+   }
+  },
+  "al-fwd-cols-self": {
+   "spec": {
+    "name": "al-fwd-cols-self",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "axis": "column",
+     "height": 200
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40
+     },
+     {
+      "id": "b",
+      "h": 60,
+      "self": "end"
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "self": "center"
+     },
+     {
+      "id": "f",
+      "h": 25
+     },
+     {
+      "id": "g",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-self class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;row-gap:5px;column-gap:5px;width:200px;height:200px'><div id=al-fwd-cols-self-a style='height:40px'></div><div id=al-fwd-cols-self-b style='height:60px;align-self:end'></div><div id=al-fwd-cols-self-c style='height:20px'></div><div id=al-fwd-cols-self-d style='height:30px'></div><div id=al-fwd-cols-self-e style='height:10px;align-self:center'></div><div id=al-fwd-cols-self-f style='height:25px'></div><div id=al-fwd-cols-self-g style='height:15px'></div></div>",
+   "rects": {
+    "al-fwd-cols-self": [
+     0,
+     0,
+     200,
+     200
+    ],
+    "al-fwd-cols-self-a": [
+     0,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-self-b": [
+     85,
+     0,
+     80,
+     60
+    ],
+    "al-fwd-cols-self-c": [
+     170,
+     0,
+     80,
+     20
+    ],
+    "al-fwd-cols-self-d": [
+     170,
+     25,
+     80,
+     30
+    ],
+    "al-fwd-cols-self-e": [
+     0,
+     117.5,
+     80,
+     10
+    ],
+    "al-fwd-cols-self-f": [
+     85,
+     65,
+     80,
+     25
+    ],
+    "al-fwd-cols-self-g": [
+     170,
+     60,
+     80,
+     15
+    ]
+   }
+  },
+  "al-fwd-cols-self-auto": {
+   "spec": {
+    "name": "al-fwd-cols-self-auto",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "axis": "column"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40
+     },
+     {
+      "id": "b",
+      "h": 60,
+      "self": "end"
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "self": "center"
+     },
+     {
+      "id": "f",
+      "h": 25
+     },
+     {
+      "id": "g",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-cols-self-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-cols-self-auto-a style='height:40px'></div><div id=al-fwd-cols-self-auto-b style='height:60px;align-self:end'></div><div id=al-fwd-cols-self-auto-c style='height:20px'></div><div id=al-fwd-cols-self-auto-d style='height:30px'></div><div id=al-fwd-cols-self-auto-e style='height:10px;align-self:center'></div><div id=al-fwd-cols-self-auto-f style='height:25px'></div><div id=al-fwd-cols-self-auto-g style='height:15px'></div></div>",
+   "rects": {
+    "al-fwd-cols-self-auto": [
+     0,
+     0,
+     200,
+     90
+    ],
+    "al-fwd-cols-self-auto-a": [
+     0,
+     0,
+     80,
+     40
+    ],
+    "al-fwd-cols-self-auto-b": [
+     85,
+     0,
+     80,
+     60
+    ],
+    "al-fwd-cols-self-auto-c": [
+     170,
+     0,
+     80,
+     20
+    ],
+    "al-fwd-cols-self-auto-d": [
+     170,
+     25,
+     80,
+     30
+    ],
+    "al-fwd-cols-self-auto-e": [
+     0,
+     62.5,
+     80,
+     10
+    ],
+    "al-fwd-cols-self-auto-f": [
+     85,
+     65,
+     80,
+     25
+    ],
+    "al-fwd-cols-self-auto-g": [
+     170,
+     60,
+     80,
+     15
+    ]
+   }
+  },
+  "al-fwd-rows-center": {
+   "spec": {
+    "name": "al-fwd-rows-center",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "text": "XXXX"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "text": "X"
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-rows-center class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;justify-items:center;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-rows-center-a style='width:60px;height:10px'></div><div id=al-fwd-rows-center-b style='height:10px'>XX</div><div id=al-fwd-rows-center-c style='width:40px;height:10px'></div><div id=al-fwd-rows-center-d style='height:10px'>XXXX</div><div id=al-fwd-rows-center-e style='width:50px;height:10px'></div><div id=al-fwd-rows-center-f style='height:10px'>X</div><div id=al-fwd-rows-center-g style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "al-fwd-rows-center": [
+     0,
+     0,
+     200,
+     70
+    ],
+    "al-fwd-rows-center-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "al-fwd-rows-center-b": [
+     0,
+     25,
+     20,
+     10
+    ],
+    "al-fwd-rows-center-c": [
+     0,
+     50,
+     40,
+     10
+    ],
+    "al-fwd-rows-center-d": [
+     25,
+     25,
+     40,
+     10
+    ],
+    "al-fwd-rows-center-e": [
+     97.5,
+     50,
+     50,
+     10
+    ],
+    "al-fwd-rows-center-f": [
+     127.5,
+     0,
+     10,
+     10
+    ],
+    "al-fwd-rows-center-g": [
+     125,
+     25,
+     20,
+     10
+    ]
+   }
+  },
+  "al-fwd-rows-end": {
+   "spec": {
+    "name": "al-fwd-rows-end",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "end",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "text": "XXXX"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "text": "X"
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-rows-end class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;justify-items:end;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-rows-end-a style='width:60px;height:10px'></div><div id=al-fwd-rows-end-b style='height:10px'>XX</div><div id=al-fwd-rows-end-c style='width:40px;height:10px'></div><div id=al-fwd-rows-end-d style='height:10px'>XXXX</div><div id=al-fwd-rows-end-e style='width:50px;height:10px'></div><div id=al-fwd-rows-end-f style='height:10px'>X</div><div id=al-fwd-rows-end-g style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "al-fwd-rows-end": [
+     0,
+     0,
+     200,
+     70
+    ],
+    "al-fwd-rows-end-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "al-fwd-rows-end-b": [
+     0,
+     25,
+     20,
+     10
+    ],
+    "al-fwd-rows-end-c": [
+     0,
+     50,
+     40,
+     10
+    ],
+    "al-fwd-rows-end-d": [
+     25,
+     25,
+     40,
+     10
+    ],
+    "al-fwd-rows-end-e": [
+     150,
+     50,
+     50,
+     10
+    ],
+    "al-fwd-rows-end-f": [
+     190,
+     0,
+     10,
+     10
+    ],
+    "al-fwd-rows-end-g": [
+     180,
+     25,
+     20,
+     10
+    ]
+   }
+  },
+  "al-fwd-rows-stretch": {
+   "spec": {
+    "name": "al-fwd-rows-stretch",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "stretch",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "text": "XXXX"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "text": "X"
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=al-fwd-rows-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;justify-items:stretch;row-gap:5px;column-gap:5px;width:200px'><div id=al-fwd-rows-stretch-a style='width:60px;height:10px'></div><div id=al-fwd-rows-stretch-b style='height:10px'>XX</div><div id=al-fwd-rows-stretch-c style='width:40px;height:10px'></div><div id=al-fwd-rows-stretch-d style='height:10px'>XXXX</div><div id=al-fwd-rows-stretch-e style='width:50px;height:10px'></div><div id=al-fwd-rows-stretch-f style='height:10px'>X</div><div id=al-fwd-rows-stretch-g style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "al-fwd-rows-stretch": [
+     0,
+     0,
+     200,
+     70
+    ],
+    "al-fwd-rows-stretch-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "al-fwd-rows-stretch-b": [
+     0,
+     25,
+     20,
+     10
+    ],
+    "al-fwd-rows-stretch-c": [
+     0,
+     50,
+     40,
+     10
+    ],
+    "al-fwd-rows-stretch-d": [
+     25,
+     25,
+     40,
+     10
+    ],
+    "al-fwd-rows-stretch-e": [
+     45,
+     50,
+     50,
+     10
+    ],
+    "al-fwd-rows-stretch-f": [
+     65,
+     0,
+     135,
+     10
+    ],
+    "al-fwd-rows-stretch-g": [
+     70,
+     25,
+     20,
+     10
+    ]
+   }
+  },
+  "al-rev-cols-start": {
+   "spec": {
+    "name": "al-rev-cols-start",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "start",
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-start class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:start;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-cols-start-a style='height:70px'></div><div id=al-rev-cols-start-b style='height:40px'></div><div id=al-rev-cols-start-c style='height:120px'></div><div id=al-rev-cols-start-d style='height:60px'></div><div id=al-rev-cols-start-e style='height:50px'></div><div id=al-rev-cols-start-f style='height:80px'></div><div id=al-rev-cols-start-g style=''></div><div id=al-rev-cols-start-h style=''></div><div id=al-rev-cols-start-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-start": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-rev-cols-start-a": [
+     0,
+     120,
+     80,
+     70
+    ],
+    "al-rev-cols-start-b": [
+     85,
+     150,
+     80,
+     40
+    ],
+    "al-rev-cols-start-c": [
+     170,
+     70,
+     80,
+     120
+    ],
+    "al-rev-cols-start-d": [
+     85,
+     85,
+     80,
+     60
+    ],
+    "al-rev-cols-start-e": [
+     0,
+     65,
+     80,
+     50
+    ],
+    "al-rev-cols-start-f": [
+     85,
+     0,
+     80,
+     80
+    ],
+    "al-rev-cols-start-g": [
+     170,
+     65,
+     80,
+     0
+    ],
+    "al-rev-cols-start-h": [
+     0,
+     0,
+     80,
+     0
+    ],
+    "al-rev-cols-start-i": [
+     170,
+     0,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-start-h": {
+   "spec": {
+    "name": "al-rev-cols-start-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "start",
+     "axis": "column fill-reverse",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-start-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:start;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-rev-cols-start-h-a style='height:70px'></div><div id=al-rev-cols-start-h-b style='height:40px'></div><div id=al-rev-cols-start-h-c style='height:120px'></div><div id=al-rev-cols-start-h-d style='height:60px'></div><div id=al-rev-cols-start-h-e style='height:50px'></div><div id=al-rev-cols-start-h-f style='height:80px'></div><div id=al-rev-cols-start-h-g style=''></div><div id=al-rev-cols-start-h-h style=''></div><div id=al-rev-cols-start-h-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-start-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-rev-cols-start-h-a": [
+     0,
+     230,
+     80,
+     70
+    ],
+    "al-rev-cols-start-h-b": [
+     85,
+     260,
+     80,
+     40
+    ],
+    "al-rev-cols-start-h-c": [
+     170,
+     180,
+     80,
+     120
+    ],
+    "al-rev-cols-start-h-d": [
+     85,
+     195,
+     80,
+     60
+    ],
+    "al-rev-cols-start-h-e": [
+     0,
+     175,
+     80,
+     50
+    ],
+    "al-rev-cols-start-h-f": [
+     85,
+     0,
+     80,
+     80
+    ],
+    "al-rev-cols-start-h-g": [
+     170,
+     175,
+     80,
+     0
+    ],
+    "al-rev-cols-start-h-h": [
+     0,
+     0,
+     80,
+     0
+    ],
+    "al-rev-cols-start-h-i": [
+     170,
+     0,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-center": {
+   "spec": {
+    "name": "al-rev-cols-center",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-center class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:center;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-cols-center-a style='height:70px'></div><div id=al-rev-cols-center-b style='height:40px'></div><div id=al-rev-cols-center-c style='height:120px'></div><div id=al-rev-cols-center-d style='height:60px'></div><div id=al-rev-cols-center-e style='height:50px'></div><div id=al-rev-cols-center-f style='height:80px'></div><div id=al-rev-cols-center-g style=''></div><div id=al-rev-cols-center-h style=''></div><div id=al-rev-cols-center-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-center": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-rev-cols-center-a": [
+     0,
+     120,
+     80,
+     70
+    ],
+    "al-rev-cols-center-b": [
+     85,
+     150,
+     80,
+     40
+    ],
+    "al-rev-cols-center-c": [
+     170,
+     70,
+     80,
+     120
+    ],
+    "al-rev-cols-center-d": [
+     85,
+     85,
+     80,
+     60
+    ],
+    "al-rev-cols-center-e": [
+     0,
+     65,
+     80,
+     50
+    ],
+    "al-rev-cols-center-f": [
+     85,
+     0,
+     80,
+     80
+    ],
+    "al-rev-cols-center-g": [
+     170,
+     65,
+     80,
+     0
+    ],
+    "al-rev-cols-center-h": [
+     0,
+     30,
+     80,
+     0
+    ],
+    "al-rev-cols-center-i": [
+     170,
+     30,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-center-h": {
+   "spec": {
+    "name": "al-rev-cols-center-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "column fill-reverse",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-center-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:center;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-rev-cols-center-h-a style='height:70px'></div><div id=al-rev-cols-center-h-b style='height:40px'></div><div id=al-rev-cols-center-h-c style='height:120px'></div><div id=al-rev-cols-center-h-d style='height:60px'></div><div id=al-rev-cols-center-h-e style='height:50px'></div><div id=al-rev-cols-center-h-f style='height:80px'></div><div id=al-rev-cols-center-h-g style=''></div><div id=al-rev-cols-center-h-h style=''></div><div id=al-rev-cols-center-h-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-center-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-rev-cols-center-h-a": [
+     0,
+     230,
+     80,
+     70
+    ],
+    "al-rev-cols-center-h-b": [
+     85,
+     260,
+     80,
+     40
+    ],
+    "al-rev-cols-center-h-c": [
+     170,
+     180,
+     80,
+     120
+    ],
+    "al-rev-cols-center-h-d": [
+     85,
+     195,
+     80,
+     60
+    ],
+    "al-rev-cols-center-h-e": [
+     0,
+     175,
+     80,
+     50
+    ],
+    "al-rev-cols-center-h-f": [
+     85,
+     55,
+     80,
+     80
+    ],
+    "al-rev-cols-center-h-g": [
+     170,
+     175,
+     80,
+     0
+    ],
+    "al-rev-cols-center-h-h": [
+     0,
+     85,
+     80,
+     0
+    ],
+    "al-rev-cols-center-h-i": [
+     170,
+     85,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-end": {
+   "spec": {
+    "name": "al-rev-cols-end",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "end",
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-end class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:end;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-cols-end-a style='height:70px'></div><div id=al-rev-cols-end-b style='height:40px'></div><div id=al-rev-cols-end-c style='height:120px'></div><div id=al-rev-cols-end-d style='height:60px'></div><div id=al-rev-cols-end-e style='height:50px'></div><div id=al-rev-cols-end-f style='height:80px'></div><div id=al-rev-cols-end-g style=''></div><div id=al-rev-cols-end-h style=''></div><div id=al-rev-cols-end-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-end": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-rev-cols-end-a": [
+     0,
+     120,
+     80,
+     70
+    ],
+    "al-rev-cols-end-b": [
+     85,
+     150,
+     80,
+     40
+    ],
+    "al-rev-cols-end-c": [
+     170,
+     70,
+     80,
+     120
+    ],
+    "al-rev-cols-end-d": [
+     85,
+     85,
+     80,
+     60
+    ],
+    "al-rev-cols-end-e": [
+     0,
+     65,
+     80,
+     50
+    ],
+    "al-rev-cols-end-f": [
+     85,
+     0,
+     80,
+     80
+    ],
+    "al-rev-cols-end-g": [
+     170,
+     65,
+     80,
+     0
+    ],
+    "al-rev-cols-end-h": [
+     0,
+     60,
+     80,
+     0
+    ],
+    "al-rev-cols-end-i": [
+     170,
+     60,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-end-h": {
+   "spec": {
+    "name": "al-rev-cols-end-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "end",
+     "axis": "column fill-reverse",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-end-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:end;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-rev-cols-end-h-a style='height:70px'></div><div id=al-rev-cols-end-h-b style='height:40px'></div><div id=al-rev-cols-end-h-c style='height:120px'></div><div id=al-rev-cols-end-h-d style='height:60px'></div><div id=al-rev-cols-end-h-e style='height:50px'></div><div id=al-rev-cols-end-h-f style='height:80px'></div><div id=al-rev-cols-end-h-g style=''></div><div id=al-rev-cols-end-h-h style=''></div><div id=al-rev-cols-end-h-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-end-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-rev-cols-end-h-a": [
+     0,
+     230,
+     80,
+     70
+    ],
+    "al-rev-cols-end-h-b": [
+     85,
+     260,
+     80,
+     40
+    ],
+    "al-rev-cols-end-h-c": [
+     170,
+     180,
+     80,
+     120
+    ],
+    "al-rev-cols-end-h-d": [
+     85,
+     195,
+     80,
+     60
+    ],
+    "al-rev-cols-end-h-e": [
+     0,
+     175,
+     80,
+     50
+    ],
+    "al-rev-cols-end-h-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-rev-cols-end-h-g": [
+     170,
+     175,
+     80,
+     0
+    ],
+    "al-rev-cols-end-h-h": [
+     0,
+     170,
+     80,
+     0
+    ],
+    "al-rev-cols-end-h-i": [
+     170,
+     170,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-stretch": {
+   "spec": {
+    "name": "al-rev-cols-stretch",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "stretch",
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:stretch;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-cols-stretch-a style='height:70px'></div><div id=al-rev-cols-stretch-b style='height:40px'></div><div id=al-rev-cols-stretch-c style='height:120px'></div><div id=al-rev-cols-stretch-d style='height:60px'></div><div id=al-rev-cols-stretch-e style='height:50px'></div><div id=al-rev-cols-stretch-f style='height:80px'></div><div id=al-rev-cols-stretch-g style=''></div><div id=al-rev-cols-stretch-h style=''></div><div id=al-rev-cols-stretch-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-stretch": [
+     0,
+     0,
+     200,
+     190
+    ],
+    "al-rev-cols-stretch-a": [
+     0,
+     120,
+     80,
+     70
+    ],
+    "al-rev-cols-stretch-b": [
+     85,
+     150,
+     80,
+     40
+    ],
+    "al-rev-cols-stretch-c": [
+     170,
+     70,
+     80,
+     120
+    ],
+    "al-rev-cols-stretch-d": [
+     85,
+     85,
+     80,
+     60
+    ],
+    "al-rev-cols-stretch-e": [
+     0,
+     65,
+     80,
+     50
+    ],
+    "al-rev-cols-stretch-f": [
+     85,
+     0,
+     80,
+     80
+    ],
+    "al-rev-cols-stretch-g": [
+     170,
+     65,
+     80,
+     0
+    ],
+    "al-rev-cols-stretch-h": [
+     0,
+     0,
+     80,
+     60
+    ],
+    "al-rev-cols-stretch-i": [
+     170,
+     0,
+     80,
+     60
+    ]
+   }
+  },
+  "al-rev-cols-stretch-h": {
+   "spec": {
+    "name": "al-rev-cols-stretch-h",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "stretch",
+     "axis": "column fill-reverse",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 70
+     },
+     {
+      "id": "b",
+      "h": 40
+     },
+     {
+      "id": "c",
+      "h": 120
+     },
+     {
+      "id": "d",
+      "h": 60
+     },
+     {
+      "id": "e",
+      "h": 50
+     },
+     {
+      "id": "f",
+      "h": 80
+     },
+     {
+      "id": "g"
+     },
+     {
+      "id": "h"
+     },
+     {
+      "id": "i"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-stretch-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:stretch;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-rev-cols-stretch-h-a style='height:70px'></div><div id=al-rev-cols-stretch-h-b style='height:40px'></div><div id=al-rev-cols-stretch-h-c style='height:120px'></div><div id=al-rev-cols-stretch-h-d style='height:60px'></div><div id=al-rev-cols-stretch-h-e style='height:50px'></div><div id=al-rev-cols-stretch-h-f style='height:80px'></div><div id=al-rev-cols-stretch-h-g style=''></div><div id=al-rev-cols-stretch-h-h style=''></div><div id=al-rev-cols-stretch-h-i style=''></div></div>",
+   "rects": {
+    "al-rev-cols-stretch-h": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-rev-cols-stretch-h-a": [
+     0,
+     230,
+     80,
+     70
+    ],
+    "al-rev-cols-stretch-h-b": [
+     85,
+     260,
+     80,
+     40
+    ],
+    "al-rev-cols-stretch-h-c": [
+     170,
+     180,
+     80,
+     120
+    ],
+    "al-rev-cols-stretch-h-d": [
+     85,
+     195,
+     80,
+     60
+    ],
+    "al-rev-cols-stretch-h-e": [
+     0,
+     175,
+     80,
+     50
+    ],
+    "al-rev-cols-stretch-h-f": [
+     85,
+     110,
+     80,
+     80
+    ],
+    "al-rev-cols-stretch-h-g": [
+     170,
+     175,
+     80,
+     0
+    ],
+    "al-rev-cols-stretch-h-h": [
+     0,
+     0,
+     80,
+     170
+    ],
+    "al-rev-cols-stretch-h-i": [
+     170,
+     0,
+     80,
+     170
+    ]
+   }
+  },
+  "al-rev-cols-span": {
+   "spec": {
+    "name": "al-rev-cols-span",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "column fill-reverse",
+     "height": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40,
+      "place": "span 2"
+     },
+     {
+      "id": "b",
+      "h": 60
+     },
+     {
+      "id": "c",
+      "h": 50,
+      "place": "span 3"
+     },
+     {
+      "id": "d",
+      "h": 30
+     },
+     {
+      "id": "e",
+      "h": 60
+     },
+     {
+      "id": "f",
+      "place": "span 2"
+     },
+     {
+      "id": "g"
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;align-items:center;row-gap:5px;column-gap:5px;width:200px;height:300px'><div id=al-rev-cols-span-a style='height:40px;grid-column:span 2'></div><div id=al-rev-cols-span-b style='height:60px'></div><div id=al-rev-cols-span-c style='height:50px;grid-column:span 3'></div><div id=al-rev-cols-span-d style='height:30px'></div><div id=al-rev-cols-span-e style='height:60px'></div><div id=al-rev-cols-span-f style='grid-column:span 2'></div><div id=al-rev-cols-span-g style=''></div></div>",
+   "rects": {
+    "al-rev-cols-span": [
+     0,
+     0,
+     200,
+     300
+    ],
+    "al-rev-cols-span-a": [
+     0,
+     250,
+     165,
+     40
+    ],
+    "al-rev-cols-span-b": [
+     170,
+     240,
+     80,
+     60
+    ],
+    "al-rev-cols-span-c": [
+     0,
+     185,
+     250,
+     50
+    ],
+    "al-rev-cols-span-d": [
+     0,
+     135,
+     80,
+     30
+    ],
+    "al-rev-cols-span-e": [
+     85,
+     120,
+     80,
+     60
+    ],
+    "al-rev-cols-span-f": [
+     0,
+     57.5,
+     165,
+     0
+    ],
+    "al-rev-cols-span-g": [
+     170,
+     90,
+     80,
+     0
+    ]
+   }
+  },
+  "al-rev-cols-self": {
+   "spec": {
+    "name": "al-rev-cols-self",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "axis": "column fill-reverse",
+     "height": 200
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40
+     },
+     {
+      "id": "b",
+      "h": 60,
+      "self": "end"
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "self": "center"
+     },
+     {
+      "id": "f",
+      "h": 25
+     },
+     {
+      "id": "g",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-self class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;row-gap:5px;column-gap:5px;width:200px;height:200px'><div id=al-rev-cols-self-a style='height:40px'></div><div id=al-rev-cols-self-b style='height:60px;align-self:end'></div><div id=al-rev-cols-self-c style='height:20px'></div><div id=al-rev-cols-self-d style='height:30px'></div><div id=al-rev-cols-self-e style='height:10px;align-self:center'></div><div id=al-rev-cols-self-f style='height:25px'></div><div id=al-rev-cols-self-g style='height:15px'></div></div>",
+   "rects": {
+    "al-rev-cols-self": [
+     0,
+     0,
+     200,
+     200
+    ],
+    "al-rev-cols-self-a": [
+     0,
+     160,
+     80,
+     40
+    ],
+    "al-rev-cols-self-b": [
+     85,
+     140,
+     80,
+     60
+    ],
+    "al-rev-cols-self-c": [
+     170,
+     180,
+     80,
+     20
+    ],
+    "al-rev-cols-self-d": [
+     170,
+     145,
+     80,
+     30
+    ],
+    "al-rev-cols-self-e": [
+     0,
+     72.5,
+     80,
+     10
+    ],
+    "al-rev-cols-self-f": [
+     85,
+     0,
+     80,
+     25
+    ],
+    "al-rev-cols-self-g": [
+     170,
+     0,
+     80,
+     15
+    ]
+   }
+  },
+  "al-rev-cols-self-auto": {
+   "spec": {
+    "name": "al-rev-cols-self-auto",
+    "container": {
+     "template": "80px 80px 80px",
+     "gap": [
+      5,
+      5
+     ],
+     "axis": "column fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40
+     },
+     {
+      "id": "b",
+      "h": 60,
+      "self": "end"
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "self": "center"
+     },
+     {
+      "id": "f",
+      "h": 25
+     },
+     {
+      "id": "g",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=al-rev-cols-self-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:80px 80px 80px;grid-lanes-direction:column fill-reverse;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-cols-self-auto-a style='height:40px'></div><div id=al-rev-cols-self-auto-b style='height:60px;align-self:end'></div><div id=al-rev-cols-self-auto-c style='height:20px'></div><div id=al-rev-cols-self-auto-d style='height:30px'></div><div id=al-rev-cols-self-auto-e style='height:10px;align-self:center'></div><div id=al-rev-cols-self-auto-f style='height:25px'></div><div id=al-rev-cols-self-auto-g style='height:15px'></div></div>",
+   "rects": {
+    "al-rev-cols-self-auto": [
+     0,
+     0,
+     200,
+     90
+    ],
+    "al-rev-cols-self-auto-a": [
+     0,
+     50,
+     80,
+     40
+    ],
+    "al-rev-cols-self-auto-b": [
+     85,
+     30,
+     80,
+     60
+    ],
+    "al-rev-cols-self-auto-c": [
+     170,
+     70,
+     80,
+     20
+    ],
+    "al-rev-cols-self-auto-d": [
+     170,
+     35,
+     80,
+     30
+    ],
+    "al-rev-cols-self-auto-e": [
+     0,
+     17.5,
+     80,
+     10
+    ],
+    "al-rev-cols-self-auto-f": [
+     85,
+     0,
+     80,
+     25
+    ],
+    "al-rev-cols-self-auto-g": [
+     170,
+     0,
+     80,
+     15
+    ]
+   }
+  },
+  "al-rev-rows-center": {
+   "spec": {
+    "name": "al-rev-rows-center",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "center",
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "text": "XXXX"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "text": "X"
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=al-rev-rows-center class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row fill-reverse;justify-items:center;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-rows-center-a style='width:60px;height:10px'></div><div id=al-rev-rows-center-b style='height:10px'>XX</div><div id=al-rev-rows-center-c style='width:40px;height:10px'></div><div id=al-rev-rows-center-d style='height:10px'>XXXX</div><div id=al-rev-rows-center-e style='width:50px;height:10px'></div><div id=al-rev-rows-center-f style='height:10px'>X</div><div id=al-rev-rows-center-g style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "al-rev-rows-center": [
+     0,
+     0,
+     200,
+     70
+    ],
+    "al-rev-rows-center-a": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "al-rev-rows-center-b": [
+     180,
+     25,
+     20,
+     10
+    ],
+    "al-rev-rows-center-c": [
+     160,
+     50,
+     40,
+     10
+    ],
+    "al-rev-rows-center-d": [
+     135,
+     25,
+     40,
+     10
+    ],
+    "al-rev-rows-center-e": [
+     52.5,
+     50,
+     50,
+     10
+    ],
+    "al-rev-rows-center-f": [
+     62.5,
+     0,
+     10,
+     10
+    ],
+    "al-rev-rows-center-g": [
+     55,
+     25,
+     20,
+     10
+    ]
+   }
+  },
+  "al-rev-rows-end": {
+   "spec": {
+    "name": "al-rev-rows-end",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "end",
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "text": "XXXX"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "text": "X"
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=al-rev-rows-end class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row fill-reverse;justify-items:end;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-rows-end-a style='width:60px;height:10px'></div><div id=al-rev-rows-end-b style='height:10px'>XX</div><div id=al-rev-rows-end-c style='width:40px;height:10px'></div><div id=al-rev-rows-end-d style='height:10px'>XXXX</div><div id=al-rev-rows-end-e style='width:50px;height:10px'></div><div id=al-rev-rows-end-f style='height:10px'>X</div><div id=al-rev-rows-end-g style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "al-rev-rows-end": [
+     0,
+     0,
+     200,
+     70
+    ],
+    "al-rev-rows-end-a": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "al-rev-rows-end-b": [
+     180,
+     25,
+     20,
+     10
+    ],
+    "al-rev-rows-end-c": [
+     160,
+     50,
+     40,
+     10
+    ],
+    "al-rev-rows-end-d": [
+     135,
+     25,
+     40,
+     10
+    ],
+    "al-rev-rows-end-e": [
+     105,
+     50,
+     50,
+     10
+    ],
+    "al-rev-rows-end-f": [
+     125,
+     0,
+     10,
+     10
+    ],
+    "al-rev-rows-end-g": [
+     110,
+     25,
+     20,
+     10
+    ]
+   }
+  },
+  "al-rev-rows-stretch": {
+   "spec": {
+    "name": "al-rev-rows-stretch",
+    "container": {
+     "template": "20px 20px 20px",
+     "gap": [
+      5,
+      5
+     ],
+     "align": "stretch",
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "text": "XX"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "text": "XXXX"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "text": "X"
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=al-rev-rows-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row fill-reverse;justify-items:stretch;row-gap:5px;column-gap:5px;width:200px'><div id=al-rev-rows-stretch-a style='width:60px;height:10px'></div><div id=al-rev-rows-stretch-b style='height:10px'>XX</div><div id=al-rev-rows-stretch-c style='width:40px;height:10px'></div><div id=al-rev-rows-stretch-d style='height:10px'>XXXX</div><div id=al-rev-rows-stretch-e style='width:50px;height:10px'></div><div id=al-rev-rows-stretch-f style='height:10px'>X</div><div id=al-rev-rows-stretch-g style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "al-rev-rows-stretch": [
+     0,
+     0,
+     200,
+     70
+    ],
+    "al-rev-rows-stretch-a": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "al-rev-rows-stretch-b": [
+     180,
+     25,
+     20,
+     10
+    ],
+    "al-rev-rows-stretch-c": [
+     160,
+     50,
+     40,
+     10
+    ],
+    "al-rev-rows-stretch-d": [
+     135,
+     25,
+     40,
+     10
+    ],
+    "al-rev-rows-stretch-e": [
+     105,
+     50,
+     50,
+     10
+    ],
+    "al-rev-rows-stretch-f": [
+     0,
+     0,
+     135,
+     10
+    ],
+    "al-rev-rows-stretch-g": [
+     110,
+     25,
+     20,
+     10
+    ]
+   }
+  },
+  "d-cols-span": {
+   "spec": {
+    "name": "d-cols-span",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-pack:dense;width:200px'><div id=d-cols-span-a style='height:20px'></div><div id=d-cols-span-b style='height:30px;grid-column:span 2'></div><div id=d-cols-span-c style='height:10px'></div><div id=d-cols-span-d style='height:10px'></div><div id=d-cols-span-e style='height:15px;grid-column:span 2'></div><div id=d-cols-span-f style='height:5px'></div><div id=d-cols-span-g style='height:20px'></div><div id=d-cols-span-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-span": [
+     0,
+     0,
+     200,
+     67
+    ],
+    "d-cols-span-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-span-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-span-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-span-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-span-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-span-f": [
+     0,
+     30,
+     40,
+     5
+    ],
+    "d-cols-span-g": [
+     80,
+     30,
+     40,
+     20
+    ],
+    "d-cols-span-h": [
+     0,
+     55,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-span-none": {
+   "spec": {
+    "name": "d-cols-span-none",
+    "container": {
+     "template": "40px 40px 40px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-span-none class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;width:200px'><div id=d-cols-span-none-a style='height:20px'></div><div id=d-cols-span-none-b style='height:30px;grid-column:span 2'></div><div id=d-cols-span-none-c style='height:10px'></div><div id=d-cols-span-none-d style='height:10px'></div><div id=d-cols-span-none-e style='height:15px;grid-column:span 2'></div><div id=d-cols-span-none-f style='height:5px'></div><div id=d-cols-span-none-g style='height:20px'></div><div id=d-cols-span-none-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-span-none": [
+     0,
+     0,
+     200,
+     67
+    ],
+    "d-cols-span-none-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-span-none-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-span-none-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-span-none-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-span-none-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-span-none-f": [
+     80,
+     30,
+     40,
+     5
+    ],
+    "d-cols-span-none-g": [
+     80,
+     35,
+     40,
+     20
+    ],
+    "d-cols-span-none-h": [
+     0,
+     55,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-span-both": {
+   "spec": {
+    "name": "d-cols-span-both",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-auto-flow:dense;grid-lanes-pack:dense"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-span-both class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-auto-flow:dense;grid-lanes-pack:dense;width:200px'><div id=d-cols-span-both-a style='height:20px'></div><div id=d-cols-span-both-b style='height:30px;grid-column:span 2'></div><div id=d-cols-span-both-c style='height:10px'></div><div id=d-cols-span-both-d style='height:10px'></div><div id=d-cols-span-both-e style='height:15px;grid-column:span 2'></div><div id=d-cols-span-both-f style='height:5px'></div><div id=d-cols-span-both-g style='height:20px'></div><div id=d-cols-span-both-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-span-both": [
+     0,
+     0,
+     200,
+     67
+    ],
+    "d-cols-span-both-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-span-both-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-span-both-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-span-both-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-span-both-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-span-both-f": [
+     0,
+     30,
+     40,
+     5
+    ],
+    "d-cols-span-both-g": [
+     80,
+     30,
+     40,
+     20
+    ],
+    "d-cols-span-both-h": [
+     0,
+     55,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-span-tol0": {
+   "spec": {
+    "name": "d-cols-span-tol0",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-span-tol0 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-cols-span-tol0-a style='height:20px'></div><div id=d-cols-span-tol0-b style='height:30px;grid-column:span 2'></div><div id=d-cols-span-tol0-c style='height:10px'></div><div id=d-cols-span-tol0-d style='height:10px'></div><div id=d-cols-span-tol0-e style='height:15px;grid-column:span 2'></div><div id=d-cols-span-tol0-f style='height:5px'></div><div id=d-cols-span-tol0-g style='height:20px'></div><div id=d-cols-span-tol0-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-span-tol0": [
+     0,
+     0,
+     200,
+     62
+    ],
+    "d-cols-span-tol0-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-span-tol0-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-span-tol0-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-span-tol0-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-span-tol0-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-span-tol0-f": [
+     0,
+     30,
+     40,
+     5
+    ],
+    "d-cols-span-tol0-g": [
+     80,
+     30,
+     40,
+     20
+    ],
+    "d-cols-span-tol0-h": [
+     80,
+     50,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-span-gap": {
+   "spec": {
+    "name": "d-cols-span-gap",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "gap": [
+      8,
+      5
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-span-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-pack:dense;row-gap:8px;column-gap:5px;width:200px'><div id=d-cols-span-gap-a style='height:20px'></div><div id=d-cols-span-gap-b style='height:30px;grid-column:span 2'></div><div id=d-cols-span-gap-c style='height:10px'></div><div id=d-cols-span-gap-d style='height:10px'></div><div id=d-cols-span-gap-e style='height:15px;grid-column:span 2'></div><div id=d-cols-span-gap-f style='height:5px'></div><div id=d-cols-span-gap-g style='height:20px'></div><div id=d-cols-span-gap-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-span-gap": [
+     0,
+     0,
+     200,
+     91
+    ],
+    "d-cols-span-gap-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-span-gap-b": [
+     45,
+     0,
+     85,
+     30
+    ],
+    "d-cols-span-gap-c": [
+     0,
+     28,
+     40,
+     10
+    ],
+    "d-cols-span-gap-d": [
+     45,
+     38,
+     40,
+     10
+    ],
+    "d-cols-span-gap-e": [
+     0,
+     56,
+     85,
+     15
+    ],
+    "d-cols-span-gap-f": [
+     90,
+     38,
+     40,
+     5
+    ],
+    "d-cols-span-gap-g": [
+     90,
+     51,
+     40,
+     20
+    ],
+    "d-cols-span-gap-h": [
+     0,
+     79,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-single": {
+   "spec": {
+    "name": "d-cols-single",
+    "container": {
+     "template": "50px 50px 50px",
+     "pack": "grid-lanes-pack:dense"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=d-cols-single class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;grid-lanes-pack:dense;width:200px'><div id=d-cols-single-a style='height:30px'></div><div id=d-cols-single-b style='height:10px'></div><div id=d-cols-single-c style='height:20px'></div><div id=d-cols-single-d style='height:40px'></div><div id=d-cols-single-e style='height:10px'></div><div id=d-cols-single-f style='height:10px'></div><div id=d-cols-single-g style='height:25px'></div></div>",
+   "rects": {
+    "d-cols-single": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "d-cols-single-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "d-cols-single-b": [
+     50,
+     0,
+     50,
+     10
+    ],
+    "d-cols-single-c": [
+     100,
+     0,
+     50,
+     20
+    ],
+    "d-cols-single-d": [
+     50,
+     10,
+     50,
+     40
+    ],
+    "d-cols-single-e": [
+     100,
+     20,
+     50,
+     10
+    ],
+    "d-cols-single-f": [
+     0,
+     30,
+     50,
+     10
+    ],
+    "d-cols-single-g": [
+     100,
+     30,
+     50,
+     25
+    ]
+   }
+  },
+  "d-cols-single-tol0": {
+   "spec": {
+    "name": "d-cols-single-tol0",
+    "container": {
+     "template": "50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=d-cols-single-tol0 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-cols-single-tol0-a style='height:30px'></div><div id=d-cols-single-tol0-b style='height:10px'></div><div id=d-cols-single-tol0-c style='height:20px'></div><div id=d-cols-single-tol0-d style='height:40px'></div><div id=d-cols-single-tol0-e style='height:10px'></div><div id=d-cols-single-tol0-f style='height:10px'></div><div id=d-cols-single-tol0-g style='height:25px'></div></div>",
+   "rects": {
+    "d-cols-single-tol0": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "d-cols-single-tol0-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "d-cols-single-tol0-b": [
+     50,
+     0,
+     50,
+     10
+    ],
+    "d-cols-single-tol0-c": [
+     100,
+     0,
+     50,
+     20
+    ],
+    "d-cols-single-tol0-d": [
+     50,
+     10,
+     50,
+     40
+    ],
+    "d-cols-single-tol0-e": [
+     100,
+     20,
+     50,
+     10
+    ],
+    "d-cols-single-tol0-f": [
+     0,
+     30,
+     50,
+     10
+    ],
+    "d-cols-single-tol0-g": [
+     100,
+     30,
+     50,
+     25
+    ]
+   }
+  },
+  "d-cols-single-tol-inf": {
+   "spec": {
+    "name": "d-cols-single-tol-inf",
+    "container": {
+     "template": "50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "tolerance": "infinite"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=d-cols-single-tol-inf class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;flow-tolerance:infinite;grid-lanes-pack:dense;width:200px'><div id=d-cols-single-tol-inf-a style='height:30px'></div><div id=d-cols-single-tol-inf-b style='height:10px'></div><div id=d-cols-single-tol-inf-c style='height:20px'></div><div id=d-cols-single-tol-inf-d style='height:40px'></div><div id=d-cols-single-tol-inf-e style='height:10px'></div><div id=d-cols-single-tol-inf-f style='height:10px'></div><div id=d-cols-single-tol-inf-g style='height:25px'></div></div>",
+   "rects": {
+    "d-cols-single-tol-inf": [
+     0,
+     0,
+     200,
+     95
+    ],
+    "d-cols-single-tol-inf-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "d-cols-single-tol-inf-b": [
+     50,
+     0,
+     50,
+     10
+    ],
+    "d-cols-single-tol-inf-c": [
+     100,
+     0,
+     50,
+     20
+    ],
+    "d-cols-single-tol-inf-d": [
+     0,
+     30,
+     50,
+     40
+    ],
+    "d-cols-single-tol-inf-e": [
+     50,
+     10,
+     50,
+     10
+    ],
+    "d-cols-single-tol-inf-f": [
+     100,
+     20,
+     50,
+     10
+    ],
+    "d-cols-single-tol-inf-g": [
+     0,
+     70,
+     50,
+     25
+    ]
+   }
+  },
+  "d-cols-single-gap": {
+   "spec": {
+    "name": "d-cols-single-gap",
+    "container": {
+     "template": "50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "gap": [
+      6,
+      4
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10
+     },
+     {
+      "id": "c",
+      "h": 20
+     },
+     {
+      "id": "d",
+      "h": 40
+     },
+     {
+      "id": "e",
+      "h": 10
+     },
+     {
+      "id": "f",
+      "h": 10
+     },
+     {
+      "id": "g",
+      "h": 25
+     }
+    ]
+   },
+   "html": "<div id=d-cols-single-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;grid-lanes-pack:dense;row-gap:6px;column-gap:4px;width:200px'><div id=d-cols-single-gap-a style='height:30px'></div><div id=d-cols-single-gap-b style='height:10px'></div><div id=d-cols-single-gap-c style='height:20px'></div><div id=d-cols-single-gap-d style='height:40px'></div><div id=d-cols-single-gap-e style='height:10px'></div><div id=d-cols-single-gap-f style='height:10px'></div><div id=d-cols-single-gap-g style='height:25px'></div></div>",
+   "rects": {
+    "d-cols-single-gap": [
+     0,
+     0,
+     200,
+     67
+    ],
+    "d-cols-single-gap-a": [
+     0,
+     0,
+     50,
+     30
+    ],
+    "d-cols-single-gap-b": [
+     54,
+     0,
+     50,
+     10
+    ],
+    "d-cols-single-gap-c": [
+     108,
+     0,
+     50,
+     20
+    ],
+    "d-cols-single-gap-d": [
+     54,
+     16,
+     50,
+     40
+    ],
+    "d-cols-single-gap-e": [
+     108,
+     26,
+     50,
+     10
+    ],
+    "d-cols-single-gap-f": [
+     0,
+     36,
+     50,
+     10
+    ],
+    "d-cols-single-gap-g": [
+     108,
+     42,
+     50,
+     25
+    ]
+   }
+  },
+  "d-cols-explicit": {
+   "spec": {
+    "name": "d-cols-explicit",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "place": "3"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "place": "3"
+     },
+     {
+      "id": "d",
+      "h": 15,
+      "place": "1"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10
+     }
+    ]
+   },
+   "html": "<div id=d-cols-explicit class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-pack:dense;width:200px'><div id=d-cols-explicit-a style='height:30px'></div><div id=d-cols-explicit-b style='height:10px;grid-column:3'></div><div id=d-cols-explicit-c style='height:10px;grid-column:3'></div><div id=d-cols-explicit-d style='height:15px;grid-column:1'></div><div id=d-cols-explicit-e style='height:10px;grid-column:span 2'></div><div id=d-cols-explicit-f style='height:10px'></div></div>",
+   "rects": {
+    "d-cols-explicit": [
+     0,
+     0,
+     200,
+     45
+    ],
+    "d-cols-explicit-a": [
+     0,
+     0,
+     40,
+     30
+    ],
+    "d-cols-explicit-b": [
+     80,
+     0,
+     40,
+     10
+    ],
+    "d-cols-explicit-c": [
+     80,
+     10,
+     40,
+     10
+    ],
+    "d-cols-explicit-d": [
+     0,
+     30,
+     40,
+     15
+    ],
+    "d-cols-explicit-e": [
+     40,
+     20,
+     80,
+     10
+    ],
+    "d-cols-explicit-f": [
+     40,
+     0,
+     40,
+     10
+    ]
+   }
+  },
+  "d-cols-four": {
+   "spec": {
+    "name": "d-cols-four",
+    "container": {
+     "template": "30px 30px 30px 30px",
+     "pack": "grid-lanes-pack:dense",
+     "width": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 40
+     },
+     {
+      "id": "b",
+      "h": 20,
+      "place": "span 3"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 20
+     },
+     {
+      "id": "g",
+      "h": 5
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "place": "span 4"
+     },
+     {
+      "id": "i",
+      "h": 7
+     }
+    ]
+   },
+   "html": "<div id=d-cols-four class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:30px 30px 30px 30px;grid-lanes-pack:dense;width:150px'><div id=d-cols-four-a style='height:40px'></div><div id=d-cols-four-b style='height:20px;grid-column:span 3'></div><div id=d-cols-four-c style='height:10px'></div><div id=d-cols-four-d style='height:10px'></div><div id=d-cols-four-e style='height:10px;grid-column:span 2'></div><div id=d-cols-four-f style='height:20px'></div><div id=d-cols-four-g style='height:5px'></div><div id=d-cols-four-h style='height:10px;grid-column:span 4'></div><div id=d-cols-four-i style='height:7px'></div></div>",
+   "rects": {
+    "d-cols-four": [
+     0,
+     0,
+     150,
+     60
+    ],
+    "d-cols-four-a": [
+     0,
+     0,
+     30,
+     40
+    ],
+    "d-cols-four-b": [
+     30,
+     0,
+     90,
+     20
+    ],
+    "d-cols-four-c": [
+     30,
+     20,
+     30,
+     10
+    ],
+    "d-cols-four-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "d-cols-four-e": [
+     0,
+     40,
+     60,
+     10
+    ],
+    "d-cols-four-f": [
+     60,
+     30,
+     30,
+     20
+    ],
+    "d-cols-four-g": [
+     90,
+     20,
+     30,
+     5
+    ],
+    "d-cols-four-h": [
+     0,
+     50,
+     120,
+     10
+    ],
+    "d-cols-four-i": [
+     30,
+     30,
+     30,
+     7
+    ]
+   }
+  },
+  "d-cols-uneven": {
+   "spec": {
+    "name": "d-cols-uneven",
+    "container": {
+     "template": "40px 40px 60px 60px",
+     "pack": "grid-lanes-pack:dense",
+     "width": 220
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 30
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     }
+    ]
+   },
+   "html": "<div id=d-cols-uneven class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 60px 60px;grid-lanes-pack:dense;width:220px'><div id=d-cols-uneven-a style='height:30px'></div><div id=d-cols-uneven-b style='height:10px;grid-column:span 2'></div><div id=d-cols-uneven-c style='height:10px'></div><div id=d-cols-uneven-d style='height:10px'></div><div id=d-cols-uneven-e style='height:15px;grid-column:span 2'></div><div id=d-cols-uneven-f style='height:5px'></div><div id=d-cols-uneven-g style='height:20px'></div></div>",
+   "rects": {
+    "d-cols-uneven": [
+     0,
+     0,
+     220,
+     40
+    ],
+    "d-cols-uneven-a": [
+     0,
+     0,
+     40,
+     30
+    ],
+    "d-cols-uneven-b": [
+     40,
+     0,
+     100,
+     10
+    ],
+    "d-cols-uneven-c": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "d-cols-uneven-d": [
+     40,
+     10,
+     40,
+     10
+    ],
+    "d-cols-uneven-e": [
+     80,
+     10,
+     120,
+     15
+    ],
+    "d-cols-uneven-f": [
+     0,
+     30,
+     40,
+     5
+    ],
+    "d-cols-uneven-g": [
+     40,
+     20,
+     40,
+     20
+    ]
+   }
+  },
+  "d-cols-order": {
+   "spec": {
+    "name": "d-cols-order",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "order": 2
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2",
+      "order": 1
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "order": -1
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=d-cols-order class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-pack:dense;width:200px'><div id=d-cols-order-a style='height:20px;order:2'></div><div id=d-cols-order-b style='height:30px;grid-column:span 2;order:1'></div><div id=d-cols-order-c style='height:10px'></div><div id=d-cols-order-d style='height:10px;order:-1'></div><div id=d-cols-order-e style='height:15px;grid-column:span 2'></div><div id=d-cols-order-f style='height:5px'></div></div>",
+   "rects": {
+    "d-cols-order": [
+     0,
+     0,
+     200,
+     55
+    ],
+    "d-cols-order-a": [
+     80,
+     5,
+     40,
+     20
+    ],
+    "d-cols-order-b": [
+     0,
+     25,
+     80,
+     30
+    ],
+    "d-cols-order-c": [
+     40,
+     0,
+     40,
+     10
+    ],
+    "d-cols-order-d": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-cols-order-e": [
+     0,
+     10,
+     80,
+     15
+    ],
+    "d-cols-order-f": [
+     80,
+     0,
+     40,
+     5
+    ]
+   }
+  },
+  "d-cols-box": {
+   "spec": {
+    "name": "d-cols-box",
+    "container": {
+     "template": "50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "gap": [
+      3,
+      4
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20,
+      "margin": 3
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2",
+      "margin": 2
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "margin": 4
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=d-cols-box class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;grid-lanes-pack:dense;row-gap:3px;column-gap:4px;width:200px'><div id=d-cols-box-a style='height:20px;margin:3px;padding:2px;border:1px solid'></div><div id=d-cols-box-b style='height:30px;grid-column:span 2;margin:2px;padding:2px;border:1px solid'></div><div id=d-cols-box-c style='height:10px'></div><div id=d-cols-box-d style='height:10px;margin:4px;padding:2px;border:1px solid'></div><div id=d-cols-box-e style='height:15px;grid-column:span 2'></div><div id=d-cols-box-f style='height:5px'></div></div>",
+   "rects": {
+    "d-cols-box": [
+     0,
+     0,
+     200,
+     85
+    ],
+    "d-cols-box-a": [
+     3,
+     3,
+     44,
+     26
+    ],
+    "d-cols-box-b": [
+     56,
+     2,
+     100,
+     36
+    ],
+    "d-cols-box-c": [
+     0,
+     35,
+     50,
+     10
+    ],
+    "d-cols-box-d": [
+     58,
+     47,
+     42,
+     16
+    ],
+    "d-cols-box-e": [
+     0,
+     70,
+     104,
+     15
+    ],
+    "d-cols-box-f": [
+     108,
+     43,
+     50,
+     5
+    ]
+   }
+  },
+  "d-cols-fill-rev": {
+   "spec": {
+    "name": "d-cols-fill-rev",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "column fill-reverse",
+     "height": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-fill-rev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-direction:column fill-reverse;grid-lanes-pack:dense;width:200px;height:150px'><div id=d-cols-fill-rev-a style='height:20px'></div><div id=d-cols-fill-rev-b style='height:30px;grid-column:span 2'></div><div id=d-cols-fill-rev-c style='height:10px'></div><div id=d-cols-fill-rev-d style='height:10px'></div><div id=d-cols-fill-rev-e style='height:15px;grid-column:span 2'></div><div id=d-cols-fill-rev-f style='height:5px'></div><div id=d-cols-fill-rev-g style='height:20px'></div><div id=d-cols-fill-rev-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-fill-rev": [
+     0,
+     0,
+     200,
+     150
+    ],
+    "d-cols-fill-rev-a": [
+     0,
+     130,
+     40,
+     20
+    ],
+    "d-cols-fill-rev-b": [
+     40,
+     120,
+     80,
+     30
+    ],
+    "d-cols-fill-rev-c": [
+     0,
+     120,
+     40,
+     10
+    ],
+    "d-cols-fill-rev-d": [
+     40,
+     110,
+     40,
+     10
+    ],
+    "d-cols-fill-rev-e": [
+     0,
+     95,
+     80,
+     15
+    ],
+    "d-cols-fill-rev-f": [
+     0,
+     115,
+     40,
+     5
+    ],
+    "d-cols-fill-rev-g": [
+     80,
+     100,
+     40,
+     20
+    ],
+    "d-cols-fill-rev-h": [
+     0,
+     83,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-track-rev": {
+   "spec": {
+    "name": "d-cols-track-rev",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "column track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-track-rev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-direction:column track-reverse;grid-lanes-pack:dense;width:200px'><div id=d-cols-track-rev-a style='height:20px'></div><div id=d-cols-track-rev-b style='height:30px;grid-column:span 2'></div><div id=d-cols-track-rev-c style='height:10px'></div><div id=d-cols-track-rev-d style='height:10px'></div><div id=d-cols-track-rev-e style='height:15px;grid-column:span 2'></div><div id=d-cols-track-rev-f style='height:5px'></div><div id=d-cols-track-rev-g style='height:20px'></div><div id=d-cols-track-rev-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-track-rev": [
+     0,
+     0,
+     200,
+     67
+    ],
+    "d-cols-track-rev-a": [
+     80,
+     0,
+     40,
+     20
+    ],
+    "d-cols-track-rev-b": [
+     0,
+     0,
+     80,
+     30
+    ],
+    "d-cols-track-rev-c": [
+     80,
+     20,
+     40,
+     10
+    ],
+    "d-cols-track-rev-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-track-rev-e": [
+     40,
+     40,
+     80,
+     15
+    ],
+    "d-cols-track-rev-f": [
+     80,
+     30,
+     40,
+     5
+    ],
+    "d-cols-track-rev-g": [
+     0,
+     30,
+     40,
+     20
+    ],
+    "d-cols-track-rev-h": [
+     80,
+     55,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-both-rev": {
+   "spec": {
+    "name": "d-cols-both-rev",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "column fill-reverse track-reverse",
+     "height": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-both-rev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-direction:column fill-reverse track-reverse;grid-lanes-pack:dense;width:200px;height:150px'><div id=d-cols-both-rev-a style='height:20px'></div><div id=d-cols-both-rev-b style='height:30px;grid-column:span 2'></div><div id=d-cols-both-rev-c style='height:10px'></div><div id=d-cols-both-rev-d style='height:10px'></div><div id=d-cols-both-rev-e style='height:15px;grid-column:span 2'></div><div id=d-cols-both-rev-f style='height:5px'></div><div id=d-cols-both-rev-g style='height:20px'></div><div id=d-cols-both-rev-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-both-rev": [
+     0,
+     0,
+     200,
+     150
+    ],
+    "d-cols-both-rev-a": [
+     80,
+     130,
+     40,
+     20
+    ],
+    "d-cols-both-rev-b": [
+     0,
+     120,
+     80,
+     30
+    ],
+    "d-cols-both-rev-c": [
+     80,
+     120,
+     40,
+     10
+    ],
+    "d-cols-both-rev-d": [
+     40,
+     110,
+     40,
+     10
+    ],
+    "d-cols-both-rev-e": [
+     40,
+     95,
+     80,
+     15
+    ],
+    "d-cols-both-rev-f": [
+     80,
+     115,
+     40,
+     5
+    ],
+    "d-cols-both-rev-g": [
+     0,
+     100,
+     40,
+     20
+    ],
+    "d-cols-both-rev-h": [
+     80,
+     83,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-align-center": {
+   "spec": {
+    "name": "d-cols-align-center",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "align": "center",
+     "height": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-align-center class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;align-items:center;grid-lanes-pack:dense;width:200px;height:150px'><div id=d-cols-align-center-a style='height:20px'></div><div id=d-cols-align-center-b style='height:30px;grid-column:span 2'></div><div id=d-cols-align-center-c style='height:10px'></div><div id=d-cols-align-center-d style='height:10px'></div><div id=d-cols-align-center-e style='height:15px;grid-column:span 2'></div><div id=d-cols-align-center-f style='height:5px'></div><div id=d-cols-align-center-g style='height:20px'></div><div id=d-cols-align-center-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-align-center": [
+     0,
+     0,
+     200,
+     150
+    ],
+    "d-cols-align-center-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-align-center-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-align-center-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-align-center-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-align-center-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-align-center-f": [
+     0,
+     32.5,
+     40,
+     5
+    ],
+    "d-cols-align-center-g": [
+     80,
+     80,
+     40,
+     20
+    ],
+    "d-cols-align-center-h": [
+     0,
+     96.5,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-align-end": {
+   "spec": {
+    "name": "d-cols-align-end",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "align": "end",
+     "height": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-align-end class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;align-items:end;grid-lanes-pack:dense;width:200px;height:150px'><div id=d-cols-align-end-a style='height:20px'></div><div id=d-cols-align-end-b style='height:30px;grid-column:span 2'></div><div id=d-cols-align-end-c style='height:10px'></div><div id=d-cols-align-end-d style='height:10px'></div><div id=d-cols-align-end-e style='height:15px;grid-column:span 2'></div><div id=d-cols-align-end-f style='height:5px'></div><div id=d-cols-align-end-g style='height:20px'></div><div id=d-cols-align-end-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-align-end": [
+     0,
+     0,
+     200,
+     150
+    ],
+    "d-cols-align-end-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-align-end-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-align-end-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-align-end-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-align-end-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-align-end-f": [
+     0,
+     35,
+     40,
+     5
+    ],
+    "d-cols-align-end-g": [
+     80,
+     130,
+     40,
+     20
+    ],
+    "d-cols-align-end-h": [
+     0,
+     138,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-align-stretch": {
+   "spec": {
+    "name": "d-cols-align-stretch",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "align": "stretch",
+     "height": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     },
+     {
+      "id": "g",
+      "h": 20
+     },
+     {
+      "id": "h",
+      "h": 12
+     }
+    ]
+   },
+   "html": "<div id=d-cols-align-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;align-items:stretch;grid-lanes-pack:dense;width:200px;height:150px'><div id=d-cols-align-stretch-a style='height:20px'></div><div id=d-cols-align-stretch-b style='height:30px;grid-column:span 2'></div><div id=d-cols-align-stretch-c style='height:10px'></div><div id=d-cols-align-stretch-d style='height:10px'></div><div id=d-cols-align-stretch-e style='height:15px;grid-column:span 2'></div><div id=d-cols-align-stretch-f style='height:5px'></div><div id=d-cols-align-stretch-g style='height:20px'></div><div id=d-cols-align-stretch-h style='height:12px'></div></div>",
+   "rects": {
+    "d-cols-align-stretch": [
+     0,
+     0,
+     200,
+     150
+    ],
+    "d-cols-align-stretch-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-align-stretch-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-align-stretch-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-align-stretch-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-align-stretch-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-align-stretch-f": [
+     0,
+     30,
+     40,
+     5
+    ],
+    "d-cols-align-stretch-g": [
+     80,
+     30,
+     40,
+     20
+    ],
+    "d-cols-align-stretch-h": [
+     0,
+     55,
+     40,
+     12
+    ]
+   }
+  },
+  "d-cols-align-self": {
+   "spec": {
+    "name": "d-cols-align-self",
+    "container": {
+     "template": "40px 40px 40px",
+     "pack": "grid-lanes-pack:dense",
+     "height": 150
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30,
+      "place": "span 2",
+      "self": "end"
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "self": "center"
+     },
+     {
+      "id": "e",
+      "h": 15,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 5
+     }
+    ]
+   },
+   "html": "<div id=d-cols-align-self class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px 40px;grid-lanes-pack:dense;width:200px;height:150px'><div id=d-cols-align-self-a style='height:20px'></div><div id=d-cols-align-self-b style='height:30px;grid-column:span 2;align-self:end'></div><div id=d-cols-align-self-c style='height:10px'></div><div id=d-cols-align-self-d style='height:10px;align-self:center'></div><div id=d-cols-align-self-e style='height:15px;grid-column:span 2'></div><div id=d-cols-align-self-f style='height:5px'></div></div>",
+   "rects": {
+    "d-cols-align-self": [
+     0,
+     0,
+     200,
+     150
+    ],
+    "d-cols-align-self-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "d-cols-align-self-b": [
+     40,
+     0,
+     80,
+     30
+    ],
+    "d-cols-align-self-c": [
+     0,
+     20,
+     40,
+     10
+    ],
+    "d-cols-align-self-d": [
+     40,
+     30,
+     40,
+     10
+    ],
+    "d-cols-align-self-e": [
+     0,
+     40,
+     80,
+     15
+    ],
+    "d-cols-align-self-f": [
+     0,
+     30,
+     40,
+     5
+    ]
+   }
+  },
+  "d-rows-span": {
+   "spec": {
+    "name": "d-rows-span",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;grid-lanes-pack:dense;width:200px'><div id=d-rows-span-a style='width:40px;height:10px'></div><div id=d-rows-span-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-span-c style='width:30px;height:10px'></div><div id=d-rows-span-d style='width:30px;height:10px'></div><div id=d-rows-span-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-span-f style='width:20px;height:10px'></div><div id=d-rows-span-g style='width:40px;height:10px'></div><div id=d-rows-span-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-span": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-span-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-rows-span-b": [
+     0,
+     20,
+     60,
+     10
+    ],
+    "d-rows-span-c": [
+     40,
+     0,
+     30,
+     10
+    ],
+    "d-rows-span-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "d-rows-span-e": [
+     90,
+     0,
+     50,
+     10
+    ],
+    "d-rows-span-f": [
+     60,
+     40,
+     20,
+     10
+    ],
+    "d-rows-span-g": [
+     80,
+     40,
+     40,
+     10
+    ],
+    "d-rows-span-h": [
+     120,
+     40,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-span-tol0": {
+   "spec": {
+    "name": "d-rows-span-tol0",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-span-tol0 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-rows-span-tol0-a style='width:40px;height:10px'></div><div id=d-rows-span-tol0-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-span-tol0-c style='width:30px;height:10px'></div><div id=d-rows-span-tol0-d style='width:30px;height:10px'></div><div id=d-rows-span-tol0-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-span-tol0-f style='width:20px;height:10px'></div><div id=d-rows-span-tol0-g style='width:40px;height:10px'></div><div id=d-rows-span-tol0-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-span-tol0": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-span-tol0-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-rows-span-tol0-b": [
+     0,
+     20,
+     60,
+     10
+    ],
+    "d-rows-span-tol0-c": [
+     40,
+     0,
+     30,
+     10
+    ],
+    "d-rows-span-tol0-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "d-rows-span-tol0-e": [
+     90,
+     0,
+     50,
+     10
+    ],
+    "d-rows-span-tol0-f": [
+     60,
+     40,
+     20,
+     10
+    ],
+    "d-rows-span-tol0-g": [
+     80,
+     40,
+     40,
+     10
+    ],
+    "d-rows-span-tol0-h": [
+     120,
+     40,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-span-gap": {
+   "spec": {
+    "name": "d-rows-span-gap",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "gap": [
+      6,
+      4
+     ]
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-span-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;grid-lanes-pack:dense;row-gap:6px;column-gap:4px;width:200px'><div id=d-rows-span-gap-a style='width:40px;height:10px'></div><div id=d-rows-span-gap-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-span-gap-c style='width:30px;height:10px'></div><div id=d-rows-span-gap-d style='width:30px;height:10px'></div><div id=d-rows-span-gap-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-span-gap-f style='width:20px;height:10px'></div><div id=d-rows-span-gap-g style='width:40px;height:10px'></div><div id=d-rows-span-gap-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-span-gap": [
+     0,
+     0,
+     200,
+     72
+    ],
+    "d-rows-span-gap-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-rows-span-gap-b": [
+     0,
+     26,
+     60,
+     10
+    ],
+    "d-rows-span-gap-c": [
+     44,
+     0,
+     30,
+     10
+    ],
+    "d-rows-span-gap-d": [
+     64,
+     26,
+     30,
+     10
+    ],
+    "d-rows-span-gap-e": [
+     98,
+     0,
+     50,
+     10
+    ],
+    "d-rows-span-gap-f": [
+     64,
+     52,
+     20,
+     10
+    ],
+    "d-rows-span-gap-g": [
+     88,
+     52,
+     40,
+     10
+    ],
+    "d-rows-span-gap-h": [
+     132,
+     52,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-single": {
+   "spec": {
+    "name": "d-rows-single",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 80
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 50
+     }
+    ]
+   },
+   "html": "<div id=d-rows-single class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;grid-lanes-pack:dense;width:200px'><div id=d-rows-single-a style='width:60px;height:10px'></div><div id=d-rows-single-b style='width:20px;height:10px'></div><div id=d-rows-single-c style='width:40px;height:10px'></div><div id=d-rows-single-d style='width:80px;height:10px'></div><div id=d-rows-single-e style='width:20px;height:10px'></div><div id=d-rows-single-f style='width:20px;height:10px'></div><div id=d-rows-single-g style='width:50px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-single": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-single-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "d-rows-single-b": [
+     0,
+     20,
+     20,
+     10
+    ],
+    "d-rows-single-c": [
+     0,
+     40,
+     40,
+     10
+    ],
+    "d-rows-single-d": [
+     20,
+     20,
+     80,
+     10
+    ],
+    "d-rows-single-e": [
+     40,
+     40,
+     20,
+     10
+    ],
+    "d-rows-single-f": [
+     60,
+     0,
+     20,
+     10
+    ],
+    "d-rows-single-g": [
+     60,
+     40,
+     50,
+     10
+    ]
+   }
+  },
+  "d-rows-explicit": {
+   "spec": {
+    "name": "d-rows-explicit",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 20,
+      "place": "3"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30,
+      "place": "3"
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 25,
+      "place": "1"
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=d-rows-explicit class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;grid-lanes-pack:dense;width:200px'><div id=d-rows-explicit-a style='width:60px;height:10px'></div><div id=d-rows-explicit-b style='width:20px;height:10px;grid-row:3'></div><div id=d-rows-explicit-c style='width:30px;height:10px;grid-row:3'></div><div id=d-rows-explicit-d style='width:25px;height:10px;grid-row:1'></div><div id=d-rows-explicit-e style='width:20px;height:10px;grid-row:span 2'></div><div id=d-rows-explicit-f style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-explicit": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-explicit-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "d-rows-explicit-b": [
+     0,
+     40,
+     20,
+     10
+    ],
+    "d-rows-explicit-c": [
+     20,
+     40,
+     30,
+     10
+    ],
+    "d-rows-explicit-d": [
+     60,
+     0,
+     25,
+     10
+    ],
+    "d-rows-explicit-e": [
+     50,
+     20,
+     20,
+     10
+    ],
+    "d-rows-explicit-f": [
+     0,
+     20,
+     20,
+     10
+    ]
+   }
+  },
+  "d-rows-track-rev": {
+   "spec": {
+    "name": "d-rows-track-rev",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row track-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-track-rev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row track-reverse;grid-lanes-pack:dense;width:200px'><div id=d-rows-track-rev-a style='width:40px;height:10px'></div><div id=d-rows-track-rev-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-track-rev-c style='width:30px;height:10px'></div><div id=d-rows-track-rev-d style='width:30px;height:10px'></div><div id=d-rows-track-rev-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-track-rev-f style='width:20px;height:10px'></div><div id=d-rows-track-rev-g style='width:40px;height:10px'></div><div id=d-rows-track-rev-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-track-rev": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-track-rev-a": [
+     0,
+     40,
+     40,
+     10
+    ],
+    "d-rows-track-rev-b": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "d-rows-track-rev-c": [
+     40,
+     40,
+     30,
+     10
+    ],
+    "d-rows-track-rev-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "d-rows-track-rev-e": [
+     90,
+     20,
+     50,
+     10
+    ],
+    "d-rows-track-rev-f": [
+     60,
+     0,
+     20,
+     10
+    ],
+    "d-rows-track-rev-g": [
+     80,
+     0,
+     40,
+     10
+    ],
+    "d-rows-track-rev-h": [
+     120,
+     0,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-fill-rev": {
+   "spec": {
+    "name": "d-rows-fill-rev",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row fill-reverse"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-fill-rev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row fill-reverse;grid-lanes-pack:dense;width:200px'><div id=d-rows-fill-rev-a style='width:40px;height:10px'></div><div id=d-rows-fill-rev-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-fill-rev-c style='width:30px;height:10px'></div><div id=d-rows-fill-rev-d style='width:30px;height:10px'></div><div id=d-rows-fill-rev-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-fill-rev-f style='width:20px;height:10px'></div><div id=d-rows-fill-rev-g style='width:40px;height:10px'></div><div id=d-rows-fill-rev-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-fill-rev": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-fill-rev-a": [
+     160,
+     0,
+     40,
+     10
+    ],
+    "d-rows-fill-rev-b": [
+     140,
+     20,
+     60,
+     10
+    ],
+    "d-rows-fill-rev-c": [
+     130,
+     0,
+     30,
+     10
+    ],
+    "d-rows-fill-rev-d": [
+     110,
+     20,
+     30,
+     10
+    ],
+    "d-rows-fill-rev-e": [
+     60,
+     0,
+     50,
+     10
+    ],
+    "d-rows-fill-rev-f": [
+     120,
+     40,
+     20,
+     10
+    ],
+    "d-rows-fill-rev-g": [
+     80,
+     40,
+     40,
+     10
+    ],
+    "d-rows-fill-rev-h": [
+     55,
+     40,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-align-center": {
+   "spec": {
+    "name": "d-rows-align-center",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "align": "center"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-align-center class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;justify-items:center;grid-lanes-pack:dense;width:200px'><div id=d-rows-align-center-a style='width:40px;height:10px'></div><div id=d-rows-align-center-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-align-center-c style='width:30px;height:10px'></div><div id=d-rows-align-center-d style='width:30px;height:10px'></div><div id=d-rows-align-center-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-align-center-f style='width:20px;height:10px'></div><div id=d-rows-align-center-g style='width:40px;height:10px'></div><div id=d-rows-align-center-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-align-center": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-align-center-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-rows-align-center-b": [
+     0,
+     20,
+     60,
+     10
+    ],
+    "d-rows-align-center-c": [
+     50,
+     0,
+     30,
+     10
+    ],
+    "d-rows-align-center-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "d-rows-align-center-e": [
+     120,
+     0,
+     50,
+     10
+    ],
+    "d-rows-align-center-f": [
+     60,
+     40,
+     20,
+     10
+    ],
+    "d-rows-align-center-g": [
+     80,
+     40,
+     40,
+     10
+    ],
+    "d-rows-align-center-h": [
+     147.5,
+     40,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-align-stretch": {
+   "spec": {
+    "name": "d-rows-align-stretch",
+    "container": {
+     "template": "20px 20px 20px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "align": "stretch"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 60,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "d",
+      "h": 10,
+      "w": 30
+     },
+     {
+      "id": "e",
+      "h": 10,
+      "w": 50,
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "h": 10,
+      "w": 20
+     },
+     {
+      "id": "g",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "h",
+      "h": 10,
+      "w": 25
+     }
+    ]
+   },
+   "html": "<div id=d-rows-align-stretch class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:20px 20px 20px;grid-lanes-direction:row;justify-items:stretch;grid-lanes-pack:dense;width:200px'><div id=d-rows-align-stretch-a style='width:40px;height:10px'></div><div id=d-rows-align-stretch-b style='width:60px;height:10px;grid-row:span 2'></div><div id=d-rows-align-stretch-c style='width:30px;height:10px'></div><div id=d-rows-align-stretch-d style='width:30px;height:10px'></div><div id=d-rows-align-stretch-e style='width:50px;height:10px;grid-row:span 2'></div><div id=d-rows-align-stretch-f style='width:20px;height:10px'></div><div id=d-rows-align-stretch-g style='width:40px;height:10px'></div><div id=d-rows-align-stretch-h style='width:25px;height:10px'></div></div>",
+   "rects": {
+    "d-rows-align-stretch": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "d-rows-align-stretch-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-rows-align-stretch-b": [
+     0,
+     20,
+     60,
+     10
+    ],
+    "d-rows-align-stretch-c": [
+     40,
+     0,
+     30,
+     10
+    ],
+    "d-rows-align-stretch-d": [
+     60,
+     20,
+     30,
+     10
+    ],
+    "d-rows-align-stretch-e": [
+     90,
+     0,
+     50,
+     10
+    ],
+    "d-rows-align-stretch-f": [
+     60,
+     40,
+     20,
+     10
+    ],
+    "d-rows-align-stretch-g": [
+     80,
+     40,
+     40,
+     10
+    ],
+    "d-rows-align-stretch-h": [
+     120,
+     40,
+     25,
+     10
+    ]
+   }
+  },
+  "d-rows-auto": {
+   "spec": {
+    "name": "d-rows-auto",
+    "container": {
+     "template": "auto auto auto",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX"
+     },
+     {
+      "id": "b",
+      "text": "XXXXXX",
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "text": "XX"
+     },
+     {
+      "id": "d",
+      "text": "XXX"
+     },
+     {
+      "id": "e",
+      "text": "XXXXX",
+      "place": "span 2"
+     },
+     {
+      "id": "f",
+      "text": "X"
+     }
+    ]
+   },
+   "html": "<div id=d-rows-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:auto auto auto;grid-lanes-direction:row;grid-lanes-pack:dense;width:200px'><div id=d-rows-auto-a style=''>XXXX</div><div id=d-rows-auto-b style='grid-row:span 2'>XXXXXX</div><div id=d-rows-auto-c style=''>XX</div><div id=d-rows-auto-d style=''>XXX</div><div id=d-rows-auto-e style='grid-row:span 2'>XXXXX</div><div id=d-rows-auto-f style=''>X</div></div>",
+   "rects": {
+    "d-rows-auto": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "d-rows-auto-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "d-rows-auto-b": [
+     0,
+     10,
+     60,
+     20
+    ],
+    "d-rows-auto-c": [
+     40,
+     0,
+     20,
+     10
+    ],
+    "d-rows-auto-d": [
+     60,
+     10,
+     30,
+     10
+    ],
+    "d-rows-auto-e": [
+     90,
+     0,
+     50,
+     20
+    ],
+    "d-rows-auto-f": [
+     60,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "d-wpt-row-004": {
+   "spec": {
+    "name": "d-wpt-row-004",
+    "container": {
+     "template": "50px 50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 20
+     },
+     {
+      "id": "b",
+      "w": 40
+     },
+     {
+      "id": "c",
+      "w": 60,
+      "place": "4"
+     },
+     {
+      "id": "d",
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "e",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "f",
+      "w": 20,
+      "place": "span 3"
+     },
+     {
+      "id": "g",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "h",
+      "w": 20,
+      "place": "4"
+     },
+     {
+      "id": "i",
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=d-wpt-row-004 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px 50px 50px;grid-lanes-direction:row;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-wpt-row-004-a style='width:20px'></div><div id=d-wpt-row-004-b style='width:40px'></div><div id=d-wpt-row-004-c style='width:60px;grid-row:4'></div><div id=d-wpt-row-004-d style='width:20px;grid-row:span 2'></div><div id=d-wpt-row-004-e style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-004-f style='width:20px;grid-row:span 3'></div><div id=d-wpt-row-004-g style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-004-h style='width:20px;grid-row:4'></div><div id=d-wpt-row-004-i style='width:20px'></div></div>",
+   "rects": {
+    "d-wpt-row-004": [
+     0,
+     0,
+     200,
+     200
+    ],
+    "d-wpt-row-004-a": [
+     0,
+     0,
+     20,
+     50
+    ],
+    "d-wpt-row-004-b": [
+     0,
+     50,
+     40,
+     50
+    ],
+    "d-wpt-row-004-c": [
+     0,
+     150,
+     60,
+     50
+    ],
+    "d-wpt-row-004-d": [
+     40,
+     0,
+     20,
+     100
+    ],
+    "d-wpt-row-004-e": [
+     60,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-004-f": [
+     80,
+     0,
+     20,
+     150
+    ],
+    "d-wpt-row-004-g": [
+     100,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-004-h": [
+     80,
+     150,
+     20,
+     50
+    ],
+    "d-wpt-row-004-i": [
+     0,
+     100,
+     20,
+     50
+    ]
+   }
+  },
+  "d-wpt-row-ms-004": {
+   "spec": {
+    "name": "d-wpt-row-ms-004",
+    "container": {
+     "template": "50px 50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "b",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "c",
+      "w": 40,
+      "place": "3 / span 2"
+     },
+     {
+      "id": "d",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "e",
+      "w": 20,
+      "place": "1 / span 2"
+     },
+     {
+      "id": "f",
+      "w": 20,
+      "place": "span 2"
+     }
+    ]
+   },
+   "html": "<div id=d-wpt-row-ms-004 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px 50px 50px;grid-lanes-direction:row;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-wpt-row-ms-004-a style='width:20px;grid-row:span 2'></div><div id=d-wpt-row-ms-004-b style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-ms-004-c style='width:40px;grid-row:3 / span 2'></div><div id=d-wpt-row-ms-004-d style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-ms-004-e style='width:20px;grid-row:1 / span 2'></div><div id=d-wpt-row-ms-004-f style='width:20px;grid-row:span 2'></div></div>",
+   "rects": {
+    "d-wpt-row-ms-004": [
+     0,
+     0,
+     200,
+     200
+    ],
+    "d-wpt-row-ms-004-a": [
+     0,
+     0,
+     20,
+     100
+    ],
+    "d-wpt-row-ms-004-b": [
+     20,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-ms-004-c": [
+     40,
+     100,
+     40,
+     100
+    ],
+    "d-wpt-row-ms-004-d": [
+     80,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-ms-004-e": [
+     40,
+     0,
+     20,
+     100
+    ],
+    "d-wpt-row-ms-004-f": [
+     0,
+     100,
+     20,
+     100
+    ]
+   }
+  },
+  "d-wpt-row-rev-ms-005": {
+   "spec": {
+    "name": "d-wpt-row-rev-ms-005",
+    "container": {
+     "template": "50px 50px 50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row track-reverse",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 80
+     },
+     {
+      "id": "b",
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "w": 40
+     },
+     {
+      "id": "d",
+      "w": 100
+     },
+     {
+      "id": "e",
+      "w": 10,
+      "place": "span 5"
+     },
+     {
+      "id": "f",
+      "w": 10,
+      "place": "span 4"
+     },
+     {
+      "id": "g",
+      "w": 10,
+      "place": "span 2"
+     }
+    ]
+   },
+   "html": "<div id=d-wpt-row-rev-ms-005 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px 50px 50px 50px;grid-lanes-direction:row track-reverse;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-wpt-row-rev-ms-005-a style='width:80px'></div><div id=d-wpt-row-rev-ms-005-b style='width:20px;grid-row:span 2'></div><div id=d-wpt-row-rev-ms-005-c style='width:40px'></div><div id=d-wpt-row-rev-ms-005-d style='width:100px'></div><div id=d-wpt-row-rev-ms-005-e style='width:10px;grid-row:span 5'></div><div id=d-wpt-row-rev-ms-005-f style='width:10px;grid-row:span 4'></div><div id=d-wpt-row-rev-ms-005-g style='width:10px;grid-row:span 2'></div></div>",
+   "rects": {
+    "d-wpt-row-rev-ms-005": [
+     0,
+     0,
+     200,
+     250
+    ],
+    "d-wpt-row-rev-ms-005-a": [
+     0,
+     200,
+     80,
+     50
+    ],
+    "d-wpt-row-rev-ms-005-b": [
+     0,
+     100,
+     20,
+     100
+    ],
+    "d-wpt-row-rev-ms-005-c": [
+     0,
+     50,
+     40,
+     50
+    ],
+    "d-wpt-row-rev-ms-005-d": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "d-wpt-row-rev-ms-005-e": [
+     100,
+     0,
+     10,
+     250
+    ],
+    "d-wpt-row-rev-ms-005-f": [
+     80,
+     50,
+     10,
+     200
+    ],
+    "d-wpt-row-rev-ms-005-g": [
+     20,
+     100,
+     10,
+     100
+    ]
+   }
+  }
+ }
+}

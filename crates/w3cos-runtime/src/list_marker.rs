@@ -312,7 +312,7 @@ mod tests {
     fn outside_string_marker_uses_text_advance_and_first_line_baseline() {
         let item = Style {
             display: Display::Block,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-list-item".into(),
                 "1".into(),
             )])),
@@ -401,7 +401,7 @@ mod tests {
                     font_size: 16.0,
                     line_height: 1.0,
                     direction,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-list-item".into(),
                         "1".into(),
                     )])),
@@ -668,7 +668,7 @@ mod tests {
                 font_size: 20.0,
                 line_height: 1.0,
                 direction,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-list-item".into(),
                     "1".into(),
                 )])),
@@ -894,7 +894,7 @@ mod tests {
             let style = Style {
                 font_family: Some("Ahem".into()),
                 font_size: 16.0,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inside-list-marker".into(),
                     kind.into(),
                 )])),

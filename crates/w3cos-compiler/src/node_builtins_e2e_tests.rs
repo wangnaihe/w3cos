@@ -2,7 +2,7 @@
 //! path / events / util / url / os / process / timers is AOT-compiled with
 //! the builtin glue and must print what Node 20 prints for the same file.
 
-use crate::cjs_e2e_tests::{compile_and_run, write_fixture};
+use crate::cjs_e2e_tests::{compile_and_run, compile_and_run_with_env, write_fixture};
 
 const MAIN: &str = r##"const path = require("path");
 const posix = require("node:path/posix");
@@ -57,6 +57,7 @@ console.log("custom", util.inspect(custom), util.inspect.custom === Symbol.for("
 const url = require("url");
 console.log("fileURLToPath", url.fileURLToPath("file:///tmp/a%20b.txt"), url.pathToFileURL("/tmp/x y#1.txt").href);
 console.log("url format", url.format({ protocol: "https", hostname: "example.com", pathname: "/p", query: { q: "1 2" } }));
+const lp = require("url").parse("http://u:p@Example.COM:8080/a b?x=1&y=2#h", true); console.log("url parse", lp.protocol, lp.auth, lp.host, lp.hostname, lp.port, lp.pathname, lp.search, lp.query.y, lp.hash, lp.href, require("url").parse("/rel?q").path, require("url").parse("localhost:3000").hostname, require("url").resolve("http://a.com/b/c", "../d"), require("url").format("HTTP://X.com"));
 console.log("URL", new url.URL("https://a.b/c?d=1").searchParams.get("d"), url.URL === URL);
 try { url.fileURLToPath("https://x/y"); } catch (e) { console.log("url err", e.code); }
 
@@ -112,6 +113,7 @@ types true true true true true
 custom CUSTOM true
 fileURLToPath /tmp/a b.txt file:///tmp/x%20y%231.txt
 url format https://example.com/p?q=1%202
+url parse http: u:p example.com:8080 example.com 8080 /a%20b ?x=1&y=2 2 #h http://u:p@example.com:8080/a%20b?x=1&y=2#h /rel?q 3000 http://a.com/d http://x.com/
 URL 1 true
 url err ERR_INVALID_URL_SCHEME
 os "\n" linux Linux LE string string 15 2
@@ -159,6 +161,8 @@ const cp = Buffer.alloc(6, "."); console.log("copy", Buffer.from("xyz").copy(cp,
 console.log("inspect", require("util").inspect(Buffer.from("hi")), Buffer.from("hi").inspect());
 console.log("ab", Buffer.from(new Uint8Array([1, 2, 3]).buffer, 1).toString("hex"), Buffer.from(Buffer.from("x")).toString(), Object.prototype.toString.call(b));
 console.log("fill", Buffer.alloc(4).fill("ab").toString(), Buffer.alloc(4).fill(0x41, 1, 3).toString("hex"), typeof Buffer.poolSize, require("node:buffer").kMaxLength > 0);
+const big = Buffer.concat([Buffer.alloc(300000, 1), Buffer.alloc(300000, 2)]); const cq = Buffer.alloc(4, "."); console.log("bulk", big.length, big[299999], big[300000], big[599999], Buffer.from("abcdef").copy(cq, 1, 2), cq.toString(), Buffer.from("ab").copy(cq, 9), Buffer.from("abc").copy(cq, 0, 3), Buffer.concat([Buffer.from("abc"), Buffer.from("def")], 4).toString());
+const u8big = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.alloc(200000, 0x61), Buffer.from([0xe2, 0x82, 0xac, 0xff, 0xc3])]); const us = u8big.toString(); console.log("utf8big", us.length, us.charCodeAt(0), JSON.stringify(us.slice(-4)), u8big.toString("utf8", 3, 6), JSON.stringify(u8big.toString("utf8", 200003, 200005)), typeof TextDecoder);
 "##;
 
 /// `node main.cjs` (v20.19.2).
@@ -179,6 +183,8 @@ copy 3 ..xyz. badc dcba
 inspect <Buffer 68 69> <Buffer 68 69>
 ab 0203 x [object Uint8Array]
 fill abab 00414100 number true
+bulk 600000 1 2 2 3 .cde 0 0 abcd
+utf8big 200004 65279 "a€��" aaa "�" function
 "##;
 
 #[test]
@@ -231,6 +237,8 @@ assert.rejects(Promise.reject(new Error("r")), /r/)
   .then(() => { console.log("rejects ok"); return assert.rejects(Promise.resolve(1)); })
   .catch((e) => console.log("rejects missing", e.message, e.code));
 console.log("misc", Object.is(NaN, NaN), Object.is(0, -0), Object.keys(new Error("x")).length, new Error("x").hasOwnProperty("name"), JSON.stringify(new TypeError("t")), Promise.resolve(1) instanceof Promise, (async () => 1)() instanceof Promise);
+const nodeConstants = require("constants");
+console.log("constants", nodeConstants.O_RDONLY, nodeConstants.ENOENT, nodeConstants.SIGTERM, nodeConstants.S_IFMT, nodeConstants.PRIORITY_HIGH, nodeConstants === require("node:constants"));
 "##;
 
 /// `node main.cjs` (v20.19.2).
@@ -252,6 +260,7 @@ msg6 Missing expected exception (TypeError): need it
 match no-throw ERR_ASSERTION/AssertionError/true/match no-throw ERR_ASSERTION/AssertionError/true/ifError
 msg7 ifError got unwanted exception: e1
 misc true false 0 false {} true true
+constants 0 2 15 61440 -14 true
 rejects ok
 rejects missing Missing expected rejection. ERR_ASSERTION
 "##;
@@ -447,6 +456,13 @@ out("fd-read", fs.readSync(fd, buf, 0, 4, 0), buf.toString(), fs.fstatSync(fd).s
 fs.ftruncateSync(fd, 3);
 fs.closeSync(fd);
 out("fd-closed", fs.readFileSync(path.join(tmp, "fd.txt"), "utf8"), err(() => fs.closeSync(fd)).split("/")[0]);
+const nfd = fs.openSync(path.join(tmp, "fd.txt"), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+const nbuf = Buffer.alloc(3);
+out("numeric-open", fs.readSync(nfd, nbuf, 0, 3, 0), nbuf.toString(), typeof fs.constants.O_NONBLOCK);
+fs.closeSync(nfd);
+const wfd = fs.openSync(path.join(tmp, "fd2.txt"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, 0o644);
+fs.writeSync(wfd, "num"); fs.fdatasyncSync(wfd); fs.closeSync(wfd);
+out("stdout-fd", fs.writeSync(1, ""), fs.readFileSync(path.join(tmp, "fd2.txt"), "utf8"));
 fs.chmodSync(path.join(tmp, "c.txt"), 0o600);
 out("chmod", (fs.statSync(path.join(tmp, "c.txt")).mode & 0o777).toString(8), err(() => fs.accessSync(path.join(tmp, "c.txt"), fs.constants.R_OK)));
 fs.utimesSync(path.join(tmp, "c.txt"), 1000, 2000);
@@ -503,6 +519,8 @@ symlink true true <tmp>/c.txt true
 fd-write 6 2
 fd-read 4 aXYd 6
 fd-closed aXY EBADF
+numeric-open 3 aXY number
+stdout-fd 0 num
 chmod 600 ok
 utimes 2000000
 truncate 2
@@ -743,5 +761,73 @@ fn node_zlib_matches_node() {
     let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_zlib_e2e");
     let expected: Vec<&str> = ZLIB_NODE_OUTPUT.lines().collect();
     assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+const DEBUGLOG_MAIN: &str = r##"const util = require("util");
+const process = require("process");
+const out = [];
+const origWrite = process.stderr.write;
+process.stderr.write = function (chunk) { out.push(String(chunk).replace(/ \d+: /, " PID: ")); return true; };
+const a = util.debuglog("undici");
+const b = util.debuglog("fetch", (fn) => out.push("cb " + (typeof fn)));
+const c = util.debuglog("http2");
+const d = util.debug("netx");
+console.log("types", typeof a, a.enabled, b.enabled, c.enabled, d.enabled, util.debug === util.debuglog);
+a("hello %s %d", "x", 5);
+b("fetching %j", { u: 1 });
+c("hidden");
+d("wild");
+process.stderr.write = origWrite;
+console.log("out", JSON.stringify(out));
+"##;
+
+/// `NODE_DEBUG=undici,FETCH,net* node main.cjs` (v24.18.0). undici's
+/// `lib/core/diagnostics.js` reads `util.debuglog(...).enabled` at load time.
+const DEBUGLOG_NODE_OUTPUT: &str = r##"types function true true false true true
+out ["UNDICI PID: hello x 5\n","cb function","FETCH PID: fetching {\"u\":1}\n","NETX PID: wild\n"]
+"##;
+
+#[test]
+fn node_util_debuglog_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_debuglog_e2e",
+        &[
+            ("package.json", r#"{"name":"node-debuglog"}"#),
+            ("main.cjs", DEBUGLOG_MAIN),
+        ],
+    );
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.cjs"),
+        "w3cos_node_debuglog_e2e",
+        &[("NODE_DEBUG", "undici,FETCH,net*")],
+    );
+    let expected: Vec<&str> = DEBUGLOG_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// tar's `dist/esm/index.min.js` declares its imports mid-line without
+/// spaces (`...;import{win32 as Pn}from"node:path";var{isAbsolute:zn}=Pn`).
+const MINIFIED_ESM_LIB: &str = r#"var a=1;import Qr from"events";import{win32 as Pn}from"node:path";var{isAbsolute:zn,parse:qs}=Pn;export*from"./more.js";export const t=typeof zn+" "+typeof qs+" "+typeof Qr+" "+a;"#;
+
+#[test]
+fn minified_esm_imports_of_builtins_resolve() {
+    let root = write_fixture(
+        "w3cos_node_minified_esm_e2e",
+        &[
+            ("package.json", r#"{"name":"minified-esm","type":"module"}"#),
+            ("lib.min.js", MINIFIED_ESM_LIB),
+            ("more.js", "export const more = 'more';\n"),
+            (
+                "main.js",
+                r#"import {t, more} from "./lib.min.js"; console.log(t, more);"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_node_minified_esm_e2e");
+    // `node main.js` (v24.18.0).
+    assert_eq!(lines, ["function function function 1 more"]);
     std::fs::remove_dir_all(root).ok();
 }

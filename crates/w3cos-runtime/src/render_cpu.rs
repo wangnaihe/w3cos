@@ -657,6 +657,12 @@ thread_local! {
     static RENDER_NODE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Flat paint index of the node `paint_nodes` is currently drawing. Canvas
+    /// surfaces are published per flat index, and `render_node` has no index.
+    static CURRENT_PAINT_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 fn note_painted_node() {
     #[cfg(test)]
     RENDER_NODE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
@@ -721,6 +727,7 @@ fn paint_nodes(
             continue;
         }
         let clip_mask = effective_clip.and_then(|rect| clip_masks.get_or_create(pixmap, rect));
+        crate::canvas2d::set_paint_client(idx);
         let text_value = match kind {
             ComponentKind::TextInput { value, .. } => Some(
                 text_input_values
@@ -731,6 +738,7 @@ fn paint_nodes(
             _ => None,
         };
         let is_focused = focused_index == Some(idx);
+        CURRENT_PAINT_INDEX.with(|slot| slot.set(idx));
         render_node(
             pixmap,
             offset_rect,
@@ -855,6 +863,11 @@ fn render_node(
 ) {
     note_painted_node();
     if style.opacity <= 0.0 {
+        return;
+    }
+    // `visibility: hidden` keeps layout but paints nothing for this box;
+    // descendants carry their own (inherited or overridden) computed value.
+    if style.visibility == w3cos_std::style::Visibility::Hidden {
         return;
     }
     // Apply transform offset
@@ -1144,7 +1157,35 @@ fn render_node(
         }
         ComponentKind::Button { label } => {
             if text_color.a > 0 {
-                draw_text_centered_in_rect(pixmap, rect, label, style, text_color, font, clip_mask);
+                let single_line_width = crate::layout::text_intrinsic_size(label, style).0;
+                if crate::layout::button_label_can_wrap(label, style)
+                    && single_line_width > rect.width
+                {
+                    // Wrapped label: centered lines, like a block of text.
+                    let mut wrapped = style.clone();
+                    wrapped.text_align = TextAlign::Center;
+                    draw_text_in_rect(pixmap, rect, label, &wrapped, text_color, font, clip_mask);
+                } else {
+                    draw_text_centered_in_rect(
+                        pixmap, rect, label, style, text_color, font, clip_mask,
+                    );
+                }
+            }
+        }
+        ComponentKind::Canvas { .. } => {
+            let index = CURRENT_PAINT_INDEX.with(std::cell::Cell::get);
+            if let Some(snapshot) = crate::canvas2d::surface_snapshot(index) {
+                draw_image_pixels(
+                    pixmap,
+                    text_content_box(rect, style),
+                    snapshot.width,
+                    snapshot.height,
+                    &snapshot.pixels,
+                    opacity,
+                    clip_mask,
+                    None,
+                    crate::background_image::BackgroundBlendMode::Normal,
+                );
             }
         }
         ComponentKind::Image { src } => {
@@ -1293,6 +1334,23 @@ fn render_node(
                     raster.width,
                     raster.height,
                     raster.data.as_slice(),
+                    opacity,
+                    clip_mask,
+                    None,
+                    crate::background_image::BackgroundBlendMode::Normal,
+                );
+            }
+        }
+        ComponentKind::Canvas { .. } => {
+            if let Some(snapshot) =
+                crate::canvas2d::surface_snapshot(crate::canvas2d::paint_client())
+            {
+                draw_image_pixels(
+                    pixmap,
+                    rect,
+                    snapshot.width,
+                    snapshot.height,
+                    snapshot.pixels.as_slice(),
                     opacity,
                     clip_mask,
                     None,
@@ -1819,10 +1877,27 @@ fn draw_rect(
                     clip_mask,
                 );
             }
+        } else if sk_rect.left().fract() != 0.0 && sk_rect.right().fract() != 0.0 {
+            // tiny-skia's anti-aliased rect scan converter debug-asserts when
+            // both horizontal edges are fractional and the rect covers no whole
+            // pixel column (e.g. x = 0.5..1.2). Filling the equivalent path
+            // gives the same coverage without that assertion.
+            fill_rect_as_path(pixmap, sk_rect, &paint, clip_mask);
         } else {
             pixmap.fill_rect(sk_rect, &paint, Transform::identity(), clip_mask);
         }
     }
+}
+
+fn fill_rect_as_path(pixmap: &mut Pixmap, rect: Rect, paint: &Paint, clip_mask: Option<&Mask>) {
+    let path = PathBuilder::from_rect(rect);
+    pixmap.fill_path(
+        &path,
+        paint,
+        FillRule::Winding,
+        Transform::identity(),
+        clip_mask,
+    );
 }
 
 fn draw_border(
@@ -1933,7 +2008,7 @@ fn draw_text_ink_in_box(
     draw_text_line(pixmap, x, y, text, font_size, color, font, style, clip_mask);
 }
 
-fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
+fn single_line_h_align(style: &Style, _box_w: f32, _ink_w: f32) -> TextAlign {
     if style.display == w3cos_std::style::Display::Inline {
         return TextAlign::Left;
     }
@@ -1946,14 +2021,6 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     };
     match text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
-        TextAlign::Left
-            if matches!(
-                style.white_space,
-                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre
-            ) && box_w > ink_w + 1.5 =>
-        {
-            TextAlign::Center
-        }
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => TextAlign::Left,
     }
 }
@@ -3710,6 +3777,44 @@ mod font_cjk_tests {
         assert!(
             !super::rects_intersect(super::paint_influence_bounds(filter_rect, &filtered), clip),
             "the filter box itself is outside the clip; the escape check keeps it"
+        );
+    }
+
+    #[test]
+    fn fractional_rect_spanning_two_partial_pixels_does_not_trip_tiny_skia() {
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        let rect = LayoutRect {
+            x: 0.5,
+            y: 2.0,
+            width: 0.7,
+            height: 3.0,
+        };
+        super::draw_rect(&mut pixmap, rect, Color::rgb(255, 0, 0), 0.0, None);
+        assert!(pixmap.pixel(0, 3).unwrap().red() > 0);
+        assert!(pixmap.pixel(1, 3).unwrap().red() > 0);
+        assert_eq!(pixmap.pixel(2, 3).unwrap().red(), 0);
+    }
+
+    #[test]
+    fn nowrap_and_pre_block_text_is_not_centered_by_default() {
+        for white_space in [
+            w3cos_std::style::WhiteSpace::NoWrap,
+            w3cos_std::style::WhiteSpace::Pre,
+        ] {
+            let style = Style {
+                white_space,
+                ..Style::default()
+            };
+            assert_eq!(single_line_h_align(&style, 500.0, 100.0), TextAlign::Left);
+        }
+        let centered = Style {
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            text_align: TextAlign::Center,
+            ..Style::default()
+        };
+        assert_eq!(
+            single_line_h_align(&centered, 500.0, 100.0),
+            TextAlign::Center
         );
     }
 }

@@ -241,6 +241,59 @@ impl Kind {
     }
 }
 
+/// Storage addresses are aligned pointers: a multiplicative hash spreads
+/// them without SipHash's cost on the hot `is_typed_array` path.
+#[derive(Default, Clone, Copy)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 =
+                (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type ViewIndexBuild = std::hash::BuildHasherDefault<AddressHasher>;
+
+fn storage_address(storage: &crate::value::JsArrayRef) -> usize {
+    std::ptr::from_ref::<RefCell<crate::value::ArrayStorage>>(storage) as usize
+}
+
+/// Index in `views` of the live view whose storage is `candidate`.
+fn view_index(views: &[View], candidate: &crate::value::JsArrayRef) -> Option<usize> {
+    let index =
+        VIEW_INDEX.with(|index| index.borrow().get(&storage_address(candidate)).copied())?;
+    let view = views.get(index)?;
+    view.storage
+        .upgrade()
+        .is_some_and(|storage| storage.ptr_eq(candidate))
+        .then_some(index)
+}
+
+/// Drop collected views and rebuild `VIEW_INDEX` for the survivors.
+fn sweep_views(views: &mut Vec<View>) {
+    views.retain(|view| view.storage.upgrade().is_some());
+    VIEW_INDEX.with(|index| {
+        let mut index = index.borrow_mut();
+        index.clear();
+        for (position, view) in views.iter().enumerate() {
+            if let Some(storage) = view.storage.upgrade() {
+                index.insert(storage_address(&storage), position);
+            }
+        }
+    });
+}
+
 struct View {
     storage: WeakJsArray,
     buffer: Value,
@@ -255,8 +308,23 @@ struct View {
 
 thread_local! {
     static NEXT_BUFFER_ID: RefCell<u64> = const { RefCell::new(1) };
-    static BUFFERS: RefCell<HashMap<u64, Rc<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
+    /// Buffer id -> bytes. Weak: the ArrayBuffer object's own closures hold
+    /// the bytes strongly, so a collected buffer frees its storage.
+    static BUFFERS: RefCell<HashMap<u64, std::rc::Weak<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
+    /// `BUFFERS` size that triggers the next sweep of dead entries.
+    static BUFFER_SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
     static VIEWS: RefCell<Vec<View>> = const { RefCell::new(Vec::new()) };
+    /// Storage address -> index in `VIEWS`. `is_typed_array` runs on every
+    /// array method call, so scanning `VIEWS` made each `push`/`slice` on
+    /// any array O(live typed arrays). A stale entry (address reused after
+    /// its view was collected) is rejected by the `ptr_eq` check.
+    static VIEW_INDEX: RefCell<HashMap<usize, usize, ViewIndexBuild>> =
+        RefCell::new(HashMap::default());
+    /// `VIEWS` length that triggers the next sweep of collected views:
+    /// twice the live count after the previous sweep, so dead views never
+    /// outnumber live ones (plus a small floor) and sweeping stays O(1)
+    /// amortized.
+    static VIEW_SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
     /// Set once any typed array gets a custom prototype: array property
     /// reads skip the view lookup until then.
     static ANY_VIEW_PROTOTYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -276,7 +344,21 @@ fn buffer_state(value: &Value) -> Option<Rc<RefCell<Vec<u8>>>> {
     let Some(id) = object.borrow().get_direct(BUFFER_STATE_KEY).as_number() else {
         return None;
     };
-    BUFFERS.with(|buffers| buffers.borrow().get(&(id as u64)).cloned())
+    BUFFERS.with(|buffers| {
+        buffers
+            .borrow()
+            .get(&(id as u64))
+            .and_then(std::rc::Weak::upgrade)
+    })
+}
+
+/// Weak handle to an ArrayBuffer object for its own method closures, so
+/// the buffer does not keep itself alive through a reference cycle.
+fn weak_buffer(value: &Value) -> crate::value::WeakJsObject {
+    value
+        .as_object()
+        .expect("ArrayBuffer is an object")
+        .downgrade()
 }
 
 fn new_buffer_from_state_with_options(
@@ -290,7 +372,15 @@ fn new_buffer_from_state_with_options(
         *next.borrow_mut() = id + 1;
         id
     });
-    BUFFERS.with(|buffers| buffers.borrow_mut().insert(id, state.clone()));
+    BUFFERS.with(|buffers| {
+        let mut buffers = buffers.borrow_mut();
+        if buffers.len() >= BUFFER_SWEEP_AT.with(|at| at.get()) {
+            buffers.retain(|_, bytes| bytes.strong_count() > 0);
+            let next = (buffers.len() * 2).max(64);
+            BUFFER_SWEEP_AT.with(|at| at.set(next));
+        }
+        buffers.insert(id, Rc::downgrade(&state));
+    });
     let value = Value::object(HashMap::from([
         (BUFFER_STATE_KEY.to_string(), Value::Number(id as f64)),
         (SHARED_BUFFER_KEY.to_string(), Value::Bool(shared)),
@@ -306,10 +396,13 @@ fn new_buffer_from_state_with_options(
         "__w3cos_getter_byteLength",
         Value::function(move |_, _| Value::Number(state_for_length.borrow().len() as f64)),
     );
-    let value_for_maximum = value.clone();
+    let value_for_maximum = weak_buffer(&value);
     value.set_property(
         "__w3cos_getter_maxByteLength",
         Value::function(move |_, _| {
+            let Some(value_for_maximum) = value_for_maximum.upgrade_value() else {
+                binary_error("TypeError", "ArrayBuffer is no longer alive");
+            };
             Value::Number(if value_for_maximum
                 .get_property(DETACHED_BUFFER_KEY)
                 .to_bool()
@@ -320,7 +413,7 @@ fn new_buffer_from_state_with_options(
             } as f64)
         }),
     );
-    let value_for_resizable = value.clone();
+    let value_for_resizable = weak_buffer(&value);
     value.set_property(
         if shared {
             "__w3cos_getter_growable"
@@ -328,6 +421,9 @@ fn new_buffer_from_state_with_options(
             "__w3cos_getter_resizable"
         },
         Value::function(move |_, _| {
+            let Some(value_for_resizable) = value_for_resizable.upgrade_value() else {
+                binary_error("TypeError", "ArrayBuffer is no longer alive");
+            };
             Value::Bool(
                 resizable
                     && !value_for_resizable
@@ -337,10 +433,13 @@ fn new_buffer_from_state_with_options(
         }),
     );
     if !shared {
-        let value_for_detached = value.clone();
+        let value_for_detached = weak_buffer(&value);
         value.set_property(
             "__w3cos_getter_detached",
             Value::function(move |_, _| {
+                let Some(value_for_detached) = value_for_detached.upgrade_value() else {
+                    binary_error("TypeError", "ArrayBuffer is no longer alive");
+                };
                 Value::Bool(
                     value_for_detached
                         .get_property(DETACHED_BUFFER_KEY)
@@ -349,10 +448,13 @@ fn new_buffer_from_state_with_options(
             }),
         );
     }
-    let value_for_slice = value.clone();
+    let value_for_slice = weak_buffer(&value);
     value.set_property(
         "slice",
         Value::function(move |_, args| {
+            let Some(value_for_slice) = value_for_slice.upgrade_value() else {
+                binary_error("TypeError", "ArrayBuffer is no longer alive");
+            };
             if value_for_slice.get_property(DETACHED_BUFFER_KEY).to_bool() {
                 binary_error("TypeError", "ArrayBuffer is detached");
             }
@@ -402,10 +504,13 @@ fn new_buffer_from_state_with_options(
         );
     } else {
         let state_for_resize = state.clone();
-        let value_for_resize = value.clone();
+        let value_for_resize = weak_buffer(&value);
         value.set_property(
             "resize",
             Value::function(move |_, args| {
+                let Some(value_for_resize) = value_for_resize.upgrade_value() else {
+                    binary_error("TypeError", "ArrayBuffer is no longer alive");
+                };
                 if value_for_resize.get_property(DETACHED_BUFFER_KEY).to_bool() {
                     binary_error("TypeError", "ArrayBuffer is detached");
                 }
@@ -426,10 +531,13 @@ fn new_buffer_from_state_with_options(
             }),
         );
         for (name, fixed) in [("transfer", false), ("transferToFixedLength", true)] {
-            let source = value.clone();
+            let source = weak_buffer(&value);
             value.set_property(
                 name,
                 Value::function(move |_, args| {
+                    let Some(source) = source.upgrade_value() else {
+                        binary_error("TypeError", "ArrayBuffer is no longer alive");
+                    };
                     if source.get_property(DETACHED_BUFFER_KEY).to_bool() {
                         binary_error("TypeError", "ArrayBuffer is detached");
                     }
@@ -570,7 +678,7 @@ pub fn fill_array_buffer_view(view: &Value, source: &[u8]) -> Option<Value> {
         None => source.len().min(byte_length),
     };
     bytes.borrow_mut()[offset..offset + written].copy_from_slice(&source[..written]);
-    sync_views(&bytes);
+    sync_views_range(&bytes, offset, offset + written);
     Some(slice_array_buffer_view(view, written).unwrap_or_else(|| view.clone()))
 }
 
@@ -816,28 +924,24 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
     let Some(candidate) = value.as_array() else {
         return None;
     };
+    // Collected views are swept in `new_view`; lookups stay read-only.
     VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
-        views.iter().find_map(|view| {
-            let storage = view.storage.upgrade()?;
-            storage.ptr_eq(&candidate).then(|| {
-                (
-                    view.bytes.clone(),
-                    view.offset,
-                    view.length,
-                    view.kind,
-                    view.buffer.clone(),
-                )
-            })
-        })
+        let views = views.borrow();
+        let view = &views[view_index(&views, &candidate)?];
+        Some((
+            view.bytes.clone(),
+            view.offset,
+            view.length,
+            view.kind,
+            view.buffer.clone(),
+        ))
     })
 }
 
 fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
+        sweep_views(&mut views);
         let bytes = changed.borrow();
         for view in views.iter() {
             if !Rc::ptr_eq(&view.bytes, changed) {
@@ -846,6 +950,9 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
             let Some(storage) = view.storage.upgrade() else {
                 continue;
             };
+            if storage.borrow().is_lazy() {
+                continue;
+            }
             let mut decoded = Vec::with_capacity(view.length);
             for index in 0..view.length {
                 let start = view.offset + index * view.kind.bytes();
@@ -859,21 +966,107 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     });
 }
 
+/// Refresh only the elements of aliasing views that overlap the changed
+/// byte range `[start, end)`. Element writes (`view[i] = x`, DataView
+/// setters, Atomics) touch a few bytes; re-decoding every aliasing view in
+/// full made a byte-at-a-time copy loop quadratic in the buffer size.
+fn sync_views_range(changed: &Rc<RefCell<Vec<u8>>>, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    VIEWS.with(|views| {
+        let views = views.borrow();
+        let bytes = changed.borrow();
+        for view in views.iter() {
+            if !Rc::ptr_eq(&view.bytes, changed) {
+                continue;
+            }
+            let width = view.kind.bytes();
+            let view_end = view.offset + view.length * width;
+            let lo = start.max(view.offset);
+            let hi = end.min(view_end);
+            if lo >= hi {
+                continue;
+            }
+            let Some(storage) = view.storage.upgrade() else {
+                continue;
+            };
+            let first = (lo - view.offset) / width;
+            let last = (hi - view.offset).div_ceil(width).min(view.length);
+            let mut storage = storage.borrow_mut();
+            for index in first..last {
+                let from = view.offset + index * width;
+                if from + width <= bytes.len() {
+                    storage.set_value(index, view.kind.decode(&bytes[from..from + width]));
+                }
+            }
+        }
+    });
+}
+
+/// Encode `items` into consecutive elements starting at `first` and refresh
+/// the aliasing views once for the whole range (`set`, `fill`).
+fn write_typed_elements(
+    buffer: &Value,
+    offset: usize,
+    kind: Kind,
+    first: usize,
+    items: Vec<Value>,
+) {
+    let Some(bytes) = buffer_state(buffer) else {
+        return;
+    };
+    let width = kind.bytes();
+    let start = offset + first * width;
+    let mut end = start;
+    {
+        let mut data = bytes.borrow_mut();
+        for item in &items {
+            if end + width > data.len() {
+                break;
+            }
+            data[end..end + width].copy_from_slice(&kind.encode(item));
+            end += width;
+        }
+    }
+    sync_views_range(&bytes, start, end);
+}
+
 fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     let bytes = buffer_state(&buffer).expect("typed-array buffer");
-    let values = {
-        let bytes = bytes.borrow();
-        (0..length)
-            .map(|index| {
-                let start = offset + index * kind.bytes();
-                kind.decode(&bytes[start..start + kind.bytes()])
-            })
-            .collect()
+    // The bytes are the source of truth; the `Value` elements are decoded
+    // only if generic array code asks for them (see `ArrayStorage::new_lazy`).
+    let value = {
+        let bytes = bytes.clone();
+        Value::lazy_array(length, move || {
+            let bytes = bytes.borrow();
+            (0..length)
+                .filter_map(|index| {
+                    let start = offset + index * kind.bytes();
+                    bytes
+                        .get(start..start + kind.bytes())
+                        .map(|slice| kind.decode(slice))
+                })
+                .collect()
+        })
     };
-    let value = Value::array(values);
     let storage = value.as_array().expect("typed array storage");
     VIEWS.with(|views| {
-        views.borrow_mut().push(View {
+        let mut views = views.borrow_mut();
+        // Element writes refresh aliasing views without sweeping the list,
+        // so drop collected views here once the list doubles past its
+        // last live size (amortized O(1), dead views bounded by live ones).
+        if views.len() >= VIEW_SWEEP_AT.with(|at| at.get()) {
+            sweep_views(&mut views);
+            let next = (views.len() * 2).max(64);
+            VIEW_SWEEP_AT.with(|at| at.set(next));
+        }
+        VIEW_INDEX.with(|index| {
+            index
+                .borrow_mut()
+                .insert(storage_address(&storage), views.len());
+        });
+        views.push(View {
             storage: storage.downgrade(),
             buffer,
             bytes,
@@ -990,14 +1183,8 @@ pub fn typed_array_prototype(value: &Value) -> Option<Value> {
     }
     let candidate = value.as_array()?;
     VIEWS.with(|views| {
-        views.borrow().iter().find_map(|view| {
-            let storage = view.storage.upgrade()?;
-            if storage.ptr_eq(&candidate) {
-                view.prototype.clone()
-            } else {
-                None
-            }
-        })
+        let views = views.borrow();
+        views[view_index(&views, &candidate)?].prototype.clone()
     })
 }
 
@@ -1009,21 +1196,16 @@ pub fn set_typed_array_prototype(value: &Value, prototype: &Value) -> bool {
     };
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        for view in views.iter_mut() {
-            if view
-                .storage
-                .upgrade()
-                .is_some_and(|storage| storage.ptr_eq(&candidate))
-            {
-                view.prototype =
-                    (prototype.is_object() || prototype.is_function()).then(|| prototype.clone());
-                if view.prototype.is_some() {
-                    ANY_VIEW_PROTOTYPE.with(|flag| flag.set(true));
-                }
-                return true;
-            }
+        let Some(index) = view_index(&views, &candidate) else {
+            return false;
+        };
+        let view = &mut views[index];
+        view.prototype =
+            (prototype.is_object() || prototype.is_function()).then(|| prototype.clone());
+        if view.prototype.is_some() {
+            ANY_VIEW_PROTOTYPE.with(|flag| flag.set(true));
         }
-        false
+        true
     })
 }
 
@@ -1171,9 +1353,7 @@ pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>
             {
                 binary_error("RangeError", "TypedArray source does not fit in the target");
             }
-            for (index, item) in source.into_iter().enumerate() {
-                set_typed_array_index(value, target + index, item);
-            }
+            write_typed_elements(&buffer, offset, kind, target, source);
             Value::Undefined
         }
         "subarray" => {
@@ -1191,9 +1371,13 @@ pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>
             let start = normalize_index(args.get(1), length, 0);
             let end = normalize_index(args.get(2), length, length).max(start);
             let item = argument(0);
-            for index in start..end {
-                set_typed_array_index(value, index, item.clone());
-            }
+            write_typed_elements(
+                &buffer,
+                offset,
+                kind,
+                start,
+                std::iter::repeat_n(item, end - start).collect(),
+            );
             value.clone()
         }
         "copyWithin" => {
@@ -1368,7 +1552,7 @@ pub fn set_typed_array_index(value: &Value, index: usize, item: Value) -> bool {
         return true;
     }
     bytes.borrow_mut()[start..start + kind.bytes()].copy_from_slice(&encoded);
-    sync_views(&bytes);
+    sync_views_range(&bytes, start, start + kind.bytes());
     true
 }
 
@@ -1656,7 +1840,7 @@ fn write_data(
         encoded.reverse();
     }
     bytes.borrow_mut()[offset..offset + encoded.len()].copy_from_slice(&encoded);
-    sync_views(bytes);
+    sync_views_range(bytes, offset, offset + encoded.len());
 }
 
 pub fn data_view_class() -> Value {
@@ -1808,6 +1992,146 @@ mod tests {
                 .to_number(),
             0xabcd as f64
         );
+    }
+
+    #[test]
+    fn element_writes_refresh_only_overlapping_aliases_and_stay_linear() {
+        let buffer = crate::class::construct(&array_buffer_class(), vec![Value::Number(8.0)]);
+        let bytes = crate::class::construct(&typed_array_class("Uint8Array"), vec![buffer.clone()]);
+        let tail = crate::class::construct(
+            &typed_array_class("Uint8Array"),
+            vec![buffer.clone(), Value::Number(5.0), Value::Number(3.0)],
+        );
+        let words = crate::class::construct(
+            &typed_array_class("Uint16Array"),
+            vec![buffer.clone(), Value::Number(2.0), Value::Number(3.0)],
+        );
+        // `set` writes a run of bytes; the straddling Uint16 element and
+        // the offset Uint8 view both observe it.
+        bytes.call_method(
+            "set",
+            vec![
+                Value::array(vec![
+                    Value::Number(1.0),
+                    Value::Number(2.0),
+                    Value::Number(3.0),
+                ]),
+                Value::Number(4.0),
+            ],
+        );
+        assert_eq!(words.get_property("1").to_number(), 0x0201 as f64);
+        assert_eq!(words.get_property("2").to_number(), 3.0);
+        assert_eq!(tail.get_property("0").to_number(), 2.0);
+        assert_eq!(tail.get_property("1").to_number(), 3.0);
+        tail.call_method(
+            "fill",
+            vec![Value::Number(255.0), Value::Number(1.0), Value::Number(3.0)],
+        );
+        assert_eq!(bytes.get_property("6").to_number(), 255.0);
+        assert_eq!(bytes.get_property("7").to_number(), 255.0);
+        assert_eq!(words.get_property("2").to_number(), 0xffff as f64);
+        assert_eq!(bytes.get_property("4").to_number(), 1.0);
+
+        // A byte-at-a-time copy into a large aliased buffer used to
+        // re-decode every alias per write (quadratic); 256 KiB must be quick.
+        let size = 256 * 1024;
+        let big = crate::class::construct(
+            &typed_array_class("Uint8Array"),
+            vec![Value::Number(size as f64)],
+        );
+        let alias = big.call_method("subarray", vec![Value::Number(0.0)]);
+        let started = std::time::Instant::now();
+        for index in 0..size {
+            big.set_property(&index.to_string(), Value::Number((index % 251) as f64));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(
+            alias.get_property(&(size - 1).to_string()).to_number(),
+            ((size - 1) % 251) as f64
+        );
+    }
+
+    #[test]
+    fn collected_array_buffers_release_their_bytes() {
+        let buffer = array_buffer_value(vec![7; 1 << 20]);
+        let bytes = Rc::downgrade(&buffer_state(&buffer).expect("registered"));
+        let slice = buffer.call_method("slice", vec![Value::Number(1.0), Value::Number(3.0)]);
+        assert_eq!(slice.get_property("byteLength").to_number(), 2.0);
+        drop(buffer);
+        assert!(
+            bytes.upgrade().is_none(),
+            "ArrayBuffer bytes outlived the buffer"
+        );
+
+        let typed = crate::class::construct(
+            &typed_array_class("Uint8Array"),
+            vec![Value::Number((1 << 20) as f64)],
+        );
+        let bytes =
+            Rc::downgrade(&buffer_state(&typed.get_property("buffer")).expect("registered"));
+        drop(typed);
+        for _ in 0..200 {
+            drop(crate::class::construct(
+                &typed_array_class("Uint8Array"),
+                vec![Value::Number(1.0)],
+            ));
+        }
+        assert!(
+            bytes.upgrade().is_none(),
+            "TypedArray bytes outlived the view"
+        );
+    }
+
+    #[test]
+    fn view_lookups_stay_exact_across_sweeps() {
+        let kept: Vec<Value> = (0..200)
+            .map(|index| {
+                let class = if index % 2 == 0 {
+                    "Uint8Array"
+                } else {
+                    "Float64Array"
+                };
+                crate::class::construct(&typed_array_class(class), vec![Value::Number(4.0)])
+            })
+            .collect();
+        for _ in 0..5_000 {
+            drop(kept[0].call_method("subarray", vec![Value::Number(1.0)]));
+        }
+        let plain = Value::array(vec![Value::Number(1.0)]);
+        assert!(!is_typed_array(&plain));
+        for (index, view) in kept.iter().enumerate() {
+            let expected = if index % 2 == 0 {
+                "Uint8Array"
+            } else {
+                "Float64Array"
+            };
+            assert_eq!(typed_array_name(view), Some(expected), "view {index}");
+        }
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("marker", Value::Number(7.0));
+        assert!(set_typed_array_prototype(&kept[150], &prototype));
+        assert!(!set_typed_array_prototype(&plain, &prototype));
+        assert!(typed_array_prototype(&kept[150]).is_some());
+        assert!(typed_array_prototype(&kept[151]).is_none());
+    }
+
+    #[test]
+    fn collected_views_are_swept_so_dead_views_stay_bounded() {
+        let keep =
+            crate::class::construct(&typed_array_class("Uint8Array"), vec![Value::Number(16.0)]);
+        for _ in 0..10_000 {
+            let transient = keep.call_method("subarray", vec![Value::Number(1.0)]);
+            drop(transient);
+        }
+        let (total, live) = VIEWS.with(|views| {
+            let views = views.borrow();
+            let live = views
+                .iter()
+                .filter(|view| view.storage.upgrade().is_some())
+                .count();
+            (views.len(), live)
+        });
+        assert!(total <= live * 2 + 64, "{total} views tracked, {live} live");
     }
 
     #[test]
@@ -2322,4 +2646,43 @@ mod tests {
             .expect("exception should contain a JavaScript value");
         assert_eq!(error.0.get_property("name").to_js_string(), "TypeError");
     }
+
+    fn is_lazy(value: &Value) -> bool {
+        value
+            .as_array()
+            .is_some_and(|array| array.borrow().is_lazy())
+    }
+
+    #[test]
+    fn typed_array_elements_decode_lazily_and_stay_coherent() {
+        let array =
+            crate::class::construct(&typed_array_class("Uint16Array"), vec![Value::Number(4.0)]);
+        assert!(is_lazy(&array));
+        // Typed access, writes and length never decode the Value elements.
+        array.set_property("1", Value::Number(513.0));
+        assert_eq!(array.get_property("1").to_number(), 513.0);
+        assert_eq!(array.get_property("length").to_number(), 4.0);
+        assert!(is_lazy(&array));
+        // A view over the same bytes sees the write; both stay lazy.
+        let bytes = array.get_property("buffer");
+        let view = crate::class::construct(&typed_array_class("Uint8Array"), vec![bytes]);
+        assert!(is_lazy(&view));
+        assert_eq!(view.get_property("2").to_number(), 1.0);
+        assert_eq!(view.get_property("3").to_number(), 2.0);
+        // Generic iteration decodes from the current bytes, then writes keep
+        // the decoded copy in sync.
+        let seen: Vec<f64> = view.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(!is_lazy(&view));
+        view.set_property("0", Value::Number(9.0));
+        array.set_property("3", Value::Number(1.0));
+        let seen: Vec<f64> = view.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [9.0, 0.0, 1.0, 2.0, 0.0, 0.0, 1.0, 0.0]);
+        let wide: Vec<f64> = array.iter().map(|v| v.to_number()).collect();
+        assert_eq!(wide, [9.0, 513.0, 0.0, 1.0]);
+    }
+}
+
+pub(crate) fn is_typed_array_view(value: &Value) -> bool {
+    view_for(value).is_some()
 }

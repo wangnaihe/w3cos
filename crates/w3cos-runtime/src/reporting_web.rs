@@ -312,29 +312,36 @@ pub fn report_error_value() -> Value {
                 );
             }
         });
-        let error = args.first().cloned().unwrap_or(Value::Undefined);
-        let message = if error.get_property("message").is_undefined() {
-            error.to_js_string()
-        } else {
-            error.get_property("message").to_js_string()
-        };
-        let window = crate::jsdom::window_value();
-        let event = w3cos_core::class::construct(
-            &window.get_property("ErrorEvent"),
-            vec![
-                Value::string("error"),
-                Value::object(HashMap::from([
-                    ("message".into(), Value::string(&message)),
-                    ("error".into(), error),
-                    ("filename".into(), Value::string("")),
-                    ("lineno".into(), Value::Number(0.0)),
-                    ("colno".into(), Value::Number(0.0)),
-                ])),
-            ],
-        );
-        window.call_method("dispatchEvent", vec![event]);
+        report_exception(args.first().cloned().unwrap_or(Value::Undefined), "");
         Value::Undefined
     })
+}
+
+/// HTML "report an exception": fire an ErrorEvent named `error` at the
+/// current global (window.onerror / error listeners).  Used by
+/// `reportError()` and for uncaught exceptions thrown by classic scripts,
+/// which must not abort the document load.
+pub(crate) fn report_exception(error: Value, filename: &str) {
+    let message = if error.get_property("message").is_undefined() {
+        error.to_js_string()
+    } else {
+        error.get_property("message").to_js_string()
+    };
+    let window = crate::jsdom::window_value();
+    let event = w3cos_core::class::construct(
+        &window.get_property("ErrorEvent"),
+        vec![
+            Value::string("error"),
+            Value::object(HashMap::from([
+                ("message".into(), Value::string(&message)),
+                ("error".into(), error),
+                ("filename".into(), Value::string(filename)),
+                ("lineno".into(), Value::Number(0.0)),
+                ("colno".into(), Value::Number(0.0)),
+            ])),
+        ],
+    );
+    window.call_method("dispatchEvent", vec![event]);
 }
 
 pub fn reset() {

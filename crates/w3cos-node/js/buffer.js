@@ -30,6 +30,18 @@ if (typeof Uint8Array === 'function' && Uint8Array.prototype && typeof Uint8Arra
   Object.setPrototypeOf(proto, Uint8Array.prototype);
 }
 
+// Native string codecs (std, in `__w3cos_node_host`): a per-character JS loop
+// over a multi-megabyte IPC payload costs minutes in an AOT debug build.
+const NATIVE = typeof __w3cos_node_host === 'object' && __w3cos_node_host !== null &&
+  typeof __w3cos_node_host.encodeString === 'function' ? __w3cos_node_host : null;
+
+// Uint8Array of `string` in `encoding`, or null when handled only in JS.
+function nativeBytes(string, encoding) {
+  if (NATIVE === null) return null;
+  const buffer = NATIVE.encodeString(string, encoding);
+  return buffer === undefined ? null : new Uint8Array(buffer);
+}
+
 function wrap(bytes) {
   Object.setPrototypeOf(bytes, proto);
   return bytes;
@@ -150,7 +162,17 @@ function stringBytes(string, encoding) {
 
 // ── decoders: bytes [start, end) -> string ──
 
+// Native WHATWG decoder (keeps a leading BOM, like node's toString).
+const UTF8_DECODER = typeof TextDecoder === 'function'
+  ? new TextDecoder('utf-8', { ignoreBOM: true })
+  : null;
+
 function utf8Slice(buf, start, end) {
+  // Large ranges: one native decode instead of a per-byte string build,
+  // which is quadratic for multi-megabyte files.
+  if (UTF8_DECODER !== null && end - start > 64) {
+    return UTF8_DECODER.decode(start === 0 && end === buf.length ? buf : buf.subarray(start, end));
+  }
   // WHATWG UTF-8 decode: one U+FFFD per maximal invalid subpart.
   let out = '';
   let i = start;
@@ -191,6 +213,7 @@ function utf8Slice(buf, start, end) {
 }
 
 function hexSlice(buf, start, end) {
+  if (NATIVE !== null && typeof NATIVE.hexEncode === 'function') return NATIVE.hexEncode(buf, start, end);
   let out = '';
   for (let i = start; i < end; i++) out += (buf[i] < 16 ? '0' : '') + buf[i].toString(16);
   return out;
@@ -249,7 +272,9 @@ Buffer.allocUnsafeSlow = function allocUnsafeSlow(size) { return Buffer.alloc(si
 
 Buffer.from = function from(value, encodingOrOffset, length) {
   if (typeof value === 'string') {
-    return fromBytes(stringBytes(value, checkEncoding(encodingOrOffset)));
+    const encoding = checkEncoding(encodingOrOffset);
+    const native = nativeBytes(value, encoding);
+    return native !== null ? wrap(native) : fromBytes(stringBytes(value, encoding));
   }
   if (value instanceof ArrayBuffer) {
     const offset = encodingOrOffset === undefined ? 0 : Number(encodingOrOffset);
@@ -293,7 +318,8 @@ Buffer.byteLength = function byteLength(value, encoding) {
   if (normalized === 'latin1' || normalized === 'ascii') return value.length;
   if (normalized === 'utf16le') return value.length * 2;
   if (normalized === 'hex') return value.length >>> 1;
-  return stringBytes(value, normalized).length;
+  const native = nativeBytes(value, normalized);
+  return native !== null ? native.length : stringBytes(value, normalized).length;
 };
 
 Buffer.concat = function concat(list, totalLength) {
@@ -306,7 +332,9 @@ Buffer.concat = function concat(list, totalLength) {
   let offset = 0;
   for (let i = 0; i < list.length && offset < totalLength; i++) {
     const item = list[i];
-    for (let j = 0; j < item.length && offset < totalLength; j++) out[offset++] = item[j];
+    const take = Math.min(item.length, totalLength - offset);
+    out.set(take === item.length ? item : item.subarray(0, take), offset);
+    offset += take;
   }
   return out;
 };
@@ -386,10 +414,8 @@ proto.copy = function copy(target, targetStart, sourceStart, sourceEnd) {
   targetStart = targetStart === undefined ? 0 : targetStart;
   sourceStart = sourceStart === undefined ? 0 : sourceStart;
   sourceEnd = sourceEnd === undefined ? this.length : Math.min(sourceEnd, this.length);
-  let count = 0;
-  const values = [];
-  for (let i = sourceStart; i < sourceEnd && targetStart + count < target.length; i++, count++) values.push(this[i]);
-  for (let i = 0; i < values.length; i++) target[targetStart + i] = values[i];
+  const count = Math.max(0, Math.min(sourceEnd - sourceStart, target.length - targetStart));
+  if (count > 0) target.set(this.subarray(sourceStart, sourceStart + count), targetStart);
   return count;
 };
 
@@ -405,8 +431,15 @@ proto.write = function write(string, offset, length, encoding) {
   offset = offset === undefined ? 0 : offset >>> 0;
   const remaining = this.length - offset;
   length = length === undefined ? remaining : Math.min(length >>> 0, remaining);
-  const bytes = stringBytes(String(string), checkEncoding(encoding));
+  const text = String(string);
+  const resolved = checkEncoding(encoding);
+  const native = nativeBytes(text, resolved);
+  const bytes = native !== null ? native : stringBytes(text, resolved);
   const count = Math.min(bytes.length, length);
+  if (native !== null && count > 0) {
+    this.set(count === native.length ? native : native.subarray(0, count), offset);
+    return count;
+  }
   for (let i = 0; i < count; i++) this[offset + i] = bytes[i];
   return count;
 };

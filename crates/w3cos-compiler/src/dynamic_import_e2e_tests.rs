@@ -18,3 +18,219 @@ fn literal_dynamic_import_evaluates_lazy_module() {
     assert_eq!(lines, vec!["dyn 41 42".to_string()]);
     std::fs::remove_dir_all(root).ok();
 }
+
+/// `"w3cos": { "exclude": [...] }` keeps a lazily imported package out of the
+/// build; importing it (or any module missing from the graph) rejects with
+/// `ERR_MODULE_NOT_FOUND` instead of resolving to `undefined`.
+const EXCLUDED: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-dyn-exclude", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "exclude": ["heavy"] } }"#,
+    ),
+    (
+        "node_modules/heavy/package.json",
+        r#"{ "name": "heavy", "version": "1.0.0", "main": "index.js" }"#,
+    ),
+    (
+        "node_modules/heavy/index.js",
+        "console.log('heavy evaluated'); exports.big = 1;\n",
+    ),
+    ("lazy.js", "export const lazy = 'lazy';\n"),
+    (
+        "main.js",
+        r#"const report = (label) => [
+  (ns) => console.log(label, 'loaded', typeof ns),
+  (error) => console.log(label, error instanceof Error, error.code, error.message),
+];
+await import('./lazy.js').then(...report('linked'));
+await import('heavy').then(...report('excluded'));
+const name = ['missing', 'js'].join('.');
+await import('./' + name).then(...report('computed'));
+console.log('done');
+"#,
+    ),
+];
+
+#[test]
+fn excluded_and_missing_dynamic_imports_reject_with_module_not_found() {
+    let root = write_fixture("w3cos_dynamic_import_exclude", EXCLUDED);
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_dynamic_import_exclude");
+    assert_eq!(
+        lines,
+        [
+            "linked loaded object",
+            "excluded true ERR_MODULE_NOT_FOUND Cannot find module 'heavy'",
+            "computed true ERR_MODULE_NOT_FOUND Cannot find module './missing.js'",
+            "done",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A computed `require()` of a module the app declares for run-time loading
+/// (`"w3cos": { "modules": [...] }`; Code-OSS loads extension entry points
+/// with `createRequire(import.meta.url)(extension.fsPath)`) is served from
+/// the compiled graph, through `Module._load` so a patched loader sees it.
+const RUNTIME_REQUIRE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-runtime-require", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "modules": ["ext/out/extension.js"] } }"#,
+    ),
+    // An extension directory has its own (CommonJS) package.json.
+    (
+        "ext/package.json",
+        r#"{ "name": "ext", "main": "./out/extension.js" }"#,
+    ),
+    (
+        "ext/out/extension.js",
+        "console.log('extension evaluated');\nexports.activate = function () { return 'activated ' + require('./helper').name; };\n",
+    ),
+    ("ext/out/helper.js", "exports.name = 'helper';\n"),
+    (
+        "main.js",
+        r#"import Module, { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const seen = [];
+const load = Module._load;
+Module._load = function (request, parent, isMain) {
+  seen.push(request);
+  return load.apply(this, arguments);
+};
+const name = ['extension', 'js'].join('.');
+const relative = require('./ext/out/' + name);
+console.log(relative.activate());
+const absolute = require.resolve('./ext/out/' + 'extension');
+console.log(require(absolute) === relative, absolute.endsWith('/ext/out/extension.js'));
+try {
+  require('./ext/out/' + 'missing');
+} catch (error) {
+  console.log(error.code);
+}
+console.log(seen.length);
+"#,
+    ),
+];
+
+#[test]
+fn computed_require_of_a_declared_module_loads_it_from_the_graph() {
+    let root = write_fixture("w3cos_runtime_require", RUNTIME_REQUIRE);
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_runtime_require");
+    assert_eq!(
+        lines,
+        [
+            "extension evaluated",
+            "activated helper",
+            "true true",
+            "ERR_W3COS_DYNAMIC_REQUIRE",
+            "3",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A CommonJS module's `require()` of a specifier its build could not link
+/// goes through `Module._load`, so a loader patched over it serves it (the
+/// Code-OSS extension host's `vscode` API interceptor); unserved, it still
+/// throws `MODULE_NOT_FOUND`.
+const UNLINKED_REQUIRE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-unlinked-require", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "modules": ["ext/out/extension.js"] } }"#,
+    ),
+    (
+        "ext/package.json",
+        r#"{ "name": "ext", "main": "./out/extension.js" }"#,
+    ),
+    (
+        "ext/out/extension.js",
+        r#"const api = require('host-api');
+exports.activate = function () {
+  try {
+    require('not-installed');
+  } catch (error) {
+    return api.greet(require('path').basename(module.filename)) + ' ' + error.code;
+  }
+};
+"#,
+    ),
+    (
+        "main.js",
+        r#"import Module, { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const load = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === 'host-api') return { greet: (name) => 'hello ' + name + ' from ' + typeof parent.filename };
+  return load.apply(this, arguments);
+};
+const extension = require('./ext/out/' + ['extension', 'js'].join('.'));
+console.log(extension.activate());
+"#,
+    ),
+];
+
+#[test]
+fn unlinked_commonjs_require_goes_through_the_runtime_module_loader() {
+    let root = write_fixture("w3cos_unlinked_require", UNLINKED_REQUIRE);
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_unlinked_require");
+    assert_eq!(
+        lines,
+        ["hello extension.js from string MODULE_NOT_FOUND"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A computed `import()` of a declared ES-module extension by `file://` URL
+/// (the Code-OSS extension host imports `"type": "module"` extensions with
+/// `import(pathToFileURL(entry).href)`) is served from the compiled graph;
+/// an undeclared file URL still rejects with `ERR_MODULE_NOT_FOUND`.
+const FILE_URL_IMPORT: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-file-url-import", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "modules": ["ext/out/extension.js"] } }"#,
+    ),
+    (
+        "ext/package.json",
+        r#"{ "name": "ext", "type": "module", "main": "./out/extension.js" }"#,
+    ),
+    (
+        "ext/out/extension.js",
+        "console.log('esm extension evaluated');\nexport function activate() { return 'activated'; }\n",
+    ),
+    (
+        "main.js",
+        r#"const url = new URL('./ext/out/' + ['extension', 'js'].join('.'), import.meta.url).href;
+console.log(url.startsWith('file:///'));
+const ns = await import(url);
+console.log(ns.activate());
+try {
+  await import(new URL('./ext/out/' + 'missing.js', import.meta.url).href);
+} catch (error) {
+  console.log(error.code);
+}
+"#,
+    ),
+];
+
+#[test]
+fn computed_file_url_import_of_a_declared_module_loads_it_from_the_graph() {
+    let root = write_fixture("w3cos_file_url_import", FILE_URL_IMPORT);
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_file_url_import");
+    assert_eq!(
+        lines,
+        [
+            "true",
+            "esm extension evaluated",
+            "activated",
+            "ERR_MODULE_NOT_FOUND",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

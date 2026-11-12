@@ -100,7 +100,7 @@ mod tests {
             Style {
                 display: WDisplay::Flex,
                 white_space: WWhiteSpace::Pre,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),

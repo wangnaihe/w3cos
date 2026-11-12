@@ -1,6 +1,7 @@
 // Code-OSS bootstrap patterns (M3 item 23): createRequire, node:module
 // hooks, and the builtins the Electron main graph loads.
 import { createRequire, isBuiltin, registerHooks } from "node:module";
+import nodeModule from "node:module";
 import * as v8 from "node:v8";
 import { performance, PerformanceObserver, monitorEventLoopDelay } from "node:perf_hooks";
 import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
@@ -32,6 +33,9 @@ const hooks = registerHooks({ resolve(specifier, context, next) { return next(sp
 console.log("hooks", typeof hooks.deregister);
 const fs = require("fs");
 console.log("require builtin", typeof fs.readFileSync, require("node:path").join("a", "b"));
+// extHostExtensionService: `nodeModule.createRequire(...)` on a default import.
+const require2 = nodeModule.createRequire(import.meta.url);
+console.log("nsreq", typeof require2("module")._nodeModulePaths, require2("./data.json") === data);
 
 const heap = v8.getHeapStatistics();
 console.log("v8", typeof heap.used_heap_size, typeof v8.getHeapCodeStatistics().code_and_metadata_size, typeof v8.setFlagsFromString, v8.cachedDataVersionTag() >= 0);

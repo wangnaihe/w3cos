@@ -16,6 +16,13 @@ pub const MODULES: &[(&str, &str)] = &[
     ("buffer", include_str!("../js/buffer.js")),
     ("child_process", include_str!("../js/child_process.js")),
     ("console", include_str!("../js/console.js")),
+    // Deprecated `constants`: the flat merge of os.constants (errno,
+    // priority, signals) and fs.constants, as Node's lib/constants.js
+    // (graceful-fs still requires it).
+    (
+        "constants",
+        "const os = require('os').constants;\nmodule.exports = Object.assign({}, os.errno, os.priority, os.signals, require('fs').constants);\n",
+    ),
     ("crypto", include_str!("../js/crypto.js")),
     (
         "diagnostics_channel",
@@ -46,9 +53,14 @@ pub const MODULES: &[(&str, &str)] = &[
         include_str!("../js/native_keymap.js"),
     ),
     (
+        "internal/w3cos_native_watchdog",
+        include_str!("../js/native_watchdog.js"),
+    ),
+    (
         "internal/w3cos_policy_watcher",
         include_str!("../js/policy_watcher.js"),
     ),
+    ("internal/w3cos_node_pty", include_str!("../js/node_pty.js")),
     ("internal/w3cos_spdlog", include_str!("../js/spdlog.js")),
     ("internal/w3cos_sqlite3", include_str!("../js/sqlite3.js")),
     ("internal/w3cos_watcher", include_str!("../js/watcher.js")),
@@ -100,6 +112,14 @@ pub const NATIVE_REPLACEMENTS: &[(&str, &str)] = &[
     ("@w3cos/native-keymap", "internal/w3cos_native_keymap"),
     ("@vscode/policy-watcher", "internal/w3cos_policy_watcher"),
     ("@w3cos/policy-watcher", "internal/w3cos_policy_watcher"),
+    ("@vscode/native-watchdog", "internal/w3cos_native_watchdog"),
+    ("@w3cos/native-watchdog", "internal/w3cos_native_watchdog"),
+    ("node-pty", "internal/w3cos_node_pty"),
+    (
+        "@homebridge/node-pty-prebuilt-multiarch",
+        "internal/w3cos_node_pty",
+    ),
+    ("@w3cos/node-pty", "internal/w3cos_node_pty"),
     ("@vscode/spdlog", "internal/w3cos_spdlog"),
     ("@w3cos/spdlog", "internal/w3cos_spdlog"),
     ("@vscode/sqlite3", "internal/w3cos_sqlite3"),

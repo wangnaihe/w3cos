@@ -156,6 +156,30 @@ pub fn reuse_or_clone_paint_nodes<'a>(
     (out, clones)
 }
 
+/// `transform: translate*(<percentage>)` resolves against the border box
+/// (CSS Transforms 1, 13.1). The DOM keeps the percentages in
+/// `--w3cos-internal-translate-percent` (LayoutNG only) as `"x,y"`; add them
+/// to the pixel translation once the box is laid out.
+fn resolve_translate_percent(nodes: &mut [PaintNode], layout_cache: &[(LayoutRect, usize)]) {
+    for (rect, index) in layout_cache {
+        let Some(node) = nodes.get_mut(*index) else {
+            continue;
+        };
+        let Some((x, y)) = node
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-translate-percent"))
+            .and_then(|value| value.split_once(','))
+            .and_then(|(x, y)| Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?)))
+        else {
+            continue;
+        };
+        node.style.transform.translate_x += rect.width * x / 100.0;
+        node.style.transform.translate_y += rect.height * y / 100.0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PaintProperties {
     pub transform: PropertyNodeId,
@@ -289,6 +313,12 @@ pub struct PaintArtifact {
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
     pub column_fragments: Vec<Vec<ColumnFragment>>,
+    /// Per node: the line pieces of a LayoutNG text node broken inside its
+    /// content (NGPhysicalTextFragment rect + text slice), in fragment
+    /// order. Empty for every node when nothing was broken. Paint draws the
+    /// pieces in place of the node's single rect, at the node's own position
+    /// in paint order.
+    pub text_fragments: Vec<Vec<(LayoutRect, String)>>,
     pub generation: u64,
 }
 
@@ -313,6 +343,7 @@ impl Default for PaintArtifact {
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
             column_fragments: Vec::new(),
+            text_fragments: Vec::new(),
             generation: 0,
         }
     }
@@ -450,6 +481,9 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
         Some(w3cos_std::style::Dimension::Vw(value)) => value * rect.width / 100.0,
         Some(w3cos_std::style::Dimension::Vh(value)) => value * rect.height / 100.0,
         Some(w3cos_std::style::Dimension::Percent(value)) => value * auto / 100.0,
+        Some(w3cos_std::style::Dimension::Calc(calc)) => {
+            calc.resolve(auto, style.font_size, rect.width, rect.height)
+        }
         Some(w3cos_std::style::Dimension::Auto) | None => auto,
     };
     let top = resolve(clip.top, 0.0);
@@ -2062,6 +2096,52 @@ fn annotate_table_caption_paint_insets(
 }
 
 impl PaintArtifact {
+    /// `true` when an ancestor has `opacity: 0`. Opacity applies to the whole
+    /// subtree, so nothing below such an ancestor paints (Code-OSS hides its
+    /// idle scrollbars this way).
+    pub(crate) fn has_fully_transparent_ancestor(&self, index: usize) -> bool {
+        let mut current = self.nodes.get(index).and_then(|node| node.parent);
+        while let Some(parent) = current {
+            let Some(node) = self.nodes.get(parent) else {
+                return false;
+            };
+            if node.style.opacity <= 0.0 {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    /// Opacity applies to a whole subtree, but the CPU rasterizer applies each
+    /// node's own opacity only. Approximate group opacity by folding the
+    /// product of the ancestors' fractional opacities into every descendant's
+    /// style (exact unless siblings overlap). Indexed by node; `None` means
+    /// the node paints with its own style. Empty when no node is fractional.
+    pub(crate) fn ancestor_faded_styles(&self) -> Vec<Option<Style>> {
+        let fractional = |style: &Style| style.opacity > 0.0 && style.opacity < 0.999;
+        if !self.nodes.iter().any(|node| fractional(&node.style)) {
+            return Vec::new();
+        }
+        (0..self.nodes.len())
+            .map(|index| {
+                let mut factor = 1.0f32;
+                let mut current = self.nodes.get(index).and_then(|node| node.parent);
+                while let Some(parent) = current {
+                    let node = self.nodes.get(parent)?;
+                    factor *= node.style.opacity.clamp(0.0, 1.0);
+                    current = node.parent;
+                }
+                if factor >= 0.999 {
+                    return None;
+                }
+                let mut style = self.nodes[index].style.clone();
+                style.opacity *= factor;
+                Some(style)
+            })
+            .collect()
+    }
+
     /// Applied decoration belongs to the originating box, not the child's
     /// computed property. Atomic inline and out-of-flow boxes isolate their
     /// contents, but an isolating box's own decoration still reaches them.
@@ -2080,17 +2160,8 @@ impl PaintArtifact {
         if !matches!(source.kind, ComponentKind::Text { .. }) || isolates(&source.style) {
             return Vec::new();
         }
-        let anonymous = source
-            .style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| {
-                properties
-                    .get(w3cos_std::inline_text::SOURCE_RUN)
-                    .is_some_and(|source| {
-                        source.starts_with("text:") || source.starts_with("pseudo:")
-                    })
-            });
+        let anonymous = w3cos_std::inline_text::source_run(&source.style)
+            .is_some_and(|source| source.starts_with("text:") || source.starts_with("pseudo:"));
         let baseline_offset = |style: &Style| {
             style
                 .custom_properties
@@ -2153,7 +2224,32 @@ impl PaintArtifact {
 
     /// The paragraph's available line geometry is distinct from the inline
     /// owner's intrinsic decoration box and its own bidi direction.
+    /// Install LayoutNG's text pieces (see `text_fragments`).
+    pub(crate) fn set_text_fragments(&mut self, fragments: &[crate::layout_ng::TextFragment]) {
+        self.text_fragments.clear();
+        if fragments.is_empty() {
+            return;
+        }
+        self.text_fragments = vec![Vec::new(); self.nodes.len()];
+        for fragment in fragments {
+            if let Some(slot) = self.text_fragments.get_mut(fragment.index) {
+                slot.push((fragment.rect, fragment.text.clone()));
+            }
+        }
+    }
+
+    pub(crate) fn text_fragments_of(&self, index: usize) -> &[(LayoutRect, String)] {
+        self.text_fragments
+            .get(index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub(crate) fn inline_line_context(&self, index: usize) -> Option<InlineLineContext> {
+        if !self.text_fragments_of(index).is_empty() {
+            // Each piece is already one positioned line box run.
+            return None;
+        }
         let node = self.nodes.get(index)?;
         let ComponentKind::Text { content } = &node.kind else {
             return None;
@@ -2409,6 +2505,9 @@ impl PaintArtifact {
             ]
             .into_iter()
             .any(|edge| matches!(edge, Spacing::Percent(_)));
+        }
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            resolve_translate_percent(&mut nodes, layout_cache);
         }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
@@ -3256,7 +3355,7 @@ mod tests {
             font_size: 50.0,
             line_height: 0.2,
             line_height_is_normal: false,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
                 "1".into(),
             )])),
@@ -4689,7 +4788,7 @@ mod tests {
                 display,
                 visibility,
                 custom_properties: span.map(|span| {
-                    std::collections::HashMap::from([(
+                    w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-table-column-span".to_string(),
                         span.to_string(),
                     )])
@@ -5508,6 +5607,42 @@ mod tests {
     }
 
     #[test]
+    fn translate_percent_marker_resolves_against_the_border_box() {
+        let mut style = Style::default();
+        style.transform.translate_x = 4.0;
+        style.custom_properties = Some(Default::default());
+        style
+            .custom_properties
+            .as_mut()
+            .unwrap()
+            .insert("--w3cos-internal-translate-percent".into(), "-50,10".into());
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style,
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style::default(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+        let rect = |width, height| LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        };
+        resolve_translate_percent(&mut nodes, &[(rect(60.0, 20.0), 0), (rect(8.0, 8.0), 1)]);
+        assert_eq!(nodes[0].style.transform.translate_x, 4.0 - 30.0);
+        assert_eq!(nodes[0].style.transform.translate_y, 2.0);
+        assert!(nodes[1].style.transform.is_identity());
+    }
+
+    #[test]
     fn builds_independent_property_trees_and_display_chunks() {
         let root = PaintNode {
             kind: ComponentKind::Column,
@@ -5811,7 +5946,7 @@ mod tests {
         for rank in [2, 1, 0] {
             let mut style = Style::default();
             style.display = Display::Inline;
-            style.custom_properties = Some(std::collections::HashMap::from([(
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-bidi-logical-order".to_string(),
                 rank.to_string(),
             )]));
@@ -6312,7 +6447,7 @@ mod tests {
             border.line_height_is_normal = true;
             border.border_width = 3.0;
             if split {
-                border.custom_properties = Some(std::collections::HashMap::from([(
+                border.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-split-inline-edge".to_string(),
                     "1".to_string(),
                 )]));
@@ -6373,7 +6508,7 @@ mod tests {
     fn split_inline_edge_paints_behind_following_block_text() {
         let mut edge_style = Style::default();
         edge_style.display = Display::Inline;
-        edge_style.custom_properties = Some(std::collections::HashMap::from([(
+        edge_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-split-inline-edge".to_string(),
             "1".to_string(),
         )]));

@@ -25,6 +25,21 @@ You are the developers. Pick up issues and ship code.
 4. Implement with tests
 5. Open a PR — prefix title with `[AI]`
 
+### Rust Toolchain
+
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+(with `rustfmt` and `clippy`), and `rust-version` in `Cargo.toml` matches it.
+Inside the checkout, rustup installs and uses that version automatically; your
+default toolchain is not changed. CI installs the same file. To move to a newer
+Rust, bump both values in a separate PR once the quality bar below passes with
+it.
+
+`w3cos build` compiles the generated app with `cargo` in a temporary directory
+outside the checkout. Through `cargo run -p w3cos-cli -- build …` the pin
+carries over (rustup sets `RUSTUP_TOOLCHAIN` for child processes). Running
+`target/*/w3cos` directly uses whatever toolchain is active in that directory,
+usually your default.
+
 ### Quality Bar
 
 - `cargo check --workspace` must pass

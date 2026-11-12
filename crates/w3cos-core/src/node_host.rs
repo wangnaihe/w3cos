@@ -187,6 +187,43 @@ pub(crate) fn data_bytes(value: &Value) -> Vec<u8> {
     crate::binary::bytes_of(value).unwrap_or_else(|| value.to_js_string().into_bytes())
 }
 
+/// Bytes of `text` in a Node `Buffer` string encoding (`utf8`, `hex`,
+/// `latin1`, `utf16le`); `None` for an encoding handled in JS.
+pub(crate) fn encode_string_bytes(text: &str, encoding: &str) -> Option<Vec<u8>> {
+    match encoding {
+        "utf8" => Some(text.as_bytes().to_vec()),
+        "hex" => Some(hex_decode(text)),
+        "latin1" | "ascii" => Some(text.encode_utf16().map(|unit| unit as u8).collect()),
+        "utf16le" => Some(
+            text.encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Lower-case hex text of `bytes`.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 15) as usize] as char);
+    }
+    out
+}
+
+/// Node's lenient hex decode: stops at the first non-hex pair, ignores a
+/// trailing odd digit.
+pub(crate) fn hex_decode(text: &str) -> Vec<u8> {
+    let digit = |byte: u8| (byte as char).to_digit(16);
+    text.as_bytes()
+        .chunks_exact(2)
+        .map_while(|pair| Some((digit(pair[0])? << 4 | digit(pair[1])?) as u8))
+        .collect()
+}
+
 fn millis(time: io::Result<SystemTime>) -> f64 {
     time.ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -287,6 +324,80 @@ fn open_options(flags: &str) -> Option<OpenOptions> {
         _ => return None,
     };
     Some(options)
+}
+
+/// `fs.open(path, flags)` with numeric flags built from `fs.constants`
+/// (Linux values, as published by node:fs): `O_RDONLY | O_NONBLOCK`, ...
+fn open_options_from_bits(bits: u32) -> OpenOptions {
+    const O_WRONLY: u32 = 1;
+    const O_RDWR: u32 = 2;
+    const O_CREAT: u32 = 64;
+    const O_EXCL: u32 = 128;
+    const O_TRUNC: u32 = 512;
+    const O_APPEND: u32 = 1024;
+    let mut options = OpenOptions::new();
+    match bits & 3 {
+        O_WRONLY => options.write(true),
+        O_RDWR => options.read(true).write(true),
+        _ => options.read(true),
+    };
+    if bits & O_APPEND != 0 {
+        options.append(true);
+    }
+    if bits & O_CREAT != 0 {
+        if bits & O_EXCL != 0 {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+    }
+    if bits & O_TRUNC != 0 {
+        options.truncate(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK, O_SYNC, O_DSYNC, O_NOFOLLOW, O_NOATIME, O_DIRECTORY, ...
+        let rest = bits & !(3 | O_CREAT | O_EXCL | O_TRUNC | O_APPEND);
+        if rest != 0 {
+            options.custom_flags(rest as i32);
+        }
+    }
+    options
+}
+
+fn open_options_for(flags: &Value) -> Option<OpenOptions> {
+    if flags.is_undefined() || flags.is_null() {
+        return open_options("r");
+    }
+    if let Some(bits) = flags.as_number() {
+        return (bits.is_finite() && bits >= 0.0).then(|| open_options_from_bits(bits as u32));
+    }
+    open_options(&flags.to_js_string())
+}
+
+/// Writes to the process's stdio descriptors (`fs.writeSync(1, ...)`),
+/// which node:fs accepts without an `open`.
+fn stdio_write(fd: i64, bytes: &[u8]) -> Option<io::Result<usize>> {
+    if FILES.with(|files| files.borrow().contains_key(&fd)) {
+        return None;
+    }
+    let result = match fd {
+        1 => {
+            let mut out = io::stdout().lock();
+            out.write_all(bytes).and_then(|()| out.flush())
+        }
+        2 => {
+            let mut err = io::stderr().lock();
+            err.write_all(bytes).and_then(|()| err.flush())
+        }
+        _ => return None,
+    };
+    Some(result.map(|()| bytes.len()))
+}
+
+fn is_unopened_stdio(fd: i64) -> bool {
+    (0..=2).contains(&fd) && !FILES.with(|files| files.borrow().contains_key(&fd))
 }
 
 #[cfg(unix)]
@@ -446,18 +557,37 @@ fn build_host() -> Value {
             Err(error) => throw_io(error, "open", Some(&path), None),
         }
     });
+    define(&host, "encodeString", |args| {
+        let text = arg(&args, 0).to_js_string();
+        let encoding = arg(&args, 1).to_js_string();
+        match encode_string_bytes(&text, &encoding) {
+            Some(bytes) => crate::binary::array_buffer_value(bytes),
+            None => Value::Undefined,
+        }
+    });
+    define(&host, "hexEncode", |args| {
+        let bytes = crate::binary::bytes_of(&arg(&args, 0)).unwrap_or_default();
+        let start = (arg(&args, 1).to_number().max(0.0) as usize).min(bytes.len());
+        let end = if arg(&args, 2).is_undefined() {
+            bytes.len()
+        } else {
+            (arg(&args, 2).to_number().max(0.0) as usize).min(bytes.len())
+        };
+        Value::from(hex_encode(&bytes[start..end.max(start)]))
+    });
+    define(&host, "hexDecode", |args| {
+        crate::binary::array_buffer_value(hex_decode(&arg(&args, 0).to_js_string()))
+    });
     define(&host, "writeFile", |args| {
         let path = path_arg(&args, 0);
         let bytes = data_bytes(&arg(&args, 1));
-        let flags = {
-            let flag = arg(&args, 2);
-            if flag.is_undefined() {
-                "w".to_string()
-            } else {
-                flag.to_js_string()
-            }
+        let flag = arg(&args, 2);
+        let options = if flag.is_undefined() || flag.is_null() {
+            open_options("w")
+        } else {
+            open_options_for(&flag)
         };
-        let Some(mut options) = open_options(&flags) else {
+        let Some(mut options) = options else {
             throw_io(custom_error("EINVAL", 22), "open", Some(&path), None);
         };
         apply_mode(&mut options, mode_arg(&arg(&args, 3)));
@@ -761,15 +891,7 @@ fn build_host() -> Value {
     });
     define(&host, "open", |args| {
         let path = path_arg(&args, 0);
-        let flags = {
-            let flag = arg(&args, 1);
-            if flag.is_undefined() {
-                "r".to_string()
-            } else {
-                flag.to_js_string()
-            }
-        };
-        let Some(mut options) = open_options(&flags) else {
+        let Some(mut options) = open_options_for(&arg(&args, 1)) else {
             throw_io(custom_error("EINVAL", 22), "open", Some(&path), None);
         };
         apply_mode(&mut options, mode_arg(&arg(&args, 2)));
@@ -812,6 +934,10 @@ fn build_host() -> Value {
         let fd = arg(&args, 0).to_number() as i64;
         let bytes = data_bytes(&arg(&args, 1));
         let position = arg(&args, 2);
+        if let Some(result) = stdio_write(fd, &bytes) {
+            let written = result.unwrap_or_else(|error| throw_io(error, "write", None, None));
+            return Value::Number(written as f64);
+        }
         let written = with_file(fd, "write", |file| {
             if let Some(position) = position.as_number().filter(|p| *p >= 0.0) {
                 file.seek(SeekFrom::Start(position as u64))?;
@@ -823,7 +949,18 @@ fn build_host() -> Value {
     });
     define(&host, "fsync", |args| {
         let fd = arg(&args, 0).to_number() as i64;
+        if is_unopened_stdio(fd) {
+            return Value::Undefined;
+        }
         with_file(fd, "fsync", |file| file.sync_all());
+        Value::Undefined
+    });
+    define(&host, "fdatasync", |args| {
+        let fd = arg(&args, 0).to_number() as i64;
+        if is_unopened_stdio(fd) {
+            return Value::Undefined;
+        }
+        with_file(fd, "fdatasync", |file| file.sync_data());
         Value::Undefined
     });
     define(&host, "ftruncate", |args| {
@@ -883,12 +1020,61 @@ fn build_host() -> Value {
             }
         }
     });
+    // compiledModule(path) -> whether the path is a module of the compiled graph.
+    // requireCompiled(path) -> module.exports (CommonJS) / namespace (ESM)
+    // of a module linked into the app, or undefined when the path is not in
+    // the compiled graph. Lets `require(absolutePath)` reach modules the app
+    // declares for run-time loading (`package.json` `"w3cos": { "modules" }`).
+    define(&host, "compiledModule", |args| {
+        Value::Bool(crate::module_registry::contains(
+            &arg(&args, 0).to_js_string(),
+        ))
+    });
+    define(&host, "requireCompiled", |args| {
+        require_compiled(&arg(&args, 0).to_js_string()).unwrap_or(Value::Undefined)
+    });
     crate::node_host_io::install(&host);
     crate::node_workers::install(&host);
     for install in EXTENSIONS.lock().unwrap().iter() {
         install(&host);
     }
     host
+}
+
+/// Evaluate a compiled module by path for a run-time `require()`.
+///
+/// Lazily linked modules (declared run-time roots) evaluate their static
+/// closure through the dynamic-import adapter; statically linked modules are
+/// evaluated (or already were) in place. A CommonJS file's facade default is
+/// its `module.exports`; an ES module yields its namespace, as in Node's
+/// `require(esm)`. An evaluation error is rethrown.
+pub fn require_compiled(path: &str) -> Option<Value> {
+    use crate::module_registry;
+    if !module_registry::contains(path) {
+        return None;
+    }
+    let loaded = crate::host_modules::dynamic_import(Value::from(path), Value::from(path));
+    if let Some(crate::promise::PromiseStatus::Rejected(_)) = crate::promise::status(&loaded) {
+        // Not a lazily linked root: mark the probe handled and evaluate in place.
+        let _ = crate::intrinsics::call_method(
+            &loaded,
+            &Value::from("catch"),
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+    }
+    if let Some(crate::promise::PromiseStatus::Rejected(error)) = module_registry::evaluate(path)
+        .as_ref()
+        .and_then(crate::promise::status)
+    {
+        crate::throw_value(error);
+    }
+    let commonjs = module_registry::contains(&format!("{path}.w3cos-cjs.js"));
+    if commonjs {
+        if let Some(binding) = module_registry::export(path, "default") {
+            return Some(binding.read());
+        }
+    }
+    module_registry::namespace(path)
 }
 
 /// Canonical digest name for Node's spellings (`SHA256`, `sha-256`, `RSA-SHA1`).
@@ -1064,6 +1250,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn string_codecs_match_node() {
+        assert_eq!(
+            encode_string_bytes("a\u{e9}\u{20ac}\u{1f600}", "utf8")
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(
+            encode_string_bytes("a\u{e9}\u{100}", "latin1").unwrap(),
+            [0x61, 0xe9, 0x00]
+        );
+        assert_eq!(
+            encode_string_bytes("a\u{20ac}", "utf16le").unwrap(),
+            [0x61, 0, 0xac, 0x20]
+        );
+        assert!(encode_string_bytes("x", "base64").is_none());
+        assert_eq!(hex_encode(&[0, 15, 16, 255]), "000f10ff");
+        assert_eq!(hex_decode("000F10ffz"), [0, 15, 16, 255]);
+        assert_eq!(hex_decode("00zz10"), [0]);
+        assert_eq!(hex_decode("abc"), [0xab]);
+    }
+
+    #[test]
     fn errors_are_node_shaped() {
         let error = node_error(
             &io::Error::from_raw_os_error(2),
@@ -1121,5 +1330,33 @@ mod tests {
         assert!(open_options("r").is_some());
         assert!(open_options("wx+").is_some());
         assert!(open_options("bogus").is_none());
+        assert!(open_options_for(&Value::Number(0.0)).is_some());
+        assert!(open_options_for(&Value::Number(-1.0)).is_none());
+    }
+
+    #[test]
+    fn numeric_open_flags_and_stdio_fds_work_like_node() {
+        let dir = std::env::temp_dir().join(format!("w3cos-numeric-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        // O_WRONLY | O_CREAT | O_TRUNC
+        let mut file = open_options_from_bits(1 | 64 | 512).open(&path).unwrap();
+        file.write_all(b"hi").unwrap();
+        drop(file);
+        // O_RDONLY | O_NONBLOCK (DiskFileSystemProvider.openFileForRead)
+        let mut text = String::new();
+        open_options_from_bits(2048)
+            .open(&path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "hi");
+        // O_WRONLY | O_CREAT | O_EXCL on an existing file fails.
+        assert!(open_options_from_bits(1 | 64 | 128).open(&path).is_err());
+        assert_eq!(stdio_write(2, b"").unwrap().unwrap(), 0);
+        assert!(stdio_write(7, b"x").is_none());
+        assert!(is_unopened_stdio(1));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

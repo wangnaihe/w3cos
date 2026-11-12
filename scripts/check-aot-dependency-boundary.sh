@@ -33,7 +33,7 @@ if grep -q \
     exit 1
 fi
 
-if ! grep -q 'try_generate_with_bodies_and_css' crates/w3cos-compiler/src/lib.rs; then
+if ! grep -qE 'try_generate_with_bodies_and_(css|stylesheet)' crates/w3cos-compiler/src/lib.rs; then
     echo "the production compiler must propagate native W3IR codegen failures" >&2
     exit 1
 fi

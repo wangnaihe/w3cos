@@ -29,6 +29,10 @@ pub(crate) struct RareObjectData {
     /// `super(...)` call to return. This is internal execution state, not an
     /// observable JavaScript property.
     pub(crate) pending_class_initializers: Vec<(u64, Value, Value)>,
+    /// Object returned by a base constructor during `super(...)`. It replaces
+    /// this pre-allocated instance as the derived constructor's `this` and as
+    /// the result of `new` (ECMAScript [[Construct]] / BindThisValue).
+    pub(crate) construct_replacement: Option<Value>,
     /// Opaque class brands and private elements are intentionally kept out of
     /// `properties`, so proxy traps and reflection cannot observe them.
     pub(crate) class_brand: Option<u64>,
@@ -38,6 +42,22 @@ pub(crate) struct RareObjectData {
     /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
     /// `CopyDataProperties` skip them, matching ECMAScript.
     non_enumerable: HashSet<String>,
+    /// Integrity level recorded by `Object.preventExtensions` / `seal` /
+    /// `freeze` so the matching `isExtensible` / `isSealed` / `isFrozen`
+    /// predicates answer consistently (graph walkers such as Code-OSS
+    /// `deepFreeze` rely on `isFrozen` to terminate on cycles). Writes are
+    /// not yet enforced.
+    pub(crate) integrity: IntegrityLevel,
+}
+
+/// ECMAScript object integrity, ordered weakest to strongest.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum IntegrityLevel {
+    #[default]
+    Extensible,
+    NonExtensible,
+    Sealed,
+    Frozen,
 }
 
 /// A JavaScript-like dynamic object with string-keyed properties,
@@ -129,6 +149,23 @@ impl JsObject {
         object
     }
 
+    /// Construct a fresh proxy with its initial prototype already installed.
+    ///
+    /// This is only for native host wrappers before the object can escape to
+    /// JavaScript. It deliberately bypasses Proxy `setPrototypeOf` and the
+    /// observable shape-epoch invalidation used by later prototype mutation.
+    #[doc(hidden)]
+    pub fn with_proxy_and_initial_prototype(
+        properties: HashMap<String, Value>,
+        handler: ProxyHandler,
+        prototype: &Value,
+    ) -> Self {
+        debug_assert!(handler.set_prototype_of.is_none());
+        let mut object = Self::with_proxy(properties, handler);
+        object.set_prototype_direct(prototype);
+        object
+    }
+
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
     pub fn with_call_slot(properties: HashMap<String, Value>, call: Rc<FunctionData>) -> Self {
@@ -172,6 +209,21 @@ impl JsObject {
             .map_or(true, |rare| !rare.non_enumerable.contains(key))
     }
 
+    /// Raise (never lower) the recorded integrity level.
+    pub(crate) fn raise_integrity(&mut self, level: IntegrityLevel) {
+        let rare = self.ensure_rare();
+        if level > rare.integrity {
+            rare.integrity = level;
+        }
+    }
+
+    /// The recorded integrity level.
+    pub(crate) fn integrity(&self) -> IntegrityLevel {
+        self.rare
+            .as_ref()
+            .map_or(IntegrityLevel::Extensible, |rare| rare.integrity)
+    }
+
     /// Mark an own property non-enumerable.
     pub(crate) fn mark_non_enumerable(&mut self, key: &str) {
         self.ensure_rare().non_enumerable.insert(key.to_string());
@@ -213,9 +265,16 @@ impl JsObject {
         if !self.has_getter_properties {
             return None;
         }
-        self.properties
-            .get(format!("__w3cos_getter_{key}").as_str())
-            .cloned()
+        let mut buf = [0u8; 96];
+        let getter_key = crate::value::accessor_key(&mut buf, "__w3cos_getter_", key);
+        self.properties.get(&getter_key).cloned()
+    }
+
+    /// Read an own setter without invoking it or traversing the prototype.
+    pub fn own_setter(&self, key: &str) -> Option<Value> {
+        let mut buf = [0u8; 96];
+        let setter_key = crate::value::accessor_key(&mut buf, "__w3cos_setter_", key);
+        self.properties.get(&setter_key).cloned()
     }
 
     /// Own data only, without invoking accessors, traps, or prototype lookup.
@@ -330,6 +389,26 @@ impl JsObject {
         writable.is_bool() && !writable.to_bool()
     }
 
+    /// True when `f` holds for any own string key, in insertion order,
+    /// without allocating the key list.
+    pub fn any_own_key(&self, mut f: impl FnMut(&str) -> bool) -> bool {
+        self.properties.any_key(|key| f(key.as_str()))
+    }
+
+    /// V8 boilerplate copy (object-literal AllocationSite): give an empty
+    /// ordinary object the exact own properties, in the same insertion
+    /// order, of a template object. Returns false (and changes nothing)
+    /// when `self` already has own properties or is a proxy.
+    pub fn copy_properties_from(&mut self, template: &JsObject) -> bool {
+        if !self.properties.is_empty() || self.proxy_handler.is_some() {
+            return false;
+        }
+        self.properties = template.properties.clone();
+        self.has_getter_properties |= template.has_getter_properties;
+        self.refresh_heap_accounting();
+        true
+    }
+
     pub fn may_have_getter_properties(&self) -> bool {
         self.has_getter_properties
             || self.prototype.as_ref().is_some_and(|prototype| {
@@ -365,13 +444,8 @@ impl JsObject {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.properties.contains_key(key)
-            || self
-                .properties
-                .contains_key(format!("__w3cos_getter_{key}").as_str())
-            || self
-                .properties
-                .contains_key(format!("__w3cos_setter_{key}").as_str())
+        self.properties
+            .contains_key_or_prefixed(key, "__w3cos_getter_", "__w3cos_setter_")
     }
 
     /// `[[Delete]]` — the `delete` operator.
@@ -588,6 +662,10 @@ impl JsObject {
                 return trap(&target, proto);
             }
         }
+        self.set_prototype_direct(proto)
+    }
+
+    fn set_prototype_direct(&mut self, proto: &Value) -> bool {
         match proto {
             _ if proto.as_object().is_some() => {
                 self.prototype = Some(proto.as_object().expect("object"));
@@ -690,10 +768,12 @@ impl JsObject {
         let rare = self.rare.as_ref().map(|rare| {
             Box::new(RareObjectData {
                 pending_class_initializers: Vec::new(),
+                construct_replacement: None,
                 class_brand: rare.class_brand,
                 private_brands: HashSet::new(),
                 private_elements: HashMap::new(),
                 non_enumerable: rare.non_enumerable.clone(),
+                integrity: rare.integrity,
             })
         });
         let clone = Self {
@@ -757,6 +837,25 @@ mod tests {
         assert!(obj.has_own_property("length"));
         assert!(!obj.has_own_property("inherited"));
         assert!(obj.has_direct("inherited"));
+    }
+
+    #[test]
+    fn own_property_check_matches_unicode_and_long_accessor_keys() {
+        let mut obj = JsObject::new();
+        obj.set_direct(
+            "__w3cos_getter_值",
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+
+        let long = "x".repeat(128);
+        obj.set_direct(
+            &format!("__w3cos_setter_{long}"),
+            Value::function(|_, _| Value::Undefined),
+        );
+
+        assert!(obj.has_own_property("值"));
+        assert!(obj.has_own_property(&long));
+        assert!(!obj.has_own_property("missing"));
     }
 
     #[test]
@@ -978,6 +1077,9 @@ impl JsObject {
             for (_, a, b) in &rare.pending_class_initializers {
                 push_value(out, "[[PendingInitializer]]".to_string(), a);
                 push_value(out, "[[PendingInitializer]]".to_string(), b);
+            }
+            if let Some(replacement) = &rare.construct_replacement {
+                push_value(out, "[[ConstructReplacement]]".to_string(), replacement);
             }
             let mut private = rare.private_elements.iter().collect::<Vec<_>>();
             private.sort_by(|a, b| a.0.1.cmp(&b.0.1));

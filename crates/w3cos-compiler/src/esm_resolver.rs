@@ -477,6 +477,17 @@ pub struct EsmBundle {
     pub lazy_start: Option<usize>,
     /// Literal `import()` edges, with the lazy modules each one evaluates.
     pub dynamic_imports: Vec<BundledDynamicImport>,
+    /// Declared worker entries that run as ES modules on a worker thread.
+    pub workers: Vec<BundledWorker>,
+}
+
+/// An ES-module worker entry: the worker thread evaluates its whole static
+/// closure (dependencies first) instead of the program entry.
+#[derive(Debug, Clone, Default)]
+pub struct BundledWorker {
+    pub path: PathBuf,
+    /// Bundle indices, dependencies first, ending with the worker module.
+    pub evaluation_order: Vec<usize>,
 }
 
 /// A literal `import("specifier")` linked into the bundle.
@@ -524,6 +535,31 @@ impl EsmBundle {
                     referrer: edge.referrer,
                     specifier: edge.specifier,
                     target,
+                    evaluation_order,
+                });
+            }
+        }
+
+        let workers = resolver.esm_worker_entries();
+        if !workers.is_empty() {
+            let index_of: HashMap<&Path, usize> = order
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
+            for worker in workers {
+                if !index_of.contains_key(worker.as_path()) {
+                    continue;
+                }
+                let mut visited = HashSet::new();
+                let mut closure = Vec::new();
+                visit_module(&worker, parsed, resolver, &mut visited, &mut closure);
+                let evaluation_order = closure
+                    .iter()
+                    .filter_map(|path| index_of.get(path.as_path()).copied())
+                    .collect();
+                bundle.workers.push(BundledWorker {
+                    path: worker,
                     evaluation_order,
                 });
             }
@@ -819,6 +855,15 @@ pub struct EsmResolver {
     entry: RefCell<Option<PathBuf>>,
     /// Statically named worker modules found so far, in discovery order.
     worker_entries: RefCell<Vec<PathBuf>>,
+    /// ES-module worker entries the app declares (`package.json`
+    /// `"w3cos": { "workers": [...] }`), linked as lazy roots.
+    esm_worker_entries: RefCell<Vec<PathBuf>>,
+    /// Packages the app keeps out of the compiled graph (`package.json`
+    /// `"w3cos": { "exclude": [...] }`); see [`Self::is_excluded_dynamic_import`].
+    excluded_packages: std::cell::OnceCell<Vec<String>>,
+    /// Directories under a skipped top-level tree (`extensions/<name>`) that
+    /// hold an app-declared run-time root; see [`Self::link_declared_roots`].
+    declared_root_dirs: RefCell<Vec<PathBuf>>,
 }
 
 impl EsmResolver {
@@ -835,8 +880,45 @@ impl EsmResolver {
             dynamic_imports: RefCell::new(Vec::new()),
             entry: RefCell::new(None),
             worker_entries: RefCell::new(Vec::new()),
+            esm_worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
+            excluded_packages: std::cell::OnceCell::new(),
+            declared_root_dirs: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Whether a bare `import(specifier)` names a package the app excludes:
+    ///
+    /// ```json
+    /// "w3cos": { "exclude": ["playwright-core"] }
+    /// ```
+    ///
+    /// Code-OSS lazily imports `playwright-core` (a 3 MB esbuild bundle that
+    /// compiles to ~185 MB of Rust) for an optional feature; excluded
+    /// packages are not linked and `import()` of them rejects with
+    /// `ERR_MODULE_NOT_FOUND`, as for any module missing from the build.
+    fn is_excluded_dynamic_import(&self, specifier: &str) -> bool {
+        let excluded = self.excluded_packages.get_or_init(|| {
+            let manifest = self.project_root.join("package.json");
+            std::fs::read_to_string(manifest)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|json| {
+                    json.get("w3cos")?.get("exclude")?.as_array().map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        });
+        excluded.iter().any(|name| {
+            specifier == name
+                || specifier
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 
     pub fn with_runtime_modules(mut self, specifiers: impl IntoIterator<Item = String>) -> Self {
@@ -928,6 +1010,9 @@ impl EsmResolver {
             resolved.package_name = Some(specifier.to_string());
             return Ok(resolved);
         }
+        if specifier == "vscode" && !self.project_root.join("node_modules/vscode").exists() {
+            return vscode_module(&self.project_root, from_dir);
+        }
         if crate::electron_app::is_electron_specifier(specifier) {
             let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
             self.classic_scripts.borrow_mut().extend(scripts);
@@ -941,14 +1026,18 @@ impl EsmResolver {
                 "`{specifier}` is a Node builtin module that w3cos-node does not provide yet"
             ));
         }
+        // Node: a core module wins over a same-named package (LOAD_CORE_MODULE
+        // runs before LOAD_NODE_MODULES). Code-OSS ships the browserify `util`,
+        // `events` and `buffer` polyfills in node_modules; resolving
+        // `import { promisify } from "util"` to them breaks pfs.realpath.
+        if is_node_builtin(specifier) && w3cos_node::is_available(specifier) {
+            return Ok(
+                node_builtin_module(specifier, &self.project_root)?.expect("available builtin")
+            );
+        }
         match self.resolve_package(specifier, from_dir, kind) {
             Ok(resolved) => Ok(resolved),
-            Err(_) if is_node_builtin(specifier) && w3cos_node::is_available(specifier) => {
-                Ok(node_builtin_module(specifier, &self.project_root)?.expect("available builtin"))
-            }
-            // A bare builtin name only resolves to the builtin when no
-            // package of that name is installed (`events`, `buffer`, ...
-            // polyfills are common in web dependency trees).
+            // Builtins w3cos-node lacks fall back to an installed package.
             Err(error) if is_node_builtin(specifier) => Err(error.context(format!(
                 "`{specifier}` is a Node builtin module that w3cos-node does not provide yet"
             ))),
@@ -960,10 +1049,103 @@ impl EsmResolver {
         let entry = self.resolve_entry(entry)?;
         *self.entry.borrow_mut() = Some(entry.path.clone());
         self.dynamic_imports.borrow_mut().clear();
+        self.esm_worker_entries.borrow_mut().clear();
+        let entry_path = entry.path.clone();
         let mut graph = ModuleGraph::default();
         let mut visited = HashSet::new();
         self.visit_module(entry, &mut visited, &mut graph)?;
+        self.link_declared_roots(&entry_path, &mut visited, &mut graph);
         Ok(graph)
+    }
+
+    /// Modules an app loads through paths only known at run time (Code-OSS:
+    /// `utilityProcess.fork(FileAccess.asFileUri("bootstrap-fork.js").fsPath)`
+    /// and `import(\`./${entryPoint}.js\`)`), declared in the project's
+    /// `package.json`:
+    ///
+    /// ```json
+    /// "w3cos": { "workers": ["out/bootstrap-fork.js"], "modules": ["out/vs/x/main.js"] }
+    /// ```
+    ///
+    /// Both are linked as lazily evaluated modules (a computed `import()`
+    /// that resolves to one evaluates it); `workers` are also worker /
+    /// utility-process entries that may be ES modules.
+    fn link_declared_roots(
+        &self,
+        entry: &Path,
+        visited: &mut HashSet<PathBuf>,
+        graph: &mut ModuleGraph,
+    ) {
+        let manifest = self.project_root.join("package.json");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            return;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let Some(config) = json.get("w3cos") else {
+            return;
+        };
+        let list = |key: &str| -> Vec<String> {
+            config
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|item| {
+                            if item.starts_with("./") || item.starts_with("../") {
+                                item.to_string()
+                            } else {
+                                format!("./{}", item.trim_start_matches('/'))
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let root = self.project_root.clone();
+        for (key, worker) in [("workers", true), ("modules", false)] {
+            for specifier in list(key) {
+                // `extensions/` is normally not walked (see
+                // `should_skip_graph_path`), but a declared root there (a
+                // built-in extension's `out/extension.js`) must be linked
+                // like any other module: as CommonJS, with its own
+                // `require()` graph. Otherwise it compiles as a plain ES
+                // module with empty exports and no `activate`.
+                if let Ok(resolved) = self.resolve(&specifier, &root) {
+                    if let Some(dir) = self.skipped_tree_dir(&resolved.path) {
+                        let mut dirs = self.declared_root_dirs.borrow_mut();
+                        if !dirs.contains(&dir) {
+                            dirs.push(dir);
+                        }
+                    }
+                }
+                let edges_before = self.dynamic_imports.borrow().len();
+                self.link_dynamic_import(entry, &specifier, &root, visited, graph);
+                let linked = self.dynamic_imports.borrow().get(edges_before).cloned();
+                match linked {
+                    Some(edge) if worker => {
+                        let mut workers = self.esm_worker_entries.borrow_mut();
+                        if !workers.contains(&edge.target) {
+                            workers.push(edge.target);
+                        }
+                    }
+                    Some(_) => {}
+                    None => self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: w3cos.{key} entry `{specifier}` was not linked",
+                        manifest.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Declared worker entries (see [`Self::link_declared_roots`]) of the
+    /// last built graph.
+    pub fn esm_worker_entries(&self) -> Vec<PathBuf> {
+        self.esm_worker_entries.borrow().clone()
     }
 
     pub fn parse_graph_from_entry(&self, entry: &Path) -> Result<ParsedModuleGraph> {
@@ -1100,6 +1282,14 @@ impl EsmResolver {
             for specifier in collect_new_url_js_literals(&source) {
                 self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
             }
+            // Code-OSS `importAMDNodeModule("@xterm/xterm", "lib/xterm.js")`:
+            // amdX appends `<script src=…/node_modules/<name>/<path>>` and
+            // waits for its AMD `define`. Link the file as a lazily evaluated
+            // classic script registered under its path, which the runtime
+            // runs when that `<script src>` is inserted.
+            for (name, inner) in collect_amd_node_module_literals(&source) {
+                self.link_amd_node_module(&module.path, &name, &inner, visited, graph);
+            }
         }
 
         Ok(())
@@ -1120,6 +1310,7 @@ impl EsmResolver {
         if is_asset_import(specifier)
             || is_host_module(specifier)
             || self.is_runtime_module(specifier)
+            || self.is_excluded_dynamic_import(specifier)
         {
             return;
         }
@@ -1153,6 +1344,57 @@ impl EsmResolver {
             specifier: specifier.to_string(),
             target,
         });
+    }
+
+    /// Link `<project>/node_modules/<name>/<inner>` (the file amdX's
+    /// `importAMDNodeModule(name, inner)` loads with a `<script src>`) as a
+    /// lazily evaluated classic script. Packages the app excludes are skipped.
+    fn link_amd_node_module(
+        &self,
+        referrer: &Path,
+        name: &str,
+        inner: &str,
+        visited: &mut HashSet<PathBuf>,
+        graph: &mut ModuleGraph,
+    ) {
+        if name.is_empty()
+            || name.contains("://")
+            || name.starts_with('.')
+            || name.starts_with('/')
+            || inner.starts_with('/')
+            || inner.split('/').any(|segment| segment == "..")
+        {
+            return;
+        }
+        let bare = if inner.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}/{inner}")
+        };
+        if self.is_excluded_dynamic_import(&bare) {
+            return;
+        }
+        let file = self
+            .project_root
+            .join("node_modules")
+            .join(name)
+            .join(inner);
+        if !file.is_file() {
+            self.commonjs_diagnostics.borrow_mut().push(format!(
+                "{}: importAMDNodeModule('{name}', '{inner}') names a missing file {}",
+                referrer.display(),
+                file.display()
+            ));
+            return;
+        }
+        let file = normalize_path(&file);
+        self.classic_scripts.borrow_mut().insert(file.clone());
+        let specifier = file.to_string_lossy().to_string();
+        let from_dir = file
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        self.link_dynamic_import(referrer, &specifier, &from_dir, visited, graph);
     }
 
     /// Resolve a path-like specifier (e.g. `vs/workbench/workbench.desktop.main.js`)
@@ -1654,6 +1896,18 @@ impl EsmResolver {
     /// under `out/`, not `src/`.
     /// Build/test tooling and TypeScript sources are not part of the Electron
     /// `out/` runtime graph; following them pulls thousands of dead modules.
+    /// `<root>/extensions/<name>` for a path inside an extension directory.
+    fn skipped_tree_dir(&self, path: &Path) -> Option<PathBuf> {
+        let rel = path.strip_prefix(&self.project_root).ok()?;
+        let mut components = rel.components();
+        let first = components.next()?;
+        if first.as_os_str().to_str() != Some("extensions") {
+            return None;
+        }
+        let name = components.next()?;
+        Some(self.project_root.join("extensions").join(name))
+    }
+
     fn should_skip_graph_path(&self, path: &Path) -> bool {
         let Some(entry) = self.entry.borrow().clone() else {
             return false;
@@ -1673,7 +1927,12 @@ impl EsmResolver {
         if matches!(
             first,
             "build" | "test" | "src" | "extensions" | ".eslintplugin" | "scripts"
-        ) {
+        ) && !self
+            .declared_root_dirs
+            .borrow()
+            .iter()
+            .any(|dir| path.starts_with(dir))
+        {
             return true;
         }
         // Unit-test trees live under out/vs/**/test/** (and *.test.js). Following
@@ -1975,6 +2234,106 @@ pub fn collect_dynamic_import_literals(source: &str) -> Vec<String> {
     found
 }
 
+/// `(name, path)` string-literal argument pairs of
+/// `importAMDNodeModule("name", "path")` calls (Code-OSS `vs/amdX.js`), in
+/// source order and deduplicated. Comments, strings and calls with computed
+/// arguments are skipped; a member call (`x.importAMDNodeModule(`) counts
+/// (bundlers rename imports to `amdX.importAMDNodeModule`).
+pub fn collect_amd_node_module_literals(source: &str) -> Vec<(String, String)> {
+    const CALLEE: &[u8] = b"importAMDNodeModule";
+    let bytes = source.as_bytes();
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut index = 0;
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    let skip_ws = |mut cursor: usize| {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        cursor
+    };
+    // A plain `'…'`/`"…"` literal (no escapes) at `cursor`: (text, end).
+    let literal = |cursor: usize| -> Option<(String, usize)> {
+        let quote @ (b'\'' | b'"') = *bytes.get(cursor)? else {
+            return None;
+        };
+        let start = cursor + 1;
+        let length = bytes[start..]
+            .iter()
+            .position(|&byte| byte == quote || byte == b'\\' || byte == b'\n')?;
+        (bytes[start + length] == quote).then(|| {
+            (
+                source[start..start + length].to_string(),
+                start + length + 1,
+            )
+        })
+    };
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'i' if bytes[index..].starts_with(CALLEE)
+                && (index == 0 || !is_ident(bytes[index - 1]))
+                && !bytes
+                    .get(index + CALLEE.len())
+                    .copied()
+                    .is_some_and(is_ident) =>
+            {
+                index += CALLEE.len();
+                let cursor = skip_ws(index);
+                if bytes.get(cursor) != Some(&b'(') {
+                    continue;
+                }
+                let Some((name, end)) = literal(skip_ws(cursor + 1)) else {
+                    continue;
+                };
+                let cursor = skip_ws(end);
+                let (inner, end) = match bytes.get(cursor) {
+                    Some(b',') => match literal(skip_ws(cursor + 1)) {
+                        Some(pair) => pair,
+                        None => continue,
+                    },
+                    Some(b')') => (String::new(), cursor),
+                    _ => continue,
+                };
+                let cursor = skip_ws(end);
+                // `importAMDNodeModule(name, path, isBuilt)` is fine; any
+                // other trailing argument is ignored too.
+                if !matches!(bytes.get(cursor), Some(b')') | Some(b',')) {
+                    continue;
+                }
+                let pair = (name, inner);
+                if !found.contains(&pair) {
+                    found.push(pair);
+                }
+                index = cursor;
+            }
+            _ => index += 1,
+        }
+    }
+    found
+}
+
 /// Collect JS module paths from `new URL("….js", base)` / `new URL('….js', base)` /
 /// `` new URL(`….js`, base) `` (no `${…}` interpolations). Code-OSS builds the
 /// workbench entry as `new URL(\`vs/workbench/workbench.desktop.main.js\`, baseUrl)`
@@ -2064,6 +2423,46 @@ pub fn collect_new_url_js_literals(source: &str) -> Vec<String> {
 }
 
 pub fn collect_static_imports(source: &str) -> Vec<String> {
+    // Parse first: minified packages put declarations mid-line with no
+    // spaces (tar's `...;import{win32 as Pn}from"node:path";`), which the
+    // line scanner below cannot see. The scanner stays as the fallback for
+    // sources the parser rejects, and still contributes its extra matches so
+    // the previous edges are kept.
+    let mut imports = parsed_static_imports(source).unwrap_or_default();
+    for spec in lexical_static_imports(source) {
+        if !imports.contains(&spec) {
+            imports.push(spec);
+        }
+    }
+    imports
+}
+
+/// `import ... from` / `import "..."` / `export ... from` specifiers, in
+/// source order, from the parsed module (`None` when it does not parse).
+fn parsed_static_imports(source: &str) -> Option<Vec<String>> {
+    if !source.contains("import") && !source.contains("export") {
+        return Some(Vec::new());
+    }
+    let module = parse_esm_module(source, Path::new("module.ts")).ok()?;
+    let mut imports: Vec<String> = Vec::new();
+    for item in &module.body {
+        let src = match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => &import.src,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => &export.src,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(NamedExport {
+                src: Some(src), ..
+            })) => src,
+            _ => continue,
+        };
+        let spec = atom_to_string(&src.value);
+        if !imports.contains(&spec) {
+            imports.push(spec);
+        }
+    }
+    Some(imports)
+}
+
+fn lexical_static_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let mut pending = String::new();
     for line in source.lines() {
@@ -2339,7 +2738,9 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
         }
         Decl::Fn(function) if !function.declare => {
             let name = function.ident.sym.to_string();
-            info.top_level_functions.push(name.clone());
+            if !info.top_level_functions.contains(&name) {
+                info.top_level_functions.push(name.clone());
+            }
             info.exports.push(ExportBinding {
                 exported: name.clone(),
                 local: Some(name),
@@ -2396,9 +2797,12 @@ fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
         Decl::Class(class) if !class.declare => {
             info.top_level_classes.push(class.ident.sym.to_string())
         }
-        Decl::Fn(function) if !function.declare => info
-            .top_level_functions
-            .push(function.ident.sym.to_string()),
+        Decl::Fn(function) if !function.declare => {
+            let name = function.ident.sym.to_string();
+            if !info.top_level_functions.contains(&name) {
+                info.top_level_functions.push(name);
+            }
+        }
         Decl::Var(var) if !var.declare => {
             for declaration in &var.decls {
                 collect_pat_names(&declaration.name, &mut info.top_level_variables);
@@ -2478,6 +2882,96 @@ fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModu
     Ok((resolved, scripts))
 }
 
+/// Top-level value exports of the `vscode` API (`vscode.d.ts`). A namespace
+/// import (`import * as vscode`) that is handed on whole cannot be scanned for
+/// the members its consumers read, so the glue declares them all.
+const VSCODE_API_NAMES: &str = "\
+    BranchCoverage Breakpoint CallHierarchyIncomingCall CallHierarchyItem \
+    CallHierarchyOutgoingCall CancellationError CancellationTokenSource ChatRequestTurn \
+    ChatResponseAnchorPart ChatResponseCommandButtonPart ChatResponseFileTreePart \
+    ChatResponseMarkdownPart ChatResponseProgressPart ChatResponseReferencePart \
+    ChatResponseTurn ChatResultFeedbackKind CodeAction CodeActionKind CodeActionTriggerKind \
+    CodeLens Color ColorInformation ColorPresentation ColorThemeKind CommentMode \
+    CommentThreadCollapsibleState CommentThreadState CompletionItem CompletionItemKind \
+    CompletionItemTag CompletionList CompletionTriggerKind ConfigurationTarget CustomExecution \
+    DataTransfer DataTransferItem DebugAdapterExecutable DebugAdapterInlineImplementation \
+    DebugAdapterNamedPipeServer DebugAdapterServer DebugConfigurationProviderTriggerKind \
+    DebugConsoleMode DebugStackFrame DebugThread DeclarationCoverage DecorationRangeBehavior \
+    Diagnostic DiagnosticRelatedInformation DiagnosticSeverity DiagnosticTag Disposable \
+    DocumentDropEdit DocumentDropOrPasteEditKind DocumentHighlight DocumentHighlightKind \
+    DocumentLink DocumentPasteEdit DocumentPasteTriggerKind DocumentSymbol EndOfLine \
+    EnvironmentVariableMutatorType EvaluatableExpression EventEmitter ExtensionKind \
+    ExtensionMode FileChangeType FileCoverage FileDecoration FilePermission FileSystemError \
+    FileType FoldingRange FoldingRangeKind FunctionBreakpoint Hover IndentAction InlayHint \
+    InlayHintKind InlayHintLabelPart InlineCompletionItem InlineCompletionList \
+    InlineCompletionTriggerKind InlineValueEvaluatableExpression InlineValueText \
+    InlineValueVariableLookup InputBoxValidationSeverity LanguageModelChatMessage \
+    LanguageModelChatMessageRole LanguageModelChatToolMode LanguageModelDataPart \
+    LanguageModelError LanguageModelPromptTsxPart LanguageModelTextPart \
+    LanguageModelToolCallPart LanguageModelToolResult LanguageModelToolResultPart \
+    LanguageStatusSeverity LinkedEditingRanges Location LogLevel MarkdownString \
+    McpHttpServerDefinition McpStdioServerDefinition NotebookCellData NotebookCellKind \
+    NotebookCellOutput NotebookCellOutputItem NotebookCellStatusBarAlignment \
+    NotebookCellStatusBarItem NotebookControllerAffinity NotebookData NotebookEdit \
+    NotebookEditorRevealType NotebookRange OverviewRulerLane ParameterInformation Position \
+    ProcessExecution ProgressLocation QuickInputButtonLocation QuickInputButtons \
+    QuickPickItemKind Range RelativePattern Selection SelectionRange SemanticTokens \
+    SemanticTokensBuilder SemanticTokensEdit SemanticTokensEdits SemanticTokensLegend \
+    ShellExecution ShellQuoting SignatureHelp SignatureHelpTriggerKind SignatureInformation \
+    SnippetString SnippetTextEdit SourceBreakpoint StatementCoverage StatusBarAlignment \
+    SymbolInformation SymbolKind SymbolTag SyntaxTokenType TabInputCustom TabInputNotebook \
+    TabInputNotebookDiff TabInputTerminal TabInputText TabInputTextDiff TabInputWebview Task \
+    TaskGroup TaskPanelKind TaskRevealKind TaskScope TelemetryTrustedValue TerminalExitReason \
+    TerminalLink TerminalLocation TerminalProfile TerminalShellExecutionCommandLineConfidence \
+    TestCoverageCount TestMessage TestMessageStackFrame TestRunProfileKind TestRunRequest \
+    TestTag TextDocumentChangeReason TextDocumentSaveReason TextEdit TextEditorCursorStyle \
+    TextEditorLineNumbersStyle TextEditorRevealType TextEditorSelectionChangeKind ThemeColor \
+    ThemeIcon TreeItem TreeItemCheckboxState TreeItemCollapsibleState TypeHierarchyItem UIKind \
+    Uri ViewColumn WorkspaceEdit authentication chat commands comments debug env extensions \
+    l10n languages lm notebooks scm tasks tests version window workspace";
+
+/// The extension host's `vscode` API. It is not a file: the host hands out a
+/// *per-extension* API object through its patched `Module._load`, keyed by the
+/// requiring module's filename. A CommonJS record that asks the host on behalf
+/// of the importer's extension (nearest `package.json`) lets ES-module
+/// extensions (`import { window } from 'vscode'`) bind it like any CommonJS
+/// dependency; left unresolved, the names were read off the browser global.
+fn vscode_module(project_root: &Path, from_dir: &Path) -> Result<ResolvedModule> {
+    let owner = from_dir
+        .ancestors()
+        .find(|dir| dir.join("package.json").is_file())
+        .unwrap_or(project_root);
+    let dir = node_builtin_dir(project_root)?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in owner.to_string_lossy().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let path = dir.join(format!("vscode-{hash:016x}.js"));
+    let owner_file = crate::cjs::js_string(&owner.join("package.json").to_string_lossy());
+    // Lexer-visible names (`exports.X = void 0`, as tsc emits): the importer's
+    // facade exports them; `module.exports = api` below replaces the object.
+    let declared: String = VSCODE_API_NAMES
+        .split_whitespace()
+        .map(|name| format!("exports.{name} = void 0;\n"))
+        .collect();
+    // Not a literal `require('vscode')`: that would link this file to itself.
+    install_glue_file(
+        &path,
+        &format!(
+            "{declared}const loaded = globalThis.__w3cos_cjs_runtime_load('vscode', {{ id: {owner_file}, filename: {owner_file}, paths: [] }});\n\
+if (loaded === undefined) throw new Error(\"Cannot find module 'vscode'\");\n\
+module.exports = loaded.value;\n"
+        ),
+    )?;
+    Ok(ResolvedModule {
+        specifier: "vscode".to_string(),
+        path,
+        kind: ModuleKind::Package,
+        package_name: Some("vscode".to_string()),
+    })
+}
+
 fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
     // FNV-1a over every builtin, so edits never reuse stale glue.
     let fnv = |bytes: &mut dyn Iterator<Item = u8>| {
@@ -2547,6 +3041,14 @@ export function main() { return 42; }"#,
             namespace_member_names(source, "fs"),
             ["existsSync", "promises", "readFileSync"]
         );
+    }
+
+    #[test]
+    fn collect_imports_from_minified_source() {
+        let imports = collect_static_imports(
+            r#"var a=1;import Qr from"events";import{win32 as Pn}from"node:path";export*from"./x.js";export{y}from'./y.js';const s="import z from 'nope'";"#,
+        );
+        assert_eq!(imports, ["events", "node:path", "./x.js", "./y.js"]);
     }
 
     #[test]
@@ -3369,6 +3871,136 @@ export function main() {{ bump(); return value + plugin.value; }}"#
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn declared_extension_roots_link_as_commonjs_with_their_own_graph() {
+        let root = fixture_root("w3cos_declared_extension_roots");
+        write_tree(
+            &root,
+            &[
+                (
+                    "package.json",
+                    r#"{"type":"module","w3cos":{"modules":["extensions/ext/out/extension.js"]}}"#,
+                ),
+                ("out/main.js", "export const boot = 1;\n"),
+                (
+                    "extensions/ext/out/extension.js",
+                    "const util = require('./util');\nexports.activate = function () { return util.x; };\n",
+                ),
+                (
+                    "extensions/ext/package.json",
+                    r#"{"name":"ext","main":"./out/extension"}"#,
+                ),
+                ("extensions/ext/out/util.js", "exports.x = 1;\n"),
+                (
+                    "extensions/other/out/extension.js",
+                    "exports.activate = 1;\n",
+                ),
+            ],
+        );
+        let resolver = EsmResolver::new(&root);
+        let graph = resolver
+            .build_graph_from_entry(&root.join("out/main.js"))
+            .unwrap();
+        let paths: Vec<&Path> = graph
+            .nodes
+            .iter()
+            .map(|n| n.module.path.as_path())
+            .collect();
+        let ext = root.join("extensions/ext/out/extension.js");
+        assert!(paths.contains(&ext.as_path()), "{paths:?}");
+        assert!(
+            paths.contains(
+                &root
+                    .join("extensions/ext/out/util.js.w3cos-cjs.js")
+                    .as_path()
+            ),
+            "the extension's require() graph must be linked: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&root.join("extensions/other/out/extension.js").as_path()),
+            "undeclared extensions stay out of the graph"
+        );
+        assert!(
+            resolver.prepare_commonjs(&ext).unwrap(),
+            "a declared extension root is CommonJS (exports.activate), not an empty ES module"
+        );
+        assert!(
+            resolver.is_commonjs(&ext),
+            "CommonJS facade must be registered during graph build"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn esm_import_of_vscode_binds_the_host_require_not_a_global() {
+        let root = fixture_root("w3cos_esm_import_vscode");
+        write_tree(
+            &root,
+            &[
+                ("package.json", r#"{"type":"module"}"#),
+                ("ext/package.json", r#"{"name":"ext"}"#),
+                (
+                    "ext/src/ext.js",
+                    "import { window, LogLevel } from 'vscode';\nexport function activate() { return window.createOutputChannel('x', { log: true }).logLevel === LogLevel.Info; }\n",
+                ),
+            ],
+        );
+        let resolver = EsmResolver::new(&root);
+        let entry = root.join("ext/src/ext.js");
+        let graph = resolver.build_graph_from_entry(&entry).unwrap();
+        let glue = graph
+            .nodes
+            .iter()
+            .find(|node| node.module.specifier == "vscode")
+            .map(|node| node.module.path.clone())
+            .unwrap_or_else(|| panic!("vscode must link as a module: {:?}", graph.nodes.len()));
+        assert!(resolver.is_commonjs(&glue), "{}", glue.display());
+        let glue_source = std::fs::read_to_string(&glue).unwrap();
+        let facade = module_source::read(&glue).unwrap();
+        assert!(
+            facade.contains("export const EventEmitter =") && facade.contains("export const env ="),
+            "a namespace import of the host API sees every member: {facade}"
+        );
+        assert!(
+            glue_source.contains(&root.join("ext/package.json").to_string_lossy().into_owned()),
+            "the host is asked on behalf of the importing extension: {glue_source}"
+        );
+        let record = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.module
+                    .path
+                    .to_string_lossy()
+                    .ends_with(".w3cos-cjs.js")
+                    && node.module.path.to_string_lossy().contains("vscode-")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no record: {:?}",
+                    graph
+                        .nodes
+                        .iter()
+                        .map(|n| (&n.module.path, &n.imports))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            record
+                .imports
+                .iter()
+                .all(|import| !import.ends_with("w3cos-cjs.js")),
+            "the glue must not link itself: {:?}",
+            record.imports
+        );
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
     fn write_tree(root: &Path, files: &[(&str, &str)]) {
         for (path, contents) in files {
             let path = root.join(path);
@@ -3431,6 +4063,7 @@ export function main() {{ bump(); return value + plugin.value; }}"#
                     r#"{"main":"events.js"}"#,
                 ),
                 ("node_modules/events/events.js", ""),
+                ("src/deep/node_modules/dgram/index.js", ""),
             ],
         );
         let resolver = EsmResolver::new(&root);
@@ -3515,8 +4148,9 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             "src/dir/entry.js"
         );
 
-        // Builtins: `node:` always; bare names only when no package exists.
-        // w3cos-node provides some; the rest stay a coded resolution error.
+        // Builtins: `node:` always; bare names win over an installed
+        // package of the same name, as in Node. Builtins w3cos-node lacks
+        // fall back to the package, else a coded resolution error.
         let fs = resolver.resolve_with("dgram", &src, Require).unwrap_err();
         assert!(format!("{fs:#}").contains("Node builtin"), "{fs:#}");
         let events = resolver.resolve_with("node:events", &src, Require).unwrap();
@@ -3524,9 +4158,14 @@ export function main() {{ bump(); return value + plugin.value; }}"#
         assert!(events.path.ends_with("events.js"));
         let bare_path = resolver.resolve_with("path", &src, Require).unwrap();
         assert_eq!(bare_path.package_name.as_deref(), Some("node:path"));
+        let bare_events = resolver.resolve_with("events", &src, Require).unwrap();
+        assert_eq!(bare_events.package_name.as_deref(), Some("node:events"));
+        assert!(!bare_events.path.ends_with("node_modules/events/events.js"));
+        let bare_events = resolver.resolve_with("events", &src, Import).unwrap();
+        assert_eq!(bare_events.package_name.as_deref(), Some("node:events"));
         assert_eq!(
-            path("events", &src, Require),
-            "node_modules/events/events.js"
+            path("dgram", &src.join("deep/x"), Require),
+            "src/deep/node_modules/dgram/index.js"
         );
 
         assert!(!resolver.is_in_type_module_scope(&src.join("main.js")));
@@ -3550,6 +4189,115 @@ import("./literal.js");
                 "./lazy.js".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn collect_amd_node_module_literals_takes_literal_pairs_only() {
+        let source = r#"
+            import { importAMDNodeModule } from "../amdX.js";
+            const a = await importAMDNodeModule("@xterm/xterm", "lib/xterm.js");
+            const b = (await amdX.importAMDNodeModule('@xterm/addon-search', 'lib/addon-search.js', false)).SearchAddon;
+            importAMDNodeModule("@xterm/xterm", "lib/xterm.js");
+            // importAMDNodeModule("in-comment", "x.js")
+            const s = "importAMDNodeModule('in-string', 'x.js')";
+            importAMDNodeModule(name, "lib/x.js");
+            importAMDNodeModule("computed", path);
+            myimportAMDNodeModule("other", "x.js");
+            importAMDNodeModule("bare");
+        "#;
+        assert_eq!(
+            collect_amd_node_module_literals(source),
+            vec![
+                ("@xterm/xterm".to_string(), "lib/xterm.js".to_string()),
+                (
+                    "@xterm/addon-search".to_string(),
+                    "lib/addon-search.js".to_string()
+                ),
+                ("bare".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn amd_node_module_literals_link_lazy_classic_scripts() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-amd-node-module-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{"name":"app","type":"module","w3cos":{"exclude":["@xterm/addon-webgl"]}}"#,
+        );
+        write(
+            "main.js",
+            r#"import { importAMDNodeModule } from "./amdX.js";
+export const t = () => importAMDNodeModule("@xterm/xterm", "lib/xterm.js");
+export const w = () => importAMDNodeModule("@xterm/addon-webgl", "lib/addon-webgl.js");
+export const m = () => importAMDNodeModule("@xterm/missing", "lib/missing.js");
+"#,
+        );
+        write(
+            "amdX.js",
+            "export async function importAMDNodeModule(name, path) { return [name, path]; }\n",
+        );
+        // A UMD bundle like xterm.js: no ES module syntax.
+        write(
+            "node_modules/@xterm/xterm/lib/xterm.js",
+            "!function(e,t){if(\"object\"==typeof exports&&\"object\"==typeof module)module.exports=t();else if(\"function\"==typeof define&&define.amd)define([],t)}(globalThis,()=>({Terminal:1}));\n",
+        );
+        write(
+            "node_modules/@xterm/xterm/package.json",
+            r#"{"name":"@xterm/xterm","main":"lib/xterm.js"}"#,
+        );
+        write(
+            "node_modules/@xterm/addon-webgl/lib/addon-webgl.js",
+            "module.exports = {};\n",
+        );
+
+        let resolver = EsmResolver::new(&root);
+        let graph = resolver
+            .build_graph_from_entry(&root.join("main.js"))
+            .unwrap();
+        let xterm = normalize_path(&root.join("node_modules/@xterm/xterm/lib/xterm.js"));
+        let edges = resolver.dynamic_imports();
+        assert!(
+            edges.iter().any(|edge| edge.target == xterm),
+            "xterm.js is a lazily linked module: {edges:?}"
+        );
+        assert!(graph.nodes.iter().any(|node| node.module.path == xterm));
+        // Registered under its absolute path, which `<script src>` maps to.
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == xterm.to_string_lossy())
+        );
+        // Linked as a classic (CommonJS) record.
+        assert!(resolver.prepare_commonjs(&xterm).unwrap());
+        // Excluded packages stay out of the graph.
+        assert!(
+            !graph.nodes.iter().any(|node| node
+                .module
+                .path
+                .to_string_lossy()
+                .contains("addon-webgl"))
+        );
+        // A missing file is reported, not fatal.
+        assert!(
+            resolver
+                .commonjs_diagnostics()
+                .iter()
+                .any(|line| line.contains("@xterm/missing")),
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

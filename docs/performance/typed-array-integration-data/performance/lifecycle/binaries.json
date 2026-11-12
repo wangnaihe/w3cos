@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "/workspace/scratch/2d5c8d8ffe42/evidence/typed-array-integration/bin/registry-baseline",
+    "sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84"
+  },
+  "candidate": {
+    "path": "/workspace/scratch/2d5c8d8ffe42/evidence/typed-array-integration/bin/registry-candidate",
+    "sha256": "b0b05ee8ea67d88e9189b785af9691226324d80293f72479a71489f83e301591"
+  }
+}

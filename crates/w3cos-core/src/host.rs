@@ -28,6 +28,10 @@ pub fn unregister_host_module(module: &str) {
     });
 }
 
+pub fn has_host_module(module: &str) -> bool {
+    HOST_MODULES.with(|modules| modules.borrow().contains_key(module))
+}
+
 pub fn invoke(arguments: Vec<Value>) -> Value {
     let module = arguments
         .first()

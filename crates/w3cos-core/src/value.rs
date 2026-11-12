@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -416,6 +416,20 @@ impl PartialEq for Immediate {
     }
 }
 
+pub(crate) fn accessor_key<'a>(
+    buf: &'a mut [u8; 96],
+    prefix: &str,
+    key: &str,
+) -> std::borrow::Cow<'a, str> {
+    let total = prefix.len() + key.len();
+    if total > buf.len() {
+        return std::borrow::Cow::Owned(format!("{prefix}{key}"));
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    buf[prefix.len()..total].copy_from_slice(key.as_bytes());
+    std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
+}
+
 impl Value {
     /// Unit-like constructor kept so AOT / host code can write `Value::Undefined`.
     #[allow(non_upper_case_globals)]
@@ -615,12 +629,24 @@ impl Value {
     }
 }
 
+/// Elements decoded on first generic access (typed-array views, whose bytes
+/// are the source of truth): 1 byte of Uint8Array otherwise cost a 16-byte
+/// `Value` slot as well.
+struct LazyElements {
+    len: usize,
+    decode: Box<dyn FnOnce() -> Vec<Value>>,
+}
+
 /// Shared backing storage for [`Value::Array`].
 ///
 /// Construction remains centralized through [`Value::array`] so heap
 /// accounting cannot be bypassed.
 pub struct ArrayStorage {
-    values: Vec<Value>,
+    // `values` is empty while `lazy` is set; the first `Deref`/mutable access
+    // decodes it (no reference to the empty vector can outlive that point,
+    // every borrower goes through `vec`/`vec_mut`).
+    values: UnsafeCell<Vec<Value>>,
+    lazy: UnsafeCell<Option<Box<LazyElements>>>,
     allocation: HeapAllocation,
 }
 
@@ -634,7 +660,70 @@ impl ArrayStorage {
                     .saturating_mul(std::mem::size_of::<Value>()),
             ),
         );
-        Self { values, allocation }
+        Self {
+            values: UnsafeCell::new(values),
+            lazy: UnsafeCell::new(None),
+            allocation,
+        }
+    }
+
+    /// A storage of `len` elements produced by `decode` on first generic
+    /// access. `len()`/`is_empty()` do not trigger it.
+    pub fn new_lazy(len: usize, decode: impl FnOnce() -> Vec<Value> + 'static) -> Self {
+        let allocation = HeapAllocation::new(HeapKind::Array, std::mem::size_of::<Self>());
+        Self {
+            values: UnsafeCell::new(Vec::new()),
+            lazy: UnsafeCell::new(Some(Box::new(LazyElements {
+                len,
+                decode: Box::new(decode),
+            }))),
+            allocation,
+        }
+    }
+
+    /// True while the elements have not been decoded yet.
+    pub fn is_lazy(&self) -> bool {
+        // SAFETY: single-threaded interior state, no reference escapes.
+        unsafe { (*self.lazy.get()).is_some() }
+    }
+
+    fn materialize(&self) {
+        // SAFETY: while `lazy` is set `values` is empty and never borrowed
+        // (all access goes through `vec`/`vec_mut`, which call this first).
+        unsafe {
+            if let Some(lazy) = (*self.lazy.get()).take() {
+                let decoded = (lazy.decode)();
+                *self.values.get() = decoded;
+                self.refresh_heap_accounting();
+            }
+        }
+    }
+
+    #[inline]
+    fn vec(&self) -> &Vec<Value> {
+        self.materialize();
+        // SAFETY: see `materialize`.
+        unsafe { &*self.values.get() }
+    }
+
+    #[inline]
+    fn vec_mut(&mut self) -> &mut Vec<Value> {
+        self.materialize();
+        self.values.get_mut()
+    }
+
+    pub fn len(&self) -> usize {
+        // SAFETY: see `materialize`.
+        unsafe {
+            match &*self.lazy.get() {
+                Some(lazy) => lazy.len,
+                None => (*self.values.get()).len(),
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     #[inline]
@@ -643,61 +732,80 @@ impl ArrayStorage {
     }
 
     pub(crate) fn refresh_heap_accounting(&self) {
+        // SAFETY: reads the capacity only.
+        let capacity = unsafe { (*self.values.get()).capacity() };
         self.allocation.set_bytes(
-            std::mem::size_of::<Self>().saturating_add(
-                self.values
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Value>()),
-            ),
+            std::mem::size_of::<Self>()
+                .saturating_add(capacity.saturating_mul(std::mem::size_of::<Value>())),
         );
     }
 
     pub fn replace_values(&mut self, values: Vec<Value>) {
-        self.values = values;
+        *self.lazy.get_mut() = None;
+        *self.values.get_mut() = values;
         self.refresh_heap_accounting();
     }
 
+    /// Overwrite one existing slot; out-of-range indexes are ignored. The
+    /// capacity is unchanged, so heap accounting needs no refresh. A lazy
+    /// storage ignores it: its bytes are authoritative and decode later.
+    pub(crate) fn set_value(&mut self, index: usize, value: Value) {
+        if self.lazy.get_mut().is_some() {
+            return;
+        }
+        if let Some(slot) = self.values.get_mut().get_mut(index) {
+            *slot = value;
+        }
+    }
+
     pub(crate) fn push(&mut self, value: Value) {
-        self.values.push(value);
+        self.vec_mut().push(value);
         self.refresh_heap_accounting();
     }
 
     /// Grow once toward `min_capacity` instead of doubling through every
     /// power of two. Create loops push thousands of handles.
     pub(crate) fn push_reserved(&mut self, value: Value, min_capacity: usize) {
-        if self.values.len() >= 16 && self.values.capacity() < min_capacity {
-            self.values.reserve(min_capacity - self.values.capacity());
+        let values = self.vec_mut();
+        if values.len() >= 16 && values.capacity() < min_capacity {
+            values.reserve(min_capacity - values.capacity());
         }
         self.push(value);
     }
 
     pub(crate) fn pop(&mut self) -> Option<Value> {
-        self.values.pop()
+        self.vec_mut().pop()
+    }
+
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        self.vec_mut().truncate(new_len);
+        self.refresh_heap_accounting();
     }
 
     pub(crate) fn remove(&mut self, index: usize) -> Value {
-        self.values.remove(index)
+        self.vec_mut().remove(index)
     }
 
     pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
-        self.values.split_off(at)
+        self.vec_mut().split_off(at)
     }
 
     pub(crate) fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> Value) {
-        self.values.resize_with(new_len, f);
+        self.vec_mut().resize_with(new_len, f);
         self.refresh_heap_accounting();
     }
 
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
-        self.values.get_mut(index)
+        self.vec_mut().get_mut(index)
     }
 
     pub(crate) fn clear(&mut self) {
-        self.values.clear();
+        *self.lazy.get_mut() = None;
+        self.values.get_mut().clear();
     }
 
     pub(crate) fn reverse(&mut self) {
-        self.values.reverse();
+        self.vec_mut().reverse();
     }
 }
 
@@ -705,13 +813,13 @@ impl Deref for ArrayStorage {
     type Target = Vec<Value>;
 
     fn deref(&self) -> &Self::Target {
-        &self.values
+        self.vec()
     }
 }
 
 impl Extend<Value> for ArrayStorage {
     fn extend<T: IntoIterator<Item = Value>>(&mut self, iter: T) {
-        self.values.extend(iter);
+        self.vec_mut().extend(iter);
         self.refresh_heap_accounting();
     }
 }
@@ -723,7 +831,7 @@ where
     type Output = I::Output;
 
     fn index(&self, index: I) -> &Self::Output {
-        &self.values[index]
+        &self.vec()[index]
     }
 }
 
@@ -732,13 +840,13 @@ where
     I: SliceIndex<[Value]>,
 {
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        &mut self.values[index]
+        &mut self.vec_mut()[index]
     }
 }
 
 impl fmt::Debug for ArrayStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.values.fmt(formatter)
+        self.vec().fmt(formatter)
     }
 }
 
@@ -1438,6 +1546,24 @@ pub fn install_length_write_hook(hook: fn(&Value)) {
     let _ = LENGTH_WRITE.set(hook);
 }
 
+/// `array.length = n`: truncate, or extend with holes. A value that is not a
+/// uint32 is a RangeError in JS; the array is left untouched here. Growth is
+/// capped so a stray huge length cannot allocate gigabytes of hole slots.
+fn set_array_length(array: &mut ArrayStorage, value: &Value) {
+    const MAX_GROWTH: usize = 1 << 24;
+    let n = value.to_number();
+    if !(n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= u32::MAX as f64) {
+        return;
+    }
+    let new_len = n as usize;
+    let len = array.len();
+    if new_len < len {
+        array.truncate(new_len);
+    } else if new_len > len && new_len - len <= MAX_GROWTH {
+        array.resize_with(new_len, array_hole);
+    }
+}
+
 fn note_length_write(value: &Value) {
     if let Some(hook) = LENGTH_WRITE.get() {
         hook(value);
@@ -1524,13 +1650,31 @@ fn aot_function_meta(factory: AotFactory) -> Option<(&'static str, u32, bool)> {
         .and_then(|map| map.get(&(factory as usize)).copied())
 }
 
+/// Object-safe call surface for host closures.
+///
+/// A `Box<dyn Fn(..)>` vtable carries `call`, `call_mut` and `call_once` slots,
+/// and rustc emits a `FnOnce` by-value shim for every closure type to fill the
+/// last one. Thousands of host functions are erased through this path, so the
+/// shims, their vtable slots and the relocations for those slots add up to a
+/// large share of the binary. This trait exposes a single `invoke` slot.
+trait HostFn {
+    fn invoke(&self, this: Value, args: Vec<Value>) -> Value;
+}
+
+impl<F: Fn(Value, Vec<Value>) -> Value> HostFn for F {
+    #[inline]
+    fn invoke(&self, this: Value, args: Vec<Value>) -> Value {
+        self(this, args)
+    }
+}
+
 /// Callable body stored inside [`FunctionData`].
 ///
 /// Host / DOM / capture-adapter closures keep [`FunctionBody::Dyn`]. AOT
 /// `CreateClosure` uses [`FunctionBody::Aot`] so the page slab holds a fn
 /// pointer + captures without an extra `Box<dyn Fn>` allocation per closure.
 enum FunctionBody {
-    Dyn(Box<dyn Fn(Value, Vec<Value>) -> Value>),
+    Dyn(Box<dyn HostFn>),
     Aot {
         factory: AotFactory,
         captures: Box<AotCaptureMap>,
@@ -1607,7 +1751,7 @@ impl FunctionData {
     /// Rust closure type. Host / DOM / adapter sites still go through this path;
     /// AOT `CreateClosure` uses [`Self::from_aot`] instead.
     #[inline(never)]
-    fn from_erased(inner: Box<dyn Fn(Value, Vec<Value>) -> Value>) -> Self {
+    fn from_erased(inner: Box<dyn HostFn>) -> Self {
         Self::finish(FunctionBody::Dyn(inner))
     }
 
@@ -1687,7 +1831,7 @@ impl FunctionData {
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match &self.body {
-            FunctionBody::Dyn(inner) => inner(this, args),
+            FunctionBody::Dyn(inner) => inner.invoke(this, args),
             FunctionBody::Aot { factory, captures } => factory(this, &args, captures),
             FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
@@ -1697,7 +1841,7 @@ impl FunctionData {
     /// collect a `Vec`; AOT factories receive the slice directly.
     pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
         match &self.body {
-            FunctionBody::Dyn(inner) => inner(this, args.to_vec()),
+            FunctionBody::Dyn(inner) => inner.invoke(this, args.to_vec()),
             FunctionBody::Aot { factory, captures } => factory(this, args, captures),
             FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
@@ -1842,6 +1986,13 @@ impl Clone for JsFunction {
 }
 
 impl JsFunction {
+    pub fn aot_factory_address(&self) -> Option<usize> {
+        match &self.data().body {
+            FunctionBody::Aot { factory, .. } => Some(*factory as usize),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
         Self::from_host(Rc::new(FunctionData::new(f)))
@@ -2349,7 +2500,9 @@ impl Value {
             return Value::Bool(o.borrow().has(&key));
         }
         if let Some(function) = obj.as_function() {
-            return Value::Bool(function.has_own_property(&key));
+            return Value::Bool(
+                function.has_own_property(&key) || crate::builtins::function_prototype_has(&key),
+            );
         }
         if let Some(arr) = obj.as_array() {
             return if key == "length" {
@@ -2446,15 +2599,18 @@ impl Value {
             _ if self.is_string() => {
                 let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
-                    s.encode_utf16()
-                        .nth(idx)
+                    utf16_unit_at(&s, idx)
                         .and_then(|unit| String::from_utf16(&[unit]).ok())
                         .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(s.encode_utf16().count() as f64)
+                    Value::Number(utf16_len(&s) as f64)
                 } else {
-                    Value::Undefined
+                    // ToObject(string) inherits String.prototype: `s.startsWith`
+                    // and `s?.startsWith(...)` read the method by value.
+                    crate::builtins::string_value()
+                        .get_property("prototype")
+                        .get_property_with_receiver(key, self)
                 }
             }
             _ if self.as_number().is_some() || self.as_bool().is_some() => {
@@ -2489,7 +2645,11 @@ impl Value {
                         Value::Undefined
                     };
                 }
-                function.get_property(key)
+                let own = function.get_property(key);
+                if !own.is_undefined() || function.has_own_property(key) {
+                    return own;
+                }
+                crate::builtins::function_prototype_lookup(key, receiver)
             }
             _ => Value::Undefined,
         }
@@ -2627,6 +2787,8 @@ impl Value {
                     a.resize_with(idx + 1, array_hole);
                 }
                 a[idx] = value;
+            } else if key == "length" && crate::binary::typed_array_property(self, key).is_none() {
+                set_array_length(&mut arr.borrow_mut(), &value);
             }
             return true;
         }
@@ -2888,7 +3050,16 @@ impl Value {
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        match crate::page_arena::alloc_array(ArrayStorage::new(items)) {
+        Self::array_from_storage(ArrayStorage::new(items))
+    }
+
+    /// An array of `len` elements decoded by `decode` on first generic access.
+    pub fn lazy_array(len: usize, decode: impl FnOnce() -> Vec<Value> + 'static) -> Self {
+        Self::array_from_storage(ArrayStorage::new_lazy(len, decode))
+    }
+
+    fn array_from_storage(storage: ArrayStorage) -> Self {
+        match crate::page_arena::alloc_array(storage) {
             Ok(handle) => Value::Imm(Immediate::from_array_handle(handle)),
             Err(storage) => Value::Array(Rc::new(RefCell::new(storage))),
         }
@@ -3084,6 +3255,15 @@ impl Value {
     pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
+        }
+        if matches!(key, "toString" | "valueOf") && self.type_of() == "symbol" {
+            // Symbol values use a string sentinel internally, but their
+            // methods resolve through Symbol.prototype rather than the
+            // physical String prototype.
+            return crate::builtins::symbol_value()
+                .get_property("prototype")
+                .get_property(key)
+                .call(self.clone(), args);
         }
         if key == "__w3cos_symbol_to_primitive" && self.type_of() == "symbol" {
             // Symbols are string sentinels: `sym[Symbol.toPrimitive]()` (and
@@ -3295,8 +3475,15 @@ impl Value {
             }
             (this, "slice") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                // ASCII: UTF-16 units are bytes, so slice the text directly
+                // instead of re-encoding it on every call.
+                let ascii = is_ascii_js_string(&value);
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let normalize = |argument: Option<&Value>, fallback: i64| {
                     let raw = argument
                         .map(Value::to_number)
@@ -3311,12 +3498,20 @@ impl Value {
                 };
                 let start = normalize(args.first(), 0);
                 let end = normalize(args.get(1), length).max(start);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "substr") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                let ascii = is_ascii_js_string(&value);
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let raw_start = args
                     .first()
                     .map(Value::to_number)
@@ -3333,8 +3528,11 @@ impl Value {
                     .map(Value::to_number)
                     .filter(|number| number.is_finite())
                     .map(|number| number.trunc().max(0.0) as usize)
-                    .unwrap_or(units.len() - start);
-                let end = start.saturating_add(count).min(units.len());
+                    .unwrap_or(length as usize - start);
+                let end = start.saturating_add(count).min(length as usize);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "repeat") if this.is_string() => {
@@ -3393,11 +3591,22 @@ impl Value {
                 let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start_byte = string_index_to_byte(&value, start);
+                let ascii = is_ascii_js_string(&value);
+                let start_byte = if ascii {
+                    start.min(value.len())
+                } else {
+                    string_index_to_byte(&value, start)
+                };
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
-                    .map(|byte| value[..byte].chars().count() as f64)
+                    .map(|byte| {
+                        if ascii {
+                            byte as f64
+                        } else {
+                            value[..byte].chars().count() as f64
+                        }
+                    })
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
@@ -3429,14 +3638,15 @@ impl Value {
                 let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 let index = if index.is_nan() { 0.0 } else { index.trunc() };
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                if index < 0.0 || index >= units.len() as f64 {
+                if !index.is_finite() || index < 0.0 {
                     return Value::Undefined;
                 }
                 let index = index as usize;
-                let first = units[index];
+                let Some(first) = utf16_unit_at(&value, index) else {
+                    return Value::Undefined;
+                };
                 if (0xD800..0xDC00).contains(&first)
-                    && let Some(&second) = units.get(index + 1)
+                    && let Some(second) = utf16_unit_at(&value, index + 1)
                     && (0xDC00..0xE000).contains(&second)
                 {
                     let code = 0x10000
@@ -3454,9 +3664,7 @@ impl Value {
                     return Value::Number(f64::NAN);
                 }
                 return Value::Number(
-                    value
-                        .encode_utf16()
-                        .nth(index as usize)
+                    utf16_unit_at(&value, index as usize)
                         .map(f64::from)
                         .unwrap_or(f64::NAN),
                 );
@@ -3466,6 +3674,11 @@ impl Value {
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 {
                     return Value::from(String::new());
+                }
+                if is_ascii_js_string(&value) {
+                    return Value::from(
+                        value.get(index as usize..index as usize + 1).unwrap_or(""),
+                    );
                 }
                 return Value::from(
                     value
@@ -3477,7 +3690,12 @@ impl Value {
             }
             (this, "substring") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let len = value.chars().count();
+                let ascii = is_ascii_js_string(&value);
+                let len = if ascii {
+                    value.len()
+                } else {
+                    value.chars().count()
+                };
                 let mut start = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
                 let mut end = args
                     .get(1)
@@ -3488,6 +3706,9 @@ impl Value {
                 end = end.min(len);
                 if start > end {
                     std::mem::swap(&mut start, &mut end);
+                }
+                if ascii {
+                    return Value::from(&value[start..end]);
                 }
                 let start = string_index_to_byte(&value, start);
                 let end = string_index_to_byte(&value, end);
@@ -3513,6 +3734,92 @@ impl Value {
             (this, "trim") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
                 return Value::from(value.trim().to_string());
+            }
+            (this, "trimStart") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                return Value::from(value.trim_start_matches(is_js_whitespace).to_string());
+            }
+            (this, "trimEnd") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                return Value::from(value.trim_end_matches(is_js_whitespace).to_string());
+            }
+            (this, "toLocaleUpperCase") if this.is_string() => {
+                return Value::from(this.as_js_string().expect("string").to_uppercase());
+            }
+            (this, "toLocaleLowerCase") if this.is_string() => {
+                return Value::from(this.as_js_string().expect("string").to_lowercase());
+            }
+            (this, "normalize") if this.is_string() => {
+                // NFC is assumed for compiled sources; other forms are
+                // validated per spec but return the string unchanged.
+                let form = match args.first() {
+                    None => "NFC".to_string(),
+                    Some(value) if value.is_undefined() => "NFC".to_string(),
+                    Some(value) => value.to_js_string(),
+                };
+                if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                    crate::throw_value(range_error(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+                    ));
+                }
+                return this.clone();
+            }
+            // Rust strings hold no lone surrogates.
+            (this, "isWellFormed") if this.is_string() => return Value::Bool(true),
+            (this, "toWellFormed") if this.is_string() => return this.clone(),
+            (this, "at") if this.is_string() => {
+                let units: Vec<u16> = this
+                    .as_js_string()
+                    .expect("string")
+                    .encode_utf16()
+                    .collect();
+                let len = units.len() as f64;
+                let relative = args.first().map(Value::to_number).unwrap_or(0.0);
+                let relative = if relative.is_nan() {
+                    0.0
+                } else {
+                    relative.trunc()
+                };
+                let index = if relative < 0.0 {
+                    len + relative
+                } else {
+                    relative
+                };
+                if index < 0.0 || index >= len {
+                    return Value::Undefined;
+                }
+                return Value::from(String::from_utf16_lossy(
+                    &units[index as usize..index as usize + 1],
+                ));
+            }
+            (this, "concat") if this.is_string() => {
+                let mut out = this.to_js_string();
+                for arg in &args {
+                    out.push_str(&arg.to_js_string());
+                }
+                return Value::from(out);
+            }
+            (this, "replaceAll") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+                let replacement = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if let Some((_, flags)) = crate::regexp::parts(&pattern) {
+                    if !flags.contains('g') {
+                        crate::throw_value(type_error(
+                            "replaceAll must be called with a global RegExp",
+                        ));
+                    }
+                    if let Some(result) =
+                        crate::regexp::string_replace(&value, &pattern, &replacement)
+                    {
+                        return result;
+                    }
+                }
+                return Value::from(string_replace_all(
+                    &value,
+                    &pattern.to_js_string(),
+                    &replacement,
+                ));
             }
             (this, "split") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -3701,6 +4008,13 @@ impl Value {
                 return result;
             }
         }
+        if self.is_string() && crate::builtins::take_string_dispatch(key) {
+            // A `String.prototype` builtin forwarded here and no native
+            // implementation exists: looking it up again would recurse.
+            crate::throw_value(type_error(&format!(
+                "String.prototype.{key} is not supported"
+            )));
+        }
         self.get_property(key).call(self.clone(), args)
     }
 
@@ -3747,6 +4061,12 @@ impl Value {
         if let Some(values) = self.as_array() {
             return ValueIterator::new(LiveArrayIterator { values, index: 0 });
         }
+        if let Some(iterator) = crate::collections::default_collection_iter(self) {
+            return ValueIterator::boxed(iterator);
+        }
+        if self.is_string() && crate::builtins::string_iterator_is_builtin() {
+            return string_code_points(self);
+        }
         if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", vec![]) {
             return ValueIterator::new(ProtocolValueIterator {
                 iterator,
@@ -3757,16 +4077,7 @@ impl Value {
             return iterator;
         }
         match self {
-            _ if self.is_string() => {
-                let value = self.as_js_string().expect("string");
-                ValueIterator::new(
-                    value
-                        .chars()
-                        .map(|character| Value::from(character.to_string()))
-                        .collect::<Vec<_>>()
-                        .into_iter(),
-                )
-            }
+            _ if self.is_string() => string_code_points(self),
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled application paths.
@@ -3826,6 +4137,18 @@ impl Value {
 /// iterator object (which would create an uncollectable reference cycle).
 pub(crate) fn self_returning_iterator_method() -> Value {
     Value::function(|this, _| this)
+}
+
+/// The code points of a string value, as one-character strings.
+pub(crate) fn string_code_points(text: &Value) -> ValueIterator {
+    let value = text.as_js_string().expect("string");
+    ValueIterator::new(
+        value
+            .chars()
+            .map(|character| Value::from(character.to_string()))
+            .collect::<Vec<_>>()
+            .into_iter(),
+    )
 }
 
 pub(crate) fn iterator_object(iterator: ValueIterator) -> Value {
@@ -4003,6 +4326,100 @@ fn array_index(value: Option<&Value>, len: usize, default: usize) -> usize {
     }
 }
 
+/// Strings shorter than this are indexed by re-encoding from the start.
+const UTF16_CURSOR_MIN_LEN: usize = 256;
+
+thread_local! {
+    /// The last long string indexed by UTF-16 unit, with a char-boundary
+    /// cursor into it: `(string, unit index, byte offset)`. Holding the
+    /// `JsString` keeps its storage alive, so `ptr_eq` cannot see a reused
+    /// allocation. Scanners walk `charCodeAt(i)` forward one unit at a
+    /// time; without the cursor every call re-encodes the prefix and a
+    /// parse is quadratic in the text length.
+    static UTF16_CURSOR: RefCell<Option<(crate::JsString, usize, usize)>> =
+        const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The last long string whose UTF-16 length was measured. `s.length`
+    /// in a scanner loop (`while (i < s.length)`) reads it once per step;
+    /// re-encoding the whole text each time makes the loop quadratic.
+    /// Holding a clone keeps the `Rc` shared, so the text cannot be
+    /// mutated in place while cached.
+    static UTF16_LEN: RefCell<Option<(crate::JsString, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// Whether every character is ASCII (UTF-16 units, chars and bytes then
+/// coincide). Amortized O(1) for long strings via the [`utf16_len`] cache:
+/// the UTF-16 length equals the byte length only for all-ASCII text.
+pub(crate) fn is_ascii_js_string(value: &crate::JsString) -> bool {
+    utf16_len(value) == value.as_str().len()
+}
+
+/// `String.prototype.length`: the UTF-16 length, amortized O(1) for
+/// repeated reads of the same long string.
+pub(crate) fn utf16_len(value: &crate::JsString) -> usize {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().count();
+    }
+    if let Some(len) = UTF16_LEN.with(|cache| match &*cache.borrow() {
+        Some((cached, len)) if cached.ptr_eq(value) && cached.as_str().len() == text.len() => {
+            Some(*len)
+        }
+        _ => None,
+    }) {
+        return len;
+    }
+    let len = if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    };
+    UTF16_LEN.with(|cache| *cache.borrow_mut() = Some((value.clone(), len)));
+    len
+}
+
+/// The UTF-16 code unit at `index` (`String.prototype.charCodeAt`), or
+/// `None` past the end. Amortized O(1) for nearby indices on long strings.
+fn utf16_unit_at(value: &crate::JsString, index: usize) -> Option<u16> {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().nth(index);
+    }
+    let (mut unit, mut byte) = UTF16_CURSOR.with(|cursor| match &*cursor.borrow() {
+        Some((cached, unit, byte))
+            if cached.ptr_eq(value) && cached.as_str().len() == text.len() =>
+        {
+            (*unit, *byte)
+        }
+        _ => (0, 0),
+    });
+    if index < unit {
+        if index < unit / 2 {
+            (unit, byte) = (0, 0);
+        } else {
+            while unit > index {
+                let ch = text[..byte].chars().next_back()?;
+                byte -= ch.len_utf8();
+                unit -= ch.len_utf16();
+            }
+        }
+    }
+    let ch = loop {
+        let ch = text[byte..].chars().next()?;
+        if unit + ch.len_utf16() > index {
+            break ch;
+        }
+        byte += ch.len_utf8();
+        unit += ch.len_utf16();
+    };
+    UTF16_CURSOR.with(|cursor| *cursor.borrow_mut() = Some((value.clone(), unit, byte)));
+    let mut units = [0u16; 2];
+    Some(ch.encode_utf16(&mut units)[index - unit])
+}
+
 fn string_index_to_byte(value: &str, index: usize) -> usize {
     value
         .char_indices()
@@ -4045,7 +4462,7 @@ fn array_call_method(
         }
         "unshift" => {
             let mut values = values.borrow_mut();
-            values.values.splice(0..0, args.iter().cloned());
+            values.vec_mut().splice(0..0, args.iter().cloned());
             values.refresh_heap_accounting();
             Value::Number(values.len() as f64)
         }
@@ -4281,7 +4698,7 @@ fn array_call_method(
                 _ => left.to_js_string().cmp(&right.to_js_string()),
             });
             let mut values = values.borrow_mut();
-            values.values = sorted;
+            values.replace_values(sorted);
             values.refresh_heap_accounting();
             this.clone()
         }
@@ -4884,6 +5301,18 @@ pub fn throw_value(value: Value) -> ! {
             message.to_js_string()
         };
         eprintln!("[js.throw] {detail}");
+        if let Some(patterns) = std::env::var_os("W3COS_THROW_BT") {
+            let patterns = patterns.to_string_lossy().into_owned();
+            if patterns
+                .split('|')
+                .any(|p| !p.is_empty() && detail.contains(p))
+            {
+                eprintln!(
+                    "[js.throw.bt]\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
     }
     std::panic::panic_any(PanicValue(value))
 }
@@ -4926,6 +5355,81 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
         Ok(result) => result,
         Err(payload) => Err(panic_payload_to_throw(payload)),
     }
+}
+
+/// ECMAScript WhiteSpace and LineTerminator code points (String.prototype.trim*).
+fn is_js_whitespace(c: char) -> bool {
+    c.is_whitespace() || c == '\u{FEFF}'
+}
+
+/// `String.prototype.replaceAll` with a string search value
+/// (StringIndexOf over UTF-16 positions, GetSubstitution for `$` patterns).
+fn string_replace_all(input: &str, search: &str, replacement: &Value) -> String {
+    let mut positions = Vec::new();
+    if search.is_empty() {
+        positions.extend(input.char_indices().map(|(byte, _)| byte));
+        positions.push(input.len());
+    } else {
+        let mut from = 0;
+        while let Some(found) = input[from..].find(search) {
+            positions.push(from + found);
+            from += found + search.len();
+        }
+    }
+    if positions.is_empty() {
+        return input.to_string();
+    }
+    let template = (!replacement.is_callable()).then(|| replacement.to_js_string());
+    let mut out = String::with_capacity(input.len());
+    let mut end = 0;
+    for byte in positions {
+        out.push_str(&input[end..byte]);
+        let matched_end = byte + search.len();
+        match &template {
+            None => {
+                let result = replacement.call(
+                    Value::Undefined,
+                    vec![
+                        Value::from(search),
+                        Value::Number(input[..byte].encode_utf16().count() as f64),
+                        Value::from(input),
+                    ],
+                );
+                out.push_str(&result.to_js_string());
+            }
+            Some(template) => {
+                let mut chars = template.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c != '$' {
+                        out.push(c);
+                        continue;
+                    }
+                    match chars.peek() {
+                        Some('$') => {
+                            out.push('$');
+                            chars.next();
+                        }
+                        Some('&') => {
+                            out.push_str(search);
+                            chars.next();
+                        }
+                        Some('`') => {
+                            out.push_str(&input[..byte]);
+                            chars.next();
+                        }
+                        Some('\'') => {
+                            out.push_str(&input[matched_end..]);
+                            chars.next();
+                        }
+                        _ => out.push('$'),
+                    }
+                }
+            }
+        }
+        end = matched_end;
+    }
+    out.push_str(&input[end..]);
+    out
 }
 
 #[cfg(test)]
@@ -5441,6 +5945,99 @@ mod tests {
     }
 
     #[test]
+    fn strings_expose_symbol_iterator_as_a_property() {
+        let text = Value::string("A😀b");
+        let method = text.get_property("__w3cos_symbol_iterator");
+        assert!(method.is_callable());
+        let proto = crate::builtins::string_value().get_property("prototype");
+        assert_eq!(proto.get_property("__w3cos_symbol_iterator"), method);
+        let iterator = method.call(text.clone(), vec![]);
+        let values: Vec<String> = iterator.iter().map(|v| v.to_js_string()).collect();
+        assert_eq!(values, ["A", "😀", "b"]);
+        // `for...of` keeps the native path, and honours an override.
+        assert_eq!(text.iter().count(), 3);
+        proto.set_property(
+            "__w3cos_symbol_iterator",
+            Value::function(|_, _| {
+                Value::array(vec![Value::string("z")])
+                    .call_method("__w3cos_symbol_iterator", vec![])
+            }),
+        );
+        let overridden: Vec<String> = text.iter().map(|v| v.to_js_string()).collect();
+        proto.set_property("__w3cos_symbol_iterator", method);
+        assert_eq!(overridden, ["z"]);
+        assert!(crate::builtins::string_iterator_is_builtin());
+    }
+
+    #[test]
+    fn every_string_prototype_builtin_dispatches_without_recursion() {
+        let proto = crate::builtins::string_value().get_property("prototype");
+        let receiver = Value::from(" aXa ");
+        for &(name, _) in crate::builtins::STRING_METHODS {
+            let method = proto.get_property(name);
+            assert!(method.is_callable(), "{name}");
+            let args = match name {
+                "replace" | "replaceAll" => vec![Value::from("a"), Value::from("b")],
+                "match" | "matchAll" | "search" | "split" => vec![Value::from("a")],
+                _ => vec![Value::from("a")],
+            };
+            // Must return or throw a JS error, never overflow the stack.
+            let _ = catch_js(|| method.call(receiver.clone(), args));
+        }
+        let call = |name: &str, args: Vec<Value>| {
+            proto
+                .get_property(name)
+                .call(Value::from(" aXa "), args)
+                .to_js_string()
+        };
+        assert_eq!(call("trimStart", vec![]), "aXa ");
+        assert_eq!(call("trimEnd", vec![]), " aXa");
+        assert_eq!(call("toLocaleUpperCase", vec![]), " AXA ");
+        assert_eq!(call("toLocaleLowerCase", vec![]), " axa ");
+        assert_eq!(call("normalize", vec![]), " aXa ");
+        assert_eq!(call("isWellFormed", vec![]), "true");
+        assert_eq!(call("toWellFormed", vec![]), " aXa ");
+        assert_eq!(call("at", vec![Value::Number(-2.0)]), "a");
+        assert_eq!(call("at", vec![Value::Number(9.0)]), "undefined");
+        assert_eq!(
+            call("concat", vec![Value::from(1.0), Value::from("!")]),
+            " aXa 1!"
+        );
+        assert_eq!(
+            call("replaceAll", vec![Value::from("a"), Value::from("[$&]")]),
+            " [a]X[a] "
+        );
+        assert_eq!(
+            call("replaceAll", vec![Value::from(""), Value::from("-")]),
+            "- -a-X-a- -"
+        );
+        let thrown = catch_js(|| {
+            proto
+                .get_property("normalize")
+                .call(Value::from("x"), vec![Value::from("bogus")])
+        });
+        assert!(thrown.is_err());
+    }
+
+    #[test]
+    fn string_dispatch_guard_throws_instead_of_recursing() {
+        let proto = crate::builtins::string_value().get_property("prototype");
+        // Mimic a String.prototype builtin without a native arm: it forwards
+        // to call_method, whose generic lookup finds the builtin again.
+        proto.set_property(
+            "noNativeArm",
+            Value::function(|this, args| {
+                let _dispatch = crate::builtins::StringDispatch::enter("noNativeArm");
+                this.call_method("noNativeArm", args)
+            }),
+        );
+        let thrown = catch_js(|| Value::from("abc").call_method("noNativeArm", vec![]));
+        proto.delete_property("noNativeArm");
+        let error = thrown.expect_err("guard must throw");
+        assert!(error.to_js_string().contains("not supported"), "{error:?}");
+    }
+
+    #[test]
     fn string_methods_cover_token_parsing() {
         let token = Value::String("source.ts".into());
         let path = Value::String("/a/b/c".into());
@@ -5495,6 +6092,158 @@ mod tests {
                 .call_method("charCodeAt", vec![Value::Number(2.0)])
                 .to_number()
                 .is_nan()
+        );
+    }
+
+    #[test]
+    fn long_string_char_code_at_matches_utf16_in_any_order() {
+        // Long enough for the UTF-16 cursor; mixes 1-, 2-, 3- and 4-byte
+        // characters so unit and byte offsets diverge (astral = 2 units).
+        let text: String = "a\u{e9}\u{20ac}\u{1f600}x".repeat(200);
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let value = Value::from(text.as_str());
+        let other = Value::from("z".repeat(300).as_str());
+        let char_code =
+            |v: &Value, i: usize| v.call_method("charCodeAt", vec![Value::Number(i as f64)]);
+        // Forward, backward, random jumps, and interleaved with another
+        // long string (which takes over the cursor).
+        let mut order: Vec<usize> = (0..units.len()).collect();
+        order.extend((0..units.len()).rev());
+        order.extend((0..units.len()).map(|i| (i * 7919) % units.len()));
+        for (step, &index) in order.iter().enumerate() {
+            assert_eq!(
+                char_code(&value, index),
+                Value::Number(f64::from(units[index])),
+                "index {index}"
+            );
+            if step % 97 == 0 {
+                assert_eq!(
+                    char_code(&other, step % 300),
+                    Value::Number(f64::from(b'z'))
+                );
+            }
+        }
+        assert!(char_code(&value, units.len()).to_number().is_nan());
+        // codePointAt pairs surrogates and reports a lone low surrogate.
+        let astral = units
+            .iter()
+            .position(|unit| (0xD800..0xDC00).contains(unit))
+            .unwrap();
+        assert_eq!(
+            value.call_method("codePointAt", vec![Value::Number(astral as f64)]),
+            Value::Number(f64::from(0x1f600))
+        );
+        assert_eq!(
+            value.call_method("codePointAt", vec![Value::Number((astral + 1) as f64)]),
+            Value::Number(f64::from(units[astral + 1]))
+        );
+        assert_eq!(
+            value.call_method("codePointAt", vec![Value::Number(units.len() as f64)]),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn long_string_char_code_at_scan_is_linear() {
+        // 2 MB scanned unit by unit: quadratic re-encoding would take
+        // minutes; the cursor makes it a single pass.
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let started = std::time::Instant::now();
+        let mut sum = 0.0;
+        for index in 0..text.len() {
+            sum += value
+                .call_method("charCodeAt", vec![Value::Number(index as f64)])
+                .to_number();
+        }
+        assert_eq!(sum, text.bytes().map(f64::from).sum::<f64>());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_string_length_and_index_scan_is_linear() {
+        // `for (i = 0; i < s.length; i++) s[i]` over a 2 MB string: each
+        // step reads `length` and an index; both must be amortized O(1).
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let other = Value::from("\u{e9}\u{1f600}".repeat(200).as_str());
+        let started = std::time::Instant::now();
+        let mut index = 0usize;
+        let mut bytes = 0usize;
+        while (index as f64) < value.get_property("length").to_number() {
+            bytes += value.get_property(&index.to_string()).to_js_string().len();
+            if index % 50_000 == 0 {
+                // Another long string takes over the caches; non-ASCII
+                // lengths count UTF-16 units (astral = 2).
+                assert_eq!(other.get_property("length"), Value::Number(600.0));
+                assert_eq!(other.get_property("0"), Value::from("\u{e9}"));
+            }
+            index += 1;
+        }
+        assert_eq!((index, bytes), (text.len(), text.len()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_ascii_string_slicing_is_linear_and_matches_unicode_path() {
+        // hexBytes-style `s.substr(i, 2)` / `s.slice(i, i + 2)` scans over
+        // a 2 MB string: each call used to re-encode the whole text.
+        let text = "0123456789abcdef".repeat(130_000);
+        let value = Value::from(text.as_str());
+        let started = std::time::Instant::now();
+        let mut i = 0usize;
+        while i + 1 < text.len() {
+            let expected = Value::from(&text[i..i + 2]);
+            let n = |x: usize| Value::Number(x as f64);
+            assert_eq!(value.call_method("substr", vec![n(i), n(2)]), expected);
+            assert_eq!(value.call_method("slice", vec![n(i), n(i + 2)]), expected);
+            assert_eq!(
+                value.call_method("substring", vec![n(i + 2), n(i)]),
+                expected
+            );
+            assert_eq!(
+                value.call_method("charAt", vec![n(i)]),
+                Value::from(&text[i..i + 1])
+            );
+            i += 2_001;
+        }
+        for i in (0..text.len()).step_by(3) {
+            let _ = value.call_method("substr", vec![Value::Number(i as f64), Value::Number(2.0)]);
+        }
+        assert_eq!(
+            value.call_method("indexOf", vec![Value::from("f0"), Value::Number(20.0)]),
+            Value::Number(31.0)
+        );
+        assert_eq!(
+            value.call_method("slice", vec![Value::Number(-3.0)]),
+            Value::from("def")
+        );
+        assert_eq!(
+            value.call_method("substr", vec![Value::Number(-2.0)]),
+            Value::from("ef")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        // Long non-ASCII strings keep the UTF-16 path (astral = 2 units).
+        let wide = Value::from("\u{1f600}ab".repeat(100).as_str());
+        assert_eq!(
+            wide.call_method("slice", vec![Value::Number(2.0), Value::Number(4.0)]),
+            Value::from("ab")
+        );
+        assert_eq!(
+            wide.call_method("substr", vec![Value::Number(4.0), Value::Number(2.0)]),
+            Value::from("\u{1f600}")
         );
     }
 
@@ -5606,6 +6355,34 @@ mod tests {
             Value::Number(9.0).js_pow(&Value::Number(0.5)).to_number(),
             3.0
         );
+    }
+
+    #[test]
+    fn functions_inherit_call_apply_bind_as_property_values() {
+        let function = Value::function(|this, args| {
+            Value::Number(this.get_property("base").to_number() + args[0].to_number())
+        });
+        let receiver = Value::object(HashMap::from([("base".to_string(), Value::Number(1.0))]));
+        let call = function.get_property("call");
+        assert!(call.is_callable());
+        assert!(Value::string("apply").js_in(&function).to_bool());
+        assert!(!Value::string("missing").js_in(&function).to_bool());
+        assert_eq!(
+            call.call(function.clone(), vec![receiver.clone(), Value::Number(2.0)])
+                .to_number(),
+            3.0
+        );
+        let apply = function.get_property("apply");
+        assert_eq!(
+            apply
+                .call(
+                    function.clone(),
+                    vec![receiver, Value::array(vec![Value::Number(4.0)])],
+                )
+                .to_number(),
+            5.0
+        );
+        assert!(function.get_property("bind").is_callable());
     }
 
     #[test]
@@ -6030,6 +6807,26 @@ mod tests {
             Some(crate::promise::PromiseStatus::Rejected(reason))
                 if reason == Value::string("close")
         ));
+    }
+
+    #[test]
+    fn writing_array_length_truncates_or_extends_with_holes() {
+        let arr = Value::array((0..5).map(|n| Value::Number(n as f64)).collect());
+        arr.set_property("length", Value::Number(2.0));
+        assert_eq!(arr.get_property("length").to_number(), 2.0);
+        assert!(arr.get_property("2").is_undefined());
+        assert_eq!(arr.get_property("1").to_number(), 1.0);
+        arr.set_property("length", Value::Number(4.0));
+        assert_eq!(arr.get_property("length").to_number(), 4.0);
+        assert!(arr.get_property("3").is_undefined());
+        arr.set_property("length", Value::Number(0.0));
+        assert_eq!(arr.get_property("length").to_number(), 0.0);
+        // Not a uint32: JS throws a RangeError; the array must stay intact.
+        arr.set_property("0", Value::Number(9.0));
+        for bad in [-1.0, 1.5, f64::NAN, f64::INFINITY] {
+            arr.set_property("length", Value::Number(bad));
+            assert_eq!(arr.get_property("length").to_number(), 1.0, "{bad}");
+        }
     }
 
     #[test]
@@ -6758,7 +7555,7 @@ pub(crate) mod leak_edges {
 
     impl ArrayStorage {
         pub(crate) fn leak_edges(&self, out: &mut Vec<(String, LeakTarget)>) {
-            for (index, value) in self.values.iter().enumerate() {
+            for (index, value) in self.vec().iter().enumerate() {
                 push_value(out, format!("[{index}]"), value);
             }
         }

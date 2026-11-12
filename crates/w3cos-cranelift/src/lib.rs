@@ -406,6 +406,10 @@ helper!(h_define_field, |f, object, key, value, _d| {
     intrinsics::define_field(reg(f, object), reg(f, key), reg(f, value).clone());
     Ok(())
 });
+helper!(h_define_method, |f, object, key, value, _d| {
+    intrinsics::define_method(reg(f, object), reg(f, key), reg(f, value).clone());
+    Ok(())
+});
 helper!(h_create_object, |f, dst, list_index, _c, _d| {
     let pairs = list(f, list_index)
         .chunks(2)
@@ -744,6 +748,7 @@ pub fn op_name(instruction: &Instruction) -> &'static str {
         Instruction::DeleteProperty { .. } => "DeleteProperty",
         Instruction::SetProperty { .. } => "SetProperty",
         Instruction::DefineField { .. } => "DefineField",
+        Instruction::DefineMethod { .. } => "DefineMethod",
         Instruction::CreateObject { .. } => "CreateObject",
         Instruction::CopyDataProperties { .. } => "CopyDataProperties",
         Instruction::CreateArray { .. } => "CreateArray",
@@ -1082,6 +1087,10 @@ impl Emitter<'_> {
                     }
                     Instruction::DefineField { object, key, value } => {
                         let s = call(&mut b, h_define_field, object.0, key.0, value.0, 0);
+                        checked(&mut b, s);
+                    }
+                    Instruction::DefineMethod { object, key, value } => {
+                        let s = call(&mut b, h_define_method, object.0, key.0, value.0, 0);
                         checked(&mut b, s);
                     }
                     Instruction::CreateObject { dst, properties } => {
@@ -1452,7 +1461,8 @@ fn boxed_reads(instruction: &Instruction) -> Vec<u32> {
         Instruction::SetProperty {
             object, key, value, ..
         }
-        | Instruction::DefineField { object, key, value } => {
+        | Instruction::DefineField { object, key, value }
+        | Instruction::DefineMethod { object, key, value } => {
             push(object);
             push(key);
             push(value);

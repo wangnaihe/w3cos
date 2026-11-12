@@ -65,8 +65,14 @@ pub fn analyze_unique_back_edges(
     for block in &function.blocks {
         let mut origins: HashMap<u32, RegOrigin> = HashMap::new();
         let mut fresh_closures: HashMap<u32, Vec<(FunctionId, Vec<BindingId>)>> = HashMap::new();
+        // Keys proven before `instruction`, advanced one step per iteration
+        // (rebuilding the prefix each time was quadratic on bundled blocks).
+        let mut proven_before: HashMap<u32, String> = HashMap::new();
         for (index, instruction) in block.instructions.iter().enumerate() {
-            let proven = proven_string_keys(&block.instructions, index);
+            if let Some(previous) = index.checked_sub(1) {
+                advance_proven_string_keys(&mut proven_before, &block.instructions[previous]);
+            }
+            let proven = &proven_before;
             match instruction {
                 Instruction::LoadBinding { dst, binding } => {
                     origins.insert(dst.0, RegOrigin::Binding(*binding));
@@ -123,7 +129,8 @@ pub fn analyze_unique_back_edges(
                 Instruction::SetProperty {
                     object, key, value, ..
                 }
-                | Instruction::DefineField { object, key, value } => {
+                | Instruction::DefineField { object, key, value }
+                | Instruction::DefineMethod { object, key, value } => {
                     note_fresh_closure(&origins, &mut fresh_closures, *object, *value);
                     if proven.get(&key.0).is_none() {
                         saw_dynamic_assignment = true;
@@ -332,24 +339,20 @@ fn push_closure_origin(
     }
 }
 
-fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32, String> {
-    let mut known = HashMap::new();
-    for instruction in &instructions[..index] {
-        match instruction {
-            Instruction::LoadConstant {
-                dst,
-                value: Constant::String(value),
-            } => {
-                known.insert(dst.0, value.clone());
-            }
-            other => {
-                if let Some(dst) = written_register(other) {
-                    known.remove(&dst.0);
-                }
+fn advance_proven_string_keys(known: &mut HashMap<u32, String>, instruction: &Instruction) {
+    match instruction {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::String(value),
+        } => {
+            known.insert(dst.0, value.clone());
+        }
+        other => {
+            if let Some(dst) = written_register(other) {
+                known.remove(&dst.0);
             }
         }
     }
-    known
 }
 
 fn written_register(instruction: &Instruction) -> Option<Register> {
@@ -378,6 +381,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(*dst),
@@ -439,6 +443,28 @@ mod tests {
             plan.warnings.is_empty(),
             "unique self-install must not warn: {:?}",
             plan.warnings
+        );
+    }
+
+    #[test]
+    fn reassigned_back_edge_capture_stays_a_writable_cell() {
+        // A weakened capture has no setter: `pending = undefined` inside the
+        // reaction threw "captured binding is immutable" (Code-OSS).
+        let (_, generated) = analyze_named(
+            r#"
+                function track(job) {
+                    let pending = job;
+                    pending.then(() => { pending = undefined; });
+                    return job;
+                }
+                track;
+            "#,
+            "track",
+            "app:///reassigned-promise-reaction.js",
+        );
+        assert!(
+            !is_rewritten(&generated),
+            "a reassigned capture must not become a setter-less WeakRef: {generated}"
         );
     }
 

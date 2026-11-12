@@ -80,6 +80,66 @@ pub struct CompileOptions {
     /// Emit a component bundle loaded by the system runtime instead of a
     /// standalone binary with the runtime linked statically.
     pub shared_runtime: bool,
+    /// Package assets/CJK-Subset.ttf. Off unless W3COS_EMBED_CJK_FONT opts in.
+    pub embed_cjk_font: bool,
+}
+
+pub(crate) const DESKTOP_IMAGE_FEATURES: &[&str] = &[
+    "image-png",
+    "image-jpeg",
+    "image-webp",
+    "image-gif",
+    "image-bmp",
+    "image-ico",
+];
+
+pub(crate) const MOBILE_IMAGE_FEATURES: &[&str] = &["image-png", "image-jpeg", "image-webp"];
+
+/// `W3COS_EMBED_CJK_FONT=0/false/off/no` forces the subset off. Any other
+/// non-empty value forces it on. An unset variable uses `options`.
+pub(crate) fn embed_cjk_font_enabled(options: &CompileOptions) -> bool {
+    if let Ok(value) = std::env::var("W3COS_EMBED_CJK_FONT") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        }
+    }
+    options.embed_cjk_font
+}
+
+pub(crate) fn push_feature(features: &mut Vec<String>, feature: &str) {
+    if !features.iter().any(|existing| existing == feature) {
+        features.push(feature.to_string());
+    }
+}
+
+pub(crate) fn append_desktop_codecs(features: &mut Vec<String>, options: &CompileOptions) {
+    // Code-OSS's CPU-rendered desktop loads its file-icon face from
+    // seti.woff. Keep the capability on the generated product manifest, while
+    // the renderer-free ordinary-AOT linkage probe remains WOFF-free.
+    if features.iter().any(|feature| feature == "cpu-render") {
+        push_feature(features, "woff");
+    }
+    for feature in DESKTOP_IMAGE_FEATURES {
+        push_feature(features, feature);
+    }
+    if embed_cjk_font_enabled(options) {
+        push_feature(features, "embed-cjk-font");
+    }
+}
+
+pub(crate) fn format_features(features: &[String]) -> String {
+    format!(
+        "[{}]",
+        features
+            .iter()
+            .map(|feature| format!("{feature:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 pub(crate) const GENERATED_RELEASE_PROFILE: &str = r#"
@@ -94,6 +154,24 @@ lto = "fat"
 codegen-units = 1
 panic = "unwind"
 strip = "symbols"
+
+# The engine crates are the hot path (value ops, DOM, style, layout). At
+# opt-level "z" their generic std code (iterators, char decoding, hashing,
+# slice compares) stays out of line and the machine outliner splits hot
+# loops: md-stream-append ran 2.4x slower than opt-level 3. opt-level 2
+# keeps them as fast as 3 (measured) for +4.2 MB on a 12.4 MB binary; the
+# generated application code and third-party crates stay at "z".
+[profile.release.package.w3cos-core]
+opt-level = 2
+
+[profile.release.package.w3cos-std]
+opt-level = 2
+
+[profile.release.package.w3cos-dom]
+opt-level = 2
+
+[profile.release.package.w3cos-runtime]
+opt-level = 2
 "#;
 
 /// Replace the standalone `fn main` with the versioned C entry the system
@@ -229,13 +307,11 @@ pub fn generate_cargo_toml(
     let workspace_root = find_workspace_root()?;
     let runtime_path = workspace_root.join("crates/w3cos-runtime");
     let std_path = workspace_root.join("crates/w3cos-std");
-    let runtime_features = if options.devtools {
-        r#"["gpu", "devtools"]"#.to_string()
-    } else if let Some(custom) = std::env::var("W3COS_RUNTIME_FEATURES")
+    let mut runtime_features = if let Some(custom) = std::env::var("W3COS_RUNTIME_FEATURES")
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        let features = custom
+        custom
             .split(',')
             .map(str::trim)
             .filter(|feature| {
@@ -244,13 +320,20 @@ pub fn generate_cargo_toml(
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
             })
-            .map(|feature| format!("{feature:?}"))
+            .map(str::to_string)
             .collect::<Vec<_>>()
-            .join(", ");
-        format!("[{features}]")
     } else {
-        r#"["gpu"]"#.to_string()
+        let mut features = vec!["gpu".to_string()];
+        if options.devtools {
+            features.push("devtools".to_string());
+        }
+        features
     };
+    if options.devtools {
+        push_feature(&mut runtime_features, "devtools");
+    }
+    append_desktop_codecs(&mut runtime_features, options);
+    let runtime_features = format_features(&runtime_features);
 
     Ok(format!(
         r#"[package]
@@ -1111,6 +1194,18 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     if let Some(ref value) = s.grid_column {
         fields.push(format!("grid_column: Some({value:?}.to_string())"));
     }
+    if let Some(ref value) = s.grid_template_rows {
+        fields.push(format!("grid_template_rows: Some({value:?}.to_string())"));
+    }
+    if let Some(ref value) = s.grid_template_areas {
+        fields.push(format!("grid_template_areas: Some({value:?}.to_string())"));
+    }
+    if let Some(ref value) = s.grid_row {
+        fields.push(format!("grid_row: Some({value:?}.to_string())"));
+    }
+    if let Some(ref value) = s.grid_area {
+        fields.push(format!("grid_area: Some({value:?}.to_string())"));
+    }
     if let Some(ref mw) = s.max_width {
         fields.push(format!("max_width: {}", gen_dimension(mw)));
     }
@@ -1389,7 +1484,7 @@ fn gen_animation_rust(value: &str) -> Option<String> {
         _ => "Easing::Ease",
     };
     Some(format!(
-        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None }})",
+        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None, paused: false }})",
         a.name, a.duration_ms, a.delay_ms
     ))
 }
@@ -1718,6 +1813,18 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     if let Some(ref value) = style.grid_column {
         out.push_str(&sp("grid-column", value));
     }
+    if let Some(ref value) = style.grid_template_rows {
+        out.push_str(&sp("grid-template-rows", value));
+    }
+    if let Some(ref value) = style.grid_template_areas {
+        out.push_str(&sp("grid-template-areas", value));
+    }
+    if let Some(ref value) = style.grid_row {
+        out.push_str(&sp("grid-row", value));
+    }
+    if let Some(ref value) = style.grid_area {
+        out.push_str(&sp("grid-area", value));
+    }
     if let Some(ref w) = style.width {
         out.push_str(&sp("width", w));
     }
@@ -1917,7 +2024,7 @@ mod tests {
         };
         let toml = generate_cargo_toml(std::path::Path::new("."), &opts).unwrap();
         assert!(
-            toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
+            toml.contains(r#"default-features = false, features = ["gpu", "devtools", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]"#),
             "devtools feature missing: {toml}"
         );
     }
@@ -1927,7 +2034,7 @@ mod tests {
         let toml =
             generate_cargo_toml(std::path::Path::new("."), &CompileOptions::default()).unwrap();
         assert!(
-            toml.contains(r#"default-features = false, features = ["gpu"]"#),
+            toml.contains(r#"default-features = false, features = ["gpu", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]"#),
             "desktop applications must link one renderer: {toml}"
         );
         assert!(toml.contains("opt-level = \"z\""), "{toml}");
@@ -1935,6 +2042,33 @@ mod tests {
         assert!(toml.contains("codegen-units = 1"), "{toml}");
         assert!(toml.contains("panic = \"unwind\""), "{toml}");
         assert!(toml.contains("strip = \"symbols\""), "{toml}");
+        for engine in ["w3cos-core", "w3cos-std", "w3cos-dom", "w3cos-runtime"] {
+            assert!(
+                toml.contains(&format!(
+                    "[profile.release.package.{engine}]\nopt-level = 2"
+                )),
+                "{engine} must be speed-optimized inside the size profile: {toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_oss_cpu_render_manifest_features_include_woff_without_dynamic_js() {
+        let mut features = vec!["cpu-render".to_string()];
+        append_desktop_codecs(&mut features, &CompileOptions::default());
+        let manifest_features = format_features(&features);
+        assert!(manifest_features.contains(r#""cpu-render""#));
+        assert!(manifest_features.contains(r#""woff""#));
+        assert!(!manifest_features.contains(r#""dynamic-js""#));
+        append_desktop_codecs(&mut features, &CompileOptions::default());
+        assert_eq!(
+            features.iter().filter(|feature| *feature == "woff").count(),
+            1
+        );
+
+        let mut ordinary_aot_features = Vec::new();
+        append_desktop_codecs(&mut ordinary_aot_features, &CompileOptions::default());
+        assert!(!format_features(&ordinary_aot_features).contains(r#""woff""#));
     }
 
     #[test]

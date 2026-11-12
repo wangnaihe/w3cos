@@ -488,3 +488,541 @@ fn real_world_commonjs_packages_match_node() {
     }
     assert!(failures.is_empty(), "real packages failing: {failures:?}");
 }
+
+/// Class elements are non-enumerable: Code-OSS's `ProxyChannel.fromService`
+/// walks a service with `for-in` and must not see prototype methods such as
+/// `onDynamicBrowserViewEvent` (Node 20 output).
+#[test]
+fn class_methods_accessors_and_constructor_are_not_enumerable() {
+    let root = write_fixture(
+        "w3cos_class_method_enumerability",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class Base { baseMethod() {} get g() { return 1 } static s() {} }
+class Svc extends Base { constructor() { super(); this.own = 1; this.onDidX = 2 } onDynamicFoo(a) { return this.own } }
+const keys = []; for (const k in new Svc()) keys.push(k)
+console.log(keys.join(','))
+console.log(JSON.stringify(Object.getOwnPropertyDescriptor(Svc.prototype, 'onDynamicFoo')))
+console.log(Object.keys(Svc.prototype).join(','), Object.keys(Svc).join(','))
+const o = { m() {}, get a() { return 1 } }; const ok = []; for (const k in o) ok.push(k); console.log(ok.join(','))
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_class_method_enumerability",
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "own,onDidX",
+            "{\"configurable\":true,\"enumerable\":false,\"writable\":true}",
+            " ",
+            "m,a",
+        ]
+    );
+}
+
+/// `super(message)` from a class extending a builtin error installs the
+/// error's own fields on the derived instance, and classes own their
+/// `name` (Node: validateString's ERR_INVALID_ARG_TYPE message).
+#[test]
+fn error_subclass_super_sets_message_and_classes_own_name() {
+    let root = write_fixture(
+        "w3cos_error_subclass_super",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class A extends Error { constructor(m) { super(m) } }
+class B extends Error { constructor(m) { const x = m + "!"; super(x) } }
+class C extends Error { constructor(m) { let msg = `a${m}`; super(msg) } }
+class D extends Error { constructor(n) { let d; if (n) { d = 1 } else { d = 2 } super("d" + d) } }
+class F extends Error { constructor(m) { let msg = "x"; msg += m; super(msg) } }
+class G extends Error { constructor(m, e) { e = e.replace(/^not /, ""); super(m + e) } }
+class H extends Error { constructor(m) { super(m); this.code = 1 } }
+for (const K of [A, B, C, D, F, G, H]) console.log(K.name, JSON.stringify(new K("m", "not y").message))
+class Plain {}
+const e = new A("boom");
+class K2 extends Error {}
+console.log(new K2("k", { cause: 7 }).cause, new K2("k").message)
+console.log(Plain.name, A.name, e instanceof A, e instanceof Error, String(e), e.stack.split("\n")[0], Object.keys(e).length)
+class T extends TypeError { constructor(m) { super(m); this.name = "T" } }
+console.log(String(new T("bad")), new T("x") instanceof TypeError, e.cause)
+function mk() { class Inner extends RangeError { constructor(m) { super(m) } } return Inner }
+const I = mk();
+console.log(I.name, new I("r").message, new I("r") instanceof RangeError)
+class S { static name = "custom" }
+class N { static get name() { return "getter" } }
+console.log(S.name, N.name, Object.keys(A).length, Object.keys(Plain).length)
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_error_subclass_super");
+    assert_eq!(
+        lines,
+        vec![
+            "A \"m\"",
+            "B \"m!\"",
+            "C \"am\"",
+            "D \"d1\"",
+            "F \"xm\"",
+            "G \"my\"",
+            "H \"m\"",
+            "7 k",
+            "Plain A true true Error: boom Error: boom 0",
+            "T: bad true undefined",
+            "Inner r true",
+            "custom getter 0 0",
+        ]
+    );
+}
+
+/// `new.target` in a class constructor (and arrows inside it) is the class
+/// that was constructed, also through `super()` (zod's `ZodError` does
+/// `Object.setPrototypeOf(this, new.target.prototype)` after `super()`).
+#[test]
+fn class_constructor_new_target_is_the_constructed_class() {
+    let root = write_fixture(
+        "w3cos_class_new_target",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class Base { constructor() { this.kind = new.target.name; const arrow = () => new.target; this.same = arrow() === new.target } }
+class Derived extends Base { constructor() { super(); this.proto = new.target.prototype === Derived.prototype } }
+class ZodError extends Error { constructor(issues) { super(); const actualProto = new.target.prototype; Object.setPrototypeOf(this, actualProto); this.issues = issues } }
+const b = new Base();
+const d = new Derived();
+const z = new ZodError([1]);
+console.log(b.kind, b.same, d.kind, d.same, d.proto)
+console.log(z instanceof ZodError, z instanceof Error, z.issues.length)
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_class_new_target");
+    assert_eq!(lines, vec!["Base true Derived true true", "true true 1"]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A destructuring assignment inside a closure writes the enclosing
+/// function's bindings (esbuild's lazy `init_*` bodies do
+/// `({ PNG } = require("./utilsBundle"))` on module-level `var`s), and
+/// rest parameters may be patterns (`registerSession(...[session, opts])`).
+#[test]
+fn closure_destructuring_assignment_writes_outer_bindings() {
+    let root = write_fixture(
+        "w3cos_closure_destructuring_assignment",
+        &[
+            ("package.json", r#"{ "name": "p", "version": "0.1.0" }"#),
+            (
+                "main.js",
+                r#"var PNG, rest, first, second;
+var init = function () { ({ PNG, ...rest } = { PNG: "png", a: 1, b: 2 }); };
+function arrays() { const swap = () => { [first, second] = [second, first]; }; first = 1; second = 2; swap(); }
+init();
+arrays();
+console.log(PNG, Object.keys(rest).join(","), first, second);
+function rp(...[a, b]) { return a + b; }
+const o = { m(head, ...{ length }) { return head + length; } };
+console.log(rp(1, 2, 3), rp.length, o.m("n", 1, 2));
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_closure_destructuring_assignment",
+    );
+    assert_eq!(lines, vec!["png a,b 2 1", "3 0 n2"]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+/// A primitive string inherits `String.prototype` methods by value, so
+/// `s.startsWith` is a function and `s?.startsWith(x)` calls it (Code-OSS
+/// `validatedIpcMain` checks `channel?.startsWith("vscode:")`).
+fn string_methods_read_through_string_prototype() {
+    let root = write_fixture(
+        "w3cos_string_proto_read",
+        &[
+            ("package.json", r#"{"name":"sp","type":"module"}"#),
+            (
+                "main.mjs",
+                r#"const c = "vscode:x";
+const f = c.startsWith; console.log("1", typeof f);
+console.log("2", c?.startsWith("vscode:"), c.startsWith("vscode:"));
+console.log("3", typeof c?.startsWith, c?.length);
+const o = { m() { return 7; } }; console.log("4", o?.m());
+const n = 5; console.log("5", n?.toFixed(1));
+function g(ch) { return ch?.startsWith("vs"); } console.log("6", g("vsx"));
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_string_proto_read");
+    assert_eq!(
+        lines,
+        vec![
+            "1 function",
+            "2 true true",
+            "3 function 8",
+            "4 7",
+            "5 5.0",
+            "6 true",
+        ]
+    );
+}
+
+#[test]
+/// An anonymous `export default function () {}` is recorded by codegen as
+/// `__w3cos_default_export_N` while W3IR binds it as `*default:N*`; both must
+/// name the same function (zod `v4/locales/*.js`).
+fn anonymous_default_export_function_is_emitted_from_w3ir() {
+    let root = write_fixture(
+        "w3cos_anon_default_fn",
+        &[
+            ("package.json", r#"{"name":"adf","type":"module"}"#),
+            (
+                "locale.mjs",
+                r#"import { helper } from "./util.mjs";
+const error = () => { return (issue) => helper(issue); };
+export default function () {
+  return { localeError: error() };
+}
+"#,
+            ),
+            (
+                "util.mjs",
+                "export function helper(x) { return \"msg:\" + x; }\n",
+            ),
+            (
+                "gen.mjs",
+                "export default function* () { yield 1; yield 2; }\n",
+            ),
+            (
+                "main.mjs",
+                r#"import locale from "./locale.mjs";
+import gen from "./gen.mjs";
+console.log("1", typeof locale, locale().localeError("x"));
+console.log("2", [...gen()].join(","));
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_anon_default_fn");
+    assert_eq!(lines, vec!["1 function msg:x", "2 1,2"]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+/// A class whose computed `[Symbol.iterator]()` returns `Map#values()` must be
+/// iterable with `for...of`, including inside nested loops with early
+/// `continue` (Code-OSS `ContributedCustomEditors`).
+fn class_symbol_iterator_returning_map_values_is_iterable() {
+    let root = write_fixture(
+        "w3cos_class_symiter_map",
+        &[
+            ("package.json", r#"{"name":"symiter","type":"module"}"#),
+            (
+                "editors.mjs",
+                r#"class Disposable { _register(x) { return x; } }
+export class Contributed extends Disposable {
+  constructor() { super(); this._editors = new Map(); }
+  add(info) { this._editors.set(info.id, info); }
+  [Symbol.iterator]() { return this._editors.values(); }
+}
+"#,
+            ),
+            (
+                "main.mjs",
+                r#"import { Contributed } from "./editors.mjs";
+class Service extends Object {
+  constructor() {
+    super();
+    this._c = new Contributed();
+    this._c.add({ id: "a", selector: [{ filenamePattern: "*.a" }, {}] });
+    this._c.add({ id: "b", selector: [{ filenamePattern: "*.b" }] });
+  }
+  register() {
+    const out = [];
+    for (const editor of this._c) {
+      for (const glob of editor.selector) {
+        if (!glob.filenamePattern) { continue; }
+        out.push(editor.id + ":" + glob.filenamePattern);
+      }
+    }
+    return out.join(",");
+  }
+}
+const s = new Service();
+console.log("1", s.register());
+console.log("2", [...new Contributed()].length);
+const it = new Map([[1, "x"]]).values();
+console.log("3", typeof it.next, typeof it[Symbol.iterator]);
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_class_symiter_map");
+    assert_eq!(lines, vec!["1 a:*.a,b:*.b", "2 0", "3 function function"]);
+}
+
+#[test]
+fn derived_class_super_returning_object_and_proxy_getter() {
+    let root = write_fixture(
+        "w3cos_super_return_proxy",
+        &[
+            ("package.json", r#"{"name":"superret","type":"module"}"#),
+            (
+                "main.mjs",
+                r#"const State = { Uninitialized: { type: "uninitialized" } };
+class Client {
+  constructor(channel) {
+    this.channel = channel;
+    this._state = State.Uninitialized;
+    channel.then((s) => this.state = s);
+  }
+  get state() { return this._state; }
+  set state(s) { this._state = s; }
+}
+class Stub {
+  constructor(name, options) {
+    return new options.ctor(Promise.resolve({ type: "disabled" }));
+  }
+}
+let MainStub = class extends Stub {
+  constructor(name, options) { super(name, options); }
+};
+MainStub = (function (c) { return c; })(MainStub);
+const direct = new MainStub("update", { ctor: Client });
+console.log("1", direct instanceof Client, direct.state.type);
+let cached;
+const proxy = new Proxy(Object.create(null), {
+  get(target, key) {
+    if (key in target) { return target[key]; }
+    const obj = cached ?? (cached = new MainStub("update", { ctor: Client }));
+    let prop = obj[key];
+    if (typeof prop !== "function") { return prop; }
+    prop = prop.bind(obj);
+    target[key] = prop;
+    return prop;
+  },
+  getPrototypeOf() { return MainStub.prototype; }
+});
+console.log("2", proxy.state.type);
+setTimeout(() => console.log("3", proxy.state.type, direct.state.type, cached.state.type), 0);
+class P { constructor() { this.x = 1; } get g() { return this.x; } }
+class Base { constructor(c) { return new c(); } }
+class Mid extends Base { constructor(c) { super(c); this.y = 2; } }
+class Leaf extends Mid { z = 3; }
+const leaf = new Leaf(P);
+console.log("4", leaf instanceof P, leaf instanceof Leaf, leaf.g, leaf.y, leaf.z);
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_super_return_proxy");
+    assert_eq!(
+        lines,
+        vec![
+            "1 true uninitialized",
+            "2 uninitialized",
+            "4 true false 1 2 3",
+            "3 disabled disabled disabled",
+        ]
+    );
+}
+
+const PROMISE_COMBINATORS_MAIN: &str = r#"class S {
+  async a() { return [1]; }
+  async b() { throw new Error("no"); }
+  async run(flag) {
+    const result = await Promise.allSettled([this.a(), this.b(), flag ? [] : Promise.resolve([2])]);
+    return result.map((r) => r.status + ":" + JSON.stringify(r.value ?? r.reason.message)).join(" ");
+  }
+}
+(async () => {
+  console.log(await new S().run(true));
+  console.log(await new S().run(false));
+  const empty = await Promise.allSettled([]);
+  console.log("empty", Array.isArray(empty), empty.length);
+  console.log("any", await Promise.any([Promise.reject(1), new Promise((r) => setTimeout(() => r("late"), 5)), Promise.resolve("first")]));
+  try {
+    await Promise.any([Promise.reject(new Error("e1")), Promise.reject("e2")]);
+  } catch (e) {
+    console.log("anyerr", e instanceof AggregateError, e.message, e.errors.length, e.errors[1]);
+  }
+  try { await Promise.any([]); } catch (e) { console.log("anyempty", e.constructor.name, e.errors.length); }
+  const { promise, resolve, reject } = Promise.withResolvers();
+  setTimeout(() => resolve("wr"), 1);
+  console.log("withResolvers", typeof reject, await promise);
+})();
+"#;
+
+/// `node main.js` (v24.18.0). Code-OSS's cachedExtensionScanner awaits
+/// `Promise.allSettled([...])` and reads `result[0].status`.
+const PROMISE_COMBINATORS_NODE_OUTPUT: &str = r#"fulfilled:[1] rejected:"no" fulfilled:[]
+fulfilled:[1] rejected:"no" fulfilled:[2]
+empty true 0
+any first
+anyerr true All promises were rejected 2 e2
+anyempty AggregateError 0
+withResolvers function wr
+"#;
+
+#[test]
+fn promise_all_settled_any_with_resolvers_match_node() {
+    let root = write_fixture(
+        "w3cos_cjs_e2e_promise_combinators",
+        &[
+            ("package.json", r#"{"name":"promise-combinators"}"#),
+            ("main.js", PROMISE_COMBINATORS_MAIN),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_cjs_e2e_promise_combinators",
+    );
+    let expected: Vec<&str> = PROMISE_COMBINATORS_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Optional calls keep their receiver: `super.m?.()`, `f?.call(o)`, and
+/// functions inheriting `Function.prototype` (`f.call`, polyfills).
+const OPTIONAL_CALL_RECEIVER_MAIN: &str = r#""use strict";
+function setB(s) { this.b = s; return this; }
+const o = {};
+console.log(setB?.call(o, 2) === o, o.b);
+console.log(setB?.apply(o, [4]) === o, o.b);
+const c = setB.call, a = setB.apply, b = setB.bind;
+console.log(typeof c, typeof a, typeof b, "call" in setB, "nope" in setB);
+console.log(c === Function.prototype.call, a === Function.prototype.apply, setB.bind === b);
+console.log(Reflect.apply(c, setB, [o, 5]) === o, o.b, b.call(setB, o, 6)().b);
+try { c.call({}); } catch (e) { console.log(e instanceof TypeError); }
+Function.prototype.w3cosExtra = function () { return typeof this; };
+console.log(setB.w3cosExtra(), (() => 1).w3cosExtra());
+class Base { setB(s) { this.b = s; } static make(v) { return v + 1; } }
+class Side extends Base {
+  setB(s) { super.setB?.(s); super.setB?.call(this, s + 1); return this.b; }
+  static make(v) { return (super.make)?.(v); }
+}
+console.log(new Side().setB(7), Side.make(1));
+"#;
+
+/// Captured from `node main.js` (Node v24).
+const OPTIONAL_CALL_RECEIVER_NODE_OUTPUT: &str = "true 2\n\
+true 4\n\
+function function function true false\n\
+true true true\n\
+true 5 6\n\
+true\n\
+function function\n\
+8 2\n";
+
+#[test]
+fn optional_calls_keep_receiver_and_functions_inherit_function_prototype_match_node() {
+    let root = write_fixture(
+        "w3cos_cjs_e2e_optional_call_receiver",
+        &[
+            ("package.json", r#"{"name":"optional-call-receiver"}"#),
+            ("main.js", OPTIONAL_CALL_RECEIVER_MAIN),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_cjs_e2e_optional_call_receiver",
+    );
+    let expected: Vec<&str> = OPTIONAL_CALL_RECEIVER_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn toolbar_hidden_actions_leave_no_undefined_after_coalesce_in_place() {
+    let root = write_fixture(
+        "w3cos_toolbar_coalesce",
+        &[
+            ("package.json", r#"{"name":"tbcoalesce","type":"module"}"#),
+            (
+                "main.mjs",
+                r#"function coalesceInPlace(array) {
+  let to = 0;
+  for (let i = 0; i < array.length; i++) {
+    if (!!array[i]) { array[to] = array[i]; to += 1; }
+  }
+  array.length = to;
+}
+class Separator {
+  static clean(actions) {
+    while (actions.length > 0 && actions[0].id === Separator.ID) { actions.shift(); }
+    while (actions.length > 0 && actions[actions.length - 1].id === Separator.ID) { actions.pop(); }
+    for (let i = actions.length - 2; i >= 0; i--) {
+      if (actions[i].id === Separator.ID && actions[i + 1].id === Separator.ID) { actions.splice(i + 1, 1); }
+    }
+    return actions;
+  }
+  static ID = 'sep';
+  id = Separator.ID;
+}
+const mk = (id) => ({ id });
+const primary = [mk('a'), mk('b'), mk('c'), mk('d')];
+const extra = [];
+for (let i = 0; i < primary.length; i++) {
+  if (i === 1 || i === 3) { extra[i] = primary[i]; primary[i] = undefined; }
+}
+console.log("1", primary.length, extra.length, 0 in extra, 1 in extra);
+coalesceInPlace(primary);
+coalesceInPlace(extra);
+console.log("2", primary.length, extra.length, JSON.stringify(primary), JSON.stringify(extra));
+console.log("3", Separator.clean(primary).map((a) => a.id).join(","), Separator.clean(extra).map((a) => a.id).join(","));
+const lone = [undefined, mk('x'), undefined];
+coalesceInPlace(lone);
+console.log("4", lone.length, lone[0].id);
+const holes = [];
+holes[2] = mk('h');
+coalesceInPlace(holes);
+console.log("5", holes.length, holes[0].id);
+const direct = [1, 2, 3, 4];
+direct.length = 2;
+function setLength(arr, n) { arr.length = n; }
+const viaParam = [1, 2, 3, 4];
+setLength(viaParam, 1);
+setLength(direct, 3);
+console.log("6", direct.length, viaParam.length, 2 in direct);
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_toolbar_coalesce");
+    assert_eq!(
+        lines,
+        vec![
+            "1 4 4 false true",
+            "2 2 2 [{\"id\":\"a\"},{\"id\":\"c\"}] [{\"id\":\"b\"},{\"id\":\"d\"}]",
+            "3 a,c b,d",
+            "4 1 x",
+            "5 1 h",
+            "6 3 1 false",
+        ]
+    );
+}
