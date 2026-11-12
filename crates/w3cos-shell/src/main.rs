@@ -4996,11 +4996,24 @@ fn sheet_actions(children: Vec<Component>) -> Component {
             children,
         )
     } else {
+        // Keep the pair on one row when the labels fit. Long English
+        // actions such as "Allow reading files" must wrap instead of
+        // overflowing past the left edge of a FlexEnd row.
+        let children = children
+            .into_iter()
+            .map(|mut child| {
+                child.style.min_width = Dimension::Px(0.0);
+                child.style.max_width = Dimension::Percent(100.0);
+                child.style.flex_shrink = 0.0;
+                child
+            })
+            .collect();
         Component::row(
             Style {
                 gap: 8.0,
                 width: Dimension::Percent(100.0),
                 min_width: Dimension::Px(0.0),
+                flex_wrap: FlexWrap::Wrap,
                 justify_content: JustifyContent::FlexEnd,
                 align_items: AlignItems::Center,
                 ..Style::default()
@@ -10005,6 +10018,14 @@ mod shell_ux_tests {
 
     static POSTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A panicked sibling must not fail the rest of the suite: the first
+    /// assertion is the one that matters, not a poisoned mutex cascade.
+    fn lock_posture() -> std::sync::MutexGuard<'static, ()> {
+        POSTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct EnvFlag(&'static str);
 
     impl EnvFlag {
@@ -10028,7 +10049,7 @@ mod shell_ux_tests {
 
     #[test]
     fn posture_follows_width_breakpoints() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         state::note_shell_viewport(390.0, 760.0);
         assert!(matches!(posture(), Posture::Phone));
         state::note_shell_viewport(800.0, 600.0);
@@ -10087,7 +10108,7 @@ mod shell_ux_tests {
 
     #[test]
     fn coarse_pointer_at_desktop_width_is_a_wide_tablet() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         let _env = EnvFlag::set("W3COS_POINTER", "coarse");
         state::note_shell_viewport(1280.0, 800.0);
         assert!(matches!(posture(), Posture::WideTablet));
@@ -10185,7 +10206,7 @@ mod shell_ux_tests {
 
     #[test]
     fn sign_sheet_confirms_once_and_stores_a_signed_receipt() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         sign_host::reset();
         let dir = std::env::temp_dir().join(format!(
@@ -10365,7 +10386,7 @@ mod shell_ux_tests {
 
     #[test]
     fn dock_icons_keep_names_without_painting_them() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         state::note_shell_viewport(1200.0, 800.0);
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -10388,7 +10409,7 @@ mod shell_ux_tests {
 
     #[test]
     fn window_controls_are_icons_not_a_missing_glyph() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
         assert_ne!(locale::t("win-maximize"), "[]");
@@ -10420,7 +10441,7 @@ mod shell_ux_tests {
 
     #[test]
     fn closing_a_window_returns_home_and_full_bleed_hides_maximize() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -10523,7 +10544,7 @@ mod shell_ux_tests {
 
     #[test]
     fn receipts_drawer_stops_above_the_intent_bar() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         state::note_shell_viewport(1200.0, 800.0);
         let panel = place_receipts(Component::column(Style::default(), vec![]));
         let bottom = px(panel.style.top) + px(panel.style.height);
@@ -10552,7 +10573,7 @@ mod shell_ux_tests {
 
     #[test]
     fn notify_panel_stops_above_the_intent_bar() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         state::note_shell_viewport(1200.0, 800.0);
         let panel = build_notify_panel();
@@ -10566,7 +10587,7 @@ mod shell_ux_tests {
 
     #[test]
     fn phone_keyboard_is_in_the_phone_shell_only_while_a_field_is_focused() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         ime_bar::reset_for_tests();
         locale::set_locale("zh-CN");
@@ -10613,7 +10634,7 @@ mod shell_ux_tests {
 
     #[test]
     fn chrome_accents_are_not_indigo() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         state::note_shell_viewport(768.0, 1024.0);
         let rail = format!("{:?}", build_tablet_rail());
@@ -10681,7 +10702,7 @@ mod shell_ux_tests {
 
     #[test]
     fn terminal_copy_matches_what_run_can_do() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-term-{}-{}",
@@ -10792,7 +10813,7 @@ mod shell_ux_tests {
 
     #[test]
     fn sandbox_sheet_starts_closed_and_a_grant_is_one_run() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-sb-{}-{}",
@@ -11034,7 +11055,7 @@ mod shell_ux_tests {
 
     #[test]
     fn chrome_stays_inside_the_viewport_and_candidates_clear_the_intent() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11149,7 +11170,7 @@ mod shell_ux_tests {
 
     #[test]
     fn command_action_opens_confirm_without_executing() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         ime_bar::reset_for_tests();
         locale::set_locale("zh-CN");
@@ -11188,7 +11209,7 @@ mod shell_ux_tests {
 
     #[test]
     fn smart_bar_explains_blocked_capture_and_stays_off_the_network() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11310,7 +11331,7 @@ mod shell_ux_tests {
             }
         }
 
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11384,7 +11405,7 @@ mod shell_ux_tests {
 
     #[test]
     fn speech_model_stays_off_until_a_second_confirmation() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11423,7 +11444,7 @@ mod shell_ux_tests {
 
     #[test]
     fn handwriting_model_stays_off_until_a_second_confirmation() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::set_signal(UNLOCKED_SIGNAL, 1);
@@ -11483,7 +11504,7 @@ mod shell_ux_tests {
 
     #[test]
     fn strangers_show_a_grouped_code_and_are_not_connected() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         handoff::demo_pending();
@@ -11509,7 +11530,7 @@ mod shell_ux_tests {
 
     #[test]
     fn pairing_screen_shows_the_spec_did_beside_the_fingerprint() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
@@ -11648,7 +11669,7 @@ mod shell_ux_tests {
 
     #[test]
     fn sync_sheet_asks_one_surface_and_does_not_enable_the_rest() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         handoff::demo_pending();
@@ -11670,7 +11691,7 @@ mod shell_ux_tests {
 
     #[test]
     fn continue_banner_sits_under_the_title_bar_and_is_not_a_scrim() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         ensure_shell_signals();
@@ -11704,7 +11725,7 @@ mod shell_ux_tests {
 
     #[test]
     fn phone_receive_page_opens_the_file_without_confirming() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         let _name = EnvFlag::set("W3COS_DEVICE_NAME", "手机");
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
@@ -11745,7 +11766,7 @@ mod shell_ux_tests {
 
     #[test]
     fn an_unrevealed_phone_handoff_is_a_notification() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         handoff::reset_for_tests();
         locale::set_locale("zh-CN");
         ensure_shell_signals();
@@ -11785,7 +11806,7 @@ mod shell_ux_tests {
 
     #[test]
     fn personal_lexicon_learns_on_accept_and_skips_secure_fields() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         lexicon::reset_for_tests();
         ime_bar::reset_for_tests();
@@ -11916,7 +11937,7 @@ mod shell_ux_tests {
 
     #[test]
     fn receipts_show_four_decisions_and_keep_the_written_subject() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -12030,7 +12051,7 @@ mod shell_ux_tests {
 
     #[test]
     fn lock_screen_covers_the_shell_and_the_open_lock_locks() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -12165,7 +12186,7 @@ mod shell_ux_tests {
     #[test]
     #[test]
     fn chain_sheet_names_the_saved_endpoint_and_does_not_broadcast() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_shell_viewport(1200.0, 800.0);
@@ -12210,7 +12231,7 @@ mod shell_ux_tests {
 
     #[test]
     fn tx_sheet_decodes_fields_and_broadcast_is_a_second_confirm() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         sign_host::reset();
         let dir = std::env::temp_dir().join(format!(
@@ -12391,7 +12412,7 @@ mod shell_ux_tests {
     }
 
     fn passkey_binds_the_device_did_and_keeps_the_pairing_fingerprint() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-passkey-{}-{}",
@@ -12492,7 +12513,7 @@ mod shell_ux_tests {
 
     #[test]
     fn passphrase_refuses_empty_and_wrong_and_lock_blocks_confirm() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-lock-{}-{}",
@@ -12611,7 +12632,7 @@ mod shell_ux_tests {
 
     #[test]
     fn confirm_does_not_grant_process_and_permission_is_once() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-perm-{}-{}",
@@ -12853,7 +12874,7 @@ mod shell_ux_tests {
 
     #[test]
     fn settings_sidebar_switches_panes_and_toggles_night_and_context() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-settings-{}-{}",
@@ -13121,7 +13142,7 @@ mod shell_ux_tests {
 
     #[test]
     fn desktop_has_no_assistant_app_and_no_fake_metrics() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         let dir = std::env::temp_dir().join(format!(
             "w3cos-honesty-{}-{}",
@@ -13298,7 +13319,7 @@ mod shell_ux_tests {
 
     #[test]
     fn notifications_start_empty_and_record_a_real_receipt() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         reset_notices();
         locale::set_locale("zh-CN");
@@ -13493,7 +13514,7 @@ mod shell_ux_tests {
 
     #[test]
     fn dialogs_trap_focus_and_chrome_meets_the_touch_minimum() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_pointer_coarse(false);
@@ -13628,7 +13649,7 @@ mod shell_ux_tests {
 
     #[test]
     fn tier_badges_lead_with_words_and_l2_off_stays_on_the_chrome() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         locale::set_locale("zh-CN");
         state::note_pointer_coarse(false);
@@ -13729,7 +13750,7 @@ mod shell_ux_tests {
 
     #[test]
     fn infer_backend_toggle_uses_fluent_and_stays_out_of_process_by_default() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         ensure_shell_signals();
         w3cos_ai_bridge::infer::clear_runtime_backend();
         state::note_shell_viewport(1200.0, 800.0);
@@ -13909,7 +13930,7 @@ mod shell_ux_tests {
 
     #[test]
     fn narrow_sheets_fit_the_viewport_and_stack_the_primary_action() {
-        let _guard = POSTURE_LOCK.lock().unwrap();
+        let _guard = lock_posture();
         let _safe = SafeAreaGuard;
         ensure_shell_signals();
         locale::set_locale("zh-CN");
