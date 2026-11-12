@@ -211,15 +211,15 @@ class RuntimeBenchTests(unittest.TestCase):
         )
 
     def test_runner_baseline_matches_green_main_and_rejects_drift(self):
-        # ubuntu-latest main 7f1c12dc, run 42155314497 job 127687955856.
-        # Branch W3COS_LAYOUT_NG=0, run 42338677739 job 128301295869, matched.
+        # ubuntu-latest main 3b46fd78, run 42737048870 job 129568708507.
+        # Same four values as the W3COS_LAYOUT_NG=0 lane on that run.
         self.assertEqual(
             gate.RUNNER_LEGACY_BASELINE_CHECKSUMS,
             (
-                (("style_layout", "layout_checksum"), 18291149073252),
-                (("startup", "child", "layout_checksum"), 31625672812),
-                (("startup", "child", "checksum"), 147785895),
-                (("paint_scroll", "checksum"), 1797980318),
+                (("style_layout", "layout_checksum"), 18321946508132),
+                (("startup", "child", "layout_checksum"), 31632136300),
+                (("startup", "child", "checksum"), 153009029),
+                (("paint_scroll", "checksum"), 1818266327),
             ),
         )
         self.assertNotEqual(
@@ -228,12 +228,12 @@ class RuntimeBenchTests(unittest.TestCase):
         )
         report = synthetic_report()
         report["layout_ng"] = "off"
-        report["style_layout"]["layout_checksum"] = 18291149073252
+        report["style_layout"]["layout_checksum"] = 18321946508132
         report["startup"] = {
             "wall_us": 10,
-            "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+            "child": {"layout_checksum": 31632136300, "checksum": 153009029},
         }
-        report["paint_scroll"]["checksum"] = 1797980318
+        report["paint_scroll"]["checksum"] = 1818266327
         report["paint_scroll"]["checksum_frames"] = 3
         gate.validate_report(report)
         gate.expect_runner_legacy_baseline(report)
@@ -248,10 +248,10 @@ class RuntimeBenchTests(unittest.TestCase):
         with self.assertRaises(gate.InvalidReport):
             gate.expect_runner_legacy_baseline(box)
         for path, replacement in (
-            (("style_layout", "layout_checksum"), 18291149073253),
-            (("startup", "child", "layout_checksum"), 31625672813),
-            (("startup", "child", "checksum"), 147785896),
-            (("paint_scroll", "checksum"), 1797980319),
+            (("style_layout", "layout_checksum"), 18321946508133),
+            (("startup", "child", "layout_checksum"), 31632136301),
+            (("startup", "child", "checksum"), 153009030),
+            (("paint_scroll", "checksum"), 1818266328),
         ):
             drifted = json.loads(json.dumps(report))
             cursor = drifted
