@@ -136,6 +136,27 @@ fn decoration_has_glyph_outlines(style: &Style) -> bool {
     !super::style_uses_ahem(style) || super::registered_ahem_face(style).is_some()
 }
 
+/// Glyph baseline for a decoration stripe on a text run. Matches
+/// `paint`: Ahem and generic `monospace` use the same typographic
+/// box as glyph paint; other faces use `text_baseline`. The
+/// decorating box still supplies underline thickness and ascent
+/// (CSS Text Decoration).
+fn decoration_text_baseline(
+    top: f32,
+    font_size: f32,
+    typeface: &Typeface,
+    style: &Style,
+    visual_text: &str,
+) -> f32 {
+    if super::style_uses_ahem(style) {
+        top + font_size * 0.8
+    } else if super::style_uses_generic_monospace(style) {
+        top + font_size
+    } else {
+        super::text_baseline(top, font_size, typeface, style, visual_text)
+    }
+}
+
 pub(super) fn paint_applied_in_rect(
     canvas: &Canvas,
     rect: crate::layout::LayoutRect,
@@ -158,7 +179,7 @@ pub(super) fn paint_applied_in_rect(
             let visual = crate::text_layout::font_render_text_for_style(text, child);
             let expansion = expansion.map(|expansion| expansion.for_text(visual.as_ref()));
             let glyph_baseline = shaped_fragment.map_or_else(
-                || super::text_baseline(top, child.font_size, typeface, child, visual.as_ref()),
+                || decoration_text_baseline(top, child.font_size, typeface, child, visual.as_ref()),
                 |fragment| fragment.baseline(rect),
             );
             // A descendant's vertical-align raises its glyph baseline, not the
@@ -329,13 +350,7 @@ pub(super) fn paint_with_expansion(
     let face = runs.first().map_or(typeface, |run| &run.typeface);
     let (_, metrics) = crate::skia_text_run::css_font(face, font_size).metrics();
     let ascent = -metrics.ascent;
-    let baseline = if super::style_uses_ahem(style) {
-        top + font_size * 0.8
-    } else if super::style_uses_generic_monospace(style) {
-        top + font_size
-    } else {
-        super::text_baseline(top, font_size, typeface, style, visual.as_ref())
-    };
+    let baseline = decoration_text_baseline(top, font_size, typeface, style, visual.as_ref());
     // Auto thickness and solid-line snapping follow Blink's horizontal
     // decoration geometry, including its minimum one device-space pixel.
     let thickness = (font_size / 10.0).max(1.0);
@@ -872,5 +887,101 @@ mod tests {
         }
         assert_eq!(pixels[((painted_row - 1) * 64 + 16) * 4], 255);
         assert_eq!(pixels[((painted_row + 1) * 64 + 16) * 4], 255);
+    }
+
+    #[test]
+    fn applied_decoration_matches_text_run_underline_baseline() {
+        // A generated principal box keeps text-decoration on the owner
+        // (CSS: it is not inherited). Paint must place that ancestor
+        // stripe on the same typographic baseline as a text leaf with
+        // the same font — including generic monospace (reattach-target-current).
+        use crate::layout::LayoutRect;
+        use crate::paint_artifact::AppliedTextDecoration;
+        use skia_safe::{AlphaType, Color, ColorType, FontStyle, ImageInfo, Surface};
+        let face = crate::font_face::pinned_font_mgr()
+            .match_family_style("monospace", FontStyle::normal())
+            .unwrap_or_else(|| {
+                crate::font_face::pinned_font_mgr()
+                    .legacy_make_typeface(None, FontStyle::normal())
+                    .expect("a default typeface")
+            });
+        let leaf = Style {
+            display: w3cos_std::style::Display::Inline,
+            font_family: Some("monospace".into()),
+            font_size: 16.0,
+            color: w3cos_std::Color::rgb(0, 0, 238),
+            text_decoration: TextDecoration::Underline,
+            ..Style::default()
+        };
+        let mut child = leaf.clone();
+        child.text_decoration = TextDecoration::None;
+        let owner = AppliedTextDecoration {
+            style: std::borrow::Cow::Borrowed(&leaf),
+            baseline_shift: 0.0,
+        };
+        let rect = LayoutRect {
+            x: 8.0,
+            y: 40.0,
+            width: 64.0,
+            height: 16.0,
+        };
+        let text = "PASS";
+        let advance = 32.0;
+        let pixels = |applied: bool| {
+            let mut surface = Surface::new_raster_n32_premul((80, 80)).unwrap();
+            surface.canvas().clear(Color::WHITE);
+            if applied {
+                paint_applied_in_rect(
+                    surface.canvas(),
+                    rect,
+                    text,
+                    &child,
+                    &face,
+                    crate::layout::layout_font(),
+                    None,
+                    None,
+                    &owner,
+                );
+            } else {
+                paint(
+                    surface.canvas(),
+                    rect.x,
+                    rect.y,
+                    text,
+                    advance,
+                    leaf.font_size,
+                    leaf.color,
+                    1.0,
+                    &face,
+                    &leaf,
+                );
+            }
+            let info = ImageInfo::new((80, 80), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![255_u8; 80 * 80 * 4];
+            assert!(surface.read_pixels(&info, &mut pixels, 80 * 4, (0, 0)));
+            pixels
+        };
+        let leaf_pixels = pixels(false);
+        let applied_pixels = pixels(true);
+        let rows = |pixels: &[u8]| {
+            (0..80)
+                .filter(|&y| {
+                    (0..80).any(|x| {
+                        let i = (y * 80 + x) * 4;
+                        pixels[i] != 255 || pixels[i + 1] != 255 || pixels[i + 2] != 255
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let leaf_rows = rows(&leaf_pixels);
+        let applied_rows = rows(&applied_pixels);
+        assert_eq!(
+            applied_rows, leaf_rows,
+            "ancestor decoration rows {applied_rows:?} must match the text-run baseline {leaf_rows:?}"
+        );
+        assert!(
+            !leaf_rows.is_empty(),
+            "the text-run underline must paint some pixels"
+        );
     }
 }

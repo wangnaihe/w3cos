@@ -832,6 +832,9 @@ fn format_dimension(d: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Em(v) => format!("{v}em"),
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
+        w3cos_std::style::Dimension::Lh(v) => format!("{v}lh"),
+        w3cos_std::style::Dimension::Ch(v) => format!("{v}ch"),
+        w3cos_std::style::Dimension::Calc { .. } => "calc()".into(),
     }
 }
 

@@ -14,23 +14,46 @@
 //! the box's fragment.
 
 use super::Why;
-use super::block::{border_widths, clamp_inline_size, intrinsic_sizes, layout_block_sized};
+use super::block::{
+    BoxAspectRatio, border_widths, clamp_inline_size, intrinsic_sizes_at, layout_block_sized,
+    non_visible_overflow,
+};
 use super::{BoxFragment, ConstraintSpace, MarginStrut};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
-use w3cos_std::style::{BoxSizing, Dimension, Position, Spacing, Style, TextDirection};
+use w3cos_std::style::{
+    BoxSizing, Dimension, Position, Spacing, Style, TextDirection, WritingMode,
+};
 
 /// An out-of-flow box waiting for its containing block, with its static
 /// position (NGLogicalStaticPosition: the margin-box inline-start edge
 /// and block-start edge it would have in flow) relative to the border box
 /// of the fragment currently carrying it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct OofCandidate {
     pub index: usize,
     /// Left edge (ltr parent) or right edge (rtl parent) of the static
-    /// position.
+    /// position (the physical `inline_anchor` point when that is set).
     pub static_inline: f32,
     pub static_block: f32,
     pub static_rtl: bool,
+    /// Which edge of the box the static point is, when the alignment
+    /// container's `justify-self` / `align-self` is not `start`
+    /// (NGLogicalStaticPosition inline / block edge): the box is aligned
+    /// to the point once its size is known.
+    pub inline_anchor: Anchor,
+    pub block_anchor: Anchor,
+}
+
+/// The side of the margin box that sits at the static point. `Auto` keeps
+/// the box's start edge as `static_inline` / `static_block` describe it.
+/// Physical: `Start` is the left / top edge, `End` the right / bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) enum Anchor {
+    #[default]
+    Auto,
+    Start,
+    Center,
+    End,
 }
 
 impl OofCandidate {
@@ -117,7 +140,10 @@ pub(super) fn layout_out_of_flow(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        fixed_block_indefinite: false,
         percent_unresolved: false,
+        cyclic_percent_auto: false,
+        line_clamp: None,
     };
     let (w, h) = (cb.width, cb.height);
     let spacing = |s: Spacing| match s {
@@ -144,50 +170,297 @@ pub(super) fn layout_out_of_flow(
         spacing(style.margin.left),
     );
 
+    // `stretch` fills the containing block's padding box between the
+    // insets (an auto inset is zero unless both are auto, which places the
+    // box at its static position). Its min/max forms stay on legacy.
+    let stretch = super::block::marker(style, super::block::STRETCH).unwrap_or("");
+    if stretch
+        .split(',')
+        .any(|t| matches!(t, "minw" | "maxw" | "minh" | "maxh"))
+    {
+        return super::bail("oof-stretch-limit");
+    }
+    let stretch_w = stretch.split(',').any(|t| t == "w");
+    let stretch_h = stretch.split(',').any(|t| t == "h");
     // CSS2 10.3.7.
     let mut left = length(style.left, w, style, &space);
     let mut right = length(style.right, w, style, &space);
     let static_inline = candidate.static_inline - cb.x;
+    // A centred static position gives the box the room the nearer side of
+    // the point leaves; its margin box is centred on the point below.
+    let mut centered_inline = None;
     if left.is_none() && right.is_none() {
-        if candidate.static_rtl {
-            right = Some(w - static_inline);
-        } else {
-            left = Some(static_inline);
+        match candidate.inline_anchor {
+            Anchor::Start => left = Some(static_inline),
+            Anchor::End => right = Some(w - static_inline),
+            Anchor::Center => {
+                let near = static_inline.min(w - static_inline).max(0.0);
+                left = Some(static_inline - near);
+                right = Some(w - static_inline - near);
+                centered_inline = Some(static_inline);
+            }
+            Anchor::Auto => {
+                if candidate.static_rtl {
+                    right = Some(w - static_inline);
+                } else {
+                    left = Some(static_inline);
+                }
+            }
         }
     }
     let content_w = |v: f32| match style.box_sizing {
         BoxSizing::BorderBox => (v - edges_h).max(0.0),
         BoxSizing::ContentBox => v,
     };
-    let width = match length(style.width, w, style, &space).map(content_w) {
-        Some(v) => clamp_inline_size(style, &space, edges_h, v),
-        None => match (left, right) {
-            (Some(l), Some(r)) => clamp_inline_size(
-                style,
-                &space,
-                edges_h,
-                (w - l - r - ml.unwrap_or(0.0) - mr.unwrap_or(0.0) - edges_h).max(0.0),
-            ),
-            _ => {
-                // Shrink-to-fit (CSS2 10.3.7 cases 1, 3).
-                let available = w
-                    - left.unwrap_or(0.0)
+    // A block size that does not depend on the inline size
+    // (specified, or stretched between both insets, CSS2
+    // 10.6.4) is definite for the content (CSS Flexbox §9.8).
+    let content_h = |v: f32| match style.box_sizing {
+        BoxSizing::BorderBox => (v - edges_v).max(0.0),
+        BoxSizing::ContentBox => v,
+    };
+    let block = length(style.height, h, style, &space)
+        .map(content_h)
+        .or_else(|| {
+            if stretch_h {
+                // Both insets resolve below; here only whether the block
+                // size is definite for the content.
+                let top = length(style.top, h, style, &space).unwrap_or(0.0);
+                let bottom = length(style.bottom, h, style, &space).unwrap_or(0.0);
+                return Some(
+                    content_h(h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0)).max(0.0),
+                );
+            }
+            if content_height_keyword(style) {
+                return None;
+            }
+            let top = length(style.top, h, style, &space)?;
+            let bottom = length(style.bottom, h, style, &space)?;
+            Some((h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0))
+        });
+    // A replaced box has no shrink-to-fit width and is not stretched between
+    // its insets: auto sizes are its natural size (or the other axis through
+    // its ratio), CSS 2.1 10.3.8 and 10.6.5 (Blink ComputeReplacedSize).
+    // `stretch` fills the space between the insets and margins.
+    let replaced_dims = if super::block::is_replaced(flat[index].kind) {
+        let top = length(style.top, h, style, &space);
+        let bottom = length(style.bottom, h, style, &space);
+        let top = if top.is_none() && bottom.is_none() {
+            Some(candidate.static_block - cb.y)
+        } else {
+            top
+        };
+        let mut sized = style.clone();
+        let border_box = |avail: f32, edges: f32| match style.box_sizing {
+            BoxSizing::BorderBox => avail.max(0.0),
+            BoxSizing::ContentBox => (avail - edges).max(0.0),
+        };
+        if stretch_w {
+            let avail = w
+                - left.unwrap_or(0.0)
+                - right.unwrap_or(0.0)
+                - ml.unwrap_or(0.0)
+                - mr.unwrap_or(0.0);
+            sized.width = Dimension::Px(border_box(avail, edges_h));
+        }
+        if stretch_h {
+            let avail = h
+                - top.unwrap_or(0.0)
+                - bottom.unwrap_or(0.0)
+                - mt.unwrap_or(0.0)
+                - mb.unwrap_or(0.0);
+            sized.height = Dimension::Px(border_box(avail, edges_v));
+        }
+        Some(super::block::replaced_size_with_keyword_limits(
+            &flat[index].kind,
+            &sized,
+            &space,
+        )?)
+    } else {
+        None
+    };
+    // An intrinsic `width` keyword (css-sizing-3) is the box's own
+    // min/max-content size, or for fit-content the available size clamped
+    // between them, whatever its insets.
+    let width_keyword = super::block::marker(style, super::block::WIDTH_KEYWORD).filter(|_| {
+        style.width == Dimension::Auto
+            && !super::block::is_replaced(flat[index].kind)
+            && !super::block::size_contained(style)
+    });
+    let width = if let Some((replaced_w, _)) = replaced_dims {
+        replaced_w
+    } else if stretch_w {
+        clamp_inline_size(
+            style,
+            &space,
+            edges_h,
+            content_w(
+                w - left.unwrap_or(0.0)
                     - right.unwrap_or(0.0)
                     - ml.unwrap_or(0.0)
-                    - mr.unwrap_or(0.0)
-                    - edges_h;
-                let sizes = intrinsic_sizes(flat, index, &space).why("oof-intrinsic")?;
-                let fit = match sizes.min {
-                    Some(min) => sizes.max.min(available.max(min)),
-                    None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
-                    None => return super::bail("oof-shrink-min"),
-                };
-                clamp_inline_size(style, &space, edges_h, fit.max(0.0))
+                    - mr.unwrap_or(0.0),
+            )
+            .max(0.0),
+        )
+    } else if let Some(keyword) = width_keyword {
+        let available = w
+            - left.unwrap_or(0.0)
+            - right.unwrap_or(0.0)
+            - ml.unwrap_or(0.0)
+            - mr.unwrap_or(0.0)
+            - edges_h;
+        let sizes = intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
+        let min = sizes.min.or_else(|| super::bail("oof-width-keyword-min"))?;
+        let content = super::block::keyword_content_size(
+            keyword,
+            min,
+            sizes.max,
+            Some(available.max(0.0)),
+            Some(w),
+            style,
+            &space,
+            edges_h,
+        )
+        .why("oof-width-keyword")?;
+        clamp_inline_size(style, &space, edges_h, content.max(0.0))
+    } else {
+        match length(style.width, w, style, &space).map(content_w) {
+            Some(v) => clamp_inline_size(style, &space, edges_h, v),
+            None => match (left, right) {
+                (Some(l), Some(r)) if centered_inline.is_none() => clamp_inline_size(
+                    style,
+                    &space,
+                    edges_h,
+                    (w - l - r - ml.unwrap_or(0.0) - mr.unwrap_or(0.0) - edges_h).max(0.0),
+                ),
+                _ => {
+                    // Shrink-to-fit (CSS2 10.3.7 cases 1, 3).
+                    let available = w
+                        - left.unwrap_or(0.0)
+                        - right.unwrap_or(0.0)
+                        - ml.unwrap_or(0.0)
+                        - mr.unwrap_or(0.0)
+                        - edges_h;
+                    let sizes =
+                        intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
+                    let fit = match sizes.min {
+                        Some(min) => sizes.max.min(available.max(min)),
+                        None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
+                        None => return super::bail("oof-shrink-min"),
+                    };
+                    clamp_inline_size(style, &space, edges_h, fit.max(0.0))
+                }
+            },
+        }
+    };
+    // css-sizing-4 `aspect-ratio` on a non-replaced absolutely positioned
+    // box (Blink ComputeOutOfFlowInline/BlockDimensions): a specified size
+    // on one axis fixes the other through the ratio (it wins over stretching
+    // between insets); with both auto, a box stretched between its inline
+    // insets keeps that width and derives the height, one stretched only
+    // between its block insets derives the width from that height, and
+    // otherwise the shrink-to-fit width derives the height. The min/max
+    // block sizes reach the inline size through the ratio.
+    let ratio = (replaced_dims.is_none()
+        && !stretch_w
+        && !stretch_h
+        && centered_inline.is_none()
+        && style.writing_mode == WritingMode::HorizontalTb
+        && !content_height_keyword(style)
+        && width_keyword.is_none()
+        && super::block::marker(style, super::block::WIDTH_KEYWORD).is_none()
+        && super::block::marker(style, super::block::MIN_HEIGHT_KEYWORD).is_none()
+        && super::block::marker(style, super::block::MAX_HEIGHT_KEYWORD).is_none())
+    .then(|| BoxAspectRatio::new(style, edges_h, edges_v))
+    .flatten();
+    let mut ratio_height = None;
+    // A height the ratio derived is floored by the content (the automatic
+    // minimum size, css-sizing-4) unless min-height is set or it scrolls.
+    let mut floor_height = false;
+    let width = match ratio {
+        Some(r) => {
+            let max_h = length(style.max_height, h, style, &space).map(content_h);
+            let min_h = length(style.min_height, h, style, &space).map(content_h);
+            let clamp_h = |mut v: f32| {
+                if let Some(max) = max_h {
+                    v = v.min(max);
+                }
+                if let Some(min) = min_h {
+                    v = v.max(min);
+                }
+                v
+            };
+            let specified_height = length(style.height, h, style, &space).map(content_h);
+            let specified_width = length(style.width, w, style, &space).is_some();
+            let top_inset = length(style.top, h, style, &space);
+            let bottom_inset = length(style.bottom, h, style, &space);
+            if specified_width {
+                if specified_height.is_none() {
+                    ratio_height = Some(clamp_h(r.block_from_inline(width)));
+                    floor_height = true;
+                }
+                width
+            } else if let Some(height) = specified_height {
+                let mut inline = r.inline_from_block(clamp_h(height));
+                if style.min_width == Dimension::Auto && !non_visible_overflow(style) {
+                    let sizes =
+                        intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
+                    let min = sizes.min.or_else(|| super::bail("oof-ratio-min"))?;
+                    inline = inline.max(min);
+                }
+                clamp_inline_size(style, &space, edges_h, inline)
+            } else if !(left.is_some() && right.is_some())
+                && let (Some(t), Some(bo)) = (top_inset, bottom_inset)
+            {
+                let stretched = clamp_h(
+                    (h - t - bo - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0),
+                );
+                ratio_height = Some(stretched);
+                clamp_inline_size(style, &space, edges_h, r.inline_from_block(stretched))
+            } else {
+                let mut inline = width;
+                if let Some(max) = max_h {
+                    inline = inline.min(r.inline_from_block(max));
+                }
+                if let Some(min) = min_h {
+                    inline = inline.max(r.inline_from_block(min));
+                }
+                let inline = clamp_inline_size(style, &space, edges_h, inline);
+                ratio_height = Some(clamp_h(r.block_from_inline(inline)));
+                floor_height = true;
+                inline
             }
-        },
+        }
+        None => width,
+    };
+    // Intrinsic min-width / max-width keywords (css-sizing-3).
+    let available = w
+        - left.unwrap_or(0.0)
+        - right.unwrap_or(0.0)
+        - ml.unwrap_or(0.0)
+        - mr.unwrap_or(0.0)
+        - edges_h;
+    let width = if replaced_dims.is_some() {
+        width
+    } else {
+        super::block::keyword_limited_inline(
+            flat,
+            index,
+            &space,
+            edges_h,
+            width,
+            available.max(0.0),
+            w,
+        )
+        .why("oof-width-keyword")?
     };
     let border_w = width + edges_h;
     let (margin_left, x) = match (left, right) {
+        _ if centered_inline.is_some() => {
+            let (mlu, mru) = (ml.unwrap_or(0.0), mr.unwrap_or(0.0));
+            let at = centered_inline.unwrap_or(0.0);
+            (mlu, at - (border_w + mlu + mru) / 2.0)
+        }
         (Some(l), Some(r)) => {
             let remaining = w - l - r - border_w;
             let (ml_used, mr_used) = match (ml, mr) {
@@ -226,30 +499,82 @@ pub(super) fn layout_out_of_flow(
     // CSS2 10.6.4.
     let mut top = length(style.top, h, style, &space);
     let bottom = length(style.bottom, h, style, &space);
+    let mut bottom = bottom;
+    let mut centered_block = None;
     if top.is_none() && bottom.is_none() {
-        top = Some(candidate.static_block - cb.y);
+        let at = candidate.static_block - cb.y;
+        match candidate.block_anchor {
+            Anchor::End => bottom = Some(h - at),
+            Anchor::Center => centered_block = Some(at),
+            Anchor::Auto | Anchor::Start => top = Some(at),
+        }
     }
     let content_h = |v: f32| match style.box_sizing {
         BoxSizing::BorderBox => (v - edges_v).max(0.0),
         BoxSizing::ContentBox => v,
     };
-    let specified_h = length(style.height, h, style, &space).map(content_h);
+    let specified_h = length(style.height, h, style, &space)
+        .map(content_h)
+        .or_else(|| {
+            stretch_h.then(|| {
+                content_h(
+                    h - top.unwrap_or(0.0)
+                        - bottom.unwrap_or(0.0)
+                        - mt.unwrap_or(0.0)
+                        - mb.unwrap_or(0.0),
+                )
+                .max(0.0)
+            })
+        });
     let stretched = match (specified_h, top, bottom) {
+        // `height: min-content | max-content | fit-content` is the content
+        // height in the block axis (css-sizing-3), not stretched between
+        // the insets (fit-content-block-size-abspos).
+        (None, Some(_), Some(_)) if content_height_keyword(style) => None,
         (None, Some(t), Some(bo)) => {
             Some((h - t - bo - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0))
         }
         _ => None,
     };
-    let result = layout_block_sized(
-        flat,
-        index,
-        &space,
-        true,
-        Some((width, specified_h.or(stretched))),
-    )
-    .why("oof-layout")?;
+    let mut fixed_h = match replaced_dims {
+        Some((_, replaced_h)) => Some(replaced_h),
+        None => specified_h.or(stretched),
+    };
+    if let Some(mut ratio_h) = ratio_height {
+        if floor_height && style.min_height == Dimension::Auto && !non_visible_overflow(style) {
+            let auto = layout_block_sized(flat, index, &space, true, Some((width, None)))
+                .why("oof-layout")?;
+            ratio_h = ratio_h.max((auto.fragment.height - edges_v).max(0.0));
+        }
+        fixed_h = Some(ratio_h);
+    }
+    // An intrinsic min-height / max-height keyword is the content height
+    // (css-sizing-3); a specified or stretched height is limited by it.
+    let min_keyword = replaced_dims.is_none()
+        && super::block::marker(style, super::block::MIN_HEIGHT_KEYWORD).is_some();
+    let max_keyword = replaced_dims.is_none()
+        && super::block::marker(style, super::block::MAX_HEIGHT_KEYWORD).is_some();
+    if let Some(fixed) = fixed_h.filter(|_| min_keyword || max_keyword) {
+        let auto =
+            layout_block_sized(flat, index, &space, true, Some((width, None))).why("oof-layout")?;
+        let content = (auto.fragment.height - edges_v).max(0.0);
+        let mut limited = fixed;
+        if max_keyword {
+            limited = limited.min(content);
+        }
+        if min_keyword {
+            limited = limited.max(content);
+        }
+        fixed_h = Some(limited);
+    }
+    let result =
+        layout_block_sized(flat, index, &space, true, Some((width, fixed_h))).why("oof-layout")?;
     let border_h = result.fragment.height;
     let y = match (top, bottom) {
+        _ if centered_block.is_some() => {
+            let (mtu, mbu) = (mt.unwrap_or(0.0), mb.unwrap_or(0.0));
+            centered_block.unwrap_or(0.0) - (border_h + mtu + mbu) / 2.0 + mtu
+        }
         (Some(t), Some(bo)) => {
             let remaining = h - t - bo - border_h;
             let mt_used = match (mt, mb) {
@@ -313,6 +638,16 @@ pub(super) fn fixed_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'stat
         ancestor = flat[a].parent;
     }
     None
+}
+
+/// Whether an auto `height` carries an intrinsic keyword, which in the
+/// block axis means the content height.
+fn content_height_keyword(style: &Style) -> bool {
+    matches!(style.height, w3cos_std::style::Dimension::Auto)
+        && matches!(
+            super::block::marker(style, "--w3cos-internal-height-keyword"),
+            Some("min-content" | "max-content" | "fit-content")
+        )
 }
 
 pub(super) fn direction_rtl(style: &Style) -> bool {

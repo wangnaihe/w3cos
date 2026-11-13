@@ -1243,6 +1243,7 @@ fn apply_css_property(style: &mut StyleDecl, property: &str, value: &str) {
             style.overscroll_behavior = Some(value.to_string())
         }
         "scroll-initial-target" => style.scroll_initial_target = Some(value.to_string()),
+        "scroll-marker-group" => style.scroll_marker_group = Some(value.to_string()),
         "display" => style.display = Some(value.to_string()),
         "opacity" => style.opacity = value.parse().ok(),
         "visibility" => style.visibility = Some(value.to_string()),
@@ -1978,6 +1979,15 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn parse_scroll_marker_group() {
+        let sheet = parse_css("#scroller { scroll-marker-group: before; }");
+        assert_eq!(
+            sheet.rules[0].style.scroll_marker_group.as_deref(),
+            Some("before"),
+        );
+    }
+
     fn parse_overscroll_behavior() {
         let sheet = parse_css(".feed { overscroll-behavior: contain; }");
         assert_eq!(

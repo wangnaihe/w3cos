@@ -166,7 +166,8 @@ pub(crate) fn resolve(
                     .max(1.0 / 64.0)
                     .min(available)
             };
-            let bands = regular_bands(origin, end, height);
+            let forced = forced_column_break_offsets(nodes, rects, &members[owner]);
+            let bands = regular_bands_with_forced_breaks(origin, end, height, &forced);
             plans[owner] = Some(ColumnFragmentPlan {
                 height,
                 principal_height: rects[owner].unwrap().height,
@@ -618,14 +619,65 @@ pub(crate) fn project(
     }
 }
 
-fn regular_bands(origin: f32, end: f32, height: f32) -> Vec<ColumnFlowBand> {
-    let count = ((end - origin) / height).ceil() as usize;
-    (0..count)
-        .map(|column| ColumnFlowBand {
-            start: origin + column as f32 * height,
-            end: (origin + (column + 1) as f32 * height).min(end),
+fn forced_column_break_offsets(
+    nodes: &[(&w3cos_std::style::Style, Option<usize>)],
+    rects: &[Option<LayoutRect>],
+    members: &[usize],
+) -> Vec<f32> {
+    let mut offsets: Vec<f32> = members
+        .iter()
+        .filter_map(|&index| {
+            let style = nodes.get(index)?.0;
+            let properties = style.custom_properties.as_ref()?;
+            let value = properties.get("--w3cos-internal-break-before")?;
+            if !matches!(value.as_str(), "column" | "always" | "all" | "page") {
+                return None;
+            }
+            rects.get(index).copied().flatten().map(|rect| rect.y)
         })
-        .collect()
+        .filter(|offset| offset.is_finite())
+        .collect();
+    offsets.sort_by(|a, b| a.total_cmp(b));
+    offsets.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    offsets
+}
+
+fn regular_bands(origin: f32, end: f32, height: f32) -> Vec<ColumnFlowBand> {
+    regular_bands_with_forced_breaks(origin, end, height, &[])
+}
+
+/// Fixed-height `column-fill: auto` bands, split also at CSS Fragmentation
+/// `break-before: column | always` used block starts.
+fn regular_bands_with_forced_breaks(
+    origin: f32,
+    end: f32,
+    height: f32,
+    forced: &[f32],
+) -> Vec<ColumnFlowBand> {
+    if height <= 0.0 || end <= origin {
+        return vec![ColumnFlowBand { start: origin, end }];
+    }
+    let mut bands = Vec::new();
+    let mut start = origin;
+    let mut forced_index = 0;
+    while start < end - 0.01 {
+        while forced_index < forced.len() && forced[forced_index] <= start + 0.01 {
+            forced_index += 1;
+        }
+        let mut cut = (start + height).min(end);
+        if let Some(&at) = forced.get(forced_index).filter(|&&at| at < cut - 0.01) {
+            cut = at;
+        }
+        if cut <= start + 0.01 {
+            break;
+        }
+        bands.push(ColumnFlowBand { start, end: cut });
+        start = cut;
+    }
+    if bands.is_empty() {
+        bands.push(ColumnFlowBand { start: origin, end });
+    }
+    bands
 }
 
 fn legal_bands(
