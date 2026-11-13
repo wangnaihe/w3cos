@@ -5329,11 +5329,14 @@ fn flex_column_baseline_groups_match_chrome() {
     assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
     let out = layout_tree(&rev, &flat, 800.0, 600.0).expect("column wrap-reverse");
     let (xr, _, wr, _) = rect(&out, 2);
-    // wrap-reverse swaps cross sides, so the 11px left margin hangs on
-    // the right: 200 - 40 - 11 = 149.
+    // wrap-reverse makes the right edge the cross start. A column
+    // `baseline` item is flex-start, so its margin box packs flush right
+    // and the physical left margin stays on the left: 200 - 40 = 160.
+    // Measured in headless Chrome 156 (getBoundingClientRect x=160 for
+    // both items of this column).
     assert_eq!(
         (xr, wr),
-        (149.0, 40.0),
+        (160.0, 40.0),
         "wrap-reverse packs the group at the cross end"
     );
 
@@ -5390,6 +5393,740 @@ fn flex_column_baseline_groups_match_chrome() {
         (vrl - (200.0 - vw)).abs() < 1.0,
         "VRL minor group packs from the end, got {vrl} width {vw}"
     );
+}
+
+/// First-baseline groups of a horizontal-tb column with physical margins.
+/// Expected left edges were measured in headless Chrome 156 with Ahem and
+/// `text-orientation: sideways` (the typographic model this engine uses):
+/// two items per 200px column, `align-items: baseline`, items are 20px or
+/// 10px vertical-lr / vertical-rl text (`line-height: 1`) or 40x20 / 30x20
+/// boxes, each with `margin-left: 7px`, `margin-right: 3px`, or none. The
+/// offset stays measured from each border-box left; `wrap-reverse` flips
+/// which side each group packs to, and the packing side's margin counts.
+#[test]
+fn flex_column_baseline_margins_match_chrome() {
+    use w3cos_std::style::{AlignItems, FlexDirection, FlexWrap::*, WritingMode};
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Vlr,
+        Vrl,
+        Box,
+    }
+    use Kind::*;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let item = |(kind, size, left, right): (Kind, f32, f32, f32)| {
+        let margin = margins(0.0, right, 0.0, left);
+        let mode = match kind {
+            Vlr => WritingMode::VerticalLr,
+            Vrl => WritingMode::VerticalRl,
+            Box => {
+                let width = if size == 20.0 { 40.0 } else { 30.0 };
+                return (
+                    node(
+                        Style {
+                            width: Dimension::Px(width),
+                            height: Dimension::Px(20.0),
+                            margin,
+                            ..block()
+                        },
+                        vec![],
+                    ),
+                    1,
+                );
+            }
+        };
+        let text = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            ..block()
+        };
+        (
+            node(
+                Style {
+                    margin,
+                    ..text.clone()
+                },
+                vec![Component::text("X", text)],
+            ),
+            2,
+        )
+    };
+    let cases = [
+        (
+            NoWrap,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (7.0, 9.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (7.0, 9.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (5.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (0.0, 2.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (5.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (0.0, 2.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (7.0, 190.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (7.0, 187.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (0.0, 190.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (0.0, 187.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (0.0, 190.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (0.0, 187.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (7.0, 11.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (7.0, 11.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Box, 30.0, 7.0, 0.0),
+            (3.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Box, 30.0, 0.0, 3.0),
+            (0.0, 4.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (3.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (0.0, 4.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (180.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (180.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (177.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (177.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (180.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (180.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (180.0, 182.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (180.0, 182.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (177.0, 179.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (177.0, 179.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (180.0, 182.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (180.0, 182.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (180.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (180.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Box, 30.0, 7.0, 0.0),
+            (177.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Box, 30.0, 0.0, 3.0),
+            (177.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (180.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (180.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (9.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (7.0, 5.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (9.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (2.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (9.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (2.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (7.0, 190.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (7.0, 187.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (0.0, 190.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (0.0, 187.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (0.0, 190.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (0.0, 187.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 7.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (7.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 7.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (7.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 3.0),
+            (Box, 30.0, 7.0, 0.0),
+            (7.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 3.0),
+            (Box, 30.0, 0.0, 3.0),
+            (0.0, 0.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (7.0, 7.0),
+        ),
+        (
+            NoWrap,
+            (Box, 20.0, 0.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (0.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (180.0, 182.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (180.0, 182.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (177.0, 179.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (177.0, 179.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (180.0, 182.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (180.0, 182.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (180.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (180.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (177.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (177.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (180.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (180.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (166.0, 170.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 7.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (163.0, 167.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Box, 30.0, 7.0, 0.0),
+            (166.0, 170.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 3.0),
+            (Box, 30.0, 0.0, 3.0),
+            (163.0, 167.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (166.0, 170.0),
+        ),
+        (
+            WrapReverse,
+            (Vlr, 20.0, 0.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (163.0, 167.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (7.0, 190.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (7.0, 187.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (0.0, 190.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (0.0, 187.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (0.0, 190.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (0.0, 187.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (7.0, 9.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (7.0, 9.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (5.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (0.0, 2.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (5.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (0.0, 2.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (7.0, 170.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 7.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (7.0, 167.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Box, 30.0, 7.0, 0.0),
+            (0.0, 170.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 3.0),
+            (Box, 30.0, 0.0, 3.0),
+            (0.0, 167.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (0.0, 170.0),
+        ),
+        (
+            WrapReverse,
+            (Vrl, 20.0, 0.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (0.0, 167.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (160.0, 158.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 7.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (160.0, 158.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (157.0, 155.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 3.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (157.0, 155.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 7.0, 0.0),
+            (160.0, 158.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 0.0),
+            (Vlr, 10.0, 0.0, 3.0),
+            (160.0, 158.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (160.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 7.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (160.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (157.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 3.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (157.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 7.0, 0.0),
+            (160.0, 7.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 0.0),
+            (Vrl, 10.0, 0.0, 3.0),
+            (160.0, 0.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 7.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (160.0, 160.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 7.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (160.0, 160.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 3.0),
+            (Box, 30.0, 7.0, 0.0),
+            (157.0, 157.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 3.0),
+            (Box, 30.0, 0.0, 3.0),
+            (157.0, 157.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 0.0),
+            (Box, 30.0, 7.0, 0.0),
+            (160.0, 160.0),
+        ),
+        (
+            WrapReverse,
+            (Box, 20.0, 0.0, 0.0),
+            (Box, 30.0, 0.0, 3.0),
+            (160.0, 160.0),
+        ),
+    ];
+    for (wrap, a, b, expected) in cases {
+        let (first, first_nodes) = item(a);
+        let (second, _) = item(b);
+        let tree = node(
+            block(),
+            vec![node(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    flex_wrap: wrap,
+                    align_items: AlignItems::Baseline,
+                    width: Dimension::Px(200.0),
+                    ..block()
+                },
+                vec![first, second],
+            )],
+        );
+        let flat = pre_flatten(&tree);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("column baseline");
+        let got = (rect(&out, 2).0, rect(&out, 2 + first_nodes).0);
+        assert_eq!(got, expected, "{wrap:?} {:?} {:?}", a.1, b.1);
+    }
 }
 
 /// `align-items: last baseline` in a row flex line (CSS Align 9.3): the
@@ -15712,20 +16449,12 @@ fn column_flex_unhandled_baseline_stays_on_legacy() {
         ),
         "flex:baseline",
     );
-    still(
-        node(
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Column,
-                flex_wrap: w3cos_std::style::FlexWrap::WrapReverse,
-                align_items: w3cos_std::style::AlignItems::Baseline,
-                width: Dimension::Px(200.0),
-                ..Style::default()
-            },
-            vec![fixed_box(40.0, 10.0)],
-        ),
-        "flex:baseline",
-    );
+    // A `wrap-reverse` column with `align-items: baseline` lays out on
+    // LayoutNG in this branch (owner decision on #209):
+    // `flex_column_baseline_groups_match_chrome` and
+    // `flex_column_baseline_margins_match_chrome` pin its geometry to
+    // Chrome 156, so the #447 legacy-routing assertion for that one case
+    // is dropped.
     still(
         node(
             Style {
