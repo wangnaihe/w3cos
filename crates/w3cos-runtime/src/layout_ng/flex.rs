@@ -137,10 +137,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if style.direction == TextDirection::Rtl {
         return Some("flex:rtl");
     }
-    if !matches!(
-        style.align_content,
-        AlignContent::Stretch | AlignContent::FlexStart
-    ) {
+    // A single line ignores `align-content` (Flexbox §8.4) and stays on
+    // the existing stretch / flex-start path. Wrapped lines pack with the
+    // same distribution as `justify-content`, including `space-between`,
+    // `space-around`, and `space-evenly`.
+    if style.flex_wrap == FlexWrap::NoWrap
+        && !matches!(
+            style.align_content,
+            AlignContent::Stretch | AlignContent::FlexStart
+        )
+    {
         return Some("flex:align-content");
     }
     let row = row_axis(style.flex_direction);
@@ -1837,14 +1843,53 @@ fn layout_wrapped(
     let safe_cross = has_marker(style, "--w3cos-internal-safe-align-content");
     let cross_overflows = definite_cross.is_some_and(|size| packed > size + EPS);
     let reverse_cross = wrap_reverse && !(safe_cross && cross_overflows);
+    // Leftover cross space after line sizes and gaps. Stretch already grew
+    // the lines. The other values use the main-axis distribution (Flexbox
+    // §8.4): center and flex-end may start before the content edge when the
+    // lines overflow; space-* pack at the start in that case.
+    let (mut cross_lead, cross_between) = justify(
+        match style.align_content {
+            AlignContent::Stretch | AlignContent::FlexStart => JustifyContent::FlexStart,
+            AlignContent::FlexEnd => JustifyContent::FlexEnd,
+            AlignContent::Center => JustifyContent::Center,
+            AlignContent::SpaceBetween => JustifyContent::SpaceBetween,
+            AlignContent::SpaceAround => JustifyContent::SpaceAround,
+            AlignContent::SpaceEvenly => JustifyContent::SpaceEvenly,
+        },
+        used_cross - packed,
+        line_cross.len(),
+    );
+    if safe_cross && cross_overflows {
+        cross_lead = 0.0;
+    }
     let mut children = Vec::with_capacity(items.len());
     let mut oof_out = Vec::new();
     let mut frag_at = 0;
-    let mut cross_cursor = if reverse_cross { used_cross } else { 0.0 };
+    let mut cross_cursor = if reverse_cross {
+        used_cross - cross_lead
+    } else {
+        cross_lead
+    };
     for (line_index, &(start, end)) in lines.iter().enumerate() {
         let line_size = line_cross[line_index];
         if reverse_cross {
             cross_cursor -= line_size;
+        }
+        // Space-between puts the last line flush with the cross-end
+        // (Flexbox §8.4). Pinning that line keeps a fractional leftover
+        // (align-content-rounding) from missing the container edge after
+        // the gaps are split.
+        let last_line = line_index + 1 == lines.len();
+        if style.align_content == AlignContent::SpaceBetween
+            && lines.len() > 1
+            && used_cross + EPS >= packed
+            && last_line
+        {
+            cross_cursor = if reverse_cross {
+                0.0
+            } else {
+                used_cross - line_size
+            };
         }
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
@@ -1925,9 +1970,9 @@ fn layout_wrapped(
             }
         }
         if reverse_cross {
-            cross_cursor -= cross_gap;
+            cross_cursor -= cross_gap + cross_between;
         } else {
-            cross_cursor += line_size + cross_gap;
+            cross_cursor += line_size + cross_gap + cross_between;
         }
     }
     // A max-height limit flexes each line but does not force the used
