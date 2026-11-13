@@ -97,6 +97,7 @@ impl Line {
             Dimension::Px(value) => Some(value),
             Dimension::Em(value) => Some(value * style.font_size),
             Dimension::Rem(value) => Some(value * crate::layout::ROOT_FONT_SIZE),
+            Dimension::Lh(value) => Some(value * style.used_line_height_px()),
             _ => None,
         };
         let relative_x = relative_x
@@ -900,6 +901,7 @@ pub(crate) fn projected_height(
             Dimension::Px(value) => Some(value),
             Dimension::Em(value) => Some(value * style.font_size),
             Dimension::Rem(value) => Some(value * crate::layout::ROOT_FONT_SIZE),
+            Dimension::Lh(value) => Some(value * style.used_line_height_px()),
             _ => None,
         };
         let padding = style.padding_lengths();

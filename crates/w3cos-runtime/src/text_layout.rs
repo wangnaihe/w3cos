@@ -429,7 +429,14 @@ pub fn prepare_text_for_white_space(text: &str, white_space: WhiteSpace) -> Stri
     match white_space {
         WhiteSpace::Normal | WhiteSpace::NoWrap => collapse_css_whitespace_sequences(&text),
         WhiteSpace::PreLine => collapse_pre_line_whitespace(&text),
-        WhiteSpace::Pre | WhiteSpace::PreWrap => expand_tabs(&text),
+        // A `pre` line never soft-wraps, so its preserved tabs stay tab
+        // characters and are advanced to the block's tab stops from the
+        // line start when the line is measured and painted (Blink shapes a
+        // tab as a ShapeResult whose width depends on its line position;
+        // `tab-size` is honoured there). pre-wrap still expands to columns
+        // because wrapping measures partial runs.
+        WhiteSpace::Pre => text.replace(FORCED_LINE_BREAK, "\n"),
+        WhiteSpace::PreWrap => expand_tabs(&text),
     }
 }
 
@@ -2026,6 +2033,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn break_spaces_leading_space_is_a_wrap_opportunity_that_keeps_the_word() {
+        // overflow-wrap-break-word-006: " XXXXX " in a 5ch box with
+        // white-space: break-spaces and overflow-wrap: break-word wraps after
+        // the leading space so the word stays intact on the next line.
+        let mut style = w3cos_std::style::Style::default();
+        style.white_space = WhiteSpace::PreWrap;
+        style.break_spaces = true;
+        style.word_break = w3cos_std::style::WordBreak::BreakWord;
+        let lines = wrap_text_with_run_width_and_first_line_in(
+            " XXXXX ",
+            100.0,
+            100.0,
+            style.white_space,
+            crate::line_break::BreakMode::of(&style),
+            |run| run.chars().count() as f32 * 20.0,
+        );
+        assert!(
+            lines.len() >= 2 && lines[0] == " " && lines[1].starts_with("XXXXX"),
+            "expected a leading-space line then the unbroken word, got {lines:?}"
+        );
+    }
+
+    #[test]
     fn explicit_hyphens_wrap_at_the_latest_available_break() {
         // V576 DEFAULT Chromium141, Courier20px, width6ch. Spaces removed
         // at soft line cuts are not part of the retained painted line.
@@ -2558,7 +2588,7 @@ mod tests {
         );
         assert_eq!(
             prepare_text_for_white_space(source, WhiteSpace::Pre),
-            "This text\n        should   be"
+            "This text\n\tshould   be"
         );
     }
 
