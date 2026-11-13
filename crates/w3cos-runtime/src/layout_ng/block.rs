@@ -5824,6 +5824,13 @@ pub(super) fn layout_block_in(
         auto_content
     };
     let content_height = match (specified_height, ratio_height) {
+        // CSS 2.1 17.5.3: a table cell's `height` is a minimum. The cell's
+        // content height (its line boxes, not just the glyph boxes inside
+        // them) still sizes it, so `height: 0` on a one-line cell keeps the
+        // line's 18px under Tinos 16px/normal, as in Chrome.
+        (Some(height), _) if style.display == Display::TableCell => {
+            clamp_h(height).max(auto_content)
+        }
         (Some(height), _) => clamp_h(height),
         // css-sizing-4: the automatic minimum block size of a box with a
         // preferred aspect ratio is its content size (capped by max-height)

@@ -71,9 +71,31 @@ fn parsed_block_only_inline_block_distinguishes_content_and_empty_baselines() {
 
 #[test]
 fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
     use crate::html_parser_host::InertParserScriptHost;
     use crate::html_parser_state::StreamingDocumentParser;
     use std::rc::Rc;
+    const OWNER: u64 = 202611040001;
+    const FAMILY: &str = "W3cos anonymous table Tinos";
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: FAMILY.into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     for heights in [[100, 80, 60], [60, 120, 80], [0, 0, 0]] {
         for anonymous in [true, false] {
             w3cos_dom::stylesheet::clear_rules();
@@ -101,7 +123,7 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 "https://example.test/anonymous-height.html",
             )
             .unwrap();
-            parser.write(&format!("<!doctype html><body style='font:16px/normal serif'><div>{content}</div></body>")).unwrap();
+            parser.write(&format!("<!doctype html><body style='font:16px/normal \"{FAMILY}\"'><div>{content}</div></body>")).unwrap();
             parser.finish().unwrap();
             let root = crate::dom::to_component_tree();
             let flat = pre_flatten(&root);
@@ -120,7 +142,9 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 .map(|(index, _)| index)
                 .collect();
             assert_eq!(cells.len(), 3);
-            let height = (*heights.iter().max().unwrap()).max(22) as f32;
+            // Chrome156 with the same bundled Tinos bytes: both anonymous
+            // fixup and an authored table row use an 18px empty-line floor.
+            let height = (*heights.iter().max().unwrap()).max(18) as f32;
             for layouts in [
                 compute(&root, 800.0, 600.0).unwrap(),
                 LayoutEngine::new()
@@ -132,7 +156,7 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 let outer = LayoutRect {
                     x: 8.0,
                     y: 8.0,
-                    width: 131.79688,
+                    width: 111.0625,
                     height,
                 };
                 assert_eq!(
@@ -146,9 +170,9 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                     "anonymous={anonymous}, heights={heights:?}"
                 );
                 for (index, (x, width)) in cells.iter().zip([
-                    (8.0, 50.265625),
-                    (58.265625, 42.609375),
-                    (100.875, 38.921875),
+                    (8.0, 43.53125),
+                    (51.53125, 33.765625),
+                    (85.296875, 33.765625),
                 ]) {
                     assert_eq!(
                         rect(*index),
@@ -162,6 +186,87 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 }
             }
         }
+    }
+    w3cos_dom::stylesheet::clear_rules();
+}
+
+#[test]
+fn parsed_table_cell_inline_vertical_padding_keeps_the_text_on_the_content_line() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
+    use crate::html_parser_host::InertParserScriptHost;
+    use crate::html_parser_state::StreamingDocumentParser;
+    use std::rc::Rc;
+    const OWNER: u64 = 202611040003;
+    const FAMILY: &str = "W3cos table cell Tinos";
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: FAMILY.into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    w3cos_dom::stylesheet::clear_rules();
+    crate::dom::reset_document();
+    crate::jsdom::reset_bridge();
+    let mut parser = StreamingDocumentParser::new_with_script_host(
+        Rc::new(InertParserScriptHost),
+        "https://example.test/table-cell-inline-padding.html",
+    )
+    .unwrap();
+    parser.write(&format!("<!doctype html><body style='margin:8px'><div style='display:table-cell;width:200px;font:16px/1.2 \"{FAMILY}\"'><span style='padding-top:160px'>control</span></div></body>")).unwrap();
+    parser.finish().unwrap();
+    let root = crate::dom::to_component_tree();
+    let flat = pre_flatten(&root);
+    let cell = flat
+        .iter()
+        .position(|node| node.style.display == WDisplay::TableCell)
+        .unwrap();
+    let inline = flat
+        .iter()
+        .position(|node| {
+            node.style.display == WDisplay::Inline && node.style.padding_lengths().top == 160.0
+        })
+        .unwrap();
+    for layouts in [
+        compute(&root, 800.0, 600.0).unwrap(),
+        LayoutEngine::new()
+            .compute(&root, &flat, 800.0, 600.0)
+            .unwrap()
+            .layout_cache,
+    ] {
+        let rect = |index| layouts.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(
+            rect(cell),
+            LayoutRect {
+                x: 8.0,
+                y: 8.0,
+                width: 200.0,
+                height: 19.1875,
+            },
+            "{layouts:?}"
+        );
+        assert_eq!(
+            (rect(inline).x, rect(inline).y, rect(inline).height),
+            (8.0, -151.0, 177.0),
+            "the inline padding area must extend upward: {layouts:?}"
+        );
+        assert_eq!(
+            rect(inline).y + 160.0,
+            9.0,
+            "the inline content line must remain one pixel below the cell top: {layouts:?}"
+        );
     }
     w3cos_dom::stylesheet::clear_rules();
 }
@@ -406,19 +511,41 @@ fn parsed_table_inline_padding_preserves_browser_font_box_origin() {
 
 #[test]
 fn full_width_empty_atomic_margin_and_alignment_boundaries() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
     use crate::html_parser_host::InertParserScriptHost;
     use crate::html_parser_state::StreamingDocumentParser;
     use std::rc::Rc;
+    const OWNER: u64 = 202611040002;
+    const FAMILY: &str = "W3cos atomic boundary Tinos";
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: FAMILY.into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for (top, bottom, align, atomic_y, line_y) in [
-        (0, 0, "baseline", 32.0, 37.0),
-        (20, 0, "baseline", 35.0, 40.0),
-        (0, 20, "baseline", 15.0, 40.0),
-        (-5, 0, "baseline", 32.0, 37.0),
-        (0, 0, "top", 15.0, 37.0),
-        (0, 0, "bottom", 37.0, 37.0),
-        (0, 0, "middle", 27.703125, 37.0),
+        (0, 0, "baseline", 29.0, 33.0),
+        (20, 0, "baseline", 35.0, 39.0),
+        (0, 20, "baseline", 15.0, 39.0),
+        (-5, 0, "baseline", 29.0, 33.0),
+        (0, 0, "top", 15.0, 33.0),
+        (0, 0, "bottom", 33.0, 33.0),
+        (0, 0, "middle", 25.328125, 33.0),
     ] {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -427,7 +554,7 @@ fn full_width_empty_atomic_margin_and_alignment_boundaries() {
             "https://example.test/atomic-boundary.html",
         )
         .unwrap();
-        parser.write(&format!("<!doctype html><div style='border:5px solid black;font:16px serif;margin:10px;width:550px'>\
+        parser.write(&format!("<!doctype html><div style='border:5px solid black;font:16px \"{FAMILY}\";margin:10px;width:550px'>\
             <span><span style='display:inline-block;width:550px;margin-top:{top}px;margin-bottom:{bottom}px;vertical-align:{align}'></span>Filler Text Filler Text</span>\
             <img src='blue.png' style='height:48px;width:96px'>\
             <span style='background:orange;float:left;height:48px;width:96px'></span></div>")).unwrap();
@@ -471,7 +598,7 @@ fn full_width_empty_atomic_margin_and_alignment_boundaries() {
                 height: 0.0,
             },
             LayoutRect {
-                x: 277.528,
+                x: 256.15625,
                 y: line_y,
                 width: 96.0,
                 height: 48.0,
@@ -486,7 +613,7 @@ fn full_width_empty_atomic_margin_and_alignment_boundaries() {
                 x: 18.0,
                 y: 10.0,
                 width: 560.0,
-                height: line_y + 48.0,
+                height: line_y + 47.0,
             },
         ));
     }
