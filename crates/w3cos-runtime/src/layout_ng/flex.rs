@@ -137,19 +137,15 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if style.direction == TextDirection::Rtl {
         return Some("flex:rtl");
     }
-    // A single line ignores `align-content` (Flexbox §8.4). Wrapped
-    // `center` and `flex-end` pack lines with the same distribution as
-    // `justify-content`. `space-between`, `space-around`, and
-    // `space-evenly` stay on legacy: passing pages depend on legacy
-    // rounding and overflow for those values.
-    if !matches!(
-        style.align_content,
-        AlignContent::Stretch | AlignContent::FlexStart
-    ) && !(style.flex_wrap != FlexWrap::NoWrap
-        && matches!(
+    // A single line ignores `align-content` (Flexbox §8.4) and stays on
+    // the existing stretch / flex-start path. Wrapped lines pack with the
+    // same distribution as `justify-content`, including `space-between`,
+    // `space-around`, and `space-evenly`.
+    if style.flex_wrap == FlexWrap::NoWrap
+        && !matches!(
             style.align_content,
-            AlignContent::Center | AlignContent::FlexEnd
-        ))
+            AlignContent::Stretch | AlignContent::FlexStart
+        )
     {
         return Some("flex:align-content");
     }
@@ -1877,6 +1873,22 @@ fn layout_wrapped(
         let line_size = line_cross[line_index];
         if reverse_cross {
             cross_cursor -= line_size;
+        }
+        // Space-between puts the last line flush with the cross-end
+        // (Flexbox §8.4). Pinning that line keeps a fractional leftover
+        // (align-content-rounding) from missing the container edge after
+        // the gaps are split.
+        let last_line = line_index + 1 == lines.len();
+        if style.align_content == AlignContent::SpaceBetween
+            && lines.len() > 1
+            && used_cross + EPS >= packed
+            && last_line
+        {
+            cross_cursor = if reverse_cross {
+                0.0
+            } else {
+                used_cross - line_size
+            };
         }
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
