@@ -3109,7 +3109,15 @@ fn layout_block_in(
     } else {
         auto_content
     };
-    let content_height = clamp_h(specified_height.unwrap_or(auto_content));
+    // CSS 2.1 17.5.3: a table cell's `height` is a minimum. The cell's
+    // content height (its line boxes, not just the glyph boxes inside
+    // them) still sizes it, so `height: 0` on a one-line cell keeps the
+    // line's 18px under Tinos 16px/normal, as in Chrome.
+    let content_height = if style.display == Display::TableCell {
+        clamp_h(specified_height.unwrap_or(auto_content)).max(auto_content)
+    } else {
+        clamp_h(specified_height.unwrap_or(auto_content))
+    };
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
     // computed height is auto, whatever max-height does to the used height
     // (margin-collapse-038; Blink's FinishLayout drops the strut whenever
