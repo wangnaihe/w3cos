@@ -400,23 +400,36 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
-pub(crate) struct DirectCalleeGuard;
+pub(crate) struct DirectCalleeGuard {
+    typed: HashMap<u32, (String, usize)>,
+    boxed: HashMap<u32, (String, usize)>,
+}
 
 impl Drop for DirectCalleeGuard {
     fn drop(&mut self) {
-        DIRECT_TYPED_CALLEES.with(|callees| callees.borrow_mut().clear());
-        DIRECT_BOXED_CALLEES.with(|callees| callees.borrow_mut().clear());
+        DIRECT_TYPED_CALLEES
+            .with(|callees| *callees.borrow_mut() = std::mem::take(&mut self.typed));
+        DIRECT_BOXED_CALLEES
+            .with(|callees| *callees.borrow_mut() = std::mem::take(&mut self.boxed));
     }
 }
 
 /// Installs the proven immutable direct callees of the module being emitted.
+/// Nested installs restore the previous maps when the guard is dropped, so a
+/// synthetic module (module-init chunks use a fresh BindingId space) cannot
+/// leak its maps or keep the parent's ids.
 pub(crate) fn install_direct_callees(
     typed: HashMap<u32, (String, usize)>,
     boxed: HashMap<u32, (String, usize)>,
 ) -> DirectCalleeGuard {
-    DIRECT_TYPED_CALLEES.with(|installed| *installed.borrow_mut() = typed);
-    DIRECT_BOXED_CALLEES.with(|installed| *installed.borrow_mut() = boxed);
-    DirectCalleeGuard
+    let typed_prev = DIRECT_TYPED_CALLEES
+        .with(|installed| std::mem::replace(&mut *installed.borrow_mut(), typed));
+    let boxed_prev = DIRECT_BOXED_CALLEES
+        .with(|installed| std::mem::replace(&mut *installed.borrow_mut(), boxed));
+    DirectCalleeGuard {
+        typed: typed_prev,
+        boxed: boxed_prev,
+    }
 }
 
 /// Arity of an installed direct entry, by its Rust name.

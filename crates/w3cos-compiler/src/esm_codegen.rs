@@ -1766,6 +1766,15 @@ fn emit_w3ir_module_init_statements(
     }
 
     let factory = format!("{}__init_w3ir_{chunk_index}", module.namespace);
+    // Module-init chunks are a fresh W3IR module with their own BindingId
+    // space (externals start at 0). The parent module's direct-callee maps
+    // are keyed by that parent space, so a numeric hit would call the wrong
+    // function (e.g. `isPrimitive` becoming `print`). Fall back to dynamic
+    // dispatch for these chunks.
+    let _init_direct_guard = crate::w3ir_aot::install_direct_callees(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
     let helper = if entry.is_async {
         crate::w3ir_aot::generate_async_function_from_module(&w3ir_module, entry, &factory)
     } else {
@@ -12561,6 +12570,148 @@ fn main() {{
         );
         assert_eq!(aot_result, "S:SMT|SMT");
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Module-init chunks get a fresh BindingId space. Direct callee maps
+    /// installed for the parent module must not be applied there, or a
+    /// same-module call such as `isPrimitive(actual)` can be emitted as
+    /// `print` (or `fn5` instead of `fn4`).
+    #[test]
+    fn boxed_direct_does_not_apply_parent_ids_in_module_init_chunks() {
+        let root = fixture_root("w3cos_boxed_direct_module_init_ids");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/harness.js"),
+            r#"
+function isNegativeZero(value) { return value === 0 && 1 / value === -Infinity; }
+function isPrimitive(value) {
+  return !value || (typeof value !== "object" && typeof value !== "function");
+}
+function formatIdentityFreeValue(value) {
+  switch (value === null ? "null" : typeof value) {
+    case "string": return JSON.stringify(value);
+    case "number":
+      if (isNegativeZero(value)) return "-0";
+    case "boolean":
+    case "undefined":
+    case "null":
+      return String(value);
+  }
+}
+function formatSimpleValue(value) {
+  var basic = formatIdentityFreeValue(value);
+  if (basic) return basic;
+  return String(value);
+}
+function assert(mustBeTrue, message) {
+  if (mustBeTrue === true) return;
+  throw new Test262Error(message);
+}
+assert._isSameValue = function (a, b) { return a === b; };
+assert.sameValue = function (actual, expected, message) {
+  if (assert._isSameValue(actual, expected)) return;
+  throw new Test262Error("Expected SameValue(\u00ab" + actual + "\u00bb, \u00ab" + expected + "\u00bb)");
+};
+assert.compareArray = function (actual, expected, message) {
+  if (isPrimitive(actual)) assert(false, "primitive actual");
+  else if (isPrimitive(expected)) assert(false, "primitive expected");
+  var result = compareArray(actual, expected);
+  if (result) return;
+  assert(false, "mismatch");
+};
+function compareArray(a, b) {
+  if (b.length !== a.length) return false;
+  for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function Test262Error(message) {
+  this.message = message || "";
+}
+function $DONOTEVALUATE() {}
+var __t262_global = globalThis;
+function print(message) { __t262_global.__t262_print = String(message); }
+export { print, isPrimitive, compareArray, assert };
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+import { assert } from "./harness.js";
+export function runCompare() {
+  assert.compareArray([1, 2, "a"], [1, 2, "a"]);
+  return globalThis.__t262_print;
+}
+function fn() { return {a: 33}; }
+function fn4() { return [{a: 77}]; }
+function fn5() { return []; }
+export function runOptional() {
+  return fn4()[0]?.a;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = generate_with_bodies(&bundle);
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        let runtime_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-runtime");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            runtime_fixture_manifest(
+                "boxed_direct_module_init_ids_run",
+                "2024",
+                &core_path,
+                &runtime_path,
+                "",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    run_entry();
+    let printed = m1::m1_runCompare(Vec::new());
+    let optional = m1::m1_runOptional(Vec::new());
+    let window_printed = w3cos_core::intrinsics::get_property(
+        &w3cos_runtime::jsdom::window_value(),
+        &w3cos_core::Value::string("__t262_print"),
+    );
+    println!("PRINTED={{}}", printed.to_js_string());
+    println!("OPTIONAL={{}}", optional.to_js_string());
+    println!("WINDOW_PRINTED={{}}", window_printed.to_js_string());
+    assert!(printed.is_undefined(), "compareArray must not call print: {{}}", printed.to_js_string());
+    assert!(window_printed.is_undefined(), "window __t262_print must stay unset: {{}}", window_printed.to_js_string());
+    assert_eq!(optional.to_number(), 77.0, "fn4()[0]?.a");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{stdout}");
+        assert!(
+            output.status.success(),
+            "bundle failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }
