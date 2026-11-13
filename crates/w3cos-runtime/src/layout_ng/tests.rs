@@ -15712,10 +15712,20 @@ fn column_flex_unhandled_baseline_stays_on_legacy() {
         ),
         "flex:baseline",
     );
-    // A `wrap-reverse` column with `align-items: baseline` lays out on
-    // LayoutNG in this branch: `flex_column_baseline_groups_match_chrome`
-    // pins its geometry to Chrome, so the #447 legacy-routing oracle for
-    // that one case is not imported.
+    still(
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                flex_wrap: w3cos_std::style::FlexWrap::WrapReverse,
+                align_items: w3cos_std::style::AlignItems::Baseline,
+                width: Dimension::Px(200.0),
+                ..Style::default()
+            },
+            vec![fixed_box(40.0, 10.0)],
+        ),
+        "flex:baseline",
+    );
     still(
         node(
             Style {
