@@ -1129,10 +1129,11 @@ fn generate_module_with_bodies(
         }
     }
     let class_names = module_class_names(bundle, module);
-    let _direct_typed_guard = w3ir_module.as_ref().map(|w3ir| {
-        crate::w3ir_aot::install_direct_typed_callees(direct_typed_callees(
-            bundle, module, w3ir, &functions,
-        ))
+    let _direct_callee_guard = w3ir_module.as_ref().map(|w3ir| {
+        crate::w3ir_aot::install_direct_callees(
+            direct_typed_callees(bundle, module, w3ir, &functions),
+            direct_boxed_callees(bundle, module, w3ir, &functions),
+        )
     });
 
     // Emit definitions with bodies.
@@ -1765,6 +1766,15 @@ fn emit_w3ir_module_init_statements(
     }
 
     let factory = format!("{}__init_w3ir_{chunk_index}", module.namespace);
+    // Module-init chunks are a fresh W3IR module with their own BindingId
+    // space (externals start at 0). The parent module's direct-callee maps
+    // are keyed by that parent space, so a numeric hit would call the wrong
+    // function (e.g. `isPrimitive` becoming `print`). Fall back to dynamic
+    // dispatch for these chunks.
+    let _init_direct_guard = crate::w3ir_aot::install_direct_callees(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
     let helper = if entry.is_async {
         crate::w3ir_aot::generate_async_function_from_module(&w3ir_module, entry, &factory)
     } else {
@@ -2818,9 +2828,20 @@ fn emit_w3ir_sync_symbol(
         symbol.original_name,
         symbol.bundled_name,
     ));
-    if let Some(arity) =
-        crate::w3ir_aot::direct_typed_arity_for(&format!("{}_typed_direct", symbol.bundled_name))
-    {
+    let typed_arity =
+        crate::w3ir_aot::direct_typed_arity_for(&format!("{}_typed_direct", symbol.bundled_name));
+    let boxed_direct =
+        crate::w3ir_aot::direct_boxed_entry_for(&format!("{}_boxed_direct", symbol.bundled_name));
+    if typed_arity.is_some() || boxed_direct {
+        let bundled = &symbol.bundled_name;
+        // Capture accessors are page-local. Share one lazily refreshed map
+        // between typed and boxed direct entries without freezing their live
+        // values.
+        output.push_str(&format!(
+            "    std::thread_local! {{ static __W3COS_DIRECT_CAPTURES_{bundled}: std::cell::RefCell<Option<(u32, std::rc::Rc<w3cos_core::AotCaptureMap>)>> = const {{ std::cell::RefCell::new(None) }}; }}\n    #[allow(dead_code, non_snake_case)]\n    fn {bundled}_direct_captures() -> std::rc::Rc<w3cos_core::AotCaptureMap> {{\n        let __w3cos_epoch = w3cos_core::page_arena::page_epoch();\n        let __w3cos_cached = __W3COS_DIRECT_CAPTURES_{bundled}.with(|cell| cell.borrow().as_ref().filter(|(epoch, _)| *epoch == __w3cos_epoch).map(|(_, captures)| std::rc::Rc::clone(captures)));\n        match __w3cos_cached {{ Some(captures) => captures, None => {{ let captures = std::rc::Rc::new({captures}); let retired = __W3COS_DIRECT_CAPTURES_{bundled}.with(|cell| cell.replace(Some((__w3cos_epoch, std::rc::Rc::clone(&captures))))); drop(retired); captures }} }}\n    }}\n"
+        ));
+    }
+    if let Some(arity) = typed_arity {
         let parameters = (0..arity)
             .map(|index| format!("a{index}: f64"))
             .collect::<Vec<_>>()
@@ -2830,10 +2851,14 @@ fn emit_w3ir_sync_symbol(
             .collect::<Vec<_>>()
             .join(", ");
         let bundled = &symbol.bundled_name;
-        // The capture map is rebuilt per page (its accessors are page-local
-        // function values) and shared by every direct call on that page.
         output.push_str(&format!(
-            "    std::thread_local! {{ static __W3COS_DIRECT_CAPTURES_{bundled}: std::cell::RefCell<Option<(u32, std::rc::Rc<w3cos_core::AotCaptureMap>)>> = const {{ std::cell::RefCell::new(None) }}; }}\n    #[allow(dead_code, non_snake_case)]\n    fn {bundled}_typed_direct({parameters}) -> w3cos_core::Completion {{\n        let __w3cos_epoch = w3cos_core::page_arena::page_epoch();\n        let __w3cos_cached = __W3COS_DIRECT_CAPTURES_{bundled}.with(|cell| cell.borrow().as_ref().filter(|(epoch, _)| *epoch == __w3cos_epoch).map(|(_, captures)| std::rc::Rc::clone(captures)));\n        let __w3cos_captures = match __w3cos_cached {{ Some(captures) => captures, None => {{ let captures = std::rc::Rc::new({captures}); let retired = __W3COS_DIRECT_CAPTURES_{bundled}.with(|cell| cell.replace(Some((__w3cos_epoch, std::rc::Rc::clone(&captures))))); drop(retired); captures }} }};\n        {factory}__typed_direct(&__w3cos_captures, {arguments})\n    }}\n"
+            "    #[allow(dead_code, non_snake_case)]\n    fn {bundled}_typed_direct({parameters}) -> w3cos_core::Completion {{\n        let __w3cos_captures = {bundled}_direct_captures();\n        {factory}__typed_direct(&__w3cos_captures, {arguments})\n    }}\n"
+        ));
+    }
+    if boxed_direct {
+        let bundled = &symbol.bundled_name;
+        output.push_str(&format!(
+            "    #[allow(dead_code, non_snake_case)]\n    fn {bundled}_boxed_direct(__args: &[w3cos_core::Value]) -> w3cos_core::Completion {{\n        let __w3cos_captures = {bundled}_direct_captures();\n        w3cos_core::catch_js(|| {factory}(w3cos_core::Value::Undefined, __args, &__w3cos_captures))\n    }}\n"
         ));
     }
     if symbol.kind == SymbolKind::Variable {
@@ -2920,48 +2945,7 @@ fn direct_typed_callees(
         let Some(arity) = crate::w3ir_aot::direct_typed_arity(function) else {
             continue;
         };
-        // The binding must only ever hold this function: every write is the
-        // module body's hoisted `CreateClosure` of it.
-        let closures: HashMap<w3cos_ir::Register, w3cos_ir::FunctionId> = entry
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .filter_map(|instruction| match instruction {
-                w3cos_ir::Instruction::CreateClosure { dst, function, .. } => {
-                    Some((*dst, *function))
-                }
-                _ => None,
-            })
-            .collect();
-        let mut writes = 0;
-        let mut foreign = false;
-        for candidate in &w3ir_module.functions {
-            for instruction in candidate
-                .blocks
-                .iter()
-                .flat_map(|block| &block.instructions)
-            {
-                let (w3cos_ir::Instruction::InitializeBinding {
-                    binding: target,
-                    value,
-                }
-                | w3cos_ir::Instruction::StoreBinding {
-                    binding: target,
-                    value,
-                }) = instruction
-                else {
-                    continue;
-                };
-                if *target != binding.id {
-                    continue;
-                }
-                writes += 1;
-                if candidate.id != entry.id || closures.get(value) != Some(&function.id) {
-                    foreign = true;
-                }
-            }
-        }
-        if foreign || writes != 1 {
+        if !binding_has_single_function_write(w3ir_module, entry, binding.id, function.id) {
             continue;
         }
         callees.insert(
@@ -2970,6 +2954,111 @@ fn direct_typed_callees(
         );
     }
     callees
+}
+
+/// Boxed direct entries use the same immutable-binding proof as typed direct
+/// calls, but accept an exact-arity slice of ordinary Values. Keep the first
+/// version deliberately narrow: sync functions only, no rest parameter or
+/// observable `arguments` object.
+fn direct_boxed_callees(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    items: &[TopLevelItem],
+) -> HashMap<u32, (String, usize)> {
+    let mut callees = HashMap::new();
+    let Some(entry) = w3ir_module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == w3ir_module.entry)
+    else {
+        return callees;
+    };
+    for symbol in bundle
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.module == module.path && symbol.kind == SymbolKind::Function)
+    {
+        if function_flags(items, &symbol.original_name)
+            .is_none_or(|(is_async, is_generator)| is_async || is_generator)
+        {
+            continue;
+        }
+        let lowered_name = w3ir_entry_binding_name(&symbol.original_name);
+        let Some(binding) = entry.bindings.iter().find(|binding| {
+            binding.name == lowered_name
+                && matches!(
+                    binding.kind,
+                    w3cos_ir::BindingKind::Function | w3cos_ir::BindingKind::Var
+                )
+        }) else {
+            continue;
+        };
+        let Some(function) = entry_bound_w3ir_function(w3ir_module, &symbol.original_name) else {
+            continue;
+        };
+        if function.is_async
+            || function.is_generator
+            || function.rest_parameter.is_some()
+            || function.arguments_binding.is_some()
+            || !binding_has_single_function_write(w3ir_module, entry, binding.id, function.id)
+        {
+            continue;
+        }
+        callees.insert(
+            binding.id.0,
+            (
+                format!("{}_boxed_direct", symbol.bundled_name),
+                function.parameters.len(),
+            ),
+        );
+    }
+    callees
+}
+
+fn binding_has_single_function_write(
+    module: &w3cos_ir::Module,
+    entry: &w3cos_ir::Function,
+    binding: w3cos_ir::BindingId,
+    function: w3cos_ir::FunctionId,
+) -> bool {
+    let closures: HashMap<w3cos_ir::Register, w3cos_ir::FunctionId> = entry
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            w3cos_ir::Instruction::CreateClosure { dst, function, .. } => Some((*dst, *function)),
+            _ => None,
+        })
+        .collect();
+    let mut writes = 0;
+    for candidate in &module.functions {
+        for instruction in candidate
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+        {
+            let (w3cos_ir::Instruction::InitializeBinding {
+                binding: target,
+                value,
+            }
+            | w3cos_ir::Instruction::StoreBinding {
+                binding: target,
+                value,
+            }) = instruction
+            else {
+                continue;
+            };
+            if *target != binding {
+                continue;
+            }
+            writes += 1;
+            if candidate.id != entry.id || closures.get(value) != Some(&function) {
+                return false;
+            }
+        }
+    }
+    writes == 1
 }
 
 fn select_w3ir_function<'a>(
@@ -5889,6 +5978,24 @@ export function sqThrows(): string { try { sq(1e301); return "no"; } catch (e) {
 function fibT(n: number): number { return n < 2 ? n : fibT(n - 1) + fibT(n - 2); }
 export function fibCall(n: number): number { return fibT(n); }
 export function sqMixed(): any { const v: any = "3"; return sq(v); }
+function assertBool(ok: boolean): void { if (!ok) throw new Error("bad bool"); }
+export function boxedOk(): string { assertBool(true); return "ok"; }
+export function boxedCaught(): string {
+  try { assertBool(false); return "missed"; } catch (e) { return "caught"; }
+}
+let boxedSeed = 4;
+function boxedCapture(ok: boolean): number { assertBool(ok); return boxedSeed; }
+export function boxedCaptureRoundtrip(): number {
+  boxedSeed = 9;
+  return boxedCapture(true);
+}
+function boxedDepth(n: any): number { return n <= 0 ? 0 : 1 + boxedDepth(n - 1); }
+export function boxedDepthCall(): number { return boxedDepth(8); }
+function mutableBool(ok: boolean): boolean { return ok; }
+export function boxedReassigned(): boolean {
+  mutableBool = (ok: boolean): boolean => !ok;
+  return mutableBool(true);
+}
 export function mathIdentity(): boolean {
   (Math as any).__w3cosProbe = 5;
   return Math === Math && (Math as any).__w3cosProbe === 5 && Math.sqrt(16) === 4;
@@ -5913,6 +6020,17 @@ export function numPreds(x: any): number {
         assert!(
             code.contains("m0_fibT_typed_direct(") && code.contains("m0_sq_typed_direct("),
             "same-module typed callees should be called directly:\n{code}"
+        );
+        assert!(
+            code.contains("m0_assertBool_boxed_direct(&[")
+                && code.contains("fn m0_assertBool_boxed_direct(")
+                && code.contains("m0_boxedCapture_boxed_direct(&[")
+                && code.contains("m0_boxedDepth_boxed_direct(&["),
+            "immutable boxed callees should use the direct slice entry:\n{code}"
+        );
+        assert!(
+            !code.contains("fn m0_mutableBool_boxed_direct("),
+            "a reassigned function binding must retain dynamic dispatch:\n{code}"
         );
         assert!(
             code.contains("record_typed_entry") && code.contains("FrameTyped"),
@@ -6006,6 +6124,13 @@ fn main() {
     assert_eq!(m0::m0_sqThrows(vec![]).to_js_string(), "caught");
     assert_eq!(num(m0::m0_fibCall(vec![n(15.0)])), 610.0);
     assert_eq!(num(m0::m0_sqMixed(vec![])), 9.0);
+    assert_eq!(m0::m0_boxedOk(vec![]).to_js_string(), "ok");
+    assert_eq!(m0::m0_boxedCaught(vec![]).to_js_string(), "caught");
+    assert_eq!(num(m0::m0_boxedCaptureRoundtrip(vec![])), 9.0);
+    assert_eq!(num(m0::m0_boxedDepthCall(vec![])), 8.0);
+    // `mutableBool` reassignment is deliberately checked in generated code
+    // above. Executing it is not an available baseline semantic: top-level
+    // function declarations currently expose no assignment setter.
 
     // Multi-use receiver borrow keeps accessor order; per-iteration `let`
     // cells still refresh when a closure captures them; Math is a singleton.
@@ -12445,6 +12570,148 @@ fn main() {{
         );
         assert_eq!(aot_result, "S:SMT|SMT");
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Module-init chunks get a fresh BindingId space. Direct callee maps
+    /// installed for the parent module must not be applied there, or a
+    /// same-module call such as `isPrimitive(actual)` can be emitted as
+    /// `print` (or `fn5` instead of `fn4`).
+    #[test]
+    fn boxed_direct_does_not_apply_parent_ids_in_module_init_chunks() {
+        let root = fixture_root("w3cos_boxed_direct_module_init_ids");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/harness.js"),
+            r#"
+function isNegativeZero(value) { return value === 0 && 1 / value === -Infinity; }
+function isPrimitive(value) {
+  return !value || (typeof value !== "object" && typeof value !== "function");
+}
+function formatIdentityFreeValue(value) {
+  switch (value === null ? "null" : typeof value) {
+    case "string": return JSON.stringify(value);
+    case "number":
+      if (isNegativeZero(value)) return "-0";
+    case "boolean":
+    case "undefined":
+    case "null":
+      return String(value);
+  }
+}
+function formatSimpleValue(value) {
+  var basic = formatIdentityFreeValue(value);
+  if (basic) return basic;
+  return String(value);
+}
+function assert(mustBeTrue, message) {
+  if (mustBeTrue === true) return;
+  throw new Test262Error(message);
+}
+assert._isSameValue = function (a, b) { return a === b; };
+assert.sameValue = function (actual, expected, message) {
+  if (assert._isSameValue(actual, expected)) return;
+  throw new Test262Error("Expected SameValue(\u00ab" + actual + "\u00bb, \u00ab" + expected + "\u00bb)");
+};
+assert.compareArray = function (actual, expected, message) {
+  if (isPrimitive(actual)) assert(false, "primitive actual");
+  else if (isPrimitive(expected)) assert(false, "primitive expected");
+  var result = compareArray(actual, expected);
+  if (result) return;
+  assert(false, "mismatch");
+};
+function compareArray(a, b) {
+  if (b.length !== a.length) return false;
+  for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function Test262Error(message) {
+  this.message = message || "";
+}
+function $DONOTEVALUATE() {}
+var __t262_global = globalThis;
+function print(message) { __t262_global.__t262_print = String(message); }
+export { print, isPrimitive, compareArray, assert };
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+import { assert } from "./harness.js";
+export function runCompare() {
+  assert.compareArray([1, 2, "a"], [1, 2, "a"]);
+  return globalThis.__t262_print;
+}
+function fn() { return {a: 33}; }
+function fn4() { return [{a: 77}]; }
+function fn5() { return []; }
+export function runOptional() {
+  return fn4()[0]?.a;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = generate_with_bodies(&bundle);
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        let runtime_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-runtime");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            runtime_fixture_manifest(
+                "boxed_direct_module_init_ids_run",
+                "2024",
+                &core_path,
+                &runtime_path,
+                "",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                r#"#![allow(warnings)]
+{code}
+fn main() {{
+    run_entry();
+    let printed = m1::m1_runCompare(Vec::new());
+    let optional = m1::m1_runOptional(Vec::new());
+    let window_printed = w3cos_core::intrinsics::get_property(
+        &w3cos_runtime::jsdom::window_value(),
+        &w3cos_core::Value::string("__t262_print"),
+    );
+    println!("PRINTED={{}}", printed.to_js_string());
+    println!("OPTIONAL={{}}", optional.to_js_string());
+    println!("WINDOW_PRINTED={{}}", window_printed.to_js_string());
+    assert!(printed.is_undefined(), "compareArray must not call print: {{}}", printed.to_js_string());
+    assert!(window_printed.is_undefined(), "window __t262_print must stay unset: {{}}", window_printed.to_js_string());
+    assert_eq!(optional.to_number(), 77.0, "fn4()[0]?.a");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{stdout}");
+        assert!(
+            output.status.success(),
+            "bundle failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }
