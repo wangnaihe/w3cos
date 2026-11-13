@@ -142,6 +142,18 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if rtl_justify_unsupported(style) {
         return Some("flex:rtl-justify");
     }
+    // A single line ignores `align-content` (Flexbox §8.4) and stays on
+    // the existing stretch / flex-start path. Wrapped lines pack with the
+    // same distribution as `justify-content`, including `space-between`,
+    // `space-around`, and `space-evenly`.
+    if style.flex_wrap == FlexWrap::NoWrap
+        && !matches!(
+            style.align_content,
+            AlignContent::Stretch | AlignContent::FlexStart
+        )
+    {
+        return Some("flex:align-content");
+    }
     let row = row_axis(style.flex_direction);
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
@@ -3690,9 +3702,22 @@ fn layout_wrapped(
         if reverse_cross {
             cross_cursor -= line_size;
         }
-        let top_line = if reverse_cross { true } else { line_index == 0 };
-        let line_top = bt + pt + cross_cursor;
-        let mut fallback_baseline = None::<LastBaseline>;
+        // Space-between puts the last line flush with the cross-end
+        // (Flexbox §8.4). Pinning that line keeps a fractional leftover
+        // (align-content-rounding) from missing the container edge after
+        // the gaps are split.
+        let last_line = line_index + 1 == lines.len();
+        if style.align_content == AlignContent::SpaceBetween
+            && lines.len() > 1
+            && used_cross + EPS >= packed
+            && last_line
+        {
+            cross_cursor = if reverse_cross {
+                0.0
+            } else {
+                used_cross - line_size
+            };
+        }
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
         let used_outer = line.iter().map(|item| item.outer_main()).sum::<f32>() + gap_sum;
@@ -3707,6 +3732,9 @@ fn layout_wrapped(
                 if item.auto_main_start {
                     item.margin_main_start += share;
                 }
+                let top_line = if reverse_cross { true } else { line_index == 0 };
+                let line_top = bt + pt + cross_cursor;
+                let mut fallback_baseline = None::<LastBaseline>;
                 if item.auto_main_end {
                     item.margin_main_end += share;
                 }
