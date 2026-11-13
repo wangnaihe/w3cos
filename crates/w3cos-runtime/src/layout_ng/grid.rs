@@ -96,7 +96,7 @@ fn spacing_px(style: &Style, spacing: Spacing, cb: f32, space: &ConstraintSpace)
 
 /// A percentage `height` resolves against the item's grid area once the
 /// rows are sized; it is auto for track sizing (css-grid-1 6.2 / Blink
-/// grid layout algorithm).
+/// grid layout algorithm). Fixed rows from r43 are that area.
 fn percent_height(style: &Style) -> bool {
     matches!(style.height, Dimension::Percent(_) | Dimension::Calc { .. })
         && !has_marker(style, HEIGHT_KEYWORD)
@@ -769,6 +769,8 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("grid:baseline");
         }
+        // Percentage `height` is resolved after the rows are sized.
+        // Percentage min/max-height still falls back.
         if percent_block(child_style) {
             return Some("grid:percent-block");
         }
@@ -5782,6 +5784,8 @@ fn layout_impl(
         let content_width = block::clamp_inline_size(child_style, &item_space, edges_h, raw)
             .max(keyword_floor)
             .max(0.0);
+        // Percentage height is auto while tracks are sized, then resolved
+        // against the finished row area (r43's fixed-row case included).
         let percent_h = percent_height(child_style);
         let specified_content_h = if has_marker(child_style, HEIGHT_KEYWORD) || percent_h {
             None

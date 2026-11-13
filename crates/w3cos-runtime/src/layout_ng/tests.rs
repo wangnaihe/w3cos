@@ -16722,6 +16722,148 @@ fn wrapped_row_align_content_matches_legacy() {
     );
 }
 
+/// A percentage height resolves against the grid area after the rows are
+/// sized. `grid-item-containing-block-001.html`: a 100px row and
+/// `height: 100%` is a 100px item. A 50% row of a 200px grid is the same.
+/// Two `1fr` rows split that 200px, so the first item is also 100px.
+/// Percentage `min-height` stays on legacy.
+#[test]
+fn grid_percent_height_resolves_against_the_row_area() {
+    let mut grid = Style {
+        display: Display::Grid,
+        width: Dimension::Px(200.0),
+        height: Dimension::Px(200.0),
+        grid_template_columns: Some("100px".to_string()),
+        ..Style::default()
+    };
+    grid.grid_ng_mut().grid_template_rows = Some("100px".to_string());
+    let item = node(
+        Style {
+            width: Dimension::Percent(100.0),
+            height: Dimension::Percent(100.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![],
+        )],
+    );
+    let root = node(grid, vec![item]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("definite percent height");
+    // Legacy uses the grid box (200px) as the percentage basis. The row is
+    // 100px, which is the containing block CSS Grid specifies.
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0));
+
+    // containing-block-002: the row is 50% of the 200px grid, then the
+    // item is 100% of that row.
+    let mut percent_row = Style {
+        display: Display::Grid,
+        width: Dimension::Px(200.0),
+        height: Dimension::Px(200.0),
+        grid_template_columns: Some("50%".to_string()),
+        ..Style::default()
+    };
+    percent_row.grid_ng_mut().grid_template_rows = Some("50%".to_string());
+    let percent_root = node(
+        percent_row,
+        vec![node(
+            Style {
+                width: Dimension::Percent(100.0),
+                height: Dimension::Percent(100.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    width: Dimension::Px(100.0),
+                    height: Dimension::Px(100.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        )],
+    );
+    let flat = pre_flatten(&percent_root);
+    let ng = layout_tree(&percent_root, &flat, 800.0, 600.0).expect("percent row");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0));
+
+    // containing-block-003: two `1fr` rows in a 200px grid. The item's
+    // percentage height is the first row, 100px.
+    let mut fr_grid = Style {
+        display: Display::Grid,
+        width: Dimension::Px(200.0),
+        height: Dimension::Px(200.0),
+        grid_template_columns: Some("1fr 1fr".to_string()),
+        ..Style::default()
+    };
+    fr_grid.grid_ng_mut().grid_template_rows = Some("1fr 1fr".to_string());
+    let fr = node(
+        fr_grid,
+        vec![node(
+            Style {
+                height: Dimension::Percent(100.0),
+                ..block()
+            },
+            vec![],
+        )],
+    );
+    let flat = pre_flatten(&fr);
+    let ng = layout_tree(&fr, &flat, 800.0, 600.0).expect("fr percent height");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0));
+
+    let mut auto = Style {
+        display: Display::Grid,
+        width: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    auto.grid_template_columns = Some("50px".to_string());
+    let indefinite = node(
+        auto,
+        vec![node(
+            Style {
+                height: Dimension::Percent(100.0),
+                ..block()
+            },
+            vec![],
+        )],
+    );
+    // An auto row is sized with the percentage treated as auto, then the
+    // percentage resolves against that area. An empty item is 0 tall.
+    let flat = pre_flatten(&indefinite);
+    let ng = layout_tree(&indefinite, &flat, 800.0, 600.0).expect("auto row percent height");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 50.0, 0.0));
+
+    let mut min_grid = Style {
+        display: Display::Grid,
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    min_grid.grid_ng_mut().grid_template_rows = Some("100px".to_string());
+    let min_height = node(
+        min_grid,
+        vec![node(
+            Style {
+                min_height: Dimension::Percent(100.0),
+                ..block()
+            },
+            vec![],
+        )],
+    );
+    let flat = pre_flatten(&min_height);
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| reason == "grid:percent-block"),
+        "percentage min-height stays on legacy: {:?}",
+        block::unsupported_reasons(&flat)
+    );
+}
+
 fn wide_space() -> ConstraintSpace {
     ConstraintSpace {
         available_inline: 200.0,
