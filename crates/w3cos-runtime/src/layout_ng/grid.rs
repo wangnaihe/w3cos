@@ -89,10 +89,54 @@ fn spacing_px(style: &Style, spacing: Spacing, cb: f32, space: &ConstraintSpace)
     }
 }
 
-fn percent_block(style: &Style) -> bool {
-    matches!(style.height, Dimension::Percent(_))
-        || matches!(style.min_height, Dimension::Percent(_))
+/// Percentage `min-height` / `max-height` stays on legacy. A percentage
+/// `height` is resolved in `layout` when the spanned rows are fixed.
+fn percent_block_indefinite(style: &Style) -> bool {
+    matches!(style.min_height, Dimension::Percent(_))
         || matches!(style.max_height, Dimension::Percent(_))
+}
+
+fn fixed_breadth(breadth: Breadth, block_size: Option<f32>, font: f32) -> Option<f32> {
+    match breadth {
+        Breadth::Px(px) => Some(px.max(0.0)),
+        Breadth::Em(em) => Some((em * font).max(0.0)),
+        Breadth::Percent(percent) => block_size.map(|size| (size * percent / 100.0).max(0.0)),
+        Breadth::Fr(_)
+        | Breadth::Auto
+        | Breadth::MinContent
+        | Breadth::MaxContent
+        | Breadth::Calc { .. } => None,
+    }
+}
+
+fn fixed_row(spec: Spec, block_size: Option<f32>, font: f32) -> Option<f32> {
+    match spec {
+        Spec::One(breadth) => fixed_breadth(breadth, block_size, font),
+        Spec::MinMax(_, _) | Spec::Fit(_) => None,
+    }
+}
+
+/// The grid area's block size when every spanned row is a fixed length.
+/// `None` when a row is `auto`, `fr`, `min-content`, or `max-content`.
+fn definite_row_span(
+    specs: &[Spec],
+    row: usize,
+    span: usize,
+    gap: f32,
+    block_size: Option<f32>,
+    font: f32,
+) -> Option<f32> {
+    if span == 0 || row.saturating_add(span) > specs.len() {
+        return None;
+    }
+    let mut sum = 0.0;
+    for spec in &specs[row..row + span] {
+        sum += fixed_row(*spec, block_size, font)?;
+    }
+    if span > 1 {
+        sum += gap * (span - 1) as f32;
+    }
+    Some(sum.max(0.0))
 }
 
 fn inset_set(style: &Style) -> bool {
@@ -391,7 +435,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("grid:baseline");
         }
-        if percent_block(child_style) {
+        // A percentage block size is resolved in `layout` when every
+        // spanned row is a fixed length. An auto row, or a percentage
+        // min/max-height, stays here: indefinite percentages compute as
+        // auto (or 0 for min-height) and passing pages depend on that.
+        if percent_block_indefinite(child_style) {
             return Some("grid:percent-block");
         }
         if child_style.flex_grow != 0.0
@@ -3635,11 +3683,32 @@ pub(super) fn layout(
         item_space.available_inline = area;
         let content_width =
             block::clamp_inline_size(child_style, &item_space, edges_h, raw).max(0.0);
+        let height_basis = if matches!(child_style.height, Dimension::Percent(_)) {
+            let Some(span) = definite_row_span(
+                &row_specs,
+                item.row,
+                item.row_span,
+                row_gap,
+                definite_block,
+                font,
+            ) else {
+                return super::bail("grid:percent-block");
+            };
+            Some(span)
+        } else {
+            None
+        };
         let specified_content_h = if has_marker(child_style, HEIGHT_KEYWORD) {
             None
         } else {
-            resolve_block(child_style.height, None, child_style, space, edges_v)
-                .why("grid:percent")?
+            resolve_block(
+                child_style.height,
+                height_basis,
+                child_style,
+                space,
+                edges_v,
+            )
+            .why("grid:percent")?
         };
         let stretch_block = align == Pack::Stretch
             && specified_content_h.is_none()
