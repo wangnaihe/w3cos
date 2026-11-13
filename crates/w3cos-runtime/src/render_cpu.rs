@@ -885,7 +885,20 @@ fn render_node(
             + style.border_bottom_width.unwrap_or(style.border_width);
         LayoutRect {
             y: rect.y,
-            height: rect.height.max(line_height),
+            // A used height of 0 on a size-contained / scroll-marker box is
+            // already the laid-out line box. Expanding that to the font strut
+            // would paint a full-width bar (scroll-marker-group-style-remove).
+            // Leave other 0-height inlines alone so first-line / pre-wrap
+            // decorations still use the strut (text-box-trim, pre-wrap-016).
+            height: if rect.height <= 0.0
+                && style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-scroll-marker-origin")
+                        || properties.contains_key("--w3cos-internal-size-containment")
+                }) {
+                rect.height
+            } else {
+                rect.height.max(line_height)
+            },
             ..rect
         }
     } else {

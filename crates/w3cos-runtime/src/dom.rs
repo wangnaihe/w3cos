@@ -69,11 +69,18 @@ pub fn reset_document() {
     DOCUMENT.with(|d| *d.borrow_mut() = new_host_document());
     DOM_MUTATION_GENERATION.with(|generation| generation.set(0));
     w3cos_dom::document::bump_structure_tick();
+    w3cos_dom::document::clear_column_pseudo_counts();
     SCROLL_REQUESTS.with(|requests| requests.borrow_mut().clear());
     clear_document_dirty();
     crate::incremental_layout::invalidate();
     crate::definite_layout::invalidate();
     crate::jsdom::invalidate_scroll_size_cache();
+}
+
+/// Record the layout-time ::column count for a scroll-marker container.
+/// Returns true when the stored value changed.
+pub fn set_column_pseudo_count(node: u32, count: usize) -> bool {
+    w3cos_dom::document::set_column_pseudo_count(NodeId::from_u32(node), count)
 }
 
 // ---------------------------------------------------------------------------
