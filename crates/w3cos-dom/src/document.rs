@@ -16781,19 +16781,27 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         };
         (!content.is_empty() && content.chars().all(is_regional_indicator)).then(|| text.clone())
     });
-    let leading_has_rtl = component.children[..component.children.len().saturating_sub(1)]
-        .iter()
-        .any(|child| match &child.kind {
-            ComponentKind::Text { content } => content.chars().any(|character| {
-                matches!(
-                    unicode_bidi::bidi_class(character),
-                    unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
-                )
-            }),
-            _ => false,
-        });
+    // Only consulted when the run ends in regional indicators; ASCII text
+    // has no strong RTL characters.
+    let leading_has_rtl = || {
+        component.children[..component.children.len().saturating_sub(1)]
+            .iter()
+            .any(|child| match &child.kind {
+                ComponentKind::Text { content } => {
+                    !content.is_ascii()
+                        && content.chars().any(|character| {
+                            matches!(
+                                unicode_bidi::bidi_class(character),
+                                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+                            )
+                        })
+                }
+                _ => false,
+            })
+    };
     if style_bidi_control.is_none()
-        && leading_has_rtl
+        && trailing_isolated_indicators.is_some()
+        && leading_has_rtl()
         && let Some(mut indicators) = trailing_isolated_indicators
     {
         indicators.style.unicode_bidi = UnicodeBidi::Isolate;
