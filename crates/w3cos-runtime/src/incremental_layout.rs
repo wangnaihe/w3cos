@@ -69,7 +69,33 @@ struct Cache {
     owner_counts: Option<HashMap<u32, u32>>,
 }
 
+/// The CSSOM line rects one re-wrapped text run published, relative to its
+/// line box, with the inputs they follow from.
+struct TextRectsMemo {
+    content: String,
+    style: w3cos_std::Style,
+    width_bits: u32,
+    fonts: u64,
+    owners: Vec<u32>,
+    rects: Vec<TextLineRect>,
+}
+
+/// One published line rect, kept as the terms its position is summed from
+/// so a replay against a moved line box adds them in the same order.
+struct TextLineRect {
+    owner: u32,
+    rtl: bool,
+    prefix: f32,
+    width: f32,
+    line_top: f32,
+    font_top: f32,
+    font_height: f32,
+}
+
 thread_local! {
+    /// Per flat index: a text run's re-wrapped CSSOM rects (the wrap is a
+    /// function of the run, its style, the line box width, and the fonts).
+    static TEXT_RECTS: RefCell<HashMap<usize, TextRectsMemo>> = RefCell::new(HashMap::new());
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
     static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
         const { std::cell::Cell::new(("none", 0, 0)) };
@@ -1002,6 +1028,59 @@ pub(super) fn client_rects_for(
         // layout and paint (line-break strictness, word-break, lang), so the
         // published fragments follow the painted lines.
         // keep-all leaves fall back to the legacy layout and keep its mode.
+        let fonts = crate::font_face::FontRegistry::global().revision();
+        let width_bits = line_box.width.to_bits();
+        let replay = |rects: &[TextLineRect],
+                      published: &mut HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+                      owners_with_inline_fragments: &mut HashSet<u32>,
+                      first_fragment_is_block: &mut HashMap<u32, bool>,
+                      last_fragment_is_block: &mut HashMap<u32, bool>| {
+            for rect in rects {
+                let x = if rect.rtl {
+                    line_box.x + line_box.width - rect.prefix - rect.width
+                } else {
+                    line_box.x + rect.prefix
+                };
+                owners_with_inline_fragments.insert(rect.owner);
+                published
+                    .entry(rect.owner)
+                    .or_default()
+                    .push(w3cos_dom::DOMRect::new(
+                        x,
+                        line_box.y + rect.line_top + rect.font_top,
+                        rect.width,
+                        rect.font_height,
+                    ));
+                first_fragment_is_block.entry(rect.owner).or_insert(false);
+                last_fragment_is_block.insert(rect.owner, false);
+            }
+        };
+        let hit = TEXT_RECTS.with(|memo| {
+            let memo = memo.borrow();
+            let Some(entry) = memo.get(&index) else {
+                return false;
+            };
+            if entry.width_bits != width_bits
+                || entry.fonts != fonts
+                || entry.content != *content
+                || entry.owners != inherited_text_owners[index]
+                || entry.style != *info.style
+            {
+                return false;
+            }
+            replay(
+                &entry.rects,
+                &mut published,
+                &mut owners_with_inline_fragments,
+                &mut first_fragment_is_block,
+                &mut last_fragment_is_block,
+            );
+            true
+        });
+        if hit {
+            continue;
+        }
+        let mut rects: Vec<TextLineRect> = Vec::new();
         let break_mode = if crate::layout_ng::mode() == crate::layout_ng::Mode::Off
             || info.style.word_break == w3cos_std::style::WordBreak::KeepAll
         {
@@ -1043,12 +1122,7 @@ pub(super) fn client_rects_for(
                             measure(&line[start..end], line_style),
                         )
                     });
-                let x = match line_style.direction {
-                    w3cos_std::style::TextDirection::Ltr => line_box.x + prefix_width,
-                    w3cos_std::style::TextDirection::Rtl => {
-                        line_box.x + line_box.width - prefix_width - width
-                    }
-                };
+                let rtl = line_style.direction == w3cos_std::style::TextDirection::Rtl;
                 let line_height = crate::layout::inline_style_line_height(line_style);
                 let font_box = crate::font_face::font_box_metrics_for_text(
                     line_style,
@@ -1056,18 +1130,15 @@ pub(super) fn client_rects_for(
                 );
                 let font_height = font_box.map_or(line_height, |metrics| metrics.height());
                 let font_top = crate::layout::inline_upper_leading(line_height, font_height);
-                owners_with_inline_fragments.insert(owner);
-                published
-                    .entry(owner)
-                    .or_default()
-                    .push(w3cos_dom::DOMRect::new(
-                        x,
-                        line_box.y + line_index as f32 * line_height + font_top,
-                        width,
-                        font_height,
-                    ));
-                first_fragment_is_block.entry(owner).or_insert(false);
-                last_fragment_is_block.insert(owner, false);
+                rects.push(TextLineRect {
+                    owner,
+                    rtl,
+                    prefix: prefix_width,
+                    width,
+                    line_top: line_index as f32 * line_height,
+                    font_top,
+                    font_height,
+                });
             }
             for owner in inherited_text_owners[index]
                 .iter()
@@ -1078,28 +1149,48 @@ pub(super) fn client_rects_for(
                     .as_ref()
                     .and_then(PhysicalTextLine::total)
                     .unwrap_or_else(|| physical_advance(line, line_style));
-                let x = match line_style.direction {
-                    w3cos_std::style::TextDirection::Ltr => line_box.x,
-                    w3cos_std::style::TextDirection::Rtl => line_box.x + line_box.width - width,
-                };
+                let rtl = line_style.direction == w3cos_std::style::TextDirection::Rtl;
                 let line_height = crate::layout::inline_style_line_height(line_style);
                 let font_box = crate::font_face::font_box_metrics_for_text(line_style, line);
                 let font_height = font_box.map_or(line_height, |metrics| metrics.height());
                 let font_top = crate::layout::inline_upper_leading(line_height, font_height);
-                owners_with_inline_fragments.insert(owner);
-                published
-                    .entry(owner)
-                    .or_default()
-                    .push(w3cos_dom::DOMRect::new(
-                        x,
-                        line_box.y + line_index as f32 * line_height + font_top,
-                        width,
-                        font_height,
-                    ));
-                first_fragment_is_block.entry(owner).or_insert(false);
-                last_fragment_is_block.insert(owner, false);
+                // (`line_box.x + 0.0` is `line_box.x`, and subtracting a zero
+                // prefix leaves the RTL sum as it was.)
+                rects.push(TextLineRect {
+                    owner,
+                    rtl,
+                    prefix: 0.0,
+                    width,
+                    line_top: line_index as f32 * line_height,
+                    font_top,
+                    font_height,
+                });
             }
         }
+        replay(
+            &rects,
+            &mut published,
+            &mut owners_with_inline_fragments,
+            &mut first_fragment_is_block,
+            &mut last_fragment_is_block,
+        );
+        TEXT_RECTS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() > 2 * flat.len() + 64 {
+                memo.clear();
+            }
+            memo.insert(
+                index,
+                TextRectsMemo {
+                    content: content.to_string(),
+                    style: info.style.clone(),
+                    width_bits,
+                    fonts,
+                    owners: inherited_text_owners[index].clone(),
+                    rects,
+                },
+            );
+        });
     }
     for owner in owners_with_inline_fragments.iter().copied() {
         let Some(rects) = published.get_mut(&owner) else {
