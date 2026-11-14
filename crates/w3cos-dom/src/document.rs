@@ -15485,14 +15485,15 @@ fn group_unbroken_ascii_inline_words(
     let eligible = |child: &Component| {
         // A length vertical-align is lowered to a synthetic vertical margin.
         // That margin changes the line box, not the word-break opportunities.
-        let synthetic_vertical_margin =
+        let synthetic_vertical_margin = || {
             child
                 .style
                 .custom_properties
                 .as_ref()
                 .is_some_and(|properties| {
                     properties.contains_key("--w3cos-internal-vertical-align-length")
-                });
+                })
+        };
         matches!(&child.kind, ComponentKind::Text { content }
             if !content.is_empty() && (content.chars().all(|ch| ch.is_ascii_alphanumeric())
                 || child.style.custom_properties.as_ref().is_some_and(|p|
@@ -15507,9 +15508,9 @@ fn group_unbroken_ascii_inline_words(
             && child.style.direction == parent.direction
             && ((child.style.margin.top == Spacing::Px(0.0)
                 && child.style.margin.bottom == Spacing::Px(0.0))
-                || (synthetic_vertical_margin
-                    && child.style.margin.left == Spacing::Px(0.0)
-                    && child.style.margin.right == Spacing::Px(0.0)))
+                || (child.style.margin.left == Spacing::Px(0.0)
+                    && child.style.margin.right == Spacing::Px(0.0)
+                    && synthetic_vertical_margin()))
             && child.style.width == Dimension::Auto
         // Borders decorate an inline fragment; they do not add a word break.
     };
@@ -16554,7 +16555,8 @@ fn split_collapsible_space_after_nonbreaking_run(component: &mut w3cos_std::Comp
     for mut child in std::mem::take(&mut component.children) {
         let prefix = match &child.kind {
             ComponentKind::Text { content }
-                if child.children.is_empty()
+                if content.ends_with("\u{a0} ")
+                    && child.children.is_empty()
                     && child.style.display == Display::Inline
                     && matches!(
                         child.style.white_space,
