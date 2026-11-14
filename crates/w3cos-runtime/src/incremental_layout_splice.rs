@@ -1834,6 +1834,7 @@ pub(super) fn try_style_subtree(
         at_path_mut(&mut cache.component, &solve_path).children = relowered.children;
     }
     cache.engine.invalidate();
+    cache.engine_pending.clear();
     cache.width_memos.clear();
     super::note_flush("style-subtree", solved_nodes, shifted_nodes);
     true
@@ -2784,6 +2785,72 @@ mod tests {
         crate::dom::class_list_remove(items[1], "pad");
         assert!(crate::incremental_layout::flush());
         assert_matches_full("padding off");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn restyles_between_retained_passes_relayout_their_boxes() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".pad", &[("padding", "12px")]);
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        // Per-box layout inputs carry over between retained passes; a box
+        // restyled by a flush that laid nothing out (a width memo hit, a
+        // paint-only edit) must still lay out again in the next one.
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let row = crate::dom::create_element("div");
+            style(row, &[("display", "flex"), ("gap", "6px")]);
+            let avatar = crate::dom::create_element("div");
+            style(avatar, &[("width", "20px"), ("height", "20px")]);
+            let bubble = crate::dom::create_element("div");
+            style(bubble, &[("min-width", "0px")]);
+            crate::dom::append_child(
+                bubble,
+                crate::dom::create_text_node(&format!(
+                    "message {index} alpha beta gamma delta epsilon zeta eta theta"
+                )),
+            );
+            crate::dom::append_child(row, avatar);
+            crate::dom::append_child(row, bubble);
+            crate::dom::append_child(crate::dom::body_id(), row);
+            items.push(bubble);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("rows initial");
+        // (Checking against a full layout resets what carries over, so
+        // each run of edits is checked once at its end.)
+        let runs: [&[(usize, &str, &str)]; 3] = [
+            &[
+                (1, "width", "180px"),
+                (1, "width", "90px"),
+                (1, "width", "180px"),
+                (3, "width", "120px"),
+            ],
+            &[
+                (3, "width", "60px"),
+                (2, "color", "red"),
+                (2, "width", "100px"),
+                (0, "width", "70px"),
+            ],
+            &[
+                (1, "width", "90px"),
+                (1, "width", "180px"),
+                (1, "width", "90px"),
+                (0, "padding", "9px"),
+            ],
+        ];
+        for (run, edits) in runs.into_iter().enumerate() {
+            for (item, property, value) in edits {
+                style(items[*item], &[(property, value)]);
+                assert!(crate::incremental_layout::flush());
+            }
+            assert_matches_full(&format!("run {run}"));
+        }
+        crate::dom::class_list_add(items[2], "pad");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("pad on 2");
         crate::stylesheet::clear_rules();
     }
 

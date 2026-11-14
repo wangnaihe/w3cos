@@ -44,6 +44,9 @@ struct Cache {
     /// Full rect snapshots keyed by one node's px width. Repeat flushes of
     /// the same width restore the rects instead of solving Taffy again.
     width_memos: Vec<WidthMemo>,
+    /// Nodes restyled by flushes that restored a width memo instead of
+    /// patching `engine`: patched before its next solve.
+    engine_pending: Vec<u32>,
     /// `Document::precise_drain_epoch` after this cache took the dirty list.
     /// Any other drain means a structural splice could miss a mutation.
     drain_epoch: u32,
@@ -339,6 +342,7 @@ fn rebuild(
         cascade,
         node_ids,
         width_memos,
+        engine_pending: Vec::new(),
         viewport_w_bits: viewport_w.to_bits(),
         viewport_h_bits: viewport_h.to_bits(),
     });
@@ -397,6 +401,18 @@ fn patch_and_compute(
         }
         styles.push((id.as_u32(), style));
     }
+    // A width memo holds every box's rects for one width of one node, so it
+    // stays valid only while the edits since are width-only on that node.
+    if !paint_only {
+        let width_only = previous
+            .as_ref()
+            .filter(|_| styles.len() == 1)
+            .is_some_and(|old| width_only_change(old, &styles[0].1));
+        let edited = styles[0].0;
+        cache
+            .width_memos
+            .retain(|memo| width_only && memo.node == edited);
+    }
     let memo_hit = single_px_width(&styles).and_then(|(node, bits)| {
         let viewport_w_bits = viewport_w.to_bits();
         let viewport_h_bits = viewport_h.to_bits();
@@ -436,6 +452,9 @@ fn patch_and_compute(
         return true;
     }
     if let Some((rects, client_rects)) = memo_hit {
+        cache
+            .engine_pending
+            .extend(styles.iter().map(|(id, _)| *id));
         restore_rects(&rects);
         restore_client_rects(client_rects);
         cache.viewport_w_bits = viewport_w.to_bits();
@@ -468,12 +487,23 @@ fn patch_and_compute(
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
         cache.engine.invalidate();
+        cache.engine_pending.clear();
         cache.node_ids_stale = false;
     }
     if flat.len() != cache.node_ids.len() {
         return false;
     }
     configure_engine(&mut cache.engine, &cache.component);
+    if !patch_pending(
+        &mut cache.engine,
+        &cache.component,
+        &cache.node_ids,
+        &mut cache.engine_pending,
+        viewport_w,
+        viewport_h,
+    ) {
+        return false;
+    }
     for (id, style) in &styles {
         let Some(index) = cache.node_ids.iter().position(|node| node == id) else {
             return false;
@@ -515,14 +545,51 @@ fn patch_and_compute(
     true
 }
 
+/// Patch `engine` with the styles a width-memo flush assigned without it.
+fn patch_pending(
+    engine: &mut LayoutEngine,
+    component: &Component,
+    node_ids: &[u32],
+    pending: &mut Vec<u32>,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> bool {
+    for id in std::mem::take(pending) {
+        let Some(style) = component_style(component, id) else {
+            return false;
+        };
+        let Some(index) = node_ids.iter().position(|node| *node == id) else {
+            return false;
+        };
+        if !engine.patch_style(index, style, viewport_w, viewport_h) {
+            return false;
+        }
+    }
+    true
+}
+
 fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     let flat = pre_flatten(&cache.component);
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
         cache.engine.invalidate();
+        cache.engine_pending.clear();
         cache.node_ids_stale = false;
     }
     configure_engine(&mut cache.engine, &cache.component);
+    if !cache.engine_pending.is_empty()
+        && (flat.len() != cache.node_ids.len()
+            || !patch_pending(
+                &mut cache.engine,
+                &cache.component,
+                &cache.node_ids,
+                &mut cache.engine_pending,
+                viewport_w,
+                viewport_h,
+            ))
+    {
+        return false;
+    }
     let Ok(results) = cache
         .engine
         .compute(&cache.component, &flat, viewport_w, viewport_h)
@@ -1086,6 +1153,16 @@ fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
             );
         }
     });
+}
+
+/// `new` differs from `old` in `width` alone.
+fn width_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    if old.width == new.width {
+        return old == new;
+    }
+    let mut old = old.clone();
+    old.width = new.width;
+    old == *new
 }
 
 fn single_px_width(styles: &[(u32, w3cos_std::style::Style)]) -> Option<(u32, u32)> {
