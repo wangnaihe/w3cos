@@ -16400,77 +16400,89 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 segments
             })
             .collect::<Vec<_>>();
+        // Edits shared by every piece go on a few template styles first, so
+        // the word fragments share one style allocation per variant instead
+        // of copy-on-write cloning the full style for every word.
+        let clear_line_width = style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key("--w3cos-internal-text-line-width"));
+        let clear_vertical_margin = !style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-vertical-align-length")
+        });
+        let background_group = !decorated_border && style.background.a > 0;
+        let parent_indent_moves = percent_line_indent.is_some()
+            && source_index == 0
+            && component.style.text_indent == style.text_indent;
+        let mut base = child.style.clone();
+        if clear_line_width {
+            base.width = w3cos_std::style::Dimension::Auto;
+            if let Some(properties) = &mut base.custom_properties {
+                properties.remove("--w3cos-internal-text-line-width");
+            }
+        }
+        if percent_line_indent.is_some() {
+            base.text_indent = w3cos_std::style::Dimension::Px(0.0);
+        }
+        if clear_vertical_margin {
+            base.margin.top = Spacing::Px(0.0);
+            base.margin.bottom = Spacing::Px(0.0);
+        }
+        if background_group {
+            base.custom_properties
+                .get_or_insert_with(Default::default)
+                .entry("--w3cos-internal-inline-background-group".into())
+                .or_insert_with(|| format!("leaf:{source_index}"));
+        }
+        let variant = |left: bool, right: bool| {
+            let mut style = base.clone();
+            if left {
+                style.padding.left = Spacing::Px(0.0);
+            }
+            if right {
+                style.padding.right = Spacing::Px(0.0);
+            }
+            style
+        };
+        let styles = [
+            base.clone(),
+            variant(true, false),
+            variant(false, true),
+            variant(true, true),
+        ];
+        // `child` has no children here (checked above).
+        let piece = |text: &str, left: bool, right: bool| w3cos_std::Component {
+            kind: ComponentKind::Text {
+                content: text.to_string(),
+            },
+            style: styles[usize::from(left) + 2 * usize::from(right)].clone(),
+            children: Vec::new(),
+            on_click: child.on_click.clone(),
+            sticky_counter_signal: child.sticky_counter_signal,
+        };
         let mut pieces = Vec::with_capacity(words.len() * 2 + 1);
         if content.starts_with(' ') {
-            let mut space = child.clone();
-            space.kind = ComponentKind::Text {
-                content: " ".to_string(),
-            };
-            pieces.push(space);
+            pieces.push(piece(" ", false, false));
         }
         for (index, (word, space_after)) in words.iter().enumerate() {
-            let mut fragment = child.clone();
-            fragment.kind = ComponentKind::Text {
-                content: (*word).to_string(),
-            };
-            if index > 0 && !decorated_border {
-                fragment.style.padding.left = Spacing::Px(0.0);
-            }
-            if index + 1 < words.len() && !decorated_border {
-                fragment.style.padding.right = Spacing::Px(0.0);
-            }
-            pieces.push(fragment);
+            pieces.push(piece(
+                word,
+                index > 0 && !decorated_border,
+                index + 1 < words.len() && !decorated_border,
+            ));
             if *space_after && index + 1 < words.len() {
-                let mut space = child.clone();
-                space.kind = ComponentKind::Text {
-                    content: " ".to_string(),
-                };
-                if !decorated_border {
-                    space.style.padding.left = Spacing::Px(0.0);
-                    space.style.padding.right = Spacing::Px(0.0);
-                }
-                pieces.push(space);
+                pieces.push(piece(" ", !decorated_border, !decorated_border));
             }
         }
         if content.ends_with(' ') {
-            let mut space = child.clone();
-            space.kind = ComponentKind::Text {
-                content: " ".to_string(),
-            };
-            pieces.push(space);
-        }
-        if style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| properties.contains_key("--w3cos-internal-text-line-width"))
-        {
-            for piece in &mut pieces {
-                piece.style.width = w3cos_std::style::Dimension::Auto;
-                if let Some(properties) = &mut piece.style.custom_properties {
-                    properties.remove("--w3cos-internal-text-line-width");
-                }
-            }
+            pieces.push(piece(" ", false, false));
         }
         if let Some(indent) = percent_line_indent {
-            for piece in &mut pieces {
-                piece.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
-            }
             pieces[0].style.padding.left = Spacing::Percent(indent);
-            if source_index == 0 && component.style.text_indent == style.text_indent {
+            if parent_indent_moves {
                 // The first fragment now owns the used indent. The parent
                 // must not retain a second line-breaking constraint.
                 component.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
-            }
-        }
-        // Authored vertical margins do not apply to non-replaced inline
-        // boxes. Keep synthetic vertical-align offsets distinct: those
-        // participate in the line metrics rather than CSS margin layout.
-        if !style.custom_properties.as_ref().is_some_and(|properties| {
-            properties.contains_key("--w3cos-internal-vertical-align-length")
-        }) {
-            for piece in &mut pieces {
-                piece.style.margin.top = Spacing::Px(0.0);
-                piece.style.margin.bottom = Spacing::Px(0.0);
             }
         }
         if decorated_border {
@@ -16505,16 +16517,6 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 if index != last {
                     piece.style.margin.right = Spacing::Px(0.0);
                 }
-            }
-        }
-        if !decorated_border && style.background.a > 0 {
-            for piece in &mut pieces {
-                piece
-                    .style
-                    .custom_properties
-                    .get_or_insert_with(Default::default)
-                    .entry("--w3cos-internal-inline-background-group".into())
-                    .or_insert_with(|| format!("leaf:{source_index}"));
             }
         }
         fragments.extend(pieces);
