@@ -250,6 +250,7 @@ const SIZE_FREE_MARKERS: &[&str] = &[
     "--w3cos-internal-font-size-origin",
     "--w3cos-internal-font-specified-size",
     "--w3cos-internal-list-style-image",
+    "--w3cos-internal-list-item",
     "--w3cos-internal-text-fragment-ends",
     "--w3cos-internal-text-source-run",
     "--w3cos-internal-cssom-owner-ranges",

@@ -741,6 +741,7 @@ fn layout_flat_with_text(
         }
         out = union_text_pieces(out, &texts);
     }
+    crate::list_marker::project(&mut out, flat, viewport_w, viewport_h);
     Some((out, texts))
 }
 

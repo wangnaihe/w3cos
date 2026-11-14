@@ -178,6 +178,12 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // reads them; unsupported values gate as `text:align-last`.
             | "text-align-last"
             | "text-justify"
+            // An outside `::marker` is lowered to an absolutely positioned
+            // box of its list item; list_marker::project places it after
+            // layout (Blink LayoutNGOutsideListMarker: positioned against
+            // the item's first line), on NG as on legacy.
+            | "list-item"
+            | "outside-list-marker"
             // `text-box-trim` / `text-box-edge`: IFC line boxes trim
             // half-leading at the first/last formatted line (CSS Inline 3).
             | "text-box-trim"
