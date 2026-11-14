@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
-use w3cos_std::style::{Dimension, Display, Float, Overflow, Position, TextDirection};
+use w3cos_std::style::{
+    Dimension, Display, Float, Overflow, Position, ScrollMarkerGroup, TextDirection,
+};
 use w3cos_std::{Component, ComponentKind};
 
 use crate::layout::{LayoutEngine, pre_flatten};
@@ -259,8 +261,26 @@ fn rebuild(
     viewport_h: f32,
     drain_epoch: u32,
 ) -> bool {
-    let component = crate::dom::to_component_tree();
-    let flat = pre_flatten(&component);
+    let mut component = crate::dom::to_component_tree();
+    let mut flat = pre_flatten(&component);
+    let mut engine = LayoutEngine::new();
+    configure_engine(&mut engine, &component);
+    let Ok(mut results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
+        return false;
+    };
+    if sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h)) {
+        // Column count is a layout-time fact. Rebuild markers before
+        // publishing geometry so scrollWidth / scrollLeft clamp see
+        // overflow columns (CSS Overflow 5 / CSS Multicol).
+        component = crate::dom::to_component_tree();
+        flat = pre_flatten(&component);
+        engine = LayoutEngine::new();
+        configure_engine(&mut engine, &component);
+        let Ok(second) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
+            return false;
+        };
+        results = second;
+    }
     let node_ids = flat
         .iter()
         .map(|info| match info.on_click {
@@ -268,12 +288,7 @@ fn rebuild(
             _ => u32::MAX,
         })
         .collect::<Vec<_>>();
-    let mut engine = LayoutEngine::new();
-    configure_engine(&mut engine, &component);
-    let Ok(results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
-        return false;
-    };
-    let snaps = write_rects(&flat, &results.layout_cache);
+    let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
     let skip_projections = can_skip_projections(&component);
@@ -432,7 +447,7 @@ fn patch_and_compute(
     };
     let compute_us = compute_started.elapsed().as_micros();
     let write_started = std::time::Instant::now();
-    let snaps = write_rects(&flat, &results.layout_cache);
+    let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let write_us = write_started.elapsed().as_micros();
     if phase {
         eprintln!(
@@ -464,15 +479,18 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     else {
         return false;
     };
-    write_rects(&flat, &results.layout_cache);
-    true
+    write_rects(&flat, &results.layout_cache, &results.text_fragments);
+    // A changed column count needs a tree rebuild so overflow-column
+    // scroll geometry and ::column::scroll-marker siblings stay in sync.
+    !sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h))
 }
 
 fn write_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
+    text_fragments: &[crate::layout_ng::TextFragment],
 ) -> Vec<(u32, f32, f32, f32, f32)> {
-    publish_client_rects(flat, layouts);
+    publish_client_rects(flat, layouts, text_fragments);
     let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
@@ -563,6 +581,7 @@ fn physical_text_line(
 fn publish_client_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
+    ng_text: &[crate::layout_ng::TextFragment],
 ) {
     let mut by_index = vec![None; flat.len()];
     for (rect, index) in layouts {
@@ -686,6 +705,76 @@ fn publish_client_rects(
             ))
         };
         let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
+        // LayoutNG laid this text out: its line fragments (byte ranges of
+        // `content` with their physical rects) are where the owner ranges
+        // sit, so CSSOM reads them instead of re-wrapping the run.
+        let ng_lines = ng_text
+            .iter()
+            .filter(|fragment| fragment.index == index && !fragment.vertical)
+            .collect::<Vec<_>>();
+        if !ng_lines.is_empty() {
+            let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(content, info.style);
+            let explicit_owners = owner_ranges
+                .iter()
+                .map(|(owner, _, _)| *owner)
+                .collect::<HashSet<_>>();
+            for fragment in &ng_lines {
+                let (line_start, line_end) = (fragment.start, fragment.end.min(content.len()));
+                if line_start > line_end
+                    || !content.is_char_boundary(line_start)
+                    || !content.is_char_boundary(line_end)
+                {
+                    continue;
+                }
+                let line_rect = fragment.rect;
+                let mut push = |owner: u32, x: f32, width: f32, text: &str| {
+                    let font_box = crate::font_face::font_box_metrics_for_text(info.style, text);
+                    let font_height = font_box.map_or(line_rect.height, |metrics| metrics.height());
+                    let font_top =
+                        crate::layout::inline_upper_leading(line_rect.height, font_height);
+                    owners_with_inline_fragments.insert(owner);
+                    published
+                        .entry(owner)
+                        .or_default()
+                        .push(w3cos_dom::DOMRect::new(
+                            x,
+                            line_rect.y + font_top,
+                            width,
+                            font_height,
+                        ));
+                    first_fragment_is_block.entry(owner).or_insert(false);
+                    last_fragment_is_block.insert(owner, false);
+                };
+                for &(owner, start, end) in &owner_ranges {
+                    let (a, b) = (start.max(line_start), end.min(line_end));
+                    if a >= b {
+                        continue;
+                    }
+                    let prefix = measure(&content[line_start..a], info.style);
+                    let width = measure(&content[a..b], info.style);
+                    let x = match info.style.direction {
+                        w3cos_std::style::TextDirection::Ltr => line_rect.x + prefix,
+                        w3cos_std::style::TextDirection::Rtl => {
+                            line_rect.x + line_rect.width - prefix - width
+                        }
+                    };
+                    push(owner, x, width, &content[a..b]);
+                }
+                for owner in inherited_text_owners[index]
+                    .iter()
+                    .copied()
+                    .filter(|owner| !explicit_owners.contains(owner))
+                {
+                    push(
+                        owner,
+                        line_rect.x,
+                        line_rect.width,
+                        &content[line_start..line_end],
+                    );
+                }
+            }
+            continue;
+        }
         // With LayoutNG the writeback re-wraps with the same UAX #14 mode as
         // layout and paint (line-break strictness, word-break, lang), so the
         // published fragments follow the painted lines.
@@ -964,6 +1053,8 @@ fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::S
         && old.word_break == new.word_break
         && old.letter_spacing == new.letter_spacing
         && old.direction == new.direction
+        && old.writing_mode == new.writing_mode
+        && old.logical_overrides == new.logical_overrides
 }
 
 fn assign_layout_style(
@@ -1192,6 +1283,43 @@ pub fn with_paint_layout<R>(
     })
 }
 
+/// After a multicol layout, record how many ::column boxes each
+/// `scroll-marker-group` container produced so the next tree build can
+/// emit that many `::column::scroll-marker` children (CSS Overflow 5).
+pub(crate) fn sync_column_scroll_marker_counts(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layout_cache: &[(crate::layout::LayoutRect, usize)],
+    viewport: (f32, f32),
+) -> bool {
+    let mut changed = false;
+    let mut rects = vec![None; flat.len()];
+    for &(rect, index) in layout_cache {
+        if index < rects.len() {
+            rects[index] = Some(rect);
+        }
+    }
+    let nodes: Vec<(&w3cos_std::style::Style, Option<usize>)> =
+        flat.iter().map(|node| (node.style, node.parent)).collect();
+    let plans = crate::layout::resolve_column_fragment_plans(&nodes, &rects, Some(viewport));
+    for (index, node) in flat.iter().enumerate() {
+        if node.style.scroll_marker_group == ScrollMarkerGroup::None {
+            continue;
+        }
+        let EventAction::NativeHost { id, .. } = node.on_click else {
+            continue;
+        };
+        let count = plans
+            .get(index)
+            .and_then(|plan| plan.as_ref())
+            .map(|plan| plan.bands.len())
+            .unwrap_or(0);
+        if crate::dom::set_column_pseudo_count(*id as u32, count) {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn rebuild_paint_cache(
     slot: &mut Option<PaintCache>,
     structure: u64,
@@ -1199,17 +1327,28 @@ fn rebuild_paint_cache(
     viewport_w: f32,
     viewport_h: f32,
 ) -> anyhow::Result<()> {
-    let component = crate::dom::to_component_tree();
-    let flat = pre_flatten(&component);
-    let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
+    let mut component = crate::dom::to_component_tree();
+    let mut flat = pre_flatten(&component);
     let mut engine = LayoutEngine::new();
     // Floats, tables, and inline-block need the post-Taffy projections. A
     // block/absolute tree already matches `compute_with_scroll_details`
     // without that walk, which is most of a retained frame.
     engine.set_skip_projections(can_skip_projections(&component));
     engine.set_measure_text(true);
-    let results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
-    write_rects(&flat, &results.layout_cache);
+    let mut results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
+    if sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h)) {
+        // Column count is a layout-time fact. Rebuild the adjunct
+        // ::scroll-marker-group with the right number of markers and
+        // lay the tree out once more (CSS Overflow 5 / Blink).
+        component = crate::dom::to_component_tree();
+        flat = pre_flatten(&component);
+        engine = LayoutEngine::new();
+        engine.set_skip_projections(can_skip_projections(&component));
+        engine.set_measure_text(true);
+        results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
+    }
+    let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
+    write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let children = child_lists(&flat);
     let shift_ok = absolute_shift_ok(&flat);
     *slot = Some(PaintCache {
@@ -1310,7 +1449,7 @@ fn sync_paint_cache(
         return false;
     };
     cache.engine.set_measure_text(true);
-    write_rects(&flat, &results.layout_cache);
+    write_rects(&flat, &results.layout_cache, &results.text_fragments);
     cache.results = results;
     cache.cascade = cascade;
     note_paint_patch();
@@ -1386,7 +1525,7 @@ fn try_shift_absolute_insets(
     }
     write_host_rects(&cache.node_ids, &cache.results.layout_cache);
     let flat = pre_flatten(&cache.component);
-    publish_client_rects(&flat, &cache.results.layout_cache);
+    publish_client_rects(&flat, &cache.results.layout_cache, &[]);
     cache.cascade = cascade;
     note_paint_patch();
     note_paint_shift();

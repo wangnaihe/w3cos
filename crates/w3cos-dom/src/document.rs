@@ -32,6 +32,78 @@ pub fn bump_structure_tick() {
 thread_local! {
     static CHILD_LOG: RefCell<ChildListLog> = RefCell::new(ChildListLog::default());
     static DOCUMENT_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// Layout-time ::column counts, used to generate ::column::scroll-marker
+    /// boxes on the next component-tree build (Blink regenerates column
+    /// pseudos after multicol layout).
+    static COLUMN_PSEUDO_COUNTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
+
+/// Number of ::column boxes recorded for `id` after the last layout pass.
+pub fn column_pseudo_count(id: NodeId) -> usize {
+    COLUMN_PSEUDO_COUNTS.with(|counts| counts.borrow().get(&id.as_u32()).copied().unwrap_or(0))
+}
+
+/// Record the number of ::column boxes for `id`. Returns true when the
+/// stored value changed, so the caller can rebuild the component tree.
+pub fn set_column_pseudo_count(id: NodeId, count: usize) -> bool {
+    COLUMN_PSEUDO_COUNTS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        let key = id.as_u32();
+        let previous = counts.get(&key).copied().unwrap_or(0);
+        if previous == count {
+            return false;
+        }
+        if count == 0 {
+            counts.remove(&key);
+        } else {
+            counts.insert(key, count);
+        }
+        true
+    })
+}
+
+pub fn clear_column_pseudo_counts() {
+    COLUMN_PSEUDO_COUNTS.with(|counts| counts.borrow_mut().clear());
+}
+
+/// CSS Overflow 3: a box that establishes an overflow clip and uses
+/// `hidden | scroll | auto` on either axis is a scroll container.
+/// `overflow: clip` is not.
+fn establishes_scroll_container(style: &w3cos_std::style::Style) -> bool {
+    use w3cos_std::style::Overflow;
+    if !style.display.establishes_overflow_clip() {
+        return false;
+    }
+    let axis = |overflow| {
+        matches!(
+            overflow,
+            Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+        )
+    };
+    axis(style.resolved_overflow_x()) || axis(style.resolved_overflow_y())
+}
+
+/// Hit testing a `::scroll-marker` returns its originating element
+/// (`elementFromPoint`). This is a hit-test-only carrier, not a
+/// `NativeHost`: the marker must not publish its rect as the element's.
+pub const SCROLL_MARKER_ORIGIN: &str = "--w3cos-internal-scroll-marker-origin";
+
+fn attach_scroll_marker_host(marker: &mut w3cos_std::Component, id: NodeId) {
+    marker
+        .style
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(SCROLL_MARKER_ORIGIN.into(), id.as_u32().to_string());
+}
+
+fn with_counter_target_occurrence<T>(occurrence: usize, f: impl FnOnce() -> T) -> T {
+    COUNTER_TARGET_OCCURRENCE.with(|cell| {
+        let previous = cell.get();
+        cell.set(occurrence);
+        let value = f();
+        cell.set(previous);
+        value
+    })
 }
 
 /// One child-list edit for CollectionIndexCache-style replay (main).
@@ -101,6 +173,12 @@ pub fn replay_child_changes_since(
 #[derive(Clone, Default)]
 struct CounterSnapshot {
     scopes: Vec<HashMap<String, i32>>,
+}
+
+thread_local! {
+    /// Which `::column::scroll-marker` (0-based) a counter() snapshot should
+    /// capture. Each generated column marker increments in document order.
+    static COUNTER_TARGET_OCCURRENCE: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,6 +762,10 @@ mod text_presentation;
 #[path = "document/generated_content_inheritance_tests.rs"]
 mod generated_content_inheritance_tests;
 
+#[cfg(test)]
+#[path = "document/scroll_marker_tests.rs"]
+mod scroll_marker_tests;
+
 mod inline_boundary;
 
 #[cfg(test)]
@@ -711,6 +793,10 @@ enum ChildListDirtyKind {
         tag: Option<String>,
     },
 }
+
+#[cfg(test)]
+#[path = "document/flex_item_lowering_tests.rs"]
+mod flex_item_lowering_tests;
 
 /// An authored `display: flex` host whose children are all text runs (a
 /// styled `inline-block` span folds into one).
@@ -1944,13 +2030,41 @@ impl Document {
     pub fn set_scroll(&mut self, id: NodeId, left: Option<f32>, top: Option<f32>) {
         let idx = id.0 as usize;
         if idx < self.scroll_offsets.len() {
+            let before = self.scroll_offsets[idx];
             if let Some(l) = left {
                 self.scroll_offsets[idx].0 = l;
             }
             if let Some(t) = top {
                 self.scroll_offsets[idx].1 = t;
             }
+            if self.scroll_offsets[idx] != before {
+                self.record_layout_dirty(id);
+                if self.computed_style_for(id).scroll_marker_group
+                    != w3cos_std::style::ScrollMarkerGroup::None
+                {
+                    // :target-current is a layout-time fact of the component tree.
+                    self.mark_dirty(id);
+                }
+            }
         }
+    }
+
+    /// Extra scrollable overflow from NG overflow columns (paint-projected,
+    /// so it is not in the descendant layout-rect extent).
+    pub(crate) fn column_overflow_scroll_advance(&self, id: NodeId) -> f32 {
+        let style = self.computed_style_for(id);
+        if style.column_count.is_none() && style.column_width == w3cos_std::style::Dimension::Auto {
+            return 0.0;
+        }
+        let count = column_pseudo_count(id);
+        if count == 0 {
+            return 0.0;
+        }
+        let (port, stride) = self.column_scroll_port_and_stride(id, &style);
+        if port <= 0.0 || stride <= 0.0 {
+            return 0.0;
+        }
+        (stride * count as f32 - port).max(0.0)
     }
 
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
@@ -2937,6 +3051,50 @@ impl Document {
     // Child iteration helper
     // -----------------------------------------------------------------------
 
+    /// HTML "auto directionality" of `id` (`dir=auto`): the bidi class of
+    /// the first strong character (L, R or AL) in its descendant text,
+    /// skipping `bdi`, `script`, `style` and `textarea` subtrees and
+    /// descendants with a valid `dir` attribute of their own.
+    fn auto_directionality(&self, id: NodeId) -> Option<&'static str> {
+        use unicode_bidi::BidiClass;
+        for child in self.children_ids(id) {
+            let node = self.get_node(child);
+            match node.node_type {
+                NodeType::Text => {
+                    for c in node.text_content.as_deref().unwrap_or("").chars() {
+                        match unicode_bidi::bidi_class(c) {
+                            BidiClass::L => return Some("ltr"),
+                            BidiClass::R | BidiClass::AL => return Some("rtl"),
+                            _ => {}
+                        }
+                    }
+                }
+                NodeType::Element => {
+                    let skipped = node.is_html_element
+                        && matches!(
+                            node.tag.as_static(),
+                            "bdi" | "script" | "style" | "textarea"
+                        );
+                    let own_dir = node.attributes.iter().any(|(name, value)| {
+                        name.as_static().eq_ignore_ascii_case("dir")
+                            && matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "ltr" | "rtl" | "auto"
+                            )
+                    });
+                    if !skipped
+                        && !own_dir
+                        && let Some(dir) = self.auto_directionality(child)
+                    {
+                        return Some(dir);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn children_ids(&self, parent: NodeId) -> Vec<NodeId> {
         let mut result = Vec::new();
         let mut current = self.get_node(parent).first_child;
@@ -3378,6 +3536,7 @@ impl Document {
         author_declarations.extend(important);
         let mut merged =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+        merged.shadow_logical = true;
         // Textfield UA borders remain inset when author backgrounds disable
         // automatic theme painting. Do not apply textfield geometry to other
         // input types; author border declarations below still take precedence.
@@ -3491,7 +3650,14 @@ impl Document {
                     .map(|(_, value)| value.trim().to_ascii_lowercase())
             })
             .flatten()
-            .filter(|value| matches!(value.as_str(), "ltr" | "rtl"));
+            .and_then(|value| match value.as_str() {
+                "ltr" | "rtl" => Some(value),
+                // HTML 3.2.6.4 auto directionality: the first strong
+                // character of the element's text (no strong character:
+                // the inherited direction).
+                "auto" => self.auto_directionality(id).map(str::to_string),
+                _ => None,
+            });
         if let Some(value) = &direction_hint {
             user_normal.push(("direction".to_string(), value.to_string(), 0));
             if node.is_html_element && !matches!(node.tag.as_str().as_str(), "bdi" | "bdo") {
@@ -3550,11 +3716,14 @@ impl Document {
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && node.tag.as_str().eq_ignore_ascii_case("table")
+            && (node.tag.as_str().eq_ignore_ascii_case("table")
+                || node.tag.as_str().eq_ignore_ascii_case("img"))
         {
-            // HTML table dimensions are cascaded presentational hints.
-            // Keep it inside the cascade so authored auto/percent/important
-            // values win, and computed style and component layout agree.
+            // HTML table and image dimensions are cascaded presentational
+            // hints. Keep them inside the cascade so authored
+            // auto/percent/important values win (an authored `width: auto`
+            // drops the attribute), and computed style and component layout
+            // agree.
             for property in ["width", "height"] {
                 let Some(dimension) = node
                     .attributes
@@ -3565,7 +3734,10 @@ impl Document {
                     continue;
                 };
                 // Retain the existing zero-width behavior; height allows zero.
-                let valid = |value: f32| value > 0.0 || (property == "height" && value == 0.0);
+                let is_image = node.tag.as_static().eq_ignore_ascii_case("img");
+                let valid = |value: f32| {
+                    value > 0.0 || ((property == "height" || is_image) && value == 0.0)
+                };
                 let value = match dimension {
                     w3cos_std::style::Dimension::Px(value) if valid(value) => {
                         Some(format!("{value}px"))
@@ -3582,6 +3754,19 @@ impl Document {
         }
         user_normal.extend(author_declarations);
         user_normal.extend(user_important);
+        // CSS Grid 3.1: `vertical-align` has no effect on grid items (the
+        // item is blockified). An `inline-grid` parent is a flex box with
+        // the unrecognized-display marker here.
+        if inherited.is_some_and(|parent| {
+            parent.display == w3cos_std::style::Display::Grid
+                || parent.custom_properties.as_ref().is_some_and(|props| {
+                    props
+                        .get(crate::css_style::UNRECOGNIZED_DISPLAY_PROPERTY)
+                        .is_some_and(|value| value == "inline-grid")
+                })
+        }) {
+            user_normal.retain(|(name, _, _)| !css_property_eq(name, "vertical-align"));
+        }
         let author_declarations = expand_logical_border_declarations(user_normal);
         // list-style-image is inherited, unlike most internal layout metadata.
         // Keep it in the ordinary computed cascade so resource consumers and
@@ -3598,6 +3783,7 @@ impl Document {
         custom_properties.retain(|property, _| {
             !property.starts_with("--w3cos-internal-")
                 || property == "--w3cos-internal-text-align-last"
+                || property == "--w3cos-internal-text-justify"
                 || property == user_agent::HTML_STANDARD_FONT_PROPERTY
                 // Language is inherited and re-resolved below; keeping the
                 // inherited value lets an unchanged language leave the map
@@ -3610,6 +3796,7 @@ impl Document {
                 || property == FONT_SIZE_ORIGIN
                 || property == FONT_SPECIFIED_SIZE
                 || property == crate::css_style::LIST_IMAGE_PROPERTY
+                || property == crate::css_style::TAB_SIZE_PROPERTY
         });
 
         // Custom properties participate in the cascade independently of
@@ -3620,9 +3807,49 @@ impl Document {
                 custom_properties.insert(prop.clone(), value.clone());
             }
         }
+        // `writing-mode` is inherited and decides how the element's logical
+        // properties map to physical ones (Blink resolves it first in
+        // ComputedStyle). Settle the final mode before the declarations that
+        // depend on it are applied. `inherit` and `unset` take the parent's.
+        merged.inner.writing_mode = inherited
+            .map(|parent| parent.writing_mode)
+            .unwrap_or_default();
+        for (prop, value, _specificity) in &author_declarations {
+            if !css_property_eq(prop, "writing-mode") {
+                continue;
+            }
+            let resolved;
+            let value = if value.contains("var(") {
+                resolved = resolve_css_variables(value, &custom_properties);
+                resolved.as_str()
+            } else {
+                value.as_str()
+            };
+            let value = value.trim().to_ascii_lowercase();
+            let value = value.trim_end_matches("!important").trim();
+            match value {
+                "inherit" | "unset" => {
+                    merged.inner.writing_mode = inherited
+                        .map(|parent| parent.writing_mode)
+                        .unwrap_or_default();
+                }
+                "initial" => {
+                    merged.inner.writing_mode = w3cos_std::style::WritingMode::HorizontalTb
+                }
+                _ => {
+                    if let Some(mode) = w3cos_std::style::WritingMode::from_keyword(value) {
+                        merged.inner.writing_mode = mode;
+                    }
+                }
+            }
+        }
         for (prop, value, _specificity) in &author_declarations {
             if !prop.starts_with("--") {
                 let value = resolve_css_variables(value, &custom_properties);
+                if css_property_eq(prop, "writing-mode") {
+                    // Resolved above.
+                    continue;
+                }
                 if declaration_value_is_valid(prop, &value) {
                     merged.set_property(prop, &value);
                     if css_property_eq(prop, "text-decoration-color")
@@ -3652,6 +3879,22 @@ impl Document {
                             ),
                         );
                     }
+                    if css_property_eq(prop, "overflow-clip-margin")
+                        && value.trim().eq_ignore_ascii_case("inherit")
+                    {
+                        // Not an inherited property: explicit `inherit`
+                        // copies the parent's computed value.
+                        merged.inner.overflow_clip_margin = inherited
+                            .map(|parent| parent.overflow_clip_margin)
+                            .unwrap_or((0, 0.0));
+                    } else if css_property_eq(prop, "overflow-clip-margin")
+                        && matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "initial" | "unset"
+                        )
+                    {
+                        merged.inner.overflow_clip_margin = (0, 0.0);
+                    }
                     if css_property_eq(prop, "list-style")
                         || css_property_eq(prop, "list-style-image")
                     {
@@ -3666,6 +3909,22 @@ impl Document {
                 }
             }
         }
+        if let Some(shadow) = merged.shadow.as_mut() {
+            // The logical-mapping shadow gets the same inherited map, so only
+            // markers the mapping itself changed (not inherited ones such as
+            // the retained font-size origin) become logical overrides.
+            let mut shadow_properties = custom_properties.clone();
+            if let Some(internal) = &shadow.inner.custom_properties {
+                shadow_properties.extend(
+                    internal
+                        .iter()
+                        .filter(|(property, _)| property.starts_with("--w3cos-internal-"))
+                        .map(|(property, value)| (property.clone(), value.clone())),
+                );
+            }
+            shadow.inner.custom_properties =
+                (!shadow_properties.is_empty()).then_some(shadow_properties);
+        }
         if let Some(internal) = &merged.inner.custom_properties {
             custom_properties.extend(
                 internal
@@ -3677,6 +3936,7 @@ impl Document {
         merged.inner.custom_properties =
             (!custom_properties.is_empty()).then_some(custom_properties);
         let mut style = merged.to_style();
+        style.logical_overrides = merged.logical_overrides().map(Box::new);
 
         let control_tag = node.tag.as_str();
         let control_appearance = user_agent::control_appearance(
@@ -3701,6 +3961,12 @@ impl Document {
                     user_agent::CONTROL_APPEARANCE_PROPERTY.into(),
                     control_appearance.into(),
                 );
+        }
+        if control_tag == "button" {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(user_agent::BUTTON_PROPERTY.into(), "1".into());
         }
 
         if let Some(parent) = inherited {
@@ -4108,6 +4374,24 @@ impl Document {
             style.font_weight = weight;
         }
         let edge_ex_size = css_ex_size(&style);
+        // Font-relative tab-size lengths use the final cascaded font.
+        if let Some((_, value)) = declared_valid_property_value(&["tab-size", "tabSize"])
+            && let Some(computed) = crate::css_style::computed_tab_size(value, style.font_size)
+        {
+            let lower = value.trim().to_ascii_lowercase();
+            let computed = if lower.ends_with("ex") && !lower.ends_with("rex") {
+                lower
+                    .strip_suffix("ex")
+                    .and_then(|number| number.trim().parse::<f32>().ok())
+                    .map_or(computed, |number| format!("{}px", number * edge_ex_size))
+            } else {
+                computed
+            };
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(crate::css_style::TAB_SIZE_PROPERTY.to_string(), computed);
+        }
         if let Some(value) = declared_value(&["text-indent", "textIndent"])
             && let Some(number) = value.trim().strip_suffix("ex")
             && let Ok(number) = number.trim().parse::<f32>()
@@ -4166,6 +4450,9 @@ impl Document {
             }
             w3cos_std::style::Dimension::Rem(value) => {
                 w3cos_std::style::Dimension::Px(value * 16.0)
+            }
+            w3cos_std::style::Dimension::Lh(value) => {
+                w3cos_std::style::Dimension::Px(value * parent.used_line_height_px())
             }
             other => other,
         };
@@ -4375,6 +4662,93 @@ impl Document {
                 _ => {}
             }
         }
+        // `inherit` of the box-alignment longhands, directly or through
+        // `place-items` / `place-content` (`grid-self-alignment-baseline-
+        // with-grid-001` passes `place-items: inherit` to a nested grid).
+        if let Some(parent) = inherited {
+            for (longhand, names) in [
+                (
+                    "align-items",
+                    &["align-items", "alignItems", "place-items", "placeItems"][..],
+                ),
+                (
+                    "justify-items",
+                    &["justify-items", "justifyItems", "place-items", "placeItems"][..],
+                ),
+                (
+                    "align-content",
+                    &[
+                        "align-content",
+                        "alignContent",
+                        "place-content",
+                        "placeContent",
+                    ][..],
+                ),
+                (
+                    "justify-content",
+                    &[
+                        "justify-content",
+                        "justifyContent",
+                        "place-content",
+                        "placeContent",
+                    ][..],
+                ),
+            ] {
+                if declared_value(names)
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("inherit"))
+                {
+                    crate::css_style::inherit_box_alignment(&mut style, parent, longhand);
+                }
+            }
+            // `gap` / `row-gap` / `column-gap`: `inherit` copies the parent's
+            // computed gaps (including `normal` as None). A later longhand
+            // beats an earlier shorthand when deciding which axis inherits.
+            let gap_inherit = |value: &str| value.trim().eq_ignore_ascii_case("inherit");
+            let last_affecting = |names: &[&str]| {
+                author_declarations
+                    .iter()
+                    .filter(|(name, value, _)| {
+                        names.iter().any(|property| css_property_eq(name, property))
+                            && declaration_value_is_valid(name, value)
+                    })
+                    .map(|(_, value, _)| value.as_str())
+                    .last()
+            };
+            let gap_names = ["gap", "grid-gap", "gridGap"];
+            let row_names = [
+                "gap",
+                "grid-gap",
+                "gridGap",
+                "row-gap",
+                "rowGap",
+                "grid-row-gap",
+                "gridRowGap",
+            ];
+            let column_names = [
+                "gap",
+                "grid-gap",
+                "gridGap",
+                "column-gap",
+                "columnGap",
+                "grid-column-gap",
+                "gridColumnGap",
+            ];
+            let row_wins_inherit = last_affecting(&row_names).is_some_and(gap_inherit);
+            let column_wins_inherit = last_affecting(&column_names).is_some_and(gap_inherit);
+            if last_affecting(&gap_names).is_some_and(gap_inherit)
+                && row_wins_inherit
+                && column_wins_inherit
+            {
+                crate::css_style::inherit_gap(&mut style, parent, "gap");
+            } else {
+                if row_wins_inherit {
+                    crate::css_style::inherit_gap(&mut style, parent, "row-gap");
+                }
+                if column_wins_inherit {
+                    crate::css_style::inherit_gap(&mut style, parent, "column-gap");
+                }
+            }
+        }
         if let Some(value) = declared_value(&["z-index", "zIndex"]) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "inherit" => {
@@ -4409,6 +4783,9 @@ impl Document {
             }
             w3cos_std::style::Dimension::Rem(value) => {
                 w3cos_std::style::Dimension::Px(value * 16.0)
+            }
+            w3cos_std::style::Dimension::Lh(value) => {
+                w3cos_std::style::Dimension::Px(value * parent.used_line_height_px())
             }
             other => other,
         };
@@ -5706,6 +6083,255 @@ impl Document {
         declarations
     }
 
+    /// CSS Overflow 5 §3.1.8: active `::column::scroll-marker` for the
+    /// scroller's eventual scroll position (redistribute unreachable
+    /// targets in the first/last `min(1/8 * scrollport, range/2)`).
+    fn active_column_scroll_marker_index(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+        count: usize,
+    ) -> usize {
+        Self::select_active_column_scroll_marker(
+            self.get_scroll(id).0,
+            self.column_scroll_port_and_stride(id, origin_style),
+            count,
+        )
+    }
+
+    pub(crate) fn select_active_column_scroll_marker(
+        scroll: f32,
+        port_and_stride: (f32, f32),
+        count: usize,
+    ) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let (port, stride) = port_and_stride;
+        if count == 1 || port <= 0.0 || stride <= 0.0 {
+            return 0;
+        }
+        let scroll_size = stride * count as f32;
+        let range = (scroll_size - port).max(0.0);
+        let position = scroll.max(0.0).min(range);
+        let mut positions: Vec<f32> = (0..count).map(|i| i as f32 * stride).collect();
+        if range > 0.0 {
+            let distribute = (port / 8.0).min(range / 2.0).max(0.0);
+            if distribute > 0.0 {
+                let before: Vec<usize> = positions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p < distribute)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(min_pos) = before.iter().map(|&i| positions[i]).reduce(f32::min) {
+                    let denom = distribute - min_pos;
+                    if denom > 0.0 {
+                        for i in before {
+                            positions[i] = (positions[i] - min_pos) / denom * distribute;
+                        }
+                    }
+                }
+                let after_start = range - distribute;
+                let after: Vec<usize> = positions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p > after_start)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(max_pos) = after.iter().map(|&i| positions[i]).reduce(f32::max) {
+                    let denom = max_pos - after_start;
+                    if denom > 0.0 {
+                        for i in after {
+                            positions[i] =
+                                (positions[i] - after_start) / denom * distribute + after_start;
+                        }
+                    }
+                }
+            }
+        }
+        let mut selected = 0;
+        for (i, p) in positions.iter().enumerate() {
+            if *p <= position + 0.5 {
+                selected = i;
+            }
+        }
+        selected
+    }
+
+    fn column_scroll_port_and_stride(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+    ) -> (f32, f32) {
+        let rect = self.get_layout_rect(id);
+        let border = |side: Option<f32>| side.unwrap_or(origin_style.border_width);
+        let pad_px = |s: w3cos_std::style::Spacing| match s {
+            w3cos_std::style::Spacing::Px(v) => v,
+            _ => 0.0,
+        };
+        let port = (rect.width
+            - border(origin_style.border_left_width)
+            - border(origin_style.border_right_width)
+            - pad_px(origin_style.padding.left)
+            - pad_px(origin_style.padding.right))
+        .max(0.0);
+        let gap = origin_style.column_gap.unwrap_or(0.0).max(0.0);
+        let authored = origin_style.column_count.unwrap_or(1).max(1) as f32;
+        let column_width = if authored <= 0.0 {
+            port
+        } else {
+            ((port - gap * (authored - 1.0)) / authored).max(0.0)
+        };
+        (port, column_width + gap)
+    }
+
+    /// CSS Overflow 5 `::scroll-marker-group` adjunct box, generated as a
+    /// sibling of a scroll container whose `scroll-marker-group` is not
+    /// `none`. Column markers are created after layout reports a column
+    /// count; child `::scroll-marker` boxes are created immediately.
+    fn scroll_marker_group_component(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+    ) -> Option<w3cos_std::Component> {
+        if origin_style.scroll_marker_group == w3cos_std::style::ScrollMarkerGroup::None {
+            return None;
+        }
+        // CSS Overflow 5: the group is an adjunct of a *scroll container*.
+        if !establishes_scroll_container(origin_style) {
+            return None;
+        }
+        let declarations =
+            stylesheet::matching_pseudo_declarations_for_node(self, id, "::scroll-marker-group");
+        let mut merged = CSSStyleDeclaration::new();
+        // Initial used display of the generated adjunct is block (015's
+        // "initial display type" packs floats; author `display` still wins).
+        merged.set_property("display", "block");
+        for (property, value, _) in &declarations {
+            merged.set_property(property, value);
+        }
+        // CSS Overflow 5 recommended UA: `contain: size !important`, so
+        // marker generation cannot change the group's used size (or layout
+        // outside it). Applied after author declarations because this merge
+        // is not a full cascade. Author `display:none` still suppresses the box.
+        merged.set_property("contain", "size");
+        let mut style = merged.to_style();
+        if !generated_display_creates_box(style.display) {
+            return None;
+        }
+        // Size containment: auto block size is the contain-intrinsic-size,
+        // or 0. Pin it on the style so later auto-height projections cannot
+        // re-expand the group from in-flow markers (style-remove). Floated
+        // markers still overflow and paint (015).
+        if matches!(style.height, w3cos_std::style::Dimension::Auto) {
+            let height = style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| {
+                    properties.get(crate::css_style::CONTAIN_INTRINSIC_SIZE_PROPERTY)
+                })
+                .and_then(|value| {
+                    let mut axes = value.split_ascii_whitespace();
+                    let _width = axes.next()?;
+                    axes.next()?.parse().ok()
+                })
+                .unwrap_or(0.0);
+            style.height = w3cos_std::style::Dimension::Px(height);
+        }
+        let declares = |property: &str| {
+            declarations
+                .iter()
+                .rev()
+                .find(|(name, _, _)| css_property_eq(name, property))
+                .is_some_and(|(_, value, _)| {
+                    !matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "inherit" | "unset"
+                    )
+                })
+        };
+        inherit_text_style(&mut style, origin_style, "::scroll-marker-group", declares);
+        if !declares("flex-direction")
+            && !declares("flex-flow")
+            && matches!(
+                style.display,
+                w3cos_std::style::Display::Flex | w3cos_std::style::Display::InlineFlex
+            )
+        {
+            // CSS initial is row; Style::default() is column.
+            style.flex_direction = w3cos_std::style::FlexDirection::Row;
+        }
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-scroll-marker-group".into(), "1".into());
+
+        let mut children = Vec::new();
+        if self
+            .generated_pseudo_component(id, "::column::scroll-marker", origin_style)
+            .is_some()
+        {
+            let current_decls = stylesheet::matching_pseudo_declarations_for_node(
+                self,
+                id,
+                "::column::scroll-marker:target-current",
+            );
+            let count = column_pseudo_count(id);
+            let current = self.active_column_scroll_marker_index(id, origin_style, count);
+            for index in 0..count {
+                // Resolve `content: counter(...)` after this marker's
+                // increment, not once for a shared template.
+                let mut marker = with_counter_target_occurrence(index, || {
+                    self.generated_pseudo_component(id, "::column::scroll-marker", origin_style)
+                })
+                .expect("column scroll marker still generates");
+                if index == current && !current_decls.is_empty() {
+                    let mut declaration = CSSStyleDeclaration::from_style((*marker.style).clone());
+                    for (property, value, _) in &current_decls {
+                        if !css_property_eq(property, "content") {
+                            declaration.set_property(property, value);
+                        }
+                    }
+                    *marker.style = declaration.to_style();
+                }
+                marker
+                    .style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-column-scroll-marker".into(),
+                        index.to_string(),
+                    );
+                attach_scroll_marker_host(&mut marker, id);
+                children.push(marker);
+            }
+        }
+        for child_id in self.children_ids(id) {
+            let child = self.get_node(child_id);
+            if child.node_type != NodeType::Element {
+                continue;
+            }
+            let child_style = self.computed_style_for(child_id);
+            if let Some(mut marker) =
+                self.generated_pseudo_component(child_id, "::scroll-marker", &child_style)
+            {
+                attach_scroll_marker_host(&mut marker, child_id);
+                children.push(marker);
+            }
+        }
+
+        let component = if matches!(
+            style.flex_direction,
+            w3cos_std::style::FlexDirection::Row | w3cos_std::style::FlexDirection::RowReverse
+        ) {
+            w3cos_std::Component::row_shared(style.into(), children)
+        } else {
+            w3cos_std::Component::column_shared(style.into(), children)
+        };
+        Some(component)
+    }
+
     fn generated_pseudo_component(
         &self,
         id: NodeId,
@@ -5770,7 +6396,14 @@ impl Document {
         }
 
         let mut merged = CSSStyleDeclaration::new();
-        merged.set_property("display", "inline");
+        // CSS Overflow 5 / Chrome computed style: `::scroll-marker`
+        // defaults to `display:inline` (same initial as `::before`).
+        // Width/height then apply only when the *used* display is
+        // blockified — flex/grid item, float, abspos, or an authored
+        // block-level display — not because the UA sheet uses
+        // `inline-block`.
+        let default_display = "inline";
+        merged.set_property("display", default_display);
         for (property, value, _) in &declarations {
             if !css_property_eq(property, "content") {
                 merged.set_property(property, value);
@@ -5804,6 +6437,19 @@ impl Document {
                 })
         };
         inherit_text_style(&mut style, origin_style, pseudo_element, declares);
+        if matches!(
+            pseudo_element,
+            "::scroll-marker" | "::column::scroll-marker"
+        ) {
+            // CSS Overflow 5 / CSSWG: default styling matches a link
+            // (`:visited` never applies). Author color / text-decoration win.
+            if !declares("color") {
+                style.color = w3cos_std::Color::rgb(0, 0, 238);
+            }
+            if !declares("text-decoration") {
+                style.text_decoration = w3cos_std::style::TextDecoration::Underline;
+            }
+        }
         if style.float != w3cos_std::style::Float::None {
             use w3cos_std::style::Display;
             // Generated principal boxes obey the same computed-display
@@ -5947,9 +6593,20 @@ impl Document {
                     vec![w3cos_std::Component::text(text.clone(), inherited)],
                 ))
             }
-            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)] => Some(
-                w3cos_std::Component::text_shared(text.clone(), self.component_style_shared(style)),
-            ),
+            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
+                if !generated_single_text_requires_principal_box(&style, pseudo_element) =>
+            {
+                // cw58y default: a single generated string is a text leaf
+                // that carries the principal style, including
+                // `display:contents` and empty `display:block` clearfix.
+                // A principal wrapper is used only when a box is required
+                // (painted decorations, UA `::scroll-marker` link style,
+                // or a scroll-marker used size).
+                Some(w3cos_std::Component::text_shared(
+                    text.clone(),
+                    self.component_style_shared(style),
+                ))
+            }
             [GeneratedContentItem::Image(source)] => {
                 Some(w3cos_std::Component::image(source.clone(), style))
             }
@@ -5961,7 +6618,13 @@ impl Document {
                 // items into one transparent row inside it.
                 let mut inherited = w3cos_std::style::Style::default();
                 inherit_text_style(&mut inherited, &style, "", |_| false);
-                w3cos_std::inline_text::copy_used_decoration(&mut inherited, &style);
+                // Paint collects ancestor decorations. Copying the
+                // owner's text-decoration onto the inner run would
+                // underline the same text twice once the principal box
+                // is kept (single-text markers with UA link style).
+                if style.text_decoration == w3cos_std::style::TextDecoration::None {
+                    w3cos_std::inline_text::copy_used_decoration(&mut inherited, &style);
+                }
                 inherited.visibility = style.visibility;
 
                 let children = content
@@ -6005,28 +6668,43 @@ impl Document {
                         | w3cos_std::style::Display::InlineTable
                         | w3cos_std::style::Display::TableRow
                 ) {
-                    style.flex_direction = w3cos_std::style::FlexDirection::Row;
-                    style.align_items = w3cos_std::style::AlignItems::Baseline;
                     if style.display == w3cos_std::style::Display::Inline {
-                        style.flex_wrap = if matches!(
-                            style.white_space,
-                            w3cos_std::style::WhiteSpace::NoWrap
-                                | w3cos_std::style::WhiteSpace::Pre
-                        ) {
-                            w3cos_std::style::FlexWrap::NoWrap
-                        } else {
-                            w3cos_std::style::FlexWrap::Wrap
-                        };
-                        style
-                            .custom_properties
-                            .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-inline-formatting-context".to_string(),
-                                "1".to_string(),
-                            );
+                        // CSS 2.1 9.2.2 / 9.4.2: a non-replaced inline box
+                        // does not establish an IFC. Its `content` items
+                        // participate in the enclosing IFC, like an
+                        // authored <span> or <a>. An inner IFC row would
+                        // make the principal atomic, so "PA"+"SS" would
+                        // not join and adjacent link-styled letters would
+                        // not share a line the way the <a> ref does.
+                        // Do not tag the principal as an IFC either: a
+                        // parent block would adopt it as its line box and
+                        // hoist the text, dropping the pseudo's border.
+                        // Still expose word-break items under the principal's
+                        // own `white-space`, so 'two words' can wrap in the
+                        // enclosing line.
+                        let children = fixup_css_table_children(&style, children);
+                        let children = split_wrapping_ascii_text_runs(children, &style);
+                        let children = group_unbroken_ascii_inline_words(children, &style);
+                        return Some(w3cos_std::Component::row(style, children));
                     }
-                    let children = fixup_css_table_children(&style, children);
-                    Some(w3cos_std::Component::row_shared(
+                    // Inline-block (and other atomic inlines) establish
+                    // their own formatting context. Do not stamp
+                    // flex-row / align-items:baseline onto the principal:
+                    // that changes the used baseline of an empty
+                    // inline-block strut (`vertical-align`, grid-lanes
+                    // intrinsic size). An empty `content:''` box keeps
+                    // used width/height and no dummy text child.
+                    let children = if children.iter().all(|child| {
+                        matches!(
+                            &child.kind,
+                            w3cos_std::ComponentKind::Text { content } if content.is_empty()
+                        ) && child.children.is_empty()
+                    }) {
+                        Vec::new()
+                    } else {
+                        fixup_css_table_children(&style, children)
+                    };
+                    Some(w3cos_std::Component::boxed_shared(
                         self.component_style_shared(style),
                         children,
                     ))
@@ -6648,6 +7326,48 @@ impl Document {
         None
     }
 
+    /// `::column::scroll-marker` boxes originate on the scroll container
+    /// and participate in its counter scope (CSS Overflow 5 / CSS Lists).
+    /// Each generated marker applies its increment in column order.
+    fn visit_column_scroll_marker_counters(
+        &self,
+        id: NodeId,
+        target: NodeId,
+        target_pseudo: &str,
+        scopes: &mut Vec<HashMap<String, i32>>,
+    ) -> Option<CounterSnapshot> {
+        let count = column_pseudo_count(id);
+        if count == 0 || !self.pseudo_generates_box(id, "::column::scroll-marker") {
+            return None;
+        }
+        let target_occurrence = COUNTER_TARGET_OCCURRENCE.with(|cell| cell.get());
+        for index in 0..count {
+            scopes.push(HashMap::new());
+            for (property, default_value, operation) in [
+                ("counter-reset", 0, "reset"),
+                ("counter-set", 0, "set"),
+                ("counter-increment", 1, "increment"),
+            ] {
+                Self::apply_counter_declaration(
+                    scopes,
+                    self.pseudo_counter_value(id, "::column::scroll-marker", property),
+                    default_value,
+                    operation,
+                );
+            }
+            if id == target
+                && target_pseudo == "::column::scroll-marker"
+                && index == target_occurrence
+            {
+                return Some(CounterSnapshot {
+                    scopes: scopes.clone(),
+                });
+            }
+            scopes.pop();
+        }
+        None
+    }
+
     fn visit_counter_tree(
         &self,
         id: NodeId,
@@ -6669,6 +7389,15 @@ impl Document {
             return Some(CounterSnapshot {
                 scopes: scopes.clone(),
             });
+        }
+        if self.computed_style_for(id).scroll_marker_group
+            == w3cos_std::style::ScrollMarkerGroup::Before
+        {
+            if let Some(snapshot) =
+                self.visit_column_scroll_marker_counters(id, target, target_pseudo, scopes)
+            {
+                return Some(snapshot);
+            }
         }
         let sibling_scope_base = scopes.len();
         if let Some(snapshot) =
@@ -6720,6 +7449,15 @@ impl Document {
             self.visit_pseudo_counters(id, "::after", target, target_pseudo, scopes, false)
         {
             return Some(snapshot);
+        }
+        if self.computed_style_for(id).scroll_marker_group
+            == w3cos_std::style::ScrollMarkerGroup::After
+        {
+            if let Some(snapshot) =
+                self.visit_column_scroll_marker_counters(id, target, target_pseudo, scopes)
+            {
+                return Some(snapshot);
+            }
         }
         let element_scope = scopes[incoming_scope_count].clone();
         scopes.truncate(incoming_scope_count);
@@ -7628,7 +8366,19 @@ impl Document {
                     content: "\u{200b}".into(),
                 };
             }
-            components.push(component);
+            if let Some(group) = self.scroll_marker_group_component(child_id, &component.style) {
+                if component.style.scroll_marker_group
+                    == w3cos_std::style::ScrollMarkerGroup::Before
+                {
+                    components.push(group);
+                    components.push(component);
+                } else {
+                    components.push(component);
+                    components.push(group);
+                }
+            } else {
+                components.push(component);
+            }
         }
         components
     }
@@ -8142,6 +8892,86 @@ impl Document {
             })
     }
 
+    /// HTML §15.3.13: the fieldset's anonymous content box holds every
+    /// child except the rendered legend. Overflow and multicol on the
+    /// fieldset apply to that box, not to the legend.
+    fn wrap_fieldset_anonymous_content(
+        style: &mut w3cos_std::style::Style,
+        children: &mut Vec<w3cos_std::Component>,
+    ) {
+        let has_columns = style.column_count.is_some()
+            || !matches!(style.column_width, w3cos_std::style::Dimension::Auto);
+        let clips = matches!(
+            style.resolved_overflow_x(),
+            w3cos_std::style::Overflow::Hidden
+                | w3cos_std::style::Overflow::Scroll
+                | w3cos_std::style::Overflow::Auto
+        ) || matches!(
+            style.resolved_overflow_y(),
+            w3cos_std::style::Overflow::Hidden
+                | w3cos_std::style::Overflow::Scroll
+                | w3cos_std::style::Overflow::Auto
+        );
+        if !has_columns && !clips {
+            return;
+        }
+        let Some(legend_index) = children.iter().position(|child| {
+            child
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-rendered-legend")
+                })
+        }) else {
+            return;
+        };
+        let mut content_children = Vec::new();
+        let mut kept = Vec::with_capacity(2);
+        for (index, child) in std::mem::take(children).into_iter().enumerate() {
+            if index == legend_index {
+                kept.push(child);
+            } else {
+                content_children.push(child);
+            }
+        }
+        if content_children.is_empty() {
+            *children = kept;
+            return;
+        }
+        let mut content_style = w3cos_std::style::Style::default();
+        content_style.display = w3cos_std::style::Display::Block;
+        content_style.column_count = style.column_count;
+        content_style.column_width = style.column_width;
+        content_style.column_fill = style.column_fill;
+        content_style.column_gap = style.column_gap;
+        content_style.overflow = style.overflow;
+        content_style.overflow_x = style.overflow_x;
+        content_style.overflow_y = style.overflow_y;
+        content_style.overflow_clip_x = style.overflow_clip_x;
+        content_style.overflow_clip_y = style.overflow_clip_y;
+        content_style.height = style.height;
+        content_style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-fieldset-content-box".into(), "1".into());
+        style.column_count = None;
+        style.column_width = w3cos_std::style::Dimension::Auto;
+        style.column_fill = w3cos_std::style::ColumnFill::Balance;
+        style.column_gap = None;
+        style.overflow = w3cos_std::style::Overflow::Visible;
+        style.overflow_x = None;
+        style.overflow_y = None;
+        style.overflow_clip_x = false;
+        style.overflow_clip_y = false;
+        style.height = w3cos_std::style::Dimension::Auto;
+        kept.push(w3cos_std::Component::column(
+            content_style,
+            content_children,
+        ));
+        *children = kept;
+    }
+
     /// Lowering recurses once per DOM level and an unoptimized
     /// `node_to_component_frame` frame is ~180 KiB, so a workbench-depth tree
     /// overflows an 8 MiB main-thread stack. Grow the stack on the heap
@@ -8227,6 +9057,40 @@ impl Document {
                 style.height = w3cos_std::style::Dimension::Auto;
             }
         }
+        // The same used-value rules for a `block-size` percentage the engine
+        // that models logical properties reads.
+        if let Some(overrides) = style.logical_overrides.as_ref()
+            && let Some(w3cos_std::style::Dimension::Percent(value)) = overrides.height
+        {
+            let collapses = !matches!(
+                style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            ) && inherited.is_some_and(|parent| {
+                matches!(parent.height, w3cos_std::style::Dimension::Auto)
+                    && matches!(
+                        parent.display,
+                        w3cos_std::style::Display::Block
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::ListItem
+                            | w3cos_std::style::Display::TableCell
+                            | w3cos_std::style::Display::TableCaption
+                    )
+            });
+            let mut overrides = overrides.clone();
+            if self.quirks_mode {
+                overrides.markers.push((
+                    "--w3cos-internal-quirks-percentage-height".to_string(),
+                    Some("1".to_string()),
+                ));
+            } else if collapses {
+                overrides.markers.push((
+                    "--w3cos-internal-computed-height-percent".to_string(),
+                    Some(format!("{value}")),
+                ));
+                overrides.height = Some(w3cos_std::style::Dimension::Auto);
+            }
+            style.logical_overrides = Some(overrides);
+        }
         let qualified_tag = node.tag.as_str();
         let tag = qualified_tag.rsplit_once(':').map_or_else(
             || qualified_tag.clone(),
@@ -8238,6 +9102,16 @@ impl Document {
         if let Some(properties) = style.custom_properties.as_mut() {
             properties.remove(VIDEO_CONTROLS);
             properties.remove("--w3cos-internal-media-controls-layer");
+        }
+        // An `audio` element has no media layout here (it lowers to an
+        // empty block), and Chrome draws it the same with or without
+        // aspect-ratio (replaced-element-035), so the ratio must not size
+        // the placeholder.
+        if tag == "audio"
+            && let Some(properties) = style.custom_properties.as_mut()
+        {
+            properties.remove(crate::css_style::ASPECT_RATIO_PROPERTY);
+            properties.remove(crate::css_style::ASPECT_RATIO_AUTO_PROPERTY);
         }
         if tag == "video"
             && node
@@ -8340,6 +9214,26 @@ impl Document {
                 style.border_spacing_x = x;
                 style.border_spacing_y = values.get(1).copied().unwrap_or(x);
             }
+        }
+        // HTML §15.3.13: a fieldset's rendered legend is its first legend
+        // element child.  Layout keeps it out of the content box's
+        // baseline (Blink FieldsetLayoutAlgorithm), so mark it.
+        if tag.as_str() == "legend"
+            && let Some(parent) = node.parent
+            && local_tag_name(&self.get_node(parent).tag.as_str()) == "fieldset"
+            && self
+                .element_siblings_through(id)
+                .iter()
+                .find(|sibling| local_tag_name(&self.get_node(**sibling).tag.as_str()) == "legend")
+                == Some(&id)
+        {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-rendered-legend".to_string(),
+                    "1".to_string(),
+                );
         }
         if tag.as_str() == "table" {
             style
@@ -8488,6 +9382,9 @@ impl Document {
                     // zero-width marker paints nothing but still establishes
                     // the inherited line-height strut for following content.
                     style.display = w3cos_std::style::Display::Inline;
+                    // Blink's LayoutBR is a text-like object: margins on a
+                    // <br> do not apply (flexbox-min-width-auto-005).
+                    style.margin = w3cos_std::style::Edges::ZERO;
                     style.width = w3cos_std::style::Dimension::Px(0.0);
                     style.height =
                         w3cos_std::style::Dimension::Px(style.font_size * style.line_height);
@@ -8506,6 +9403,23 @@ impl Document {
                     );
                 }
                 if tag == "svg" {
+                    let mut style = style;
+                    for (name, property) in [
+                        ("width", crate::user_agent::SVG_WIDTH_PROPERTY),
+                        ("height", crate::user_agent::SVG_HEIGHT_PROPERTY),
+                    ] {
+                        if let Some((_, value)) = self
+                            .get_node(id)
+                            .attributes
+                            .iter()
+                            .find(|(key, _)| key.as_str().eq_ignore_ascii_case(name))
+                        {
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(property.into(), value.as_str().into());
+                        }
+                    }
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
                     let width = match style.width {
                         w3cos_std::style::Dimension::Px(width) => width,
@@ -9390,6 +10304,41 @@ impl Document {
                 // One passive inline may contain several differently styled
                 // text runs. It still uses the enclosing block's line width;
                 // its nested runs must not become max-content atomic rows.
+                // A flex or grid container's atomic children are blockified
+                // items, not an inline formatting context (CSS Display
+                // §2.7), so its authored alignment must survive (an
+                // inline-block item stretches, flexbox_flex-* WPT). Flex
+                // keeps this path for buttons and plain inline text for
+                // now: without writing-mode support, button-min-width's
+                // vertical-rl column only matches Chrome as a row.
+                let blockified_atomic_items = !children.is_empty()
+                    && match style.display {
+                        w3cos_std::style::Display::Grid => children.iter().all(|child| {
+                            !matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                                && child.style.display != w3cos_std::style::Display::Inline
+                        }),
+                        w3cos_std::style::Display::Flex | w3cos_std::style::Display::InlineFlex => {
+                            children.iter().all(|child| {
+                                matches!(
+                                    child.kind,
+                                    w3cos_std::ComponentKind::Image { .. }
+                                        | w3cos_std::ComponentKind::Canvas { .. }
+                                ) || (matches!(
+                                    child.kind,
+                                    w3cos_std::ComponentKind::Text { .. }
+                                        | w3cos_std::ComponentKind::Row
+                                        | w3cos_std::ComponentKind::Column
+                                        | w3cos_std::ComponentKind::Box
+                                ) && matches!(
+                                    child.style.display,
+                                    w3cos_std::style::Display::InlineBlock
+                                        | w3cos_std::style::Display::InlineFlex
+                                        | w3cos_std::style::Display::InlineTable
+                                ))
+                            })
+                        }
+                        _ => false,
+                    };
                 // An authored `display: flex` host whose children are all
                 // plain inline text keeps its own direction, wrap and
                 // alignment. LayoutNG also keeps a host whose children are
@@ -9407,7 +10356,8 @@ impl Document {
                         ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
                     })
                     || (layout_ng_requested() && is_flex_host_of_text_runs(&style, &children));
-                if !authored_flex_of_plain_inlines
+                if !blockified_atomic_items
+                    && !authored_flex_of_plain_inlines
                     && (children.len() >= 2
                         || children.iter().any(|child| {
                             child.style.display == w3cos_std::style::Display::Inline
@@ -10027,6 +10977,9 @@ impl Document {
                             w3cos_std::style::Dimension::Vh(value) => {
                                 w3cos_std::style::Spacing::Vh(value)
                             }
+                            w3cos_std::style::Dimension::Lh(value) => {
+                                w3cos_std::style::Spacing::Px(value * style.used_line_height_px())
+                            }
                             w3cos_std::style::Dimension::Auto
                             | w3cos_std::style::Dimension::Calc(_) => {
                                 w3cos_std::style::Spacing::Px(0.0)
@@ -10130,6 +11083,7 @@ impl Document {
                             style.white_space,
                             w3cos_std::style::WhiteSpace::Normal
                                 | w3cos_std::style::WhiteSpace::PreLine
+                                | w3cos_std::style::WhiteSpace::PreWrap
                         )
                         && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
                             || style.text_indent != w3cos_std::style::Dimension::Px(0.0)
@@ -11486,6 +12440,14 @@ impl Document {
                         // A non-leaf DOM button paints through its child nodes.
                         // Keeping the descendant text in Button::label would
                         // make every renderer paint it a second time.
+                        let mut style = style;
+                        if !has_visual_children && label.is_empty() {
+                            // No content: the placeholder is only a paint label.
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(user_agent::BUTTON_PROPERTY.into(), "empty".into());
+                        }
                         let mut button = w3cos_std::Component::button(paint_label, style);
                         button.children = children;
                         button
@@ -11556,7 +12518,10 @@ impl Document {
                             .unwrap_or("");
                         let mut image_style = style;
                         replaced_table::lower_image_style(&mut image_style);
-                        if matches!(image_style.width, w3cos_std::style::Dimension::Auto)
+                        // An `img` takes its dimension attributes through the
+                        // cascade (presentational hints); `object` has none.
+                        if tag.as_str() == "object"
+                            && matches!(image_style.width, w3cos_std::style::Dimension::Auto)
                             && let Some(width) = node
                                 .attributes
                                 .iter()
@@ -11567,7 +12532,8 @@ impl Document {
                         {
                             image_style.width = width;
                         }
-                        if matches!(image_style.height, w3cos_std::style::Dimension::Auto)
+                        if tag.as_str() == "object"
+                            && matches!(image_style.height, w3cos_std::style::Dimension::Auto)
                             && let Some(height) = node
                                 .attributes
                                 .iter()
@@ -11592,12 +12558,73 @@ impl Document {
                                 .get_or_insert_with(Default::default)
                                 .insert("--w3cos-internal-input-size".into(), size.to_string());
                         }
+                        if tag.as_str() == "textarea" {
+                            // HTML §4.10.11: `cols` / `rows` are limited to
+                            // numbers greater than zero with fallback (rules
+                            // for parsing non-negative integers, §2.3.4.1).
+                            let dimension = |name: &str, fallback: u32| {
+                                node.get_attribute_ns(None, name)
+                                    .and_then(|value| parse_html_non_negative_integer(&value))
+                                    .filter(|value| *value > 0)
+                                    .unwrap_or(fallback)
+                            };
+                            let properties =
+                                style.custom_properties.get_or_insert_with(Default::default);
+                            properties.insert(
+                                crate::user_agent::TEXTAREA_COLS_PROPERTY.into(),
+                                dimension("cols", 20).to_string(),
+                            );
+                            properties.insert(
+                                crate::user_agent::TEXTAREA_ROWS_PROPERTY.into(),
+                                dimension("rows", 2).to_string(),
+                            );
+                        }
                         let input_type = node
                             .attributes
                             .iter()
                             .find(|(key, _)| key.as_str() == "type")
                             .map(|(_, value)| value.as_str())
                             .unwrap_or("text");
+                        if tag.as_str() == "input" {
+                            // HTML §4.10.5: the type attribute's state; an
+                            // invalid or missing value is the Text state.
+                            // Layout sizes only text fields from the size
+                            // attribute (Blink LayoutTextControlSingleLine).
+                            const TYPES: [&str; 22] = [
+                                "hidden",
+                                "text",
+                                "search",
+                                "tel",
+                                "url",
+                                "email",
+                                "password",
+                                "date",
+                                "month",
+                                "week",
+                                "time",
+                                "datetime-local",
+                                "number",
+                                "range",
+                                "color",
+                                "checkbox",
+                                "radio",
+                                "file",
+                                "submit",
+                                "image",
+                                "reset",
+                                "button",
+                            ];
+                            let state = input_type.to_ascii_lowercase();
+                            let state = if TYPES.contains(&state.as_str()) {
+                                state
+                            } else {
+                                "text".to_string()
+                            };
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(crate::user_agent::INPUT_TYPE_PROPERTY.into(), state);
+                        }
                         if tag.as_str() == "input" && input_type.eq_ignore_ascii_case("file") {
                             let mut component = w3cos_std::Component::boxed_shared(
                                 self.component_style_shared(style),
@@ -11665,6 +12692,9 @@ impl Document {
                         w3cos_std::Component::canvas(width, height, style)
                     }
                     _ => {
+                        if tag == "fieldset" {
+                            Self::wrap_fieldset_anonymous_content(&mut style, &mut children);
+                        }
                         if is_row {
                             w3cos_std::Component::row_shared(
                                 self.component_style_shared(style),
@@ -12123,11 +13153,41 @@ impl Document {
         match tag {
             "svg" => {
                 let (width, height) = self.svg_root_size(id);
+                // The element's own attribute (`svg_attribute` also reads
+                // ancestors) as an HTML dimension.
+                let own_dimension = |name: &str| {
+                    self.get_node(id)
+                        .attributes
+                        .iter()
+                        .find(|(key, _)| key.as_str() == name)
+                        .and_then(|(_, value)| parse_html_dimension_attribute(value.as_str()))
+                };
                 if matches!(style.width, Dimension::Auto) {
                     let attribute_width = self
                         .svg_attribute(id, "width")
                         .and_then(|value| parse_html_dimension_attribute(&value));
                     style.width = attribute_width.unwrap_or(Dimension::Px(width));
+                    if own_dimension("width").is_none() {
+                        let mut marker = |property: &str| {
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(property.into(), "1".into());
+                        };
+                        marker(crate::user_agent::SVG_FALLBACK_WIDTH_PROPERTY);
+                        let auto_margin =
+                            matches!(style.margin.left, w3cos_std::style::Spacing::Auto)
+                                || matches!(style.margin.right, w3cos_std::style::Spacing::Auto);
+                        if auto_margin {
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    crate::user_agent::SVG_AUTO_MARGIN_PROPERTY.into(),
+                                    "1".into(),
+                                );
+                        }
+                    }
                     if attribute_width.is_none() {
                         if matches!(style.margin.left, w3cos_std::style::Spacing::Auto) {
                             style.margin.left = w3cos_std::style::Spacing::Px(0.0);
@@ -12138,10 +13198,19 @@ impl Document {
                     }
                 }
                 if matches!(style.height, Dimension::Auto) {
-                    style.height = self
+                    let attribute_height = self
                         .svg_attribute(id, "height")
-                        .and_then(|value| parse_html_dimension_attribute(&value))
-                        .unwrap_or(Dimension::Px(height));
+                        .and_then(|value| parse_html_dimension_attribute(&value));
+                    style.height = attribute_height.unwrap_or(Dimension::Px(height));
+                    if own_dimension("height").is_none() {
+                        style
+                            .custom_properties
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                crate::user_agent::SVG_FALLBACK_HEIGHT_PROPERTY.into(),
+                                "1".into(),
+                            );
+                    }
                 }
             }
             "g" | "defs" => {
@@ -13003,6 +14072,22 @@ fn declaration_value_is_valid(property: &str, value: &str) -> bool {
     if css_property_eq(property, "line-height") {
         return crate::css_style::is_valid_line_height_value(value);
     }
+    if css_property_eq(property, "flex-wrap") {
+        return crate::css_style::normalize_flex_wrap(value).is_some();
+    }
+    if css_property_eq(property, "flex-line-count") {
+        let lower = value.trim().to_ascii_lowercase();
+        return matches!(
+            lower.as_str(),
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        ) || crate::css_style::parse_flex_line_count(&lower).is_some();
+    }
+    if css_property_eq(property, "tab-size") {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "inherit" | "unset" | "revert" | "revert-layer"
+        ) || crate::css_style::computed_tab_size(value, 16.0).is_some();
+    }
     true
 }
 
@@ -13039,6 +14124,7 @@ fn inherit_text_style(
     for property in [
         user_agent::HTML_STANDARD_FONT_PROPERTY,
         user_agent::TEXT_LANGUAGE_PROPERTY,
+        crate::css_style::TAB_SIZE_PROPERTY,
     ] {
         if let Some(value) = parent
             .custom_properties
@@ -13107,6 +14193,33 @@ fn inherit_text_style(
     }
     if !declares("word-break") && !declares("overflow-wrap") && !declares("word-wrap") {
         style.word_break = parent.word_break;
+    }
+    if !declares("word-break") {
+        let key = crate::css_style::WORD_BREAK_AUTO_PHRASE_PROPERTY;
+        let inherited = parent
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+            .cloned();
+        match inherited {
+            Some(value) => {
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(key.to_string(), value);
+            }
+            None => {
+                if let Some(properties) = style.custom_properties.as_mut() {
+                    properties.remove(key);
+                }
+            }
+        }
+    }
+    if !declares("line-break") {
+        style.line_break = parent.line_break;
+    }
+    if !declares("hanging-punctuation") {
+        style.hanging_punctuation_last = parent.hanging_punctuation_last;
     }
     if !declares("direction") {
         style.direction = parent.direction;
@@ -14186,6 +15299,52 @@ fn principal_box_can_collapse_generated_text(style: &w3cos_std::style::Style) ->
         && principal_box_can_merge_generated_inline_text(style)
 }
 
+fn generated_single_text_requires_principal_box(
+    style: &w3cos_std::style::Style,
+    pseudo_element: &str,
+) -> bool {
+    use w3cos_std::style::{Dimension, OutlineStyle, TextDecoration, Transform2D};
+    // Invert of the previous allow-list: default to the cw58y text leaf
+    // for every display (contents, empty block clearfix, in-flow width,
+    // floated block, …). Keep a principal box only when one is required
+    // for paint or for a UA `::scroll-marker` flex item used size.
+    let paints = style.padding != w3cos_std::style::Edges::ZERO
+        || style.border_width > 0.0
+        || [
+            style.border_top_width,
+            style.border_right_width,
+            style.border_bottom_width,
+            style.border_left_width,
+        ]
+        .into_iter()
+        .any(|width| width.unwrap_or(0.0) > 0.0)
+        || style.background.a != 0
+        || style
+            .background_image
+            .as_deref()
+            .is_some_and(|image| !image.eq_ignore_ascii_case("none"))
+        || style.has_box_shadow()
+        || style.backdrop_blur.is_some()
+        || style.filter.is_some()
+        || style.opacity != 1.0
+        || style.transform != Transform2D::default()
+        || (style.outline_style != OutlineStyle::None && style.outline_width > 0.0);
+    let decorated = style.text_decoration != TextDecoration::None || !style.text_shadows.is_empty();
+    let used_size = style.width != Dimension::Auto
+        || style.height != Dimension::Auto
+        || style.min_width != Dimension::Auto
+        || style.min_height != Dimension::Auto
+        || style.max_width != Dimension::Auto
+        || style.max_height != Dimension::Auto;
+    let scroll_marker_item = {
+        let name = pseudo_element.trim_matches(':').to_ascii_lowercase();
+        name == "scroll-marker"
+            || name.ends_with("::scroll-marker")
+            || name.ends_with("scroll-marker")
+    };
+    paints || decorated || (scroll_marker_item && used_size)
+}
+
 fn principal_box_can_merge_generated_inline_text(style: &w3cos_std::style::Style) -> bool {
     use w3cos_std::style::{Dimension, Transform2D};
 
@@ -14391,6 +15550,8 @@ fn equivalent_text_paint_style(
         && left.word_break == right.word_break
         && left.direction == right.direction
         && left.unicode_bidi == right.unicode_bidi
+        && left.writing_mode == right.writing_mode
+        && left.logical_overrides == right.logical_overrides
         && left.visibility == right.visibility
 }
 
@@ -14409,6 +15570,65 @@ fn split_css_tokens(value: &str) -> Vec<String> {
         .map(|token| token.trim_matches(|character: char| matches!(character, ',' | '/')))
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn split_wrapping_ascii_text_runs(
+    children: Vec<w3cos_std::Component>,
+    parent: &w3cos_std::style::Style,
+) -> Vec<w3cos_std::Component> {
+    use w3cos_std::{Component, component::ComponentKind, style::*};
+    if !matches!(parent.white_space, WhiteSpace::Normal | WhiteSpace::PreLine) {
+        return children;
+    }
+    children
+        .into_iter()
+        .flat_map(|child| {
+            let ComponentKind::Text { content } = &child.kind else {
+                return vec![child];
+            };
+            if child.style.display != Display::Inline
+                || child.style.position != Position::Static
+                || !matches!(
+                    child.style.white_space,
+                    WhiteSpace::Normal | WhiteSpace::PreLine
+                )
+                || content.split(' ').filter(|word| !word.is_empty()).count() < 2
+            {
+                return vec![child];
+            }
+            let words: Vec<&str> = content.split(' ').filter(|word| !word.is_empty()).collect();
+            let mut pieces = Vec::with_capacity(words.len() * 2 + 1);
+            if content.starts_with(' ') {
+                let mut space = child.clone();
+                space.kind = ComponentKind::Text {
+                    content: " ".to_string(),
+                };
+                pieces.push(space);
+            }
+            for (index, word) in words.iter().enumerate() {
+                let mut fragment = child.clone();
+                fragment.kind = ComponentKind::Text {
+                    content: (*word).to_string(),
+                };
+                pieces.push(fragment);
+                if index + 1 < words.len() {
+                    let mut space = child.clone();
+                    space.kind = ComponentKind::Text {
+                        content: " ".to_string(),
+                    };
+                    pieces.push(space);
+                }
+            }
+            if content.ends_with(' ') && !content.chars().all(|ch| ch == ' ') {
+                let mut space = child.clone();
+                space.kind = ComponentKind::Text {
+                    content: " ".to_string(),
+                };
+                pieces.push(space);
+            }
+            pieces
+        })
         .collect()
 }
 
@@ -14705,6 +15925,7 @@ fn normalize_single_inline_text_indent(component: &mut w3cos_std::Component) {
         Dimension::Ch(value) => Spacing::Ch(value),
         Dimension::Vw(value) => Spacing::Vw(value),
         Dimension::Vh(value) => Spacing::Vh(value),
+        Dimension::Lh(value) => Spacing::Px(value * component.style.used_line_height_px()),
         Dimension::Auto | Dimension::Calc(_) => return,
     };
     let margin = match component.style.direction {
@@ -14958,6 +16179,32 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 properties.contains_key("--w3cos-internal-inline-formatting-context")
             })
     {
+        // A non-atomic `display:inline` principal is not itself an IFC,
+        // but its text still wraps in the enclosing line. After bidi
+        // coalescing joins a multi-word run, re-expose the spaces.
+        if component.style.display == Display::Inline
+            && component.style.position == Position::Static
+            && component.style.float == w3cos_std::style::Float::None
+            && matches!(
+                component.style.white_space,
+                WhiteSpace::Normal | WhiteSpace::PreLine
+            )
+            && component.children.iter().any(|child| {
+                // Words beside a replaced item need break opportunities
+                // in the enclosing IFC. Do not treat `inline-flex` (bidi
+                // isolate/override boxes, e.g. <bdo>) or other atomic
+                // inlines as a reason to split adjacent authored text;
+                // that turned "A " into two nodes beside a nested bdo.
+                // Pure-text inlines already fragment via the parent IFC.
+                matches!(
+                    child.kind,
+                    ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+                )
+            })
+        {
+            let children = std::mem::take(&mut component.children);
+            component.children = split_wrapping_ascii_text_runs(children, &component.style);
+        }
         return;
     }
 
@@ -14996,8 +16243,11 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             && matches!(child.style.align_self, w3cos_std::style::AlignSelf::Auto
                 | w3cos_std::style::AlignSelf::Baseline)
             && matches!(child.style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
-            && if bordered { principal_box_can_merge_generated_inline_text(&principal) }
-                else { painted_inline_text_box_can_merge(&child.style) }
+            && if bordered {
+                principal_box_can_merge_generated_inline_text(&principal)
+            } else {
+                painted_inline_text_box_can_merge(&child.style)
+            }
             && child.style.border_radius == 0.0
             && [child.style.border_top_left_radius, child.style.border_top_right_radius,
                 child.style.border_bottom_left_radius, child.style.border_bottom_right_radius]
@@ -18978,7 +20228,9 @@ mod generated_counter_format_tests {
 mod image_component_tests {
     use super::*;
     use w3cos_std::component::ComponentKind;
-    use w3cos_std::style::{AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing};
+    use w3cos_std::style::{
+        AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing, WhiteSpace,
+    };
 
     #[test]
     fn adjacent_decorated_inline_spaces_collapse_to_one_visual_space() {
@@ -19337,6 +20589,25 @@ mod image_component_tests {
                 "used run boundaries must survive shared storage"
             );
         }
+    }
+
+    #[test]
+    fn dir_auto_takes_the_first_strong_character_direction() {
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        block.set_attribute(&mut document, "dir", "auto");
+        let skipped = document.create_element("bdi");
+        let hebrew = document.create_text_node("\u{5d0}");
+        skipped.append_child(&mut document, hebrew);
+        let text = document.create_text_node("\u{200e}TES");
+        block.append_child(&mut document, skipped);
+        block.append_child(&mut document, text);
+        let rtl = document.create_element("div");
+        rtl.set_attribute(&mut document, "dir", "auto");
+        let mark = document.create_text_node("\u{200f}TES");
+        rtl.append_child(&mut document, mark);
+        assert_eq!(document.auto_directionality(block.id), Some("ltr"));
+        assert_eq!(document.auto_directionality(rtl.id), Some("rtl"));
     }
 
     #[test]
@@ -20595,6 +21866,35 @@ mod image_component_tests {
     }
 
     #[test]
+    fn image_dimension_attributes_are_presentational_hints_overridden_by_author_css() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#auto", &[("width", "auto")]);
+        crate::stylesheet::register_rule("#tall", &[("height", "30px")]);
+
+        let mut document = Document::new();
+        for id in ["plain", "auto", "tall"] {
+            let image = document.create_element("img");
+            image.set_attribute(&mut document, "src", "stripe.png");
+            image.set_attribute(&mut document, "id", id);
+            image.set_attribute(&mut document, "width", "40");
+            image.set_attribute(&mut document, "height", "20");
+            document.body().append_child(&mut document, image);
+        }
+
+        let tree = document.to_component_tree();
+        crate::stylesheet::clear_rules();
+        let plain = &tree.children[0].style;
+        assert_eq!(plain.width, Dimension::Px(40.0));
+        assert_eq!(plain.height, Dimension::Px(20.0));
+        let auto = &tree.children[1].style;
+        assert_eq!(auto.width, Dimension::Auto);
+        assert_eq!(auto.height, Dimension::Px(20.0));
+        let tall = &tree.children[2].style;
+        assert_eq!(tall.width, Dimension::Px(40.0));
+        assert_eq!(tall.height, Dimension::Px(30.0));
+    }
+
+    #[test]
     fn iframe_uses_replaced_fallback_size_and_resolves_definite_percent_height() {
         fn find_host(
             component: &w3cos_std::Component,
@@ -21657,6 +22957,10 @@ mod image_component_tests {
         assert_ne!(flex.style.flex_wrap, FlexWrap::Wrap);
         assert_ne!(flex.style.align_items, AlignItems::Baseline);
         assert_eq!(flex.children.len(), 2, "two flex items, not one text run");
+        // Atomic inline children of a flex host are blockified items
+        // (`blockified_atomic_items`): the host keeps its authored
+        // alignment, where main's version of this test kept the wrapping
+        // row lowering.
         let atomic = build("flex", "inline-block");
         if layout_ng_requested() {
             // Same markup as css/css-flexbox/flex-direction-column.html.
@@ -22948,7 +24252,7 @@ mod image_component_tests {
             document.body().append_child(&mut document, host);
             let tree = document.to_component_tree();
             fn find_line(node: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
-                if matches!(node.kind, ComponentKind::Row)
+                if matches!(node.kind, ComponentKind::Row | ComponentKind::Box)
                     && node
                         .children
                         .iter()
@@ -22959,17 +24263,46 @@ mod image_component_tests {
                 node.children.iter().find_map(find_line)
             }
             let line = find_line(&tree).expect("generated inline content row");
-            assert_eq!(
-                line.style.flex_wrap, expected_wrap,
-                "{display}: {white_space}"
-            );
-            assert!(
-                line.style
-                    .custom_properties
-                    .as_ref()
-                    .is_some_and(|properties| properties
-                        .contains_key("--w3cos-internal-inline-formatting-context"))
-            );
+            if display == "inline" {
+                // A non-replaced inline is not itself an IFC; wrap lives on
+                // the enclosing line. White-space is still honored by the
+                // principal's used style (word splitting is tested above).
+                assert_eq!(
+                    line.style.display,
+                    Display::Inline,
+                    "{display}: {white_space}"
+                );
+                assert!(
+                    !line
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|properties| {
+                            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                        }),
+                    "display:inline principal must not become an IFC ({white_space})"
+                );
+                assert_eq!(
+                    line.style.white_space,
+                    match white_space {
+                        "pre" => WhiteSpace::Pre,
+                        _ => WhiteSpace::Normal,
+                    },
+                    "{display}: {white_space}"
+                );
+            } else {
+                assert_eq!(
+                    line.style.flex_wrap, expected_wrap,
+                    "{display}: {white_space}"
+                );
+                assert!(
+                    line.style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|properties| properties
+                            .contains_key("--w3cos-internal-inline-formatting-context"))
+                );
+            }
         }
         crate::stylesheet::clear_rules();
     }
@@ -25708,6 +27041,51 @@ mod image_component_tests {
             w3cos_std::style::AlignSelf::FlexStart
         );
         assert_eq!(row.children[0].children.len(), 1);
+    }
+
+    #[test]
+    fn flex_container_of_images_keeps_authored_alignment() {
+        // Images in a flex container are blockified flex items (CSS
+        // Display §2.7), not an anonymous line, so `align-items` and
+        // `flex-direction` stay as authored
+        // (css-flexbox-img-expand-evenly.html).
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#flex",
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("height", "50px"),
+            ],
+        );
+        // Canvases are replaced the same way (Blink LayoutHTMLCanvas).
+        for tag in ["img", "canvas"] {
+            let mut document = Document::new();
+            let flex = document.create_element("div");
+            flex.set_attribute(&mut document, "id", "flex");
+            for _ in 0..2 {
+                let item = document.create_element(tag);
+                if tag == "img" {
+                    item.set_attribute(&mut document, "src", "a.png");
+                }
+                flex.append_child(&mut document, item);
+            }
+            document.body().append_child(&mut document, flex);
+
+            let tree = document.to_component_subtree(flex.id);
+            assert_eq!(tree.style.display, w3cos_std::style::Display::Flex, "{tag}");
+            assert_eq!(
+                tree.style.align_items,
+                w3cos_std::style::AlignItems::Stretch,
+                "{tag}"
+            );
+            assert_eq!(
+                tree.style.flex_direction,
+                w3cos_std::style::FlexDirection::Column,
+                "{tag}"
+            );
+        }
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
@@ -28697,6 +30075,73 @@ mod computed_style_cache_tests {
     }
 
     #[test]
+    fn tab_size_inherits_pixels_and_drops_invalid_values() {
+        crate::stylesheet::clear_rules();
+        let tab_size = |document: &Document, id| {
+            document
+                .computed_style_for(id)
+                .custom_properties
+                .and_then(|properties| properties.get(crate::css_style::TAB_SIZE_PROPERTY).cloned())
+        };
+        // (parent declarations, target declarations, target, child)
+        for (parent_css, target_css, expected) in [
+            ("", "", None),
+            ("tab-size:4", "", Some("4")),
+            ("tab-size:4", "tab-size:2.5", Some("2.5")),
+            ("", "tab-size:5em;font-size:10px", Some("50px")),
+            ("", "font-size:10px;tab-size:5em", Some("50px")),
+            ("tab-size:3", "tab-size:-1", Some("3")),
+            ("tab-size:3", "tab-size:10%", Some("3")),
+            ("tab-size:3", "tab-size:inherit", Some("3")),
+            ("tab-size:3", "tab-size:initial", Some("8")),
+            ("", "tab-size:20px", Some("20px")),
+            ("", "tab-size:1rem;font-size:40px", Some("16px")),
+            (
+                "",
+                "font-size:40px;tab-size:calc(10px + 0.5em)",
+                Some("30px"),
+            ),
+            (
+                "",
+                "font-size:40px;tab-size:calc(10px - 0.5em)",
+                Some("0px"),
+            ),
+            ("", "tab-size:calc(2 + 3)", Some("5")),
+            ("tab-size:3", "tab-size:calc(2 + 3px)", Some("3")),
+        ] {
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            let target = document.create_element("span");
+            for (element, css) in [(&parent, parent_css), (&target, target_css)] {
+                for declaration in css.split(';').filter(|s| !s.is_empty()) {
+                    let (property, value) = declaration.split_once(':').unwrap();
+                    element
+                        .style_mut(&mut document)
+                        .set_property(property, value);
+                }
+            }
+            let child = document.create_element("span");
+            child
+                .style_mut(&mut document)
+                .set_property("font-size", "30px");
+            target.append_child(&mut document, child);
+            parent.append_child(&mut document, target);
+            document.body().append_child(&mut document, parent);
+            let expected = expected.map(str::to_string);
+            assert_eq!(
+                tab_size(&document, target.id),
+                expected,
+                "{parent_css}; {target_css}"
+            );
+            assert_eq!(
+                tab_size(&document, child.id),
+                expected,
+                "inherits the computed value"
+            );
+        }
+    }
+
+    #[test]
     fn style_cache_hit_adopts_an_equal_inherited_variable_map() {
         stylesheet::clear_rules();
         let mut document = Document::new();
@@ -30868,6 +32313,105 @@ mod computed_style_cache_tests {
         crate::stylesheet::clear_rules();
     }
 
+    /// `writing-mode` is inherited and settles before the element's logical
+    /// sizes map: horizontal-tb maps them to the physical axes, other modes
+    /// keep the recorded marker whatever the declaration order.
+    #[test]
+    fn inline_style_vertical_parent_keeps_child_logical_sizes_unmapped() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent
+            .style_mut(&mut document)
+            .set_property("writing-mode", "vertical-lr");
+        let child = document.create_element("div");
+        child
+            .style_mut(&mut document)
+            .set_property("inline-size", "stretch");
+        child
+            .style_mut(&mut document)
+            .set_property("block-size", "100px");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+        use w3cos_std::style::{Dimension, WritingMode};
+        assert_eq!(
+            document.computed_style_for(parent.id).writing_mode,
+            WritingMode::VerticalLr
+        );
+        let style = document.computed_style_for(child.id);
+        assert_eq!(style.writing_mode, WritingMode::VerticalLr);
+        assert_eq!(style.height, Dimension::Auto);
+    }
+
+    #[test]
+    fn writing_mode_inherits_and_decides_logical_size_mapping() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#vertical", &[("writing-mode", "vertical-rl")]);
+        crate::stylesheet::register_rule("#inherits", &[("inline-size", "100px")]);
+        crate::stylesheet::register_rule(
+            "#late",
+            &[("inline-size", "100px"), ("writing-mode", "vertical-lr")],
+        );
+        crate::stylesheet::register_rule(
+            "#reset",
+            &[("writing-mode", "horizontal-tb"), ("block-size", "30px")],
+        );
+        crate::stylesheet::register_rule(
+            "#explicit",
+            &[("writing-mode", "inherit"), ("inline-size", "50px")],
+        );
+        let mut document = Document::new();
+        let mk = |document: &mut Document, id: &str| {
+            let element = document.create_element("div");
+            element.set_attribute(document, "id", id);
+            element
+        };
+        let horizontal_parent = mk(&mut document, "horizontal");
+        let horizontal_child = mk(&mut document, "inherits");
+        horizontal_parent.append_child(&mut document, horizontal_child);
+        let vertical = mk(&mut document, "vertical");
+        let inherits = mk(&mut document, "inherits");
+        let late = mk(&mut document, "late");
+        let reset = mk(&mut document, "reset");
+        let explicit = mk(&mut document, "explicit");
+        vertical.append_child(&mut document, inherits);
+        vertical.append_child(&mut document, late);
+        vertical.append_child(&mut document, reset);
+        vertical.append_child(&mut document, explicit);
+        document
+            .body()
+            .append_child(&mut document, horizontal_parent);
+        document.body().append_child(&mut document, vertical);
+        use w3cos_std::style::{Dimension, WritingMode};
+        let style = |id: NodeId| document.computed_style_for(id);
+        // The declared width ignores `inline-size`; the override maps it.
+        let resolved = |id: NodeId| {
+            let mut style = document.computed_style_for(id);
+            if let Some(overrides) = style.logical_overrides.clone() {
+                overrides.apply(&mut style);
+            }
+            style
+        };
+        assert_eq!(style(horizontal_child.id).width, Dimension::Auto);
+        assert_eq!(resolved(horizontal_child.id).width, Dimension::Px(100.0));
+        assert!(style(inherits.id).logical_overrides.is_none());
+        assert_eq!(style(vertical.id).writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style(inherits.id).writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style(inherits.id).width, Dimension::Auto);
+        assert_eq!(style(late.id).writing_mode, WritingMode::VerticalLr);
+        assert_eq!(style(late.id).width, Dimension::Auto);
+        assert_eq!(style(reset.id).writing_mode, WritingMode::HorizontalTb);
+        assert_eq!(style(reset.id).height, Dimension::Auto);
+        if crate::css_style::NG_BLOCK_AXIS_LOGICAL_PROPERTIES {
+            assert_eq!(resolved(reset.id).height, Dimension::Px(30.0));
+        } else {
+            assert_eq!(resolved(reset.id).height, Dimension::Auto);
+        }
+        assert_eq!(style(explicit.id).writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style(explicit.id).width, Dimension::Auto);
+        crate::stylesheet::clear_rules();
+    }
+
     #[test]
     fn relative_side_border_shorthands_keep_their_declared_colors() {
         crate::stylesheet::clear_rules();
@@ -32610,4 +34154,22 @@ mod tree_mutation_tests {
         assert!(restyles(&document, before) >= 1);
         assert_ne!(document.computed_style_for(node.id).z_index, 7);
     }
+}
+
+/// The local name of a possibly prefixed tag (`svg:a` → `a`).
+fn local_tag_name(tag: &str) -> &str {
+    tag.rsplit_once(':').map_or(tag, |(_, local)| local)
+}
+
+/// HTML §2.3.4.1 rules for parsing non-negative integers: skip ASCII
+/// whitespace, an optional `+`, then the leading ASCII digits (trailing
+/// garbage is ignored). `None` without a digit or on overflow.
+fn parse_html_non_negative_integer(input: &str) -> Option<u32> {
+    let rest = input.trim_start_matches(['\t', '\n', '\u{000c}', '\r', ' ']);
+    let rest = rest.strip_prefix('+').unwrap_or(rest);
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].parse::<u32>().ok()
 }

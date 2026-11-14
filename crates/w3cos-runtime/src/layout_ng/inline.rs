@@ -35,188 +35,11 @@ use crate::layout::{
 };
 use w3cos_std::ComponentKind;
 use w3cos_std::style::{
-    Dimension, Display, Float, LineBreak, Position, Style, TextAlign, TextDirection, WhiteSpace,
-    WordBreak,
+    Dimension, Display, Edges, Float, LineBreak, Position, Style, TextAlign, TextDirection,
+    WhiteSpace, WordBreak,
 };
 
 const EPSILON: f32 = 1.0 / 128.0;
-
-/// `tab-size` (--w3cos-internal-tab-size): `n<number>` or `l<px>`; absent is
-/// the initial 8.
-const TAB_SIZE_MARKER: &str = "--w3cos-internal-tab-size";
-
-/// A leaf of nothing but preserved tabs (white-space: pre, so no wrap
-/// opportunity or hanging). NGInlineItemsBuilder keeps each tab as an item
-/// character; its advance depends on the inline position, so only a leaf
-/// at the start of its line (position 0) is modelled.
-fn tab_only(content: &str, style: &Style) -> bool {
-    !content.is_empty()
-        && content.bytes().all(|b| b == b'\t')
-        && style.white_space == WhiteSpace::Pre
-        && !style.break_spaces
-}
-
-/// Blink's `Font::TabWidth` for `count` consecutive tabs from the line
-/// start: the tab size is `n` space advances (the space glyph plus
-/// letter-spacing and word-spacing) or an absolute length, each tab runs to
-/// the next multiple of it, and a tab narrower than half a space takes the
-/// following stop. A zero tab size gives no advance.
-fn tab_width(content: &str, style: &Style) -> f32 {
-    tab_width_from(content.len(), 0.0, style)
-}
-
-/// `count` tabs starting at inline offset `start` from the line start; the
-/// advance they add.
-fn tab_width_from(count: usize, start: f32, style: &Style) -> f32 {
-    let mut bare = style.clone();
-    bare.letter_spacing = 0.0;
-    bare.word_spacing = 0.0;
-    bare.padding = Style::default().padding;
-    bare.border_width = 0.0;
-    bare.border_top_width = None;
-    bare.border_right_width = None;
-    bare.border_bottom_width = None;
-    bare.border_left_width = None;
-    // The space glyph's unsnapped advance (SimpleFontData::SpaceWidth): the
-    // width of a long run spreads the LayoutUnit ceil of one shape.
-    let space = max_content_width(&" ".repeat(64), &bare) / 64.0;
-    let spaced = space + style.letter_spacing + style.word_spacing;
-    let base = match marker_value(style, TAB_SIZE_MARKER) {
-        Some(v) if v.starts_with('n') => v[1..].parse::<f32>().unwrap_or(8.0) * spaced,
-        Some(v) if v.starts_with('l') => v[1..].parse::<f32>().unwrap_or(0.0),
-        _ => 8.0 * spaced,
-    };
-    if base <= 0.0 {
-        return 0.0;
-    }
-    let mut position = start;
-    for _ in 0..count {
-        let mut distance = base - position % base;
-        if distance < space / 2.0 {
-            distance += base;
-        }
-        position += distance;
-    }
-    position - start
-}
-
-/// Preserved tabs inside other text of a `white-space: pre` leaf: one line
-/// per forced break, so each tab's inline offset is known while items are
-/// collected.
-fn tabs_in_pre_text(content: &str, style: &Style) -> bool {
-    content.contains('\t')
-        && style.white_space == WhiteSpace::Pre
-        && !style.break_spaces
-        && !content.contains(['\n', '\r'])
-}
-
-/// The text with tabs read as spaces: they shape with the primary font.
-fn detab(content: &str) -> std::borrow::Cow<'_, str> {
-    if content.contains('\t') {
-        content.replace('\t', " ").into()
-    } else {
-        content.into()
-    }
-}
-
-/// NGInlineItemsBuilder / ShapeResultSpacing for tabs in a pre container:
-/// each run of tabs becomes its own piece whose advance runs to the next
-/// tab stop from its inline offset on the line (the sum of the items before
-/// it since the last forced break); the text between them is shaped alone.
-fn split_tabs(
-    flat: &[FlatNodeInfo],
-    items: Vec<InlineItem>,
-    run: &mut usize,
-) -> Option<Vec<InlineItem>> {
-    let mut out = Vec::with_capacity(items.len());
-    let mut x = 0.0f32;
-    for item in items {
-        if item.forced {
-            x = 0.0;
-            out.push(item);
-            continue;
-        }
-        let text = item_text(flat, &item);
-        if item.atomic.is_some() || !text.contains('\t') {
-            // Line positions advance by snapped widths (LayoutUnit).
-            x += snap(item.raw);
-            out.push(item);
-            continue;
-        }
-        let style = flat[item.index].style;
-        if !zero_edges(style) {
-            return super::bail("tab-edges");
-        }
-        let base = item.range.map_or(0, |r| r.0);
-        let bytes = text.as_bytes();
-        let mut segments = Vec::new();
-        let mut s = 0;
-        while s < bytes.len() {
-            let tab = bytes[s] == b'\t';
-            let mut e = s;
-            while e < bytes.len() && (bytes[e] == b'\t') == tab {
-                e += 1;
-            }
-            segments.push((s, e, tab));
-            s = e;
-        }
-        let last = segments.len() - 1;
-        x += snap(item.box_start);
-        for (n, &(s, e, tab)) in segments.iter().enumerate() {
-            let piece = &text[s..e];
-            let width = if tab {
-                tab_width_from(e - s, x, style)
-            } else {
-                max_content_width(piece, style)
-            };
-            let mut p = item.clone();
-            p.range = Some((base + s, base + e));
-            p.box_start = if n == 0 { item.box_start } else { 0.0 };
-            p.box_end = if n == last { item.box_end } else { 0.0 };
-            p.raw = width + p.box_start + p.box_end;
-            p.raw_hang = p.raw;
-            p.starts_space = piece.starts_with(' ');
-            p.ends_space = piece.ends_with(' ');
-            p.whitespace_only = piece.trim_end_matches(' ').is_empty();
-            p.internal_break = false;
-            p.run = *run;
-            *run += 1;
-            x += snap(width);
-            out.push(p);
-        }
-        x += snap(item.box_end);
-    }
-    Some(out)
-}
-
-/// Advance of `text` when it is a modelled tab leaf, else `None`.
-fn tab_advance(text: &str, style: &Style) -> Option<f32> {
-    tab_only(text, style).then(|| tab_width(text, style))
-}
-
-/// A sole line-width leaf: paint wraps and draws its whole text itself.
-fn paragraph_leaf(style: &Style, sole: bool, container: &Style) -> bool {
-    sole && line_width_leaf(style, container)
-}
-
-/// The DOM marks a block's sole text run `text-line-width` (paint wraps it
-/// inside the block's line width).  A run coalesced from dissolved inlines
-/// (#325: it carries CSSOM owner ranges) is not marked, although it is the
-/// same paragraph: infer the marker from the DOM's conditions so it takes
-/// the same path (and line model) as an equivalent unsplit run.
-fn line_width_leaf(style: &Style, container: &Style) -> bool {
-    has_marker(style, LINE_WIDTH_MARKER)
-        || (has_marker(style, w3cos_std::inline_text::CSSOM_OWNER_RANGES)
-            && matches!(
-                container.white_space,
-                WhiteSpace::Normal | WhiteSpace::PreLine
-            )
-            && !matches!(style.position, Position::Absolute | Position::Fixed)
-            && (!matches!(container.width, Dimension::Auto)
-                || container.text_indent != Dimension::Px(0.0)
-                || container.text_align != TextAlign::Start
-                || has_marker(container, "--w3cos-internal-text-align-last")))
-}
 
 fn has_marker(style: &Style, key: &str) -> bool {
     style
@@ -237,9 +60,256 @@ const FORCED_BREAK: &str = "\u{2028}";
 /// Line count of a `-webkit-line-clamp` box (`block::webkit_box_styles`
 /// sets it on the block-flow `-webkit-box` it lays out).
 pub(super) const CLAMP_MARKER: &str = "--w3cos-internal-clamp-lines";
+/// CSS Overflow 4 `max-lines` from the `line-clamp` / `-webkit-line-clamp`
+/// shorthands.
+const LINE_CLAMP_MARKER: &str = "--w3cos-internal-line-clamp";
+/// CSS Overflow 4 `continue`. `collapse` clamps any block container;
+/// `webkit-legacy` clamps only through `CLAMP_MARKER` on a vertical
+/// `-webkit-box`.
+const CONTINUE_MARKER: &str = "--w3cos-internal-continue";
 
-fn clamp_lines(style: &Style) -> Option<usize> {
+pub(super) fn clamp_lines(style: &Style) -> Option<usize> {
+    // Standard `line-clamp: N` (`continue: collapse`) applies to any block
+    // container. `-webkit-line-clamp` uses `continue: -webkit-legacy` and
+    // only counts lines when webkit_box_styles copied `CLAMP_MARKER`.
+    // `line-clamp: auto` keeps as many lines as fit in a definite
+    // `max-height` / `height` (CSS Overflow 4).
+    if marker_value(style, CONTINUE_MARKER) == Some("collapse") {
+        return match marker_value(style, LINE_CLAMP_MARKER) {
+            Some("auto") => auto_clamp_lines(style),
+            Some(raw) => raw.parse().ok(),
+            // `continue: collapse` without max-lines is the same as
+            // `line-clamp: auto` (CSS Overflow 4; continue-001).
+            None => auto_clamp_lines(style),
+        };
+    }
     marker_value(style, CLAMP_MARKER)?.parse().ok()
+}
+
+/// Whether this box's own clamp inserts a block-ellipsis (`line-clamp`
+/// and `-webkit-line-clamp` set `block-ellipsis: auto`; `continue:
+/// collapse` alone does not).
+pub(super) fn clamp_has_ellipsis(style: &Style) -> bool {
+    marker_value(style, LINE_CLAMP_MARKER).is_some() || marker_value(style, CLAMP_MARKER).is_some()
+}
+
+/// Line budget and ellipsis flag for this IFC: the box's own `line-clamp`
+/// wins, otherwise a same-BFC ancestor budget on the constraint space.
+/// An inherited height cap becomes `floor(remaining_block / used lh)`.
+fn clamp_budget(style: &Style, space: &super::ConstraintSpace) -> Option<(usize, bool)> {
+    if let Some(n) = clamp_lines(style) {
+        return Some((n, clamp_has_ellipsis(style)));
+    }
+    let c = space.line_clamp?;
+    let from_lines = c.remaining;
+    let from_height = c.remaining_block.map(|cap| {
+        let line = style.used_line_height_px();
+        if line <= EPSILON {
+            0
+        } else {
+            (cap / line + EPSILON).floor().max(0.0) as usize
+        }
+    });
+    match (from_lines, from_height) {
+        (Some(n), Some(h)) => Some((n.min(h), c.ellipsis)),
+        (Some(n), None) => Some((n, c.ellipsis)),
+        (None, Some(h)) => Some((h, c.ellipsis)),
+        (None, None) => None,
+    }
+}
+
+/// `line-clamp: auto` or `continue: collapse` without an integer
+/// `max-lines`, when a definite height/`max-height` cap exists.
+pub(super) fn clamp_is_auto(style: &Style) -> bool {
+    marker_value(style, CONTINUE_MARKER) == Some("collapse")
+        && matches!(marker_value(style, LINE_CLAMP_MARKER), Some("auto") | None)
+        && auto_clamp_lines(style).is_some()
+}
+
+/// How many line boxes fit in the content-box block size cap used by
+/// `line-clamp: auto`. `None` means the size is indefinite (no clamp).
+fn auto_clamp_lines(style: &Style) -> Option<usize> {
+    let cap = definite_clamp_block(style)?;
+    let line = style.used_line_height_px();
+    if line <= EPSILON {
+        return Some(0);
+    }
+    Some((cap / line + EPSILON).floor().max(0.0) as usize)
+}
+
+/// Definite content-box block size from `height` and/or `max-height`.
+/// `min-height` is not a clamp cap (line-clamp-auto-012).
+pub(super) fn definite_clamp_block(style: &Style) -> Option<f32> {
+    let resolve = |d: Dimension| -> Option<f32> {
+        match d {
+            Dimension::Px(v) => Some(v),
+            Dimension::Em(v) => Some(v * style.font_size),
+            Dimension::Rem(v) => Some(v * crate::layout::ROOT_FONT_SIZE),
+            Dimension::Lh(v) => Some(v * style.used_line_height_px()),
+            Dimension::Ch(v) => Some(v * style.ch_advance()),
+            _ => None,
+        }
+    };
+    let height = resolve(style.height);
+    let max_height = resolve(style.max_height);
+    let min_height = resolve(style.min_height);
+    // `min-height` alone is not a clamp cap (auto-012). When both
+    // min and max are definite, the used constraint is max(min, max)
+    // (CSS 2.1 10.7; auto-014).
+    let used = match (height, max_height, min_height) {
+        (None, None, _) => return None,
+        (Some(h), Some(m), Some(n)) => h.min(m).max(n),
+        (Some(h), Some(m), None) => h.min(m),
+        (Some(h), None, Some(n)) => h.max(n),
+        (Some(h), None, None) => h,
+        (None, Some(m), Some(n)) => m.max(n),
+        (None, Some(m), None) => m,
+        (None, None, _) => unreachable!(),
+    };
+    let padding = style.padding_lengths();
+    let bt = style.border_top_width.unwrap_or(0.0);
+    let bb = style.border_bottom_width.unwrap_or(0.0);
+    let edges = padding.top + padding.bottom + bt + bb;
+    let content = if style.box_sizing == w3cos_std::style::BoxSizing::BorderBox {
+        (used - edges).max(0.0)
+    } else {
+        used
+    };
+    Some(content)
+}
+
+/// The substring of a text leaf this item paints (the item's range, or
+/// the whole leaf when it has none).
+fn clamp_item_text<'a>(item: &InlineItem, content: &'a str) -> &'a str {
+    item.range
+        .and_then(|(a, b)| content.get(a..b))
+        .unwrap_or(content)
+}
+
+/// Whether a last-kept-line text item can carry a block-ellipsis: paint
+/// draws the piece verbatim, with only single U+0020 spaces between words.
+/// The check looks at the item's range, not the whole leaf, so a
+/// `white-space: normal` paragraph whose source still has newlines can
+/// clamp. Collapsed whitespace (`\n` / `\t` / `\r`) is treated as space.
+fn clamp_ellipsis_piece_ok(item: &InlineItem, content: &str, style: &Style) -> bool {
+    if item.atomic.is_some() || !zero_edges(style) {
+        return false;
+    }
+    let slice = clamp_item_text(item, content);
+    let preserve = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
+    if preserve {
+        return !slice.contains(|c: char| c.is_whitespace() && c != ' ')
+            && !slice.contains("  ")
+            && !(item.range.is_none() && (item.starts_space || item.ends_space));
+    }
+    true
+}
+
+/// Longest prefix of `slice` ending at a soft wrap opportunity that is at
+/// most `max_width` wide (CSS Overflow 4 block-ellipsis).
+fn last_wrap_prefix_fit(slice: &str, style: &Style, max_width: f32) -> Option<(usize, f32)> {
+    let full = text_intrinsic_size(slice, style).0;
+    if full <= max_width + EPSILON {
+        return Some((slice.len(), full));
+    }
+    let mut best = None;
+    let mut i = 0;
+    while i < slice.len() {
+        let rest = &slice[i..];
+        let Some(rel) = rest.find(|c: char| c.is_whitespace()) else {
+            break;
+        };
+        let at = i + rel;
+        let prefix = &slice[..at];
+        let width = text_intrinsic_size(prefix, style).0;
+        if width <= max_width + EPSILON {
+            best = Some((at, width));
+        }
+        let ch = rest[rel..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        i = at + ch;
+    }
+    best
+}
+
+/// If the last kept line cannot fit its text plus the ellipsis, drop
+/// trailing items and shrink the last remaining item back to the last
+/// wrap opportunity that still leaves room (or keep only the ellipsis).
+fn trim_line_for_block_ellipsis(
+    items: &[InlineItem],
+    flat: &[FlatNodeInfo],
+    line: &mut Line,
+    dropped: &mut Vec<usize>,
+    ellipsis_width: f32,
+) -> Option<(usize, Option<(usize, usize)>)> {
+    let available = line.available;
+    loop {
+        let k = line
+            .items
+            .iter()
+            .rev()
+            .map(|&(k, ..)| k)
+            .find(|&k| !items[k].forced)?;
+        let item = &items[k];
+        let ComponentKind::Text { content } = &flat[item.index].kind else {
+            return None;
+        };
+        if !clamp_ellipsis_piece_ok(item, content, flat[item.index].style) {
+            return None;
+        }
+        if line.width + ellipsis_width <= available + EPSILON {
+            return Some((k, None));
+        }
+        let slice = clamp_item_text(item, content);
+        let start = item.range.map(|(a, _)| a).unwrap_or(0);
+        let (x, item_width) = line
+            .items
+            .iter()
+            .rev()
+            .find(|&&(ik, ..)| ik == k)
+            .map(|&(_, x, w)| (x, w))
+            .unwrap_or((0.0, 0.0));
+        let text_w = text_intrinsic_size(slice, flat[item.index].style).0;
+        let extras = (item_width - text_w).max(0.0);
+        let max_text = available - x - extras - ellipsis_width;
+        if let Some((kept_end, kept_w)) =
+            last_wrap_prefix_fit(slice, flat[item.index].style, max_text)
+        {
+            let new_w = kept_w + extras;
+            if let Some(slot) = line.items.iter_mut().rev().find(|slot| slot.0 == k) {
+                slot.2 = new_w;
+            }
+            line.width = x + new_w;
+            let range = (kept_end < slice.len()).then_some((start, start + kept_end));
+            return Some((k, range));
+        }
+        let content_items = line
+            .items
+            .iter()
+            .filter(|&&(ik, ..)| !items[ik].forced && !items[ik].whitespace_only)
+            .count();
+        if content_items <= 1 {
+            if ellipsis_width > available + EPSILON {
+                return None;
+            }
+            if let Some(slot) = line.items.iter_mut().rev().find(|slot| slot.0 == k) {
+                slot.2 = extras;
+            }
+            line.width = x + extras;
+            return Some((k, Some((start, start))));
+        }
+        while let Some(&(ik, ..)) = line.items.last() {
+            dropped.push(ik);
+            line.items.pop();
+            if ik == k {
+                break;
+            }
+        }
+        line.width = line.items.last().map(|&(_, x, w)| x + w).unwrap_or(0.0);
+    }
 }
 
 fn marker_value<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
@@ -263,6 +333,33 @@ fn bidi_fragment(style: &Style) -> bool {
     has_marker(style, BIDI_VISUAL_ORDER_MARKER)
 }
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
+
+/// A sole line-width leaf: paint wraps and draws its whole text itself.
+fn paragraph_leaf(style: &Style, sole: bool, container: &Style) -> bool {
+    sole && line_width_leaf(style, container)
+}
+
+/// The DOM marks a block's sole text run `text-line-width` (paint wraps it
+/// inside the block's line width).  A run coalesced from dissolved inlines
+/// (#325: it carries CSSOM owner ranges) is not marked, although it is the
+/// same paragraph: infer the marker from the DOM's conditions so it takes
+/// the same path (and line model) as an equivalent unsplit run.
+/// (main 7f1c12d / shaping-000: ع<span>ع</span>ع folds to one Text with
+/// cssom-owner-ranges inside a definite-width RTL block.)
+fn line_width_leaf(style: &Style, container: &Style) -> bool {
+    has_marker(style, LINE_WIDTH_MARKER)
+        || (has_marker(style, w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+            && matches!(
+                container.white_space,
+                WhiteSpace::Normal | WhiteSpace::PreLine
+            )
+            && !matches!(style.position, Position::Absolute | Position::Fixed)
+            && (!matches!(container.width, Dimension::Auto)
+                || container.text_indent != Dimension::Px(0.0)
+                || container.text_align != TextAlign::Start
+                || has_marker(container, "--w3cos-internal-text-align-last")))
+}
+
 /// `vertical-align: top | text-top | bottom | text-bottom` (the cascade
 /// maps them to align-self start/end and keeps the keyword here).
 pub(super) const VALIGN_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
@@ -283,7 +380,7 @@ fn valign_length(style: &Style) -> Option<f32> {
 
 /// `vertical-align: top` (Some(true)) or `bottom` (Some(false)): the box's
 /// aligned subtree is placed against the line box edge (CSS 2.1 10.8.1).
-fn line_relative_align(style: &Style) -> Option<bool> {
+pub(super) fn line_relative_align(style: &Style) -> Option<bool> {
     match style
         .custom_properties
         .as_ref()
@@ -371,7 +468,50 @@ fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style
     Some(half - (x_height / 2.0 * 64.0).round() / 64.0)
 }
 
+/// Whether an inline box draws nothing of its own (no edges, background,
+/// shadow, outline, decoration or effects): only then may its per-line
+/// fragments collapse into the one rect the engine keeps per node.
+fn paints_nothing(style: &Style) -> bool {
+    zero_edges(style)
+        && style.background.a == 0
+        && style.background_image.is_none()
+        && style.box_shadow.is_none()
+        && style.box_shadows.is_empty()
+        && (style.outline_style == w3cos_std::style::OutlineStyle::None
+            || style.outline_width == 0.0)
+        && style.opacity == 1.0
+        && style.filter.is_none()
+        && style.transform == w3cos_std::style::Transform2D::default()
+        && style.text_decoration == w3cos_std::style::TextDecoration::None
+}
+
+/// A spacing LayoutNG's inline items can read without a percentage basis.
+fn basis_free_spacing(s: w3cos_std::style::Spacing) -> bool {
+    use w3cos_std::style::Spacing;
+    match s {
+        Spacing::Percent(p) => p == 0.0,
+        Spacing::Calc { percent, .. } | Spacing::PaddingCalc { percent, .. } => percent == 0.0,
+        _ => true,
+    }
+}
+
 fn zero_edges(style: &Style) -> bool {
+    // A percentage edge needs the containing block's width, which inline
+    // items do not carry; it is not zero, and inline_edges_supported
+    // sends it to legacy.
+    if ![
+        style.padding.top,
+        style.padding.right,
+        style.padding.bottom,
+        style.padding.left,
+        style.margin.left,
+        style.margin.right,
+    ]
+    .into_iter()
+    .all(basis_free_spacing)
+    {
+        return false;
+    }
     let padding = style.padding_lengths();
     let margin = style.margin_lengths();
     [padding.top, padding.right, padding.bottom, padding.left]
@@ -395,9 +535,61 @@ fn is_soft_wrap_char(c: char) -> bool {
         || crate::text_layout::is_cjk_line_break_character(c)
 }
 
+/// CSS Text 3 4.1.2: in `normal` / `nowrap`, a newline, tab, or form feed
+/// is a collapsible space (same byte length as U+0020, so ranges stay valid
+/// when the character is rewritten as a space for line breaking).
+fn is_collapsible_space(c: char) -> bool {
+    matches!(c, ' ' | '\n' | '\t' | '\u{0c}')
+}
+
+fn collapses_whitespace(style: &Style) -> bool {
+    matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+}
+
+/// Line-breaking text of an item: collapsed whitespace modes rewrite
+/// source newlines / tabs / form feeds as U+0020 so UAX #14 does not
+/// treat them as mandatory breaks (CSS Text 3 4.1.2).
+fn as_collapsed_spaces<'a>(text: &'a str, style: &Style) -> std::borrow::Cow<'a, str> {
+    if collapses_whitespace(style) && text.bytes().any(|b| matches!(b, b'\n' | b'\t' | 0x0c)) {
+        std::borrow::Cow::Owned(text.replace(['\n', '\t', '\u{0c}'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn ifc_break_opportunities(text: &str, style: &Style) -> Vec<usize> {
+    let text = as_collapsed_spaces(text, style);
+    crate::line_break::break_opportunities(&text, break_mode(style))
+}
+
+/// `word-break: auto-phrase` suppresses hyphenation, so a soft hyphen is
+/// not a break opportunity (CSS Text 4 word-break).
+fn suppresses_hyphenation(style: &Style) -> bool {
+    has_marker(style, "--w3cos-internal-word-break-auto-phrase")
+}
+
+/// The run's crate::line_break mode. `word-break: auto-phrase` in Japanese
+/// is Blink's LineBreakType::kPhrase: opportunities only at phrase
+/// boundaries, none inside a phrase (keep-all). Phrase segmentation is not
+/// modeled yet, so such text breaks only where keep-all would; other
+/// languages fall back to `normal` (CSS Text 4).
+fn break_mode(style: &Style) -> crate::line_break::BreakMode {
+    let mut mode = crate::line_break::BreakMode::of(style);
+    if mode.ja
+        && suppresses_hyphenation(style)
+        && mode.kind == crate::line_break::LineBreakType::Normal
+    {
+        mode.kind = crate::line_break::LineBreakType::KeepAll;
+    }
+    mode
+}
+
 /// Text style requirements shared by every S2a text leaf.
 fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
-    if style.position != Position::Static || style.float != Float::None {
+    // An inline-level relatively positioned leaf only moves its fragments
+    // (`relative_inline_offsets`); a block-level one stays on legacy.
+    let inline_relative = style.position == Position::Relative && style.display == Display::Inline;
+    if (style.position != Position::Static && !inline_relative) || style.float != Float::None {
         return Some("text:positioned");
     }
     // (direction and unicode-bidi are checked by the callers.)
@@ -417,38 +609,33 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.text_indent != Dimension::Px(0.0) {
         return Some("text:indent");
     }
-    // The NG breaker does not apply these. Leaving them on NG lays the
-    // page out as if they were absent. ASCII hanging-punctuation stays:
-    // an overflowing quote already paints on the same line, and falling
-    // only that page back disagrees with the NG reference.
-    if style.hanging_punctuation_last && !content.chars().all(|c| c.is_ascii()) {
-        return Some("text:hanging-punctuation");
-    }
-    // `line-break: anywhere` is the shared breaker's BreakCharacter mode
-    // (ComputedStyle::GetLineBreakType); strict / loose stay on legacy.
+    // hanging-punctuation: last hangs the paragraph's final closing
+    // bracket or quote (`mark_hanging_last`; a paragraph leaf through
+    // crate::text_layout's BreakMode::hang_last_punctuation).
+    // line-break: loose / strict / anywhere all reach the breaker through
+    // crate::line_break::BreakMode (Blink LazyLineBreakIterator strictness /
+    // BreakCharacter for anywhere). Branch already lays loose/strict on NG;
+    // allowing anywhere matches main #404 without forcing loose/strict onto
+    // legacy (paired losses on line-break-loose/strict-011..018).
+    // break-spaces: the sole-leaf wrap runs through crate::line_break
+    // (BreakSpace::AfterEverySpace); multi-item lines stay on legacy.
+    // break-all / keep-all only change the opportunities
+    // (crate::line_break::BreakMode); break-word adds emergency breaks.
+    // break-word (overflow-wrap: break-word / anywhere, word-break:
+    // break-word) only adds emergency breaks inside a word that overflows its
+    // line; line building bails when one is needed ("break-word-overflow").
     if !matches!(
-        style.line_break,
-        LineBreak::Auto | LineBreak::Normal | LineBreak::Anywhere
-    ) {
-        return Some("text:line-break");
-    }
-    if style.break_spaces {
-        return Some("text:break-spaces");
-    }
-    // break-all is a LineBreakType of the UAX #14 iterator the NG breaker
-    // uses (crate::line_break::BreakMode). `keep-all` only glues CJK letter
-    // pairs (CSS Text 3 §5.3); on Latin-1 it matches `normal`. `break-word`
-    // / overflow-wrap emergency breaks are unused under `pre` / `pre-wrap`
-    // (white-space-intrinsic-size-003 / 016).
-    let word_break_ok = matches!(style.word_break, WordBreak::Normal | WordBreak::BreakAll)
-        || (style.word_break == WordBreak::KeepAll && latin1(content))
-        || (style.word_break == WordBreak::BreakWord
-            && matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap));
-    if !word_break_ok || break_all_jamo(content, style) {
+        style.word_break,
+        WordBreak::Normal | WordBreak::BreakAll | WordBreak::KeepAll
+    ) && !break_word_supported(style)
+    {
         return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
         return Some("text:justify");
+    }
+    if !text_align_last_supported(style) {
+        return Some("text:align-last");
     }
     if crate::list_marker::inside_advance(style).is_some() {
         return Some("text:list-marker");
@@ -591,7 +778,8 @@ fn visual_order(levels: &[u8]) -> Vec<usize> {
 fn supported_script_in(content: &str, reordered: bool) -> bool {
     content.chars().all(|c| {
         let u = c as u32;
-        if matches!(c, '\n' | '\u{2028}' | '\u{2029}') {
+        // (Preserved tabs are gated by `text_content_reason`.)
+        if matches!(c, '\n' | '\t' | '\u{2028}' | '\u{2029}') {
             return true;
         }
         if c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c) {
@@ -605,48 +793,104 @@ fn supported_script_in(content: &str, reordered: bool) -> bool {
             || (0xFE70..=0xFEFF).contains(&u)
             || (0x10800..=0x10FFF).contains(&u)
             || (0x1E800..=0x1EFFF).contains(&u);
-        let bidi_control = matches!(u, 0x061C | 0x200E | 0x200F)
-            || (0x202A..=0x202E).contains(&u)
-            || (0x2066..=0x2069).contains(&u);
-        // The ideographic space and the zero width space are break
-        // opportunities the NG breaker knows (`is_soft_wrap_char`), and
-        // their width matches Chrome when no line needs the break (see
-        // `unicode_breakable_spaces_in_text_match_chrome`). The other spaces
-        // (U+2000..U+200A, 202F, 205F, 1680, 180E), the joiners and the
-        // word joiner need break, no-break or intrinsic-size rules the
-        // breaker does not have, so they stay on legacy.
-        let breakable_space = matches!(u, 0x3000 | 0x200B);
-        let other_space = !breakable_space
-            && (matches!(u, 0x1680 | 0x180E | 0x205F)
-                || (0x2000..=0x200D).contains(&u)
-                || u == 0x202F
-                || (0x2060..=0x2064).contains(&u));
+        let bidi_control =
+            matches!(u, 0x061C) || (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u);
+        // Break opportunities come from crate::line_break (UAX #14 via
+        // ICU, as Blink's LazyLineBreakIterator): the ideographic space,
+        // the zero width space and the other space separators of class BA
+        // (U+1680, U+2000..U+2006, U+2008..U+200A, U+205F) allow a break
+        // after them; the GL ones (U+2007, U+202F, U+180E, U+2060) never
+        // do. None of them is a collapsible or hanging space in
+        // NGLineBreaker (only U+0020 / tab trail; break-spaces aside), so
+        // they keep their advance at the line end and in min-/max-content,
+        // as Chrome measures. The joiners (U+200C, U+200D) and the
+        // invisible operators (U+2061..U+2064) still stay on legacy.
+        let other_space = matches!(u, 0x200C | 0x200D) || (0x2061..=0x2064).contains(&u);
         let special = (0xD800..=0xDFFF).contains(&u) || (0xFFF0..=0xFFFF).contains(&u);
         !((rtl && !reordered) || bidi_control || other_space || special)
     })
 }
 
 /// `line-height: normal` text whose fallback faces grow the line box past
-/// the primary font's: the engines resolve those used-font metrics on
-/// different paths (paint wrapper, line metrics), so legacy keeps them.
+/// the primary font's. Such a line box takes each used face's rounded
+/// ascent / descent (Blink FontHeight::Unite over the item's fonts), and
+/// its text fragment is that line box so paint sits on its baseline.
 fn fallback_grows_line(content: &str, style: &Style) -> bool {
-    // Tabs shape with the primary font (no glyph fallback).
-    if tab_only(content, style) {
-        return false;
-    }
-    let content = &*detab(content);
     #[cfg(feature = "skia")]
-    if style.line_height_is_normal && !latin1(content) {
-        return crate::render_skia::text_fallback_grows_normal_line(content, style);
+    if style.line_height_is_normal {
+        // Tabs are never shaped (NGInlineItem kControl): they cannot pull
+        // in a fallback face.
+        let shaped: std::borrow::Cow<str> = if content.contains('\t') {
+            content.replace('\t', "").into()
+        } else {
+            content.into()
+        };
+        if !latin1(&shaped) {
+            return crate::render_skia::text_fallback_grows_normal_line(&shaped, style);
+        }
     }
     let _ = (content, style);
     false
 }
 
-/// Padding or borders on a text box whose edges NG does not lay out.
-pub(super) fn text_edges_reason(style: &Style) -> Option<&'static str> {
+/// The content a text leaf cannot carry yet: an empty leaf, a carriage
+/// return, a preserved tab (unless `tabs_ok`), or a preserved newline
+/// (unless `newline_ok`).
+fn text_content_reason(content: &str, newline_ok: bool, tabs_ok: bool) -> Option<&'static str> {
+    if content.is_empty() {
+        Some("text:empty")
+    } else if content.contains('\r') {
+        Some("text:cr")
+    } else if content.contains('\t') && !tabs_ok {
+        Some("text:tab")
+    } else if content.contains('\n') && !newline_ok {
+        Some("text:newline")
+    } else {
+        None
+    }
+}
+
+/// Preserved tabs in a leaf that is its line's only content from the line
+/// start (Blink NGInlineItemsBuilder keeps a preserved tab as its own
+/// item; its ShapeResult advances to the next stop of the block's
+/// `tab-size` interval from the line start, stops computed before
+/// text-align).  The leaf's measured advance and paint then both resolve
+/// the stops from offset 0: one `pre` LTR line, and the block's stops
+/// equal the leaf's own (`block` is the leaf's own style for a block text
+/// leaf).  Items past the first line (after a forced break) need their own
+/// line position: legacy.
+fn preserved_tabs_ok(content: &str, style: &Style, block: &Style) -> bool {
+    // (pre-wrap: paint resolves block tab stops from the line box only for
+    // `pre` text, InlineLineContext.)
+    style.white_space == WhiteSpace::Pre
+        && style.direction == TextDirection::Ltr
+        && block.direction == TextDirection::Ltr
+        && !content.contains(['\n', '\r', '\u{2028}', '\u{2029}'])
+        && style.text_indent == Dimension::Px(0.0)
+        && block.text_indent == Dimension::Px(0.0)
+        && matches!(block.text_align, TextAlign::Start | TextAlign::Left)
+        && style.font_family == block.font_family
+        && style.font_size == block.font_size
+        && style.font_weight == block.font_weight
+        && style.font_style == block.font_style
+        && style.font_variant == block.font_variant
+        && style.letter_spacing == block.letter_spacing
+        && style.word_spacing == block.word_spacing
+}
+
+/// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
+/// block-axis margins are handled by block layout.
+pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
+    if text_leaf_has_edges(style) {
+        return Some("text:edges");
+    }
+    block_text_leaf_reason(content, style)
+}
+
+/// Padding or border on a text leaf (an element lowered to one Text box).
+fn text_leaf_has_edges(style: &Style) -> bool {
     let padding = style.padding_lengths();
-    ([padding.top, padding.right, padding.bottom, padding.left]
+    [padding.top, padding.right, padding.bottom, padding.left]
         .into_iter()
         .any(|v| v != 0.0)
         || style.border_width != 0.0
@@ -658,47 +902,85 @@ pub(super) fn text_edges_reason(style: &Style) -> Option<&'static str> {
         ]
         .into_iter()
         .flatten()
-        .any(|v| v != 0.0))
-    .then_some("text:edges")
+        .any(|v| v != 0.0)
 }
 
-/// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
-/// block-axis margins are handled by block layout.
-///
-/// Padding and borders of a block-level leaf are its own box edges: block
-/// layout (NGBlockLayoutAlgorithm border/padding) insets the content box
-/// its lines are laid out in. Text that is an anonymous block, flex or grid
-/// item, or inline-level still checks `text_edges_reason`.
-pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
-    if content.is_empty()
-        || content.contains(['\n', '\r'])
-        || (content.contains('\t') && !tab_only(content, style))
+/// [`block_text_reason`] for the text leaf `index`: an in-flow horizontal
+/// leaf in a horizontal parent may carry padding and border, which block
+/// layout puts around the line boxes like any other box edge (the text
+/// paints at the content edge).  Orthogonal, vertical, out-of-flow and
+/// percentage-edged leaves keep the bail.
+pub(super) fn block_text_reason_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    content: &str,
+) -> Option<&'static str> {
+    let style = flat[index].style;
+    if text_leaf_has_edges(style) {
+        let horizontal = |s: &Style| s.writing_mode == w3cos_std::style::WritingMode::HorizontalTb;
+        let parent_horizontal = flat[index]
+            .parent
+            .is_some_and(|parent| horizontal(flat[parent].style));
+        if !(horizontal(style)
+            && parent_horizontal
+            && !super::oof::is_out_of_flow(style)
+            // Grid items stay legacy (animated tracks reach only legacy), and
+            // so do intrinsic width keywords: NG and legacy min-content
+            // differ for text NG cannot shape (joiners), which a reftest's
+            // NG-rendered reference would expose.
+            && !flat[index]
+                .parent
+                .is_some_and(|parent| super::block::is_author_grid(flat[parent].style))
+            && [
+                super::block::WIDTH_KEYWORD,
+                super::block::MIN_WIDTH_KEYWORD,
+                super::block::MAX_WIDTH_KEYWORD,
+            ]
+            .into_iter()
+            .all(|key| super::block::marker(style, key).is_none())
+            && [
+                style.padding.top,
+                style.padding.right,
+                style.padding.bottom,
+                style.padding.left,
+            ]
+            .into_iter()
+            .all(basis_free_spacing))
+        {
+            return Some("text:edges");
+        }
+    }
+    block_text_leaf_reason(content, style)
+}
+
+fn block_text_leaf_reason(content: &str, style: &Style) -> Option<&'static str> {
+    if super::oof::is_out_of_flow(style) {
+        // An absolutely positioned text leaf (generated `::before` with
+        // `position: absolute`) is blockified (CSS2 9.7) and is the block
+        // text of its own OOF box; its position is the OOF layout's.
+        let mut in_box = style.clone();
+        in_box.position = Position::Static;
+        return block_text_content_reason(content, &in_box);
+    }
+    block_text_content_reason(content, style)
+}
+
+/// [`block_text_reason`] without the box edges: the text of a block text
+/// leaf, or the label of a button leaf whose edges are its own box's.
+pub(super) fn block_text_content_reason(content: &str, style: &Style) -> Option<&'static str> {
+    if let Some(reason) =
+        text_content_reason(content, false, preserved_tabs_ok(content, style, style))
     {
-        return Some("text:content");
+        return Some(reason);
     }
     // (A visual-order fragment from the cascade's bidi pass: paint draws
     // the paragraph leaf as given.)
-    if !tab_only(content, style) && !supported_script_in(content, bidi_fragment(style)) {
+    if !supported_script_in(content, bidi_fragment(style)) {
         return Some("text:script");
-    }
-    if fallback_grows_line(content, style) {
-        return Some("text:fallback-metrics");
     }
     // A block text leaf is its own paragraph.
     if !super::block::block_unicode_bidi_ok(style) {
         return Some("unicode-bidi");
-    }
-    // overflow-wrap: break-word / anywhere on a block text leaf: its lines
-    // are measured (wrapped_text_height) and painted by the same breaker
-    // with emergency breaks, so NG only places the box.
-    if style.word_break == WordBreak::BreakWord {
-        return text_style_reason(
-            content,
-            &Style {
-                word_break: WordBreak::Normal,
-                ..style.clone()
-            },
-        );
     }
     text_style_reason(content, style)
 }
@@ -710,7 +992,10 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
 /// at inline box boundaries; forced breaks inside are left to legacy.
 fn inline_edges_supported(content: &str, style: &Style) -> bool {
     use w3cos_std::style::Spacing;
-    let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
+    let absolute = |s: Spacing| {
+        matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_))
+            || matches!(s, Spacing::Calc { percent, .. } | Spacing::PaddingCalc { percent, .. } if percent == 0.0)
+    };
     let m = style.margin_lengths();
     let edges = InlineEdges::of(style);
     [
@@ -764,12 +1049,9 @@ fn inline_text_reason(
     content: &str,
     style: &Style,
     sole: bool,
-    first: bool,
+    first_line: bool,
     container: &Style,
 ) -> Option<&'static str> {
-    // Only a sole leaf is a paragraph; a shared line keeps its own marker.
-    let line_width =
-        has_marker(style, LINE_WIDTH_MARKER) || (sole && line_width_leaf(style, container));
     if style.display != Display::Inline {
         return Some("text:display");
     }
@@ -789,6 +1071,8 @@ fn inline_text_reason(
     }
     // The paragraph and preserved-newline paths place the leaf without a
     // baseline shift.
+    let line_width =
+        has_marker(style, LINE_WIDTH_MARKER) || (sole && line_width_leaf(style, container));
     if valign_length(style).is_some() && (line_width || content.contains('\n')) {
         return Some("vertical-align-length");
     }
@@ -807,7 +1091,7 @@ fn inline_text_reason(
     // leaf itself; word items get their levels from leaf_bidi_levels and
     // are reordered per line.  Preserved spaces that hang (pre-wrap) would
     // hang at the line's left end (L1): legacy.
-    let paragraph = sole && line_width;
+    let paragraph = paragraph_leaf(style, sole, container);
     if container.direction == TextDirection::Rtl
         && !paragraph
         && style.white_space == WhiteSpace::PreWrap
@@ -824,34 +1108,31 @@ fn inline_text_reason(
             WhiteSpace::PreLine => line_width,
             // (line-height: normal mixes the strut's computed line height
             // with the font's line spacing differently in legacy.)
-            WhiteSpace::Pre | WhiteSpace::PreWrap => {
-                line_width || (!content.ends_with('\n') && !style.line_height_is_normal)
-            }
-            _ => false,
+            // Trailing newlines still stay on legacy (the paragraph
+            // wrapper / letter-spacing-end-of-line path). `line-height:
+            // normal` is allowed: the sole-leaf path uses the same strut
+            // + face metrics as a specified unit line-height of 1em on
+            // Ahem, which is Blink's used line box for these pre leaves.
+            WhiteSpace::Pre | WhiteSpace::PreWrap => line_width || !content.ends_with('\n'),
+            // Collapsed (not preserved) newlines are wrap spaces, CSS Text 3
+            // 4.1.2. Only take this on a line-clamp container: a general
+            // paragraph with source newlines still uses the legacy path
+            // until IFC collapse is proven gate-safe.
+            WhiteSpace::Normal | WhiteSpace::NoWrap => clamp_lines(container).is_some(),
         };
-    // An empty collapsible text item (a text node collapsed away) makes no
-    // NGInlineItem: NGInlineItemsBuilder::AppendText skips empty strings.
-    let empty_collapsed =
-        content.is_empty() && matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap);
-    if (content.is_empty() && !empty_collapsed)
-        || content.contains('\r')
-        || (content.contains('\t')
-            && !(first && tab_only(content, style))
-            && !(tabs_in_pre_text(content, style) && !paragraph_leaf(style, sole, container)))
-        || (content.contains('\n') && !newline_ok)
-    {
-        return Some("text:content");
+    // (`first_line`: the item's line offset is known when items are built;
+    // see `tab_item_advance`.)
+    let tabs_ok = (sole || first_line) && preserved_tabs_ok(content, style, container);
+    if let Some(reason) = text_content_reason(content, newline_ok, tabs_ok) {
+        return Some(reason);
     }
     // A fragment with a line break the cascade froze inside it (one
     // item per fragment here).
     if fragment && content.contains('\u{2028}') && content != FORCED_BREAK && !paragraph {
         return Some("bidi:frozen-break");
     }
-    if !tab_only(content, style) && !supported_script_in(&detab(content), fragment) {
+    if !supported_script_in(content, fragment) {
         return Some("text:script");
-    }
-    if fallback_grows_line(content, style) {
-        return Some("text:fallback-metrics");
     }
     if line_width {
         if !sole {
@@ -863,15 +1144,19 @@ fn inline_text_reason(
         if let Some(reason) = valign_reason(style) {
             return Some(reason);
         }
-        if sole && line_relative_align(style).is_some() {
-            return Some("vertical-align-keyword");
+        // A top/bottom-aligned sole leaf is an ordinary aligned item
+        // (`aligned` covers the leaf itself) unless it takes the
+        // preserved-newline path, which places it without alignment.
+        if sole && line_relative_align(style).is_some() && content.contains('\n') {
+            return Some("vertical-align-keyword-newline");
         }
-        // overflow-wrap adds emergency breaks inside an item (break-all is
-        // an iterator break type, below). `pre` / `pre-wrap` do not take
-        // those opportunities, so break-word is fine there.
-        if (style.word_break == WordBreak::BreakWord
-            && !matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap))
-            || break_all_jamo(content, style)
+        // break-all / overflow-wrap add emergency breaks inside an item.
+        if !matches!(
+            style.word_break,
+            w3cos_std::style::WordBreak::Normal
+                | w3cos_std::style::WordBreak::KeepAll
+                | w3cos_std::style::WordBreak::BreakAll
+        ) && !break_word_supported(style)
         {
             return Some("text:word-break");
         }
@@ -881,8 +1166,10 @@ fn inline_text_reason(
             return Some("text:break-spaces");
         }
         // Items may hold internal soft-wrap opportunities (the breaker falls
-        // back when it would need one), but no forced break.
-        if content.contains(['\u{2028}', '\u{2029}']) && content != FORCED_BREAK {
+        // back when it would need one).  A <br> folded into a text leaf
+        // (U+2028) becomes its own forced-break item (NGInlineItemsBuilder
+        // kControl); a paragraph separator stays on legacy.
+        if content.contains('\u{2029}') {
             return Some("text:internal-break");
         }
     }
@@ -915,6 +1202,8 @@ pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
         flat[index].kind,
         ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
     ) && flat[index].style.display == Display::Inline
+        // (An absolutely positioned one is blockified, CSS2 9.7.)
+        && !super::oof::is_out_of_flow(flat[index].style)
 }
 
 /// An inline-block box: an atomic inline (NGInlineItem kAtomicInline),
@@ -925,19 +1214,21 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     let inline_block = matches!(
         flat[index].style.display,
         Display::InlineBlock | Display::InlineTable
-    ) || (flat[index].style.display == Display::InlineFlex
-        && super::block::is_author_flex(flat[index].style));
+    );
     if matches!(
         flat[index].kind,
-        ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::TextInput { .. }
+            | ComponentKind::SvgDocument { .. }
+            | ComponentKind::Button { .. }
     ) {
         // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
         // sheet gives img and canvas `inline-block`; an author `inline` is
-        // the same kind of item.
-        return inline_block || flat[index].style.display == Display::Inline;
-    }
-    if matches!(flat[index].kind, ComponentKind::SvgDocument { .. }) {
-        // An `<svg>` root is a replaced atomic inline as well.
+        // the same kind of item (Blink LayoutReplaced is atomic either way).
+        // So is a text field (Blink LayoutTextControl is an inline-block
+        // whatever its inline display). A button is an inline-block
+        // too (HTML §15.5.3: `inline` behaves as `inline-block`).
         return inline_block || flat[index].style.display == Display::Inline;
     }
     matches!(
@@ -946,7 +1237,9 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
             | ComponentKind::Column
             | ComponentKind::Row
             | ComponentKind::Text { .. }
-    ) && inline_block
+    ) && (inline_block || super::block::is_author_inline_flex(flat[index].style))
+        // An absolutely positioned inline-block is blockified (CSS2 9.7).
+        && !super::block::inline_level_oof(flat, index)
 }
 
 fn inline_level_child(flat: &[FlatNodeInfo], child: usize) -> bool {
@@ -961,6 +1254,9 @@ fn inline_level_child(flat: &[FlatNodeInfo], child: usize) -> bool {
         && flat[child].style.display == Display::Inline)
         || is_inline_box(flat, child)
         || is_atomic_inline(flat, child)
+        // An OOF box with an inline original display is still an inline
+        // item of its parent (NGInlineItem kOutOfFlowPositioned).
+        || super::block::inline_level_oof(flat, child)
 }
 
 /// True when the block container's rendered children are inline content.
@@ -973,6 +1269,12 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
         return false;
     };
     if !inline_level_child(flat, first) {
+        return false;
+    }
+    // Only out-of-flow boxes: no line box is made (an empty line is not
+    // laid out), so the box is a block container whose OOF children have
+    // the static position of a zero-sized line.
+    if rendered_children(flat, index).all(|child| super::oof::is_out_of_flow(flat[child].style)) {
         return false;
     }
     // A table cell whose later child is a block (or a nested table) is a
@@ -1051,7 +1353,9 @@ fn inline_box_reason(
     if super::block::unsupported_marker(style, &[VALIGN_MARKER]).is_some() {
         return Some("internal-marker");
     }
-    if style.position != Position::Static || style.float != Float::None {
+    if !matches!(style.position, Position::Static | Position::Relative)
+        || style.float != Float::None
+    {
         return Some("text:positioned");
     }
     if style.direction != container.direction
@@ -1077,9 +1381,12 @@ fn inline_box_reason(
             .map(String::as_str),
         Some("text-top" | "text-bottom")
     ) {
-        return Some("vertical-align-keyword");
+        return Some("vertical-align-text-edge-box");
     }
-    let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
+    let absolute = |s: Spacing| {
+        matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_))
+            || matches!(s, Spacing::Calc { percent, .. } | Spacing::PaddingCalc { percent, .. } if percent == 0.0)
+    };
     let m = style.margin_lengths();
     if ![
         style.padding.top,
@@ -1096,15 +1403,25 @@ fn inline_box_reason(
     {
         return Some("inline-box:edges");
     }
-    // The box's strut (NGInlineBoxState text metrics) is taken from text it
-    // holds directly in its own font, which always gets a fragment.
+    // The box's strut (NGInlineBoxState text metrics, CSS 2.1 10.8.1) is
+    // its own font. Direct non-space text in that font always gets a
+    // fragment and is the usual source. An empty or space-only box still
+    // has a strut from its font; those spaces may collapse (CSS 2.1 16.6.1)
+    // and then paint nothing. A direct text child in a different font is
+    // still outside this stage.
     let strut_text = rendered_children(flat, index).any(|child| {
         matches!(flat[child].kind, ComponentKind::Text { content }
             if !content.trim_matches(' ').is_empty() && content != FORCED_BREAK)
             && same_font(flat[child].style, style)
     });
     if !strut_text {
-        return Some("inline-box:strut");
+        let other_font_text = rendered_children(flat, index).any(|child| {
+            matches!(flat[child].kind, ComponentKind::Text { .. })
+                && !same_font(flat[child].style, style)
+        });
+        if other_font_text {
+            return Some("inline-box:strut");
+        }
     }
     // An edge next to a collapsible space needs the space handling at
     // inline box boundaries.
@@ -1143,6 +1460,8 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // Only a direct text child can carry a font the box does not own. An
     // element child with its own font (an inline box, or a block lowered to
     // inline) lays out through its own strut.
+    // (main 7f1c12d / flexbox-baseline-multi-item-horiz-001 ref: unmarked
+    // inline-block with a bigFont inline child must stay on NG.)
     if !has_marker(style, IFC_MARKER)
         && rendered_children(flat, index).any(|child| {
             matches!(flat[child].kind, ComponentKind::Text { .. })
@@ -1153,6 +1472,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     if style.text_align == TextAlign::Justify {
         return Some("text:justify");
+    }
+    if !text_align_last_supported(style) {
+        return Some("text:align-last");
     }
     if style.text_indent != Dimension::Px(0.0) {
         return Some("text:indent");
@@ -1179,7 +1501,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // pixel; keep this document on legacy too.
     if let [InlineEntry::Leaf(c)] = entries[..]
         && !is_atomic_inline(flat, c)
-        && line_width_leaf(flat[c].style, style)
+        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
         && flat[c].style.font_family != style.font_family
         && style.font_size > 0.0
         && flat[c].style.font_size >= style.font_size * 4.0
@@ -1235,18 +1557,30 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if info.style.white_space != style.white_space {
             return Some("text:white-space");
         }
-        // Empty items stay on the legacy engine beside atomic inlines: the
-        // whitespace between inline-blocks and <br> leaves only these, and
-        // those pages and their references must keep one engine.
-        if content.is_empty()
-            && entries
-                .iter()
-                .any(|e| matches!(e, InlineEntry::Leaf(c) if is_atomic_inline(flat, *c)))
-        {
-            return Some("text:content");
-        }
-        if let Some(reason) = inline_text_reason(content, info.style, sole, position == 0, style) {
+        // On the first line (no forced break or preserved newline in an
+        // earlier leaf), a `pre` line never soft-wraps, so the item's line
+        // offset is the advance of everything before it.
+        let first_line = !entries[..position].iter().any(|entry| {
+            matches!(entry, InlineEntry::Leaf(earlier)
+                if matches!(&flat[*earlier].kind, ComponentKind::Text { content }
+                    if content.contains(['\n', '\r', '\u{2028}', '\u{2029}'])))
+        });
+        if let Some(reason) = inline_text_reason(content, info.style, sole, first_line, style) {
             return Some(reason);
+        }
+        if content != FORCED_BREAK && content.contains('\u{2028}') {
+            // Forced breaks folded into the leaf (split into kControl items
+            // at item building): the forced-break rules below, with the
+            // leaf's own font; visual-order and rtl paragraphs stay on legacy.
+            if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+                || has_marker(flat[0].style, QUIRKS_MARKER)
+                || !same_font(info.style, style)
+                || style.direction == TextDirection::Rtl
+                || bidi_fragment(info.style)
+                || !zero_edges(info.style)
+            {
+                return Some("text:internal-break");
+            }
         }
         if content == FORCED_BREAK {
             // NGLineBreaker forced break: the item adds no metrics, so its
@@ -1295,7 +1629,7 @@ fn rtl_paragraph_reason(
     }
     if let [InlineEntry::Leaf(c)] = entries[..]
         && !is_atomic_inline(flat, c)
-        && line_width_leaf(flat[c].style, container)
+        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
     {
         return None;
     }
@@ -1331,24 +1665,24 @@ fn needs_reorder(levels: &[LeafLevel]) -> bool {
 fn text_line_metrics(content: &str, style: &Style) -> (f32, f32) {
     let height = inline_used_line_height(inline_style_line_height(style));
     let baseline = inline_font_baseline_from_line_top(style, height);
+    // Tabs are control items (never shaped), so they take the primary
+    // font's metrics, not a fallback face's.
     #[cfg(feature = "skia")]
-    if style.line_height_is_normal
-        && let Some(metrics) = crate::render_skia::resolved_text_font_geometry(content, style)
-    {
-        return (metrics.line_spacing(), metrics.ascent);
+    if style.line_height_is_normal {
+        let shaped = content.replace('\t', "");
+        let text = if content.contains('\t') {
+            shaped.as_str()
+        } else {
+            content
+        };
+        if !text.is_empty()
+            && let Some(metrics) = crate::render_skia::resolved_text_font_geometry(text, style)
+        {
+            return (metrics.line_spacing(), metrics.ascent);
+        }
     }
     let _ = content;
     (height, baseline)
-}
-
-/// `text_line_metrics` of a leaf whose font is chosen by its characters: a
-/// tab shapes with the primary font (the space glyph), not a fallback.
-fn text_line_metrics_of(content: &str, style: &Style) -> (f32, f32) {
-    if tab_only(content, style) {
-        text_line_metrics(" ", style)
-    } else {
-        text_line_metrics(&detab(content), style)
-    }
 }
 
 /// Whether a text leaf painted alone in its rect (no inline line context)
@@ -1360,7 +1694,7 @@ pub(super) fn leaf_paints_like_ifc(content: &str, style: &Style) -> bool {
         let Some(font) = crate::render_skia::resolved_font_geometry(style) else {
             return false;
         };
-        let (line, _) = text_line_metrics_of(content, style);
+        let (line, _) = text_line_metrics(content, style);
         font.line_gap.abs() < 0.01 && (line - font.height()).abs() < 0.01
     }
     #[cfg(not(feature = "skia"))]
@@ -1371,10 +1705,45 @@ pub(super) fn leaf_paints_like_ifc(content: &str, style: &Style) -> bool {
 }
 
 /// NGLineHeightMetrics of the root inline box (the block's strut).
-fn strut(style: &Style) -> (f32, f32) {
+pub(super) fn strut(style: &Style) -> (f32, f32) {
     let height = inline_used_line_height(inline_style_line_height(style));
     let ascent = inline_font_baseline_from_line_top(style, height);
     (ascent, height - ascent)
+}
+
+/// Typographic first-baseline metrics of the root inline box in a
+/// transposed vertical IFC (`sideways`: under faces block-start).
+fn sideways_strut(style: &Style) -> (f32, f32) {
+    let (ascent, descent) = strut(style);
+    (descent, ascent)
+}
+
+/// `text-box-trim` on this IFC container: (trim-start, trim-end).
+/// Blink: node start/end trim (not fragmentainer); `text-box-edge: text`
+/// removes half-leading outside the em box of the first/last line.
+fn text_box_trim_ends(style: &Style) -> (bool, bool) {
+    let trim = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-text-box-trim"))
+        .map(String::as_str);
+    let edge = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-text-box-edge"))
+        .map(String::as_str);
+    // Only an authored `text-box-edge: text` is implemented so far.
+    // Initial/`auto` is left alone: unclassed start-001 refs assume no
+    // trim until a variant sets the edge class.
+    if edge != Some("text") {
+        return (false, false);
+    }
+    match trim {
+        Some("trim-start") => (true, false),
+        Some("trim-end") => (false, true),
+        Some("trim-both") => (true, true),
+        _ => (false, false),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1390,6 +1759,10 @@ struct InlineItem {
     raw: f32,
     /// Raw advance without trailing collapsible spaces (they hang).
     raw_hang: f32,
+    /// `hanging-punctuation: last`: advance of the closing bracket or quote
+    /// ending the paragraph's last item (CSS Text 3 8.2), which hangs and so
+    /// is not measured for fit or alignment. Zero elsewhere.
+    hang_last: f32,
     /// Items of one authored text run (NGInlineItem) share an id: a line
     /// slice of a run occupies the LayoutUnit ceiling of its raw advance.
     run: usize,
@@ -1424,32 +1797,43 @@ struct InlineItem {
     font_height: f32,
 }
 
-/// break-all over conjoining Hangul jamo: the syllable-boundary pieces are
-/// shaped apart (NGShapeResult::SubRange of one cluster run is not
-/// modelled), so their prefix widths overshoot the line.
-fn break_all_jamo(content: &str, style: &Style) -> bool {
-    style.word_break == WordBreak::BreakAll
-        && content.chars().any(|c| matches!(c, '\u{1100}'..='\u{11FF}' | '\u{A960}'..='\u{A97F}' | '\u{D7B0}'..='\u{D7FF}'))
-}
-
 /// A soft-wrap opportunity inside the item's non-space core: the engine's
 /// legacy set (spaces, hyphens, CJK) or any UAX #14 opportunity of
 /// crate::line_break.
-fn internal_opportunity(content: &str, style: &Style) -> bool {
+pub(super) fn internal_opportunity(content: &str, style: &Style) -> bool {
     let core = content.trim_matches(' ');
-    if core.bytes().all(|b| b.is_ascii_alphanumeric())
-        && style.word_break != w3cos_std::style::WordBreak::BreakAll
+    let unhyphenated;
+    let core = if suppresses_hyphenation(style) && core.contains('\u{ad}') {
+        unhyphenated = core.replace('\u{ad}', "");
+        unhyphenated.as_str()
+    } else {
+        core
+    };
+    if style.word_break != WordBreak::BreakAll
         && style.line_break != LineBreak::Anywhere
+        && core.bytes().all(|b| b.is_ascii_alphanumeric())
     {
         // FillAscii: no opportunity between ASCII letters and digits
-        // (break-all adds one between any two, ShouldBreakAfterBreakAll;
-        // line-break: anywhere is BreakCharacter, every grapheme).
+        // (break-all adds one between any two; line-break: anywhere is
+        // BreakCharacter, every grapheme).
         return false;
     }
-    core.chars().any(is_soft_wrap_char)
-        || crate::line_break::break_opportunities(core, crate::line_break::BreakMode::of(style))
+    // keep-all / auto-phrase remove the CJK opportunities of the legacy
+    // set: only crate::line_break's own count there.
+    let keep_all = style.word_break == WordBreak::KeepAll || suppresses_hyphenation(style);
+    (!keep_all && core.chars().any(is_soft_wrap_char))
+        || ifc_break_opportunities(core, style)
             .iter()
             .any(|&o| o < core.len())
+}
+
+/// Whether `split_text_item` has an opportunity to try inside `item`: a
+/// crate::line_break opportunity past its leading non-space text.
+fn has_split_opportunity(flat: &[FlatNodeInfo], item: &InlineItem) -> bool {
+    let text = item_text(flat, item);
+    ifc_break_opportunities(text, flat[item.index].style)
+        .into_iter()
+        .any(|o| o > 0 && o < text.len() && !text[..o].trim_end_matches(' ').is_empty())
 }
 
 /// A UAX #14 break opportunity between two adjacent text items
@@ -1464,12 +1848,9 @@ fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &In
         return false;
     }
     let joined = format!("{a}{b}");
-    crate::line_break::break_opportunities(
-        &joined,
-        crate::line_break::BreakMode::of(flat[prev.index].style),
-    )
-    .binary_search(&a.len())
-    .is_ok()
+    ifc_break_opportunities(&joined, flat[prev.index].style)
+        .binary_search(&a.len())
+        .is_ok()
 }
 
 /// ShapeResult::SnappedWidth.
@@ -1477,9 +1858,6 @@ fn snap(advance: f32) -> f32 {
     crate::text_layout::inline_layout_advance(advance)
 }
 
-/// `same_font`, except that two `line-height: normal` styles whose
-/// font-derived ratios differ in the third decimal still share a strut (the
-/// primary font's metrics, rounded once per style).
 fn same_text_font(a: &Style, b: &Style) -> bool {
     same_font(a, b)
         || (a.line_height_is_normal
@@ -1519,12 +1897,40 @@ fn same_run(a: &Style, b: &Style) -> bool {
         && a.word_spacing == b.word_spacing
 }
 
+/// A text item holding preserved tabs (the gate keeps it on the first line
+/// of a `pre` LTR IFC): Blink shapes the tab from the item's line position
+/// (HarfBuzzShaper tab stops from the text run's x position), so its
+/// advance is measured from the end of the earlier items plus the item's
+/// own start edges.  Paint resolves the same stops from the run's x in the
+/// line box.
+fn tab_item_advance(
+    content: &str,
+    style: &Style,
+    container: &Style,
+    earlier: &[InlineItem],
+    start_edges: f32,
+) -> Option<f32> {
+    if !content.contains('\t') || earlier.iter().any(|item| item.forced) {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    {
+        let offset = earlier.iter().map(|item| item.raw).sum::<f32>() + start_edges;
+        crate::render_skia::preserved_tab_advance_in_block(content, style, container, offset)
+    }
+    // Without Skia tabs are measured from the line start (no stops).
+    #[cfg(not(feature = "skia"))]
+    {
+        let _ = (style, container, start_edges);
+        None
+    }
+}
+
 /// Raw in-context advances of one run's pieces (Skia shapes the run once);
 /// the non-Skia backend measures each piece.
 fn run_advances(texts: &[&str], style: &Style) -> Vec<f32> {
     #[cfg(feature = "skia")]
     if texts.len() > 1
-        && !texts.iter().any(|t| t.contains('\t'))
         && let Some(advances) =
             crate::render_skia::measure_skia_inline_fragment_advances(texts, style)
         && advances.len() == texts.len()
@@ -1539,7 +1945,11 @@ fn run_advances(texts: &[&str], style: &Style) -> Vec<f32> {
 
 /// Raw advance of `content` without its trailing spaces.
 fn hang_advance(content: &str, raw: f32, style: &Style) -> f32 {
-    let trimmed = content.trim_end_matches(' ');
+    let trimmed = if collapses_whitespace(style) {
+        content.trim_end_matches(is_collapsible_space)
+    } else {
+        content.trim_end_matches(' ')
+    };
     if trimmed.is_empty() {
         return 0.0;
     }
@@ -1567,7 +1977,9 @@ fn item_text<'a>(flat: &'a [FlatNodeInfo], item: &InlineItem) -> &'a str {
 /// `max_content_width` adds. `None` when that width is not the snapped sum
 /// of per-character advances (a tab, Skia shaping, or a named family).
 fn additive_char_prefix(text: &str, style: &Style) -> Option<(Vec<f32>, f32)> {
-    if tab_advance(text, style).is_some() {
+    // This branch measures preserved tabs from line position
+    // (`tab_item_advance`); their width is not a sum of char advances.
+    if text.contains('\t') {
         return None;
     }
     #[cfg(feature = "skia")]
@@ -1625,8 +2037,7 @@ fn split_text_item(
     }
     let text = item_text(flat, item);
     let base = item.range.map_or(0, |r| r.0);
-    let mode = crate::line_break::BreakMode::of(style);
-    let candidates: Vec<usize> = crate::line_break::break_opportunities(text, mode)
+    let candidates: Vec<usize> = ifc_break_opportunities(text, style)
         .into_iter()
         .filter(|&o| o > 0 && o < text.len() && !text[..o].trim_end_matches(' ').is_empty())
         .collect();
@@ -1661,16 +2072,33 @@ fn split_text_item(
         a.range = Some((base, base + o));
         a.raw = head_width + item.box_start;
         a.raw_hang = hang(head, head_width, 0) + item.box_start;
-        a.ends_space = head.ends_with(' ');
-        a.whitespace_only = head.trim_end_matches(' ').is_empty();
+        a.hang_last = 0.0;
+        a.ends_space = if collapses_whitespace(style) {
+            head.ends_with(is_collapsible_space)
+        } else {
+            head.ends_with(' ')
+        };
+        a.whitespace_only = if collapses_whitespace(style) {
+            head.trim_end_matches(is_collapsible_space).is_empty()
+        } else {
+            head.trim_end_matches(' ').is_empty()
+        };
         a.internal_break = internal_opportunity(head, style);
         a.box_end = 0.0;
         let mut b = item.clone();
         b.range = Some((base + o, base + text.len()));
         b.raw = tail_width + item.box_end;
         b.raw_hang = hang(tail, tail_width, o) + item.box_end;
-        b.starts_space = tail.starts_with(' ');
-        b.whitespace_only = tail.trim_end_matches(' ').is_empty();
+        b.starts_space = if collapses_whitespace(style) {
+            tail.starts_with(is_collapsible_space)
+        } else {
+            tail.starts_with(' ')
+        };
+        b.whitespace_only = if collapses_whitespace(style) {
+            tail.trim_end_matches(is_collapsible_space).is_empty()
+        } else {
+            tail.trim_end_matches(' ').is_empty()
+        };
         b.internal_break = internal_opportunity(tail, style);
         b.box_start = 0.0;
         (a, b)
@@ -1690,6 +2118,134 @@ fn split_text_item(
         }
     }
     best.or_else(|| overflow.then(|| piece(candidates[0])))
+}
+
+/// NGInlineItemsBuilder: a text leaf holding folded `<br>`s (U+2028) is
+/// emitted as text items around kControl forced-break items, all sharing the
+/// leaf (`range` selects each piece).  Leading collapsible spaces after a
+/// break get their own item so the breaker drops them at the line start;
+/// the enclosing boxes' edges stay on the first and last piece.
+fn split_forced_breaks(
+    content: &str,
+    whole: InlineItem,
+    style: &Style,
+    hang_preserved: bool,
+    items: &mut Vec<InlineItem>,
+) -> Option<()> {
+    let mut pieces: Vec<(usize, usize, bool)> = Vec::new();
+    let mut at = 0;
+    for (offset, _) in content.match_indices('\u{2028}') {
+        if offset > at {
+            pieces.push((at, offset, false));
+        }
+        let end = offset + '\u{2028}'.len_utf8();
+        pieces.push((offset, end, true));
+        at = end;
+    }
+    if at < content.len() {
+        pieces.push((at, content.len(), false));
+    }
+    // Split off leading spaces of text that follows a break.
+    let mut split: Vec<(usize, usize, bool)> = Vec::with_capacity(pieces.len());
+    for (n, &(a, b, forced)) in pieces.iter().enumerate() {
+        let lead = content[a..b].len() - content[a..b].trim_start_matches(' ').len();
+        if !forced && n > 0 && lead > 0 && lead < b - a {
+            split.push((a, a + lead, false));
+            split.push((a + lead, b, false));
+        } else {
+            split.push((a, b, forced));
+        }
+    }
+    let first_forced = split.first().is_some_and(|p| p.2);
+    let last_forced = split.last().is_some_and(|p| p.2);
+    if (first_forced && whole.box_start > 0.0) || (last_forced && whole.box_end > 0.0) {
+        // A break at a box edge: the <br> would carry the box's edge.
+        return super::bail("internal-break-edges");
+    }
+    let texts: Vec<&str> = split
+        .iter()
+        .filter(|p| !p.2)
+        .map(|&(a, b, _)| &content[a..b])
+        .collect();
+    let advances = run_advances(&texts, style);
+    let mut next = advances.into_iter();
+    let count = split.len();
+    // Metrics come from the pieces' own text (NGInlineItem shape results):
+    // the U+2028 itself is a control item, never shaped, so it must not
+    // pull in a fallback font.  A break takes the leaf's text metrics.
+    let unbroken = content.replace('\u{2028}', "");
+    let metrics = |text: &str| -> (f32, f32) {
+        let source = if text.is_empty() {
+            unbroken.as_str()
+        } else {
+            text
+        };
+        let (height, baseline) = text_line_metrics(source, style);
+        (baseline, height - baseline)
+    };
+    for (n, &(a, b, forced)) in split.iter().enumerate() {
+        let mut piece = whole.clone();
+        (piece.ascent, piece.descent) = metrics(if forced { "" } else { &content[a..b] });
+        piece.range = Some((a, b));
+        piece.box_start = if n == 0 { whole.box_start } else { 0.0 };
+        piece.box_end = if n + 1 == count { whole.box_end } else { 0.0 };
+        piece.forced = forced;
+        if forced {
+            piece.raw = 0.0;
+            piece.raw_hang = 0.0;
+            piece.starts_space = false;
+            piece.ends_space = false;
+            piece.whitespace_only = false;
+            piece.internal_break = false;
+        } else {
+            let text = &content[a..b];
+            let adv = next.next()?;
+            let edges = piece.box_start + piece.box_end;
+            piece.raw = adv + edges;
+            piece.raw_hang = hang_advance(text, adv, style) + edges;
+            piece.starts_space = text.starts_with(' ');
+            piece.ends_space = text.ends_with(' ');
+            piece.whitespace_only = text.trim_end_matches(' ').is_empty();
+            piece.internal_break = internal_opportunity(text, style)
+                || (hang_preserved
+                    && text.starts_with(' ')
+                    && !text.trim_start_matches(' ').is_empty());
+        }
+        items.push(piece);
+    }
+    Some(())
+}
+
+/// `hanging-punctuation: last` (CSS Text 3 8.2): a closing bracket or
+/// quote at the very end of the paragraph hangs past the end edge, so the
+/// paragraph's last item records its advance for `line_width_of` to skip.
+/// Only an item ending without trailing spaces or a closing box edge.
+fn mark_hanging_last(flat: &[FlatNodeInfo], items: &mut [InlineItem]) {
+    let Some(item) = items
+        .iter_mut()
+        .rev()
+        .find(|i| !i.whitespace_only && !i.forced)
+    else {
+        return;
+    };
+    let style = flat[item.index].style;
+    if !style.hanging_punctuation_last || item.atomic.is_some() || item.box_end != 0.0 {
+        return;
+    }
+    let text = item_text(flat, item);
+    let Some(last) = text.chars().next_back() else {
+        return;
+    };
+    if !crate::line_break::is_hangable_last(last) {
+        return;
+    }
+    let (head, tail) = text.split_at(text.len() - last.len_utf8());
+    // In LayoutUnits, as the advances it is taken from.
+    item.hang_last = snap(if head.is_empty() {
+        max_content_width(tail, style)
+    } else {
+        run_advances(&[head, tail], style)[1]
+    });
 }
 
 /// LayoutUnit width of a line holding `line` (item indices in order) for
@@ -1716,7 +2272,7 @@ fn line_width_of(line: &[&InlineItem]) -> f32 {
             run = item.run;
         }
         slice += if position + 1 == end {
-            item.raw_hang
+            item.raw_hang - item.hang_last
         } else {
             item.raw
         };
@@ -1738,17 +2294,63 @@ struct Line {
     top: f32,
     offset: f32,
     available: f32,
+    /// The paragraph's last line or one ending in a forced break.
+    last: bool,
 }
 
 /// NGLineBoxFragmentBuilder alignment offset; `start` / `end` follow the
 /// container's direction, and an overflowing line is start-aligned (CSS
 /// Text 3 6.1), which in rtl puts it left of the content box.
 pub(super) fn align_offset(style: &Style, free: f32) -> f32 {
+    align_offset_by(style, style.text_align, free)
+}
+
+const TEXT_ALIGN_LAST: &str = "--w3cos-internal-text-align-last";
+const TEXT_JUSTIFY: &str = "--w3cos-internal-text-justify";
+
+/// The used `text-align-last` (CSS Text 3 6.3) of the last line and of
+/// lines ending in a forced break, or None for `auto` (the line follows
+/// `text-align`, which never justifies here) and for `justify` with
+/// justification opportunities, which NG does not distribute yet.
+/// `text-justify: none` leaves no opportunities (7.4), so a justified
+/// line is start-aligned as in Chrome (Blink NGInlineLayoutAlgorithm
+/// ApplyJustify falls back to the start offset when nothing expands).
+fn text_align_last(style: &Style) -> Option<TextAlign> {
+    match marker_value(style, TEXT_ALIGN_LAST)? {
+        "left" => Some(TextAlign::Left),
+        "right" => Some(TextAlign::Right),
+        "center" => Some(TextAlign::Center),
+        "start" => Some(TextAlign::Start),
+        "end" => Some(TextAlign::End),
+        "justify" if marker_value(style, TEXT_JUSTIFY) == Some("none") => Some(TextAlign::Start),
+        _ => None,
+    }
+}
+
+/// `text-align-last` values NG lays out (see `text_align_last`).
+fn text_align_last_supported(style: &Style) -> bool {
+    match marker_value(style, TEXT_ALIGN_LAST) {
+        None | Some("auto") => true,
+        Some(_) => text_align_last(style).is_some(),
+    }
+}
+
+/// `align_offset` for a line box: the last line and lines ending in a
+/// forced break use `text-align-last` (CSS Text 3 6.3).
+pub(super) fn line_align_offset(style: &Style, free: f32, last: bool) -> f32 {
+    let align = last
+        .then(|| text_align_last(style))
+        .flatten()
+        .unwrap_or(style.text_align);
+    align_offset_by(style, align, free)
+}
+
+fn align_offset_by(style: &Style, align: TextAlign, free: f32) -> f32 {
     let rtl = style.direction == TextDirection::Rtl;
     if free < 0.0 {
         return if rtl { free } else { 0.0 };
     }
-    match style.text_align {
+    match align {
         TextAlign::Center => w3cos_std::style::used_box_spacing(free / 2.0),
         TextAlign::Right => free,
         TextAlign::Left => 0.0,
@@ -1781,12 +2383,64 @@ pub(super) struct InlineResult {
     /// The widest line's content width (hanging spaces excluded): the
     /// min-content / max-content size at available 0 / indefinite.
     pub max_line_width: f32,
+    /// Line boxes produced after clamping; an ancestor line-clamp budget
+    /// subtracts this from its remaining count.
+    pub lines_used: usize,
 }
 
 /// Height of a paragraph leaf's text at `width` and whether it is a single
 /// line.  The line count is the paint wrapper's (it wraps the leaf), via its
 /// height; a single line then uses the line-box model (LayoutUnit line
 /// height, strut), several lines keep the wrapper's height.
+/// Quirks mode (the DOM marks the root).
+pub(super) fn quirks_mode(flat: &[FlatNodeInfo]) -> bool {
+    has_marker(flat[0].style, QUIRKS_MARKER)
+}
+
+/// A paragraph leaf's line-box height, whether it is one line, that line's
+/// baseline, and the rect paint reads (y offset and height): the font
+/// content box of a single line, else the lines from the upper leading.
+pub(super) fn paragraph_box(
+    content: &str,
+    available: f32,
+    style: &Style,
+    container: &Style,
+    quirks: bool,
+) -> (f32, bool, f32, f32, f32) {
+    let (height, single, ascent) = paragraph_height(content, available, style, container, quirks);
+    let font_height = inline_font_height(style);
+    let (y, rect_height) = if single {
+        // As for line items: a fallback-grown line-height: normal line
+        // paints from its own line box (see `fragments`).
+        if fallback_grows_line(content, style) {
+            let (line, baseline) = text_line_metrics(content, style);
+            (ascent - baseline, line)
+        } else {
+            (ascent - inline_font_content_ascent(style), font_height)
+        }
+    } else {
+        let line = inline_used_line_height(inline_style_line_height(style));
+        // Paint steps forced (U+2028, a coalesced <br>) lines itself
+        // from the first line's content box; soft-wrapped paragraphs
+        // cover all their lines.
+        let soft_wrapped = || {
+            content
+                .split(['\u{2028}', '\u{2029}', '\n'])
+                .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
+        };
+        // (Legacy covers all lines when the content box overflows the
+        // line box, or when line-height: normal lines also soft-wrap.)
+        let forced = has_forced_break(content, style)
+            && font_height <= line + EPSILON
+            && !(style.line_height_is_normal && soft_wrapped());
+        (
+            crate::layout::inline_upper_leading(line, font_height),
+            if forced { font_height } else { height },
+        )
+    };
+    (height, single, ascent, y, rect_height)
+}
+
 fn paragraph_height(
     content: &str,
     width: f32,
@@ -1802,7 +2456,7 @@ fn paragraph_height(
     } else {
         strut(container)
     };
-    let (line, baseline) = text_line_metrics_of(content, style);
+    let (line, baseline) = text_line_metrics(content, style);
     let ascent = strut_ascent.max(baseline);
     let single_height = ascent + strut_descent.max(line - baseline);
     let forced = has_forced_break(content, style);
@@ -1825,9 +2479,6 @@ fn paragraph_height(
 /// so a paragraph wider than 360px but narrower than the available width
 /// (the runtime-bench text edit) was treated as one line.
 fn max_content_width(content: &str, style: &Style) -> f32 {
-    if let Some(advance) = tab_advance(content, style) {
-        return advance;
-    }
     #[cfg(feature = "skia")]
     {
         text_intrinsic_size(content, style).0
@@ -1857,6 +2508,12 @@ fn max_content_width(content: &str, style: &Style) -> f32 {
     }
 }
 
+/// `break-word` is modelled only where its extra emergency breaks are never
+/// needed (line building bails otherwise).
+fn break_word_supported(style: &Style) -> bool {
+    style.word_break == WordBreak::BreakWord
+}
+
 /// A forced line break inside a leaf: a coalesced `<br>` or a preserved
 /// newline.
 fn has_forced_break(content: &str, style: &Style) -> bool {
@@ -1870,7 +2527,7 @@ fn has_forced_break(content: &str, style: &Style) -> bool {
 
 /// The style a block text leaf's lines are measured with. The legacy text
 /// measurers inset a text component by its own padding; on NG the leaf's
-/// padding is a block box edge that block layout already applied.
+/// padding is a block box edge that block layout already applied (main #399).
 pub(super) fn block_text_measure_style(style: &Style) -> std::borrow::Cow<'_, Style> {
     let padding = style.padding_lengths();
     if [padding.top, padding.right, padding.bottom, padding.left]
@@ -1880,7 +2537,7 @@ pub(super) fn block_text_measure_style(style: &Style) -> std::borrow::Cow<'_, St
         return std::borrow::Cow::Borrowed(style);
     }
     std::borrow::Cow::Owned(Style {
-        padding: w3cos_std::style::Edges::ZERO,
+        padding: Edges::ZERO,
         ..style.clone()
     })
 }
@@ -1967,9 +2624,56 @@ pub(super) fn layout_inline_beside(
     space: &ConstraintSpace,
     floats: Option<LineFloats>,
 ) -> Option<InlineResult> {
+    let mut result = layout_lines(flat, index, space, floats)?;
+    relative_inline_offsets(flat, index, space, &mut result.children);
+    Some(result)
+}
+
+/// NGInlineLayoutAlgorithm / NGInlineBoxState: a relatively positioned
+/// inline box, atomic inline, or text leaf keeps its place in the line and
+/// only its fragments (and those of everything inside it) move by its
+/// relative offset (CSS2 9.4.3, NGRelativeUtils::ComputeRelativeOffset
+/// against the IFC container's content box).  The fragments here are flat,
+/// so each one moves by the sum of the offsets of its relatively
+/// positioned inline ancestors below the container.
+fn relative_inline_offsets(
+    flat: &[FlatNodeInfo],
+    container: usize,
+    space: &ConstraintSpace,
+    children: &mut [(f32, f32, BoxFragment)],
+) {
+    let offset_of = |mut node: usize| {
+        let (mut dx, mut dy) = (0.0f32, 0.0f32);
+        while node != container {
+            let style = flat[node].style;
+            if style.position == Position::Relative {
+                let (x, y) = super::oof::relative_offset(style, space);
+                dx += x;
+                dy += y;
+            }
+            match flat[node].parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+        (dx, dy)
+    };
+    for (x, y, fragment) in children.iter_mut() {
+        let (dx, dy) = offset_of(fragment.index);
+        *x += dx;
+        *y += dy;
+    }
+}
+
+fn layout_lines(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    floats: Option<LineFloats>,
+) -> Option<InlineResult> {
     let available = space.available_inline;
     let container = flat[index].style;
-    let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
+    let quirks = quirks_mode(flat);
     let entries = collect_inlines(flat, index);
     let children: Vec<usize> = entries
         .iter()
@@ -2036,39 +2740,17 @@ pub(super) fn layout_inline_beside(
         && let [child] = children[..]
         && !is_atomic_inline(flat, child)
         && line_width_leaf(flat[child].style, container)
+        // A clamped paragraph cannot use the paint-wraps-itself path:
+        // CSS Overflow 4 block-ellipsis has to be placed on the last
+        // kept IFC line (block-ellipsis-001).
+        && clamp_lines(container).is_none()
     {
         let style = flat[child].style;
         let ComponentKind::Text { content } = flat[child].kind else {
             return super::bail("line-width-text");
         };
-        let (height, single, ascent) =
-            paragraph_height(content, available, style, container, quirks);
-        if !single && clamp_lines(container).is_some() {
-            return super::bail("clamp-paragraph");
-        }
-        let font_height = inline_font_height(style);
-        let (y, rect_height) = if single {
-            (ascent - inline_font_content_ascent(style), font_height)
-        } else {
-            let line = inline_used_line_height(inline_style_line_height(style));
-            // Paint steps forced (U+2028, a coalesced <br>) lines itself
-            // from the first line's content box; soft-wrapped paragraphs
-            // cover all their lines.
-            let soft_wrapped = || {
-                content
-                    .split(['\u{2028}', '\u{2029}', '\n'])
-                    .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
-            };
-            // (Legacy covers all lines when the content box overflows the
-            // line box, or when line-height: normal lines also soft-wrap.)
-            let forced = has_forced_break(content, style)
-                && font_height <= line + EPSILON
-                && !(style.line_height_is_normal && soft_wrapped());
-            (
-                crate::layout::inline_upper_leading(line, font_height),
-                if forced { font_height } else { height },
-            )
-        };
+        let (height, single, ascent, y, rect_height) =
+            paragraph_box(content, available, style, container, quirks);
         if floats.is_some_and(|f| {
             f.exclusions
                 .overlaps(f.x, f.y, f.x + available, f.y + height)
@@ -2082,6 +2764,7 @@ pub(super) fn layout_inline_beside(
             LastBaseline::Unknown
         };
         return Some(InlineResult {
+            lines_used: 0,
             height,
             max_line_width: available,
             last_baseline: baseline,
@@ -2093,6 +2776,7 @@ pub(super) fn layout_inline_beside(
                     index: child,
                     text_range: None,
                     ellipsis: false,
+                    vertical: false,
                     width: available,
                     height: rect_height,
                     children: Vec::new(),
@@ -2109,6 +2793,9 @@ pub(super) fn layout_inline_beside(
         && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
         && content.contains('\n')
+        // Collapsed newlines in `normal` / `nowrap` are wrap spaces; they
+        // take the IFC wrap path below, not the preserved-newline split.
+        && !collapses_whitespace(flat[child].style)
     {
         let style = flat[child].style;
         let width = text_intrinsic_size(content, style).0;
@@ -2124,15 +2811,39 @@ pub(super) fn layout_inline_beside(
         } else {
             strut(container)
         };
-        let (line, baseline) = text_line_metrics_of(content, style);
+        let (line, baseline) = text_line_metrics(content, style);
         let ascent = strut_ascent.max(baseline);
         let single = ascent + strut_descent.max(line - baseline);
         let line_count = content.split('\n').count();
-        if let Some(n) = clamp_lines(container).filter(|&n| n < line_count) {
+        let (clamp_n, use_ellipsis) = match clamp_budget(container, space) {
+            Some((n, e)) => (Some(n), e),
+            None => (None, false),
+        };
+        // Inherited height-based auto clamp emits per-line pieces even
+        // when every line fits, so a later sibling that does not fit can
+        // still attach the block-ellipsis to the last kept line (auto-033).
+        let force_lines = space
+            .line_clamp
+            .is_some_and(|c| c.remaining_block.is_some());
+        if let Some(n) = clamp_n.filter(|&n| n < line_count || force_lines) {
+            let n = n.min(line_count);
+            let use_ellipsis = use_ellipsis && n < line_count;
             // `-webkit-line-clamp`: one piece per kept line, the last one
-            // followed by the block ellipsis.
+            // followed by the block ellipsis. `line-clamp: auto` with a
+            // zero content-box cap keeps no lines. `continue: collapse`
+            // without block-ellipsis keeps the line and hides the rest.
             if floats.is_some() || style.white_space != WhiteSpace::Pre {
                 return super::bail("clamp-text");
+            }
+            if n == 0 {
+                return Some(InlineResult {
+                    lines_used: 0,
+                    height: 0.0,
+                    max_line_width: 0.0,
+                    last_baseline: LastBaseline::NoLines,
+                    first_baseline: LastBaseline::NoLines,
+                    children: Vec::new(),
+                });
             }
             let ellipsis = text_intrinsic_size("\u{2026}", style).0;
             let top = ascent - inline_font_content_ascent(style);
@@ -2142,20 +2853,32 @@ pub(super) fn layout_inline_beside(
             for (k, text) in content.split('\n').take(n).enumerate() {
                 let last = k + 1 == n;
                 let mut width = text_intrinsic_size(text, style).0;
-                if last {
-                    width += ellipsis;
-                    if width > available + EPSILON {
-                        return super::bail("clamp-ellipsis");
+                // CSS Overflow 4 block-ellipsis: place U+2026 after the last
+                // soft wrap opportunity on the last kept line that still
+                // fits. `white-space: pre` has no wrap opportunities, so a
+                // line that cannot fit its text plus the ellipsis keeps
+                // only the ellipsis (block-ellipsis-013).
+                let mut range_end = start + text.len();
+                if last && use_ellipsis {
+                    if width + ellipsis > available + EPSILON {
+                        if ellipsis > available + EPSILON {
+                            return super::bail("clamp-ellipsis");
+                        }
+                        width = ellipsis;
+                        range_end = start;
+                    } else {
+                        width += ellipsis;
                     }
                 }
                 widest = widest.max(width);
                 pieces.push((
-                    align_offset(container, available - width),
+                    line_align_offset(container, available - width, true),
                     top + k as f32 * single,
                     BoxFragment {
                         index: child,
-                        text_range: Some((start, start + text.len())),
-                        ellipsis: last,
+                        text_range: Some((start, range_end)),
+                        ellipsis: last && use_ellipsis,
+                        vertical: false,
                         width,
                         height: inline_font_height(style),
                         children: Vec::new(),
@@ -2164,6 +2887,7 @@ pub(super) fn layout_inline_beside(
                 start += text.len() + 1;
             }
             return Some(InlineResult {
+                lines_used: n,
                 height: single * n as f32,
                 max_line_width: widest,
                 last_baseline: LastBaseline::At(ascent + single * (n - 1) as f32),
@@ -2179,17 +2903,19 @@ pub(super) fn layout_inline_beside(
             return super::bail("float-paint-paragraph");
         }
         return Some(InlineResult {
+            lines_used: line_count,
             height: single * lines,
             max_line_width: width,
             last_baseline: LastBaseline::Unknown,
             first_baseline: LastBaseline::At(ascent),
             children: vec![(
-                align_offset(container, available - width),
+                line_align_offset(container, available - width, true),
                 ascent - inline_font_content_ascent(style),
                 BoxFragment {
                     index: child,
                     text_range: None,
                     ellipsis: false,
+                    vertical: false,
                     width,
                     height: inline_font_height(style),
                     children: Vec::new(),
@@ -2229,13 +2955,6 @@ pub(super) fn layout_inline_beside(
             let k = start;
             let child = children[k];
             let style = flat[child].style;
-            // An `inline-flex` box in a right-to-left line keeps legacy
-            // (flex:rtl; its main axis follows the inherited direction).
-            if style.display == Display::InlineFlex
-                && (space.rtl || container.direction == TextDirection::Rtl)
-            {
-                return super::bail("flex:rtl");
-            }
             let result =
                 super::block::layout_block(flat, child, space, true).why("atomic-layout")?;
             if !result.oof.is_empty() {
@@ -2264,9 +2983,38 @@ pub(super) fn layout_inline_beside(
                 side(style.margin.left),
             ];
             let height = margin[0] + result.fragment.height + margin[2];
+            // CSS Align 3 §9.1 / CSS Inline 3 / csswg #4675 (Blink
+            // LayoutNG atomic inlines, BSD-style Chromium license): a
+            // box whose writing mode is orthogonal to the IFC has no
+            // typographic baseline in the line's block axis. Inline-level
+            // boxes synthesize the alphabetic baseline from the under
+            // margin edge; in a horizontal-tb line that is the physical
+            // bottom of the margin box.
+            let orthogonal = container.writing_mode == w3cos_std::style::WritingMode::HorizontalTb
+                && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb;
             let ascent = match result.last_baseline {
-                _ if super::block::baseline_is_margin_edge(style) => height,
-                LastBaseline::At(b) => margin[0] + b,
+                // (A button keeps its content baseline, as in block.rs.)
+                _ if super::block::baseline_is_margin_edge(style)
+                    && !matches!(flat[child].kind, ComponentKind::Button { .. }) =>
+                {
+                    height
+                }
+                _ if orthogonal => height,
+                LastBaseline::At(b) => {
+                    // A transposed vertical IFC maps block-start to the
+                    // typographic under (`sideways`). Use padding-top +
+                    // descent, not the HTB alphabetic-from-over.
+                    let b = if super::orthogonal::is_transposed(style) {
+                        super::orthogonal::sideways_typographic_ascent(
+                            style,
+                            result.fragment.height,
+                            b,
+                        )
+                    } else {
+                        b
+                    };
+                    margin[0] + b
+                }
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),
             };
@@ -2282,6 +3030,7 @@ pub(super) fn layout_inline_beside(
                 range: None,
                 raw,
                 raw_hang: raw,
+                hang_last: 0.0,
                 run,
                 starts_space: false,
                 ends_space: false,
@@ -2348,19 +3097,22 @@ pub(super) fn layout_inline_beside(
                 }
             });
             let measure = bare.as_ref().unwrap_or(style);
-            let text_raw = if content == FORCED_BREAK {
-                0.0
-            } else if bare.is_some() {
-                tab_advance(content, measure)
-                    .unwrap_or_else(|| text_intrinsic_size(content, measure).0)
-            } else {
-                advances[offset]
-            };
             let k = start + offset;
             let box_start = start_edges(&opens[k]);
             let box_end = end_edges(&closes[k]);
+            let text_raw = if content == FORCED_BREAK {
+                0.0
+            } else if let Some(advance) =
+                tab_item_advance(content, measure, container, &items, box_start + edges.start)
+            {
+                advance
+            } else if bare.is_some() {
+                text_intrinsic_size(content, measure).0
+            } else {
+                advances[offset]
+            };
             let raw = text_raw + inline_edges + box_start + box_end;
-            let (height, baseline) = text_line_metrics_of(content, style);
+            let (height, baseline) = text_line_metrics(content, style);
             let parent = parents[k].map_or(container, |b| flat[b].style);
             let shift = vertical_align_shift(style, baseline, height - baseline, parent)
                 .why("vertical-align")?;
@@ -2375,10 +3127,23 @@ pub(super) fn layout_inline_beside(
                 } else {
                     hang_advance(content, text_raw, measure) + inline_edges + box_start + box_end
                 },
+                hang_last: 0.0,
                 run,
-                starts_space: content.starts_with(' '),
-                ends_space: content.ends_with(' '),
-                whitespace_only: content.trim_end_matches(' ').is_empty(),
+                starts_space: if collapses_whitespace(style) {
+                    content.starts_with(is_collapsible_space)
+                } else {
+                    content.starts_with(' ')
+                },
+                ends_space: if collapses_whitespace(style) {
+                    content.ends_with(is_collapsible_space)
+                } else {
+                    content.ends_with(' ')
+                },
+                whitespace_only: if collapses_whitespace(style) {
+                    content.trim_end_matches(is_collapsible_space).is_empty()
+                } else {
+                    content.trim_end_matches(' ').is_empty()
+                },
                 forced: content == FORCED_BREAK,
                 edges,
                 box_start,
@@ -2398,18 +3163,16 @@ pub(super) fn layout_inline_beside(
                 content_ascent: inline_font_content_ascent(style),
                 font_height: inline_font_height(style),
             });
+            if content != FORCED_BREAK && content.contains('\u{2028}') {
+                let whole = items.pop().expect("just pushed");
+                split_forced_breaks(content, whole, style, hang_preserved, &mut items)?;
+            }
         }
         run += 1;
         start = end;
     }
 
-    if container.white_space == WhiteSpace::Pre
-        && items
-            .iter()
-            .any(|i| i.atomic.is_none() && !i.forced && item_text(flat, i).contains('\t'))
-    {
-        items = split_tabs(flat, items, &mut run)?;
-    }
+    mark_hanging_last(flat, &mut items);
 
     // NGLineBreaker.
     let can_wrap = matches!(
@@ -2464,8 +3227,7 @@ pub(super) fn layout_inline_beside(
         if !fits && can_wrap && item.internal_break {
             // NGLineBreaker breaks inside the item at its latest opportunity
             // that fits; on an otherwise empty line, at its first one.
-            // (An earlier item's internal opportunity, or preserved spaces,
-            // stay on legacy.)
+            // (Preserved spaces stay on legacy.)
             if preserve {
                 return super::bail("internal-break-preserve");
             }
@@ -2485,14 +3247,17 @@ pub(super) fn layout_inline_beside(
                 i += 1;
                 continue;
             }
-            if current.is_empty() {
+            if current.is_empty() && has_split_opportunity(flat, item) {
                 return super::bail("internal-break");
             }
+            // (No UAX #14 opportunity inside the item for its BreakMode,
+            // e.g. CJK under keep-all: it is unbreakable and overflows.)
             // No prefix fits after the line's content: NGLineBreaker
-            // rewinds to the last opportunity before this item and retries
-            // it on the next line (the soft-wrap path below). An overflow
-            // that would need an earlier item's internal opportunity still
-            // falls back after line building ("internal-break-earlier").
+            // rewinds to the last opportunity before this item (a boundary
+            // or one inside an earlier item) and retries it on the next line
+            // (the soft-wrap path below). A line that overflows with an
+            // internal opportunity still falls back after line building
+            // ("internal-break-earlier").
         }
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
             // Not even the first piece fits beside the floats: the line
@@ -2504,6 +3269,22 @@ pub(super) fn layout_inline_beside(
             opportunity = f.opportunity(line_top, assumed_line, space.available_inline);
             continue;
         }
+        if !fits
+            && current.is_empty()
+            && can_wrap
+            && flat[item.index].style.word_break == WordBreak::BreakWord
+            && !item.whitespace_only
+            // pre / pre-wrap never take overflow-wrap emergency breaks
+            // (main #413; white-space-intrinsic-size-003 / 016).
+            && !matches!(
+                flat[item.index].style.white_space,
+                WhiteSpace::Pre | WhiteSpace::PreWrap
+            )
+        {
+            // An unbreakable word wider than the line takes an emergency
+            // break (overflow-wrap: break-word), which S2 does not model.
+            return super::bail("break-word-overflow");
+        }
         if fits || current.is_empty() || !can_wrap {
             current.push(i);
             i += 1;
@@ -2513,10 +3294,13 @@ pub(super) fn layout_inline_beside(
             // The opportunity lies after this item's leading space.
             return super::bail("leading-space");
         }
-        // Last soft-wrap opportunity: after an item ending in a space, at the
-        // end of a space run (preserved spaces in pre-wrap do not break
-        // between each other).
-        let break_at = (1..=current.len()).rev().find(|&j| {
+        // NGLineBreaker::HandleOverflow walks the line's items backwards and
+        // rewinds to the latest opportunity: the boundary before an item
+        // (after an item ending in a space, at the end of a space run;
+        // preserved spaces in pre-wrap do not break between each other), or
+        // one inside the item before that boundary (BreakText with the width
+        // left to it).
+        let boundary = |j: usize| {
             let next = current.get(j).copied().unwrap_or(i);
             let prev = current[j - 1];
             // Atomic inlines break before and after (UAX #14 CB, LB20).
@@ -2528,13 +3312,58 @@ pub(super) fn layout_inline_beside(
                 || (!items[prev].ends_space
                     && !items[next].starts_space
                     && text_boundary_opportunity(flat, &items[prev], &items[next]))
-        });
-        // NGLineBreaker rewinds to the latest opportunity: one inside an
-        // item after `break_at` would come later (not modelled yet).
-        if let Some(j) = break_at
-            && current[j..].iter().any(|&k| items[k].internal_break)
-        {
-            return super::bail("internal-break-earlier");
+        };
+        let mut break_at = None;
+        let mut inside = None;
+        for j in (1..=current.len()).rev() {
+            if boundary(j) {
+                break_at = Some(j);
+                break;
+            }
+            let k = current[j - 1];
+            if !items[k].internal_break {
+                continue;
+            }
+            if preserve {
+                return super::bail("internal-break-preserve");
+            }
+            if items[k].atomic.is_some() || !zero_edges(flat[items[k].index].style) {
+                return super::bail("internal-break-edges");
+            }
+            let head = &current[..j - 1];
+            let split = split_text_item(flat, &items[k], false, |a| {
+                let mut probe: Vec<&InlineItem> = head.iter().map(|&h| &items[h]).collect();
+                probe.push(a);
+                line_width_of(&probe) <= available + EPSILON
+            });
+            match split {
+                Some(pieces) => {
+                    inside = Some((j - 1, pieces));
+                    break;
+                }
+                None => return super::bail("internal-break-earlier"),
+            }
+        }
+        if let Some((p, (a, b))) = inside {
+            // The line ends inside current[p]; its rest and the items after
+            // it start the next line, which retries the overflowing item.
+            let k = current[p];
+            items[k] = a;
+            items.insert(k + 1, b);
+            let rest: Vec<usize> = std::iter::once(k + 1)
+                .chain(current[p + 1..].iter().map(|&r| r + 1))
+                .collect();
+            current.truncate(p + 1);
+            lines.push(std::mem::take(&mut current));
+            if rest
+                .iter()
+                .any(|&r| items[r].starts_space && !items[r].whitespace_only)
+            {
+                return super::bail("leading-space");
+            }
+            current = rest;
+            i += 1;
+            continue;
         }
         match break_at {
             Some(j) if j == current.len() => lines.push(std::mem::take(&mut current)),
@@ -2551,6 +3380,11 @@ pub(super) fn layout_inline_beside(
             }
             None => {
                 // No opportunity on this line: the item overflows.
+                if flat[item.index].style.word_break == WordBreak::BreakWord
+                    && !item.whitespace_only
+                {
+                    return super::bail("break-word-overflow");
+                }
                 current.push(i);
                 i += 1;
             }
@@ -2563,6 +3397,23 @@ pub(super) fn layout_inline_beside(
         opportunities.push((line_top, opportunity.0, opportunity.1));
     }
     debug_assert_eq!(lines.len(), opportunities.len());
+    // Tab advances were measured from the first line's start (see
+    // `tab_item_advance`): a wrapped (pre-wrap) or float-shifted tab item
+    // needs its own line position.
+    let has_tab = |i: &usize| {
+        matches!(&flat[items[*i].index].kind, ComponentKind::Text { content }
+            if content.contains('\t'))
+    };
+    if lines.iter().skip(1).flatten().any(has_tab)
+        || (floats.is_some() && lines.iter().flatten().any(has_tab))
+    {
+        return super::bail("text:tab-wrapped");
+    }
+    // Paint re-wraps a sole leaf beside floats from its rect, without the
+    // line-relative alignment.
+    if floats.is_some() && children.len() == 1 && aligned.iter().any(Option::is_some) {
+        return super::bail("vertical-align-keyword-float");
+    }
     if floats.is_some()
         && paint_rewraps_beside_floats(flat, &children)
         && opportunities
@@ -2591,8 +3442,16 @@ pub(super) fn layout_inline_beside(
     // Line boxes (NGLineBoxFragmentBuilder): run slices start on LayoutUnit
     // offsets; pieces inside a slice keep their raw shaping offsets and the
     // slice's last piece absorbs the snap remainder.
+    // A transposed typographic IFC of only inline-blocks uses the sideways
+    // strut (under faces block-start). Text-only orthogonal roots keep the
+    // HTB strut so their typographic text metrics stay consistent.
+    let atomic_only = items
+        .iter()
+        .all(|item| item.atomic.is_some() || item.whitespace_only || item.forced);
     let (strut_ascent, strut_descent) = if quirks {
         (f32::NEG_INFINITY, f32::NEG_INFINITY)
+    } else if super::orthogonal::is_transposed(container) && atomic_only {
+        sideways_strut(container)
     } else {
         strut(container)
     };
@@ -2698,20 +3557,34 @@ pub(super) fn layout_inline_beside(
         } else {
             slice_start
         };
+        // hanging-punctuation: last (`mark_hanging_last`) hangs past the end
+        // edge: not measured for fit or alignment (CSS Text 3 8.2).
+        let hung = hang_item.map_or(0.0, |k| items[k].hang_last);
         if can_wrap
-            && content_width > available + EPSILON
+            && content_width - hung > available + EPSILON
             && line.iter().any(|&k| items[k].internal_break)
         {
             return super::bail("internal-break-earlier");
         }
-        max_line_width = max_line_width.max(content_width);
+        // Max-content (an indefinite available size): preserved spaces
+        // before a forced break or at the end of the block hang only
+        // conditionally, which does not keep them out of the intrinsic
+        // size (CSS Text 3 4.1.3; white-space-intrinsic-size-004).
+        let counts_hanging = hang_preserved
+            && available >= super::block::INDEFINITE_INLINE * 0.5
+            && (line_index + 1 == line_count || forced);
+        max_line_width = max_line_width.max(if counts_hanging {
+            content_width.max(slice_start)
+        } else {
+            content_width
+        });
         // CSS Text 3 4.1.3: before a forced break or the end of the block,
         // preserved spaces hang only conditionally: the part that fits
         // still counts for alignment.
         let align_width = if hang_preserved && line_index + 1 == line_count {
             content_width.max(slice_start.min(available))
         } else {
-            content_width
+            content_width - hung
         };
         // NGInlineLayoutStateStack: top/bottom subtrees are aligned after
         // the baseline-aligned part; a taller one grows the line box away
@@ -2745,7 +3618,44 @@ pub(super) fn layout_inline_beside(
             top: line_top,
             offset: line_offset,
             available,
+            last: forced || line_index + 1 == line_count,
         });
+    }
+
+    // text-box-trim (CSS Inline 3 / Blink node start/end): pull the first
+    // line's block-start to the text-over edge and the last line's
+    // block-end to the text-under edge. Per-column fragmentainer trim is
+    // a later slice (multicol-001).
+    let (trim_start, trim_end) = text_box_trim_ends(container);
+    // Float opportunities were computed for untrimmed line heights.
+    if (trim_start || trim_end) && !built.is_empty() && floats.is_none() {
+        let content_edges = |line: &Line| {
+            let mut content_ascent = 0.0f32;
+            let mut content_descent = 0.0f32;
+            let mut saw = false;
+            for &(k, ..) in &line.items {
+                let item = &items[k];
+                if item.forced || item.aligned.is_some() {
+                    continue;
+                }
+                saw = true;
+                content_ascent = content_ascent.max((item.content_ascent - item.shift).max(0.0));
+                let font_descent = (item.font_height - item.content_ascent).max(0.0);
+                content_descent = content_descent.max((font_descent + item.shift).max(0.0));
+            }
+            saw.then_some((content_ascent, content_descent))
+        };
+        if trim_start {
+            if let Some((ca, _)) = content_edges(&built[0]) {
+                built[0].ascent = ca.max(0.0).min(built[0].ascent);
+            }
+        }
+        if trim_end {
+            let last = built.len() - 1;
+            if let Some((_, cd)) = content_edges(&built[last]) {
+                built[last].descent = cd.max(0.0).min(built[last].descent);
+            }
+        }
     }
 
     // `-webkit-line-clamp`: keep the first N lines; the last kept line's final
@@ -2754,41 +3664,57 @@ pub(super) fn layout_inline_beside(
     let mut dropped: Vec<usize> = Vec::new();
     let mut ellipsis_item = None;
     let mut ellipsis_width = 0.0f32;
-    if let Some(n) = clamp_lines(container).filter(|&n| n < built.len()) {
+    let mut ellipsis_range = None;
+    let (clamp_n, use_ellipsis) = match clamp_budget(container, space) {
+        Some((n, e)) => (Some(n), e),
+        None => (None, false),
+    };
+    if let Some(n) = clamp_n.filter(|&n| n < built.len()) {
         if floats.is_some() || has_boxes || reorder || preserve || !can_wrap {
             return super::bail("clamp-ifc");
         }
-        dropped = built[n..]
-            .iter()
-            .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
-            .collect();
-        built.truncate(n);
-        let last = &built[n - 1];
-        let k = last
-            .items
-            .iter()
-            .rev()
-            .map(|&(k, ..)| k)
-            .find(|&k| !items[k].forced)
-            .why("clamp-ifc")?;
-        let item = &items[k];
-        let ComponentKind::Text { content } = flat[item.index].kind else {
-            return super::bail("clamp-ifc");
-        };
-        // Paint draws a piece verbatim: single spaces between words only.
-        if item.atomic.is_some()
-            || !zero_edges(flat[item.index].style)
-            || content.contains(|c: char| c.is_whitespace() && c != ' ')
-            || content.contains("  ")
-            || (item.range.is_none() && (item.starts_space || item.ends_space))
-        {
-            return super::bail("clamp-ifc");
+        if n == 0 {
+            dropped = built
+                .iter()
+                .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+                .collect();
+            built.clear();
+        } else if !use_ellipsis {
+            dropped = built[n..]
+                .iter()
+                .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+                .collect();
+            built.truncate(n);
+        } else {
+            dropped = built[n..]
+                .iter()
+                .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+                .collect();
+            built.truncate(n);
+            let last = &mut built[n - 1];
+            let k = last
+                .items
+                .iter()
+                .rev()
+                .map(|&(k, ..)| k)
+                .find(|&k| !items[k].forced)
+                .why("clamp-ifc")?;
+            let item = &items[k];
+            let ComponentKind::Text { content } = &flat[item.index].kind else {
+                return super::bail("clamp-ifc");
+            };
+            if !clamp_ellipsis_piece_ok(item, content, flat[item.index].style) {
+                return super::bail("clamp-ifc");
+            }
+            ellipsis_width = text_intrinsic_size("…", flat[item.index].style).0;
+            match trim_line_for_block_ellipsis(&items, flat, last, &mut dropped, ellipsis_width) {
+                Some((k, range)) => {
+                    ellipsis_item = Some(k);
+                    ellipsis_range = range;
+                }
+                None => return super::bail("clamp-ellipsis"),
+            }
         }
-        ellipsis_width = text_intrinsic_size("\u{2026}", flat[item.index].style).0;
-        if last.width + ellipsis_width > last.available + EPSILON {
-            return super::bail("clamp-ellipsis");
-        }
-        ellipsis_item = Some(k);
     }
     let mut top = 0.0f32;
     let mut first_line_baseline = None;
@@ -2799,12 +3725,16 @@ pub(super) fn layout_inline_beside(
     // boxes, the last one closes them.
     let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
     let mut placed_last: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
+    // Every placed piece as (leaf position, line, offset, width, baseline):
+    // a box split across lines spans the pieces of its leaves per line.
+    let mut placed_all: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
+    let lines_used = built.len();
     for (line_index, line) in built.into_iter().enumerate() {
         if floats.is_some() {
             top = line.top;
         }
         let available = line.available;
-        let offset = line.offset + align_offset(container, available - line.width);
+        let offset = line.offset + line_align_offset(container, available - line.width, line.last);
         let baseline = top + line.ascent;
         first_line_baseline.get_or_insert(baseline);
         last_line_baseline = Some(baseline);
@@ -2825,6 +3755,11 @@ pub(super) fn layout_inline_beside(
                     }
                 }
             };
+            if item.forced && item.range.is_some() {
+                // A break folded into a text leaf: the leaf's rect is the
+                // union of its text pieces (no <br> node of its own).
+                continue;
+            }
             if item.forced {
                 // The engine's <br> marker: a zero-height full-width rect at
                 // the line end, painting nothing.
@@ -2835,6 +3770,7 @@ pub(super) fn layout_inline_beside(
                         index: item.index,
                         text_range: None,
                         ellipsis: false,
+                        vertical: false,
                         width: available,
                         height: 0.0,
                         children: Vec::new(),
@@ -2845,6 +3781,7 @@ pub(super) fn layout_inline_beside(
             let at = Some((line_index, offset + x, width, baseline));
             placed[item.pos] = placed[item.pos].or(at);
             placed_last[item.pos] = at;
+            placed_all.push((item.pos, line_index, offset + x, width, baseline));
             // The item's own baseline after its vertical-align shift (the
             // enclosing boxes stay on the unshifted one).
             let baseline = baseline + item.shift;
@@ -2860,22 +3797,44 @@ pub(super) fn layout_inline_beside(
             // block-axis padding/border around the font content box.
             let e = item.edges;
             let clamped = ellipsis_item == Some(k);
+            // Paint lays a text fragment out as a line box of its used
+            // (fallback-grown) metrics from the rect top: when a fallback
+            // face grows a line-height: normal line, the rect is that line
+            // box (NGLineHeightMetrics of the item) rather than the primary
+            // font box, so the glyphs sit on the line's baseline.
+            let (content_ascent, font_height) = match flat[item.index].kind {
+                ComponentKind::Text { content }
+                    if item.ascent > item.content_ascent + EPSILON
+                        && fallback_grows_line(
+                            item.range.map_or(content, |(a, b)| &content[a..b]),
+                            flat[item.index].style,
+                        ) =>
+                {
+                    (item.ascent, item.ascent + item.descent)
+                }
+                _ => (item.content_ascent, item.font_height),
+            };
             out.push((
                 offset + x + item.box_start + e.margin_start,
-                baseline - item.content_ascent - e.top,
+                baseline - content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
-                    text_range: match (item.range, clamped, flat[item.index].kind) {
-                        (None, true, ComponentKind::Text { content }) => Some((0, content.len())),
-                        (range, ..) => range,
+                    text_range: match (ellipsis_range, item.range, clamped, &flat[item.index].kind)
+                    {
+                        (Some(range), _, true, _) => Some(range),
+                        (None, None, true, ComponentKind::Text { content }) => {
+                            Some((0, content.len()))
+                        }
+                        (_, range, ..) => range,
                     },
                     ellipsis: clamped,
+                    vertical: false,
                     width: if clamped { ellipsis_width } else { 0.0 } + width
                         - item.box_start
                         - item.box_end
                         - e.margin_start
                         - e.margin_end,
-                    height: item.font_height + e.top + e.bottom,
+                    height: font_height + e.top + e.bottom,
                     children: Vec::new(),
                 },
             ));
@@ -2892,6 +3851,7 @@ pub(super) fn layout_inline_beside(
                     index,
                     text_range: (!items[k].forced).then_some((0, 0)),
                     ellipsis: false,
+                    vertical: false,
                     width: 0.0,
                     height: 0.0,
                     children: Vec::new(),
@@ -2902,27 +3862,71 @@ pub(super) fn layout_inline_beside(
     // Inline box fragments (NGInlineBoxState::CreateBoxFragment): the border
     // box from the first to the last item's edges, block-axis padding and
     // border around the box's font content area.  A box split across lines
-    // has several fragments; the engine keeps one rect, so legacy lays it out.
+    // has several fragments (one per line); the engine keeps one rect per
+    // node, so such a box gets their union (LayoutInline's bounding box)
+    // when it paints nothing of its own; otherwise legacy lays it out.
     if has_boxes {
-        let mut starts: std::collections::HashMap<usize, (usize, f32, f32)> =
+        let mut starts: std::collections::HashMap<usize, (usize, usize, f32, f32)> =
             std::collections::HashMap::new();
         for (k, boxes) in opens.iter().enumerate() {
+            // A leaf that never contributed a piece (a collapsed space,
+            // CSS 2.1 16.6.1) does not place the inline boxes that would
+            // open on it; those boxes have no fragment.
+            if placed[k].is_none() {
+                continue;
+            }
             for (pos, &b) in boxes.iter().enumerate() {
                 let (line, x, _, baseline) = placed[k].why("inline-box-placement")?;
                 let start =
                     x + start_edges(&boxes[..pos]) + InlineEdges::of(flat[b].style).margin_start;
-                starts.insert(b, (line, start, baseline));
+                starts.insert(b, (k, line, start, baseline));
             }
         }
         for (k, boxes) in closes.iter().enumerate() {
+            if placed_last[k].is_none() {
+                continue;
+            }
             for (pos, &b) in boxes.iter().enumerate() {
                 let (line, x, width, _) = placed_last[k].why("inline-box-placement")?;
-                let (start_line, start, baseline) =
+                let (first, start_line, start, baseline) =
                     starts.get(&b).copied().why("inline-box-placement")?;
-                if start_line != line {
-                    return super::bail("split-box-line");
-                }
                 let style = flat[b].style;
+                if start_line != line {
+                    if !paints_nothing(style) {
+                        return super::bail("split-box-line");
+                    }
+                    let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);
+                    let (mut top_baseline, mut bottom_baseline) = (baseline, baseline);
+                    for &(pos, _, px, pw, pb) in &placed_all {
+                        if (first..=k).contains(&pos) {
+                            x0 = x0.min(px);
+                            x1 = x1.max(px + pw);
+                            top_baseline = top_baseline.min(pb);
+                            bottom_baseline = bottom_baseline.max(pb);
+                        }
+                    }
+                    if start > x0 + EPSILON {
+                        // offsetLeft is the first fragment's start, not the
+                        // union's; one rect cannot carry both.
+                        return super::bail("split-box-line");
+                    }
+                    let ascent = inline_font_content_ascent(style);
+                    let y0 = top_baseline - ascent;
+                    out.push((
+                        x0,
+                        y0,
+                        BoxFragment {
+                            index: b,
+                            text_range: None,
+                            ellipsis: false,
+                            vertical: false,
+                            width: x1 - x0,
+                            height: bottom_baseline - ascent + inline_font_height(style) - y0,
+                            children: Vec::new(),
+                        },
+                    ));
+                    continue;
+                }
                 let e = InlineEdges::of(style);
                 let end = x + width - end_edges(&boxes[pos + 1..]) - e.margin_end;
                 out.push((
@@ -2932,6 +3936,7 @@ pub(super) fn layout_inline_beside(
                         index: b,
                         text_range: None,
                         ellipsis: false,
+                        vertical: false,
                         width: end - start,
                         height: inline_font_height(style) + e.top + e.bottom,
                         children: Vec::new(),
@@ -2941,6 +3946,7 @@ pub(super) fn layout_inline_beside(
         }
     }
     Some(InlineResult {
+        lines_used,
         height: top,
         children: out,
         last_baseline: last_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
@@ -2953,24 +3959,63 @@ pub(super) fn layout_inline_beside(
 /// text leaf, which paint wraps itself: max-content is the unwrapped
 /// advance (widest forced-break segment); min-content the widest word where
 /// spaces are the only opportunities (Latin-1 without other soft-wrap
-/// characters), the whole text for nowrap / pre.
+/// characters), the widest segment between crate::line_break opportunities
+/// otherwise, the whole text for nowrap / pre.
 pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
-    let width =
-        |t: &str| snap(tab_advance(t, style).unwrap_or_else(|| text_intrinsic_size(t, style).0));
-    let max = content
-        .split(['\n', '\u{2028}', '\u{2029}'])
-        .map(width)
-        .fold(0.0f32, f32::max);
+    let width = |t: &str| snap(text_intrinsic_size(t, style).0);
+    let collapsed = as_collapsed_spaces(content, style);
+    let measure = collapsed.as_ref();
+    let max = if collapses_whitespace(style) {
+        width(measure)
+    } else {
+        content
+            .split(['\n', '\u{2028}', '\u{2029}'])
+            .map(width)
+            .fold(0.0f32, f32::max)
+    };
+    // Preserved newlines force a max-content break; collapsed ones do not.
     let forced = has_forced_break(content, style)
-        || (content.contains('\n') && !matches!(style.white_space, WhiteSpace::Pre));
+        || (content.contains('\n')
+            && !collapses_whitespace(style)
+            && !matches!(style.white_space, WhiteSpace::Pre));
     let min = if matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
         Some(max)
     } else if !forced
-        && latin1(content)
-        && !content.chars().any(|c| c != ' ' && is_soft_wrap_char(c))
-        && style.white_space != WhiteSpace::PreWrap
+        && latin1(measure)
+        && !measure.chars().any(|c| {
+            c != ' ' && is_soft_wrap_char(c) && !(c == '\u{ad}' && suppresses_hyphenation(style))
+        })
     {
-        Some(content.split(' ').map(width).fold(0.0f32, f32::max))
+        // Pre-wrap: trailing preserved spaces hang and do not affect
+        // min-content (CSS Text 3; white-space-intrinsic-size-003).
+        let body = if style.white_space == WhiteSpace::PreWrap {
+            measure.trim_end_matches(' ')
+        } else {
+            measure
+        };
+        Some(body.split(' ').map(width).fold(0.0f32, f32::max))
+    } else if !forced {
+        // NGLineBreaker at available 0: every UAX #14 opportunity of the
+        // run's BreakMode is taken; trailing hanging spaces (pre-wrap)
+        // do not contribute to min-content.
+        let body = if style.white_space == WhiteSpace::PreWrap {
+            measure.trim_end_matches(' ')
+        } else {
+            measure
+        };
+        let mut cuts = ifc_break_opportunities(body, style);
+        cuts.retain(|&o| o > 0 && o < body.len());
+        cuts.push(body.len());
+        let mut start = 0;
+        let mut widest = 0.0f32;
+        for cut in cuts {
+            let segment = body[start..cut].trim_end_matches(' ');
+            if !segment.is_empty() {
+                widest = widest.max(width(segment));
+            }
+            start = cut;
+        }
+        Some(widest)
     } else {
         None
     };
@@ -2979,7 +4024,9 @@ pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
 
 /// NGInlineNode::ComputeMinMaxSizes: the line breaker's widest line at
 /// available 0 (every opportunity taken) and at an indefinite size (only
-/// forced breaks).  A paragraph leaf is measured as text.
+/// forced breaks).  A paragraph leaf is measured as text. `space` carries
+/// the container's child percentage basis (block::intrinsic_sizes_at), so
+/// an atomic inline's percentage height resolves as in layout.
 pub(super) fn inline_min_max(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -2989,7 +4036,9 @@ pub(super) fn inline_min_max(
     if let [InlineEntry::Leaf(child)] = entries[..]
         && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
-        && (line_width_leaf(flat[child].style, flat[index].style) || content.contains('\n'))
+        && (has_marker(flat[child].style, LINE_WIDTH_MARKER)
+            || content.contains('\n')
+            || flat[child].style.white_space == WhiteSpace::PreWrap)
     {
         return Some(text_min_max(content, flat[child].style));
     }
@@ -2999,8 +4048,9 @@ pub(super) fn inline_min_max(
             index,
             &ConstraintSpace {
                 available_inline: available,
-                percentage_block: None,
                 percent_unresolved: true,
+                cyclic_percent_auto: false,
+                line_clamp: None,
                 ..*space
             },
         )
@@ -3011,4 +4061,85 @@ pub(super) fn inline_min_max(
         min: at(0.0).map(|min| min.min(max)),
         max,
     })
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn sole_break_spaces_leaf_and_break_word_stay_on_ng() {
+        let break_spaces = Style {
+            white_space: WhiteSpace::PreWrap,
+            break_spaces: true,
+            ..Style::default()
+        };
+        assert_eq!(text_style_reason("a b", &break_spaces), None);
+        let break_word = Style {
+            word_break: WordBreak::BreakWord,
+            ..Style::default()
+        };
+        assert_eq!(text_style_reason("abc", &break_word), None);
+        let pre_wrap_break_word = Style {
+            white_space: WhiteSpace::PreWrap,
+            word_break: WordBreak::BreakWord,
+            ..Style::default()
+        };
+        assert_eq!(text_style_reason("abc", &pre_wrap_break_word), None);
+        let break_spaces_break_word = Style {
+            break_spaces: true,
+            ..pre_wrap_break_word
+        };
+        assert_eq!(text_style_reason("abc", &break_spaces_break_word), None);
+    }
+
+    #[test]
+    fn preserved_tabs_stay_on_ng_only_on_the_first_line() {
+        let pre = Style {
+            white_space: WhiteSpace::Pre,
+            ..Style::default()
+        };
+        assert!(preserved_tabs_ok("a\tb", &pre, &pre));
+        assert_eq!(text_content_reason("a\tb", false, true), None);
+        assert_eq!(text_content_reason("a\tb", false, false), Some("text:tab"));
+        assert!(supported_script_in("\tP", false));
+        // pre-wrap tabs: paint resolves line-box stops only for `pre`; a
+        // preserved newline starts a line whose stops NG does not resolve.
+        let pre_wrap = Style {
+            white_space: WhiteSpace::PreWrap,
+            ..Style::default()
+        };
+        assert!(!preserved_tabs_ok("a\tb", &pre_wrap, &pre_wrap));
+        assert_eq!(
+            block_text_content_reason("a\tb", &pre_wrap),
+            Some("text:tab")
+        );
+        assert_eq!(block_text_content_reason("a\tb", &pre), None);
+        assert!(!preserved_tabs_ok("a\n\tb", &pre, &pre));
+        // Paint offsets the stops by the line's alignment shift.
+        let centered = Style {
+            text_align: TextAlign::Center,
+            ..pre.clone()
+        };
+        assert!(!preserved_tabs_ok("\t", &pre, &centered));
+        // The block's space advance sets the interval.
+        let spaced = Style {
+            letter_spacing: 2.0,
+            ..pre.clone()
+        };
+        assert!(!preserved_tabs_ok("\t", &pre, &spaced));
+        let indented = Style {
+            text_indent: Dimension::Px(4.0),
+            ..pre.clone()
+        };
+        assert!(!preserved_tabs_ok("\t", &pre, &indented));
+    }
+}
+
+/// [`text_min_max`] of a text leaf's content box: the legacy measure behind
+/// it includes the leaf's own horizontal padding, which the caller adds back.
+pub(super) fn text_content_min_max(content: &str, style: &Style) -> MinMax {
+    let padding = style.padding_lengths();
+    let edges = padding.left + padding.right;
+    text_min_max(content, style).map(|width| (width - edges).max(0.0))
 }

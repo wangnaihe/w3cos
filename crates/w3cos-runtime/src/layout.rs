@@ -1196,6 +1196,7 @@ pub struct ScrollExtent {
 // FlatNodeInfo — O(1) indexed access to tree data (replaces O(n) recursive lookups)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct FlatNodeInfo<'a> {
     pub component: Option<&'a Component>,
     /// Stable identity for this compiled tree slot across reactive rebuilds.
@@ -1344,7 +1345,9 @@ pub(crate) fn image_intrinsic_size(
     let decoded = crate::image_loader::dimensions(src)
         .map(|(width, height)| (width as f32, height as f32))
         .unwrap_or_else(|| {
-            if crate::image_loader::is_reserved_browser_source(src) {
+            // A missing `src` never starts a request, so there is nothing
+            // to wait for: the box is 0x0, as in browsers.
+            if src.trim().is_empty() || crate::image_loader::is_reserved_browser_source(src) {
                 (0.0, 0.0)
             } else {
                 (200.0, 200.0)
@@ -1944,6 +1947,7 @@ pub(crate) fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
+        WDim::Lh(value) => Some(value * component.style.used_line_height_px()),
         WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc(_) => None,
     };
     let constraint_border_box = |dimension| {
@@ -2846,7 +2850,9 @@ fn auto_table_column_constraints(component: &Component, count: usize) -> Vec<(bo
     fn apply(style: &w3cos_std::style::Style, columns: &mut [(bool, f32)]) {
         for (constrained, percentage) in columns {
             match style.width {
-                WDim::Auto => {}
+                // CSS Tables: a `calc()` column width is treated as `auto` in
+                // `table-layout: auto` (auto-layout-calc-width-001).
+                WDim::Auto | WDim::Calc(_) => {}
                 WDim::Percent(value) => {
                     *constrained = true;
                     *percentage = percentage.max(value);
@@ -3406,7 +3412,12 @@ fn component_min_content_width_with_preferred_width(
     // In automatic table layout, a cell's width is a preferred track size.
     // Its content and edges still constrain contraction, but the declaration
     // alone must not make an otherwise empty table overflow its container.
-    if honor_preferred_width && !matches!(component.style.width, WDim::Auto | WDim::Percent(_)) {
+    if honor_preferred_width
+        && !matches!(
+            component.style.width,
+            WDim::Auto | WDim::Percent(_) | WDim::Calc(_)
+        )
+    {
         return component_max_content_width(component);
     }
     let content_width = if let Some(width) = atomic_inline_intrinsic_width(component, true) {
@@ -3849,6 +3860,7 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Ch(_)
         | WDim::Vw(_)
         | WDim::Vh(_)
+        | WDim::Lh(_)
         | WDim::Calc(_) => None,
     }
 }
@@ -3975,6 +3987,16 @@ pub(crate) fn resolve_spacing_for_layout(
 ) -> f32 {
     w3cos_std::style::used_box_spacing(match spacing {
         WSpacing::Percent(value) => percentage_spacing_for_layout(percentage_basis, value),
+        // `calc(P% + Xpx)`: against a zero basis (intrinsic sizing) only
+        // the length remains.
+        WSpacing::Calc { percent, px } => {
+            percentage_spacing_for_layout(percentage_basis, percent) + px
+        }
+        // A padding `calc()` is floored at zero (CSS Box 3: negative
+        // padding is invalid, so a used negative sum clamps).
+        WSpacing::PaddingCalc { percent, px } => {
+            (percentage_spacing_for_layout(percentage_basis, percent) + px).max(0.0)
+        }
         WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
         WSpacing::Em(value) => value * font_style.font_size,
         WSpacing::Ch(value) => value * font_style.ch_advance(),
@@ -4432,7 +4454,8 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
-            WDim::Calc(_) => (8, 0),
+            WDim::Lh(value) => (8, value.to_bits()),
+            WDim::Calc(_) => (9, 0),
         },
         padding_top: padding.top.to_bits(),
         padding_right: padding.right.to_bits(),
@@ -4868,7 +4891,11 @@ impl LayoutEngine {
                         // The legacy Taffy tree no longer matches this output.
                         self.tree_valid = false;
                         let (scrollable_nodes, clip_only_nodes, scroll_ancestor) =
-                            scroll_containers_from_layout(&layout_cache, flat);
+                            scroll_containers_from_layout(
+                                &layout_cache,
+                                flat,
+                                Some((viewport_w, viewport_h)),
+                            );
                         Ok(LayoutResults {
                             layout_cache,
                             scrollable_nodes,
@@ -4936,6 +4963,7 @@ impl LayoutEngine {
                 None,
                 None,
                 false,
+                None,
                 None,
             )?);
             self.tree_valid = true;
@@ -5019,6 +5047,17 @@ impl LayoutEngine {
         );
 
         if self.skip_projections {
+            // contain:size still clips in-flow descendants when the heavy
+            // projection walk is skipped (scroll-marker-group-style-remove).
+            clip_in_flow_children_of_size_contained(&mut results, flat);
+            // An abspos box with a lowered `<br>` still needs the forced-break
+            // pass after Taffy (overflow-wrap-break-word-006's red `<br>XXXXX`).
+            // Do not run it for in-flow pre-wrap / first-line trees: that
+            // walk changes leading-space and trim metrics (pre-wrap-016,
+            // text-box-trim-first-line-pseudo-002).
+            if tree_has_forced_break_under_out_of_flow(root) {
+                project_forced_break_lines(&mut results, root);
+            }
             results.extend(fixed_results);
             return Ok(LayoutResults {
                 layout_cache: results,
@@ -5290,7 +5329,14 @@ impl LayoutEngine {
         }
         refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
+        extend_scroll_extents_from_overflow_columns(
+            &results,
+            flat,
+            Some((viewport_w, viewport_h)),
+            &mut scrollable,
+        );
 
+        clip_in_flow_children_of_size_contained(&mut results, flat);
         results.extend(fixed_results);
 
         Ok(LayoutResults {
@@ -5594,6 +5640,7 @@ pub fn compute_with_scroll_details(
         None,
         None,
         false,
+        None,
         None,
     )?;
     phase.mark("taffy_build");
@@ -6026,6 +6073,12 @@ pub fn compute_with_scroll_details(
     }
     refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
+    extend_scroll_extents_from_overflow_columns(
+        &results,
+        &flat,
+        Some((viewport_w, viewport_h)),
+        &mut scrollable,
+    );
     phase.mark("proj_rest");
 
     results.extend(fixed_results);
@@ -15116,6 +15169,75 @@ fn project_staggered_float_inline_bands(
     }
 }
 
+fn size_containment_marker(style: &w3cos_std::style::Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key("--w3cos-internal-size-containment"))
+}
+
+/// In-flow children of a size-contained box must not paint outside its
+/// used border box. Floats and out-of-flow boxes still overflow (015).
+fn clip_in_flow_children_of_size_contained(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) {
+    if !flat.iter().any(|node| size_containment_marker(node.style)) {
+        return;
+    }
+    let positions = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<LayoutPositions>();
+    for (index, node) in flat.iter().enumerate() {
+        if !size_containment_marker(node.style) {
+            continue;
+        }
+        let Some(&parent_position) = positions.get(&index) else {
+            continue;
+        };
+        let parent = layouts[parent_position].0;
+        for child_index in (index + 1)..node.subtree_end {
+            let child_node = &flat[child_index];
+            // Clip every in-flow descendant, not only direct children, so
+            // marker text inside a 0-height adjunct box cannot still paint.
+            // Leave floats and out-of-flow (and their descendants) alone (015).
+            let mut skip = false;
+            let mut walk = Some(child_index);
+            while let Some(current) = walk {
+                if current == index {
+                    break;
+                }
+                let style = flat[current].style;
+                if style.float != WFloat::None
+                    || matches!(style.position, WPos::Absolute | WPos::Fixed)
+                    || style.display == WDisplay::None
+                {
+                    skip = true;
+                    break;
+                }
+                walk = flat[current].parent;
+            }
+            if skip {
+                continue;
+            }
+            let Some(&child_position) = positions.get(&child_index) else {
+                continue;
+            };
+            let rect = &mut layouts[child_position].0;
+            let x2 = parent.x + parent.width;
+            let y2 = parent.y + parent.height;
+            let cx2 = (rect.x + rect.width).min(x2).max(parent.x);
+            let cy2 = (rect.y + rect.height).min(y2).max(parent.y);
+            rect.x = rect.x.max(parent.x).min(x2);
+            rect.y = rect.y.max(parent.y).min(y2);
+            rect.width = (cx2 - rect.x).max(0.0);
+            rect.height = (cy2 - rect.y).max(0.0);
+        }
+    }
+}
+
 fn project_auto_height_bfc_float_heights(
     layouts: &mut [(LayoutRect, usize)],
     root: &Component,
@@ -15202,6 +15324,7 @@ fn project_auto_height_bfc_float_heights(
         }
         if establishes_bfc(&component.style, flat[index].parent.is_none())
             && matches!(component.style.height, WDim::Auto)
+            && size_contained_auto_block_size(&component.style).is_none()
             && let Some(position) = positions.get(&index).copied()
         {
             let container = layouts[position].0;
@@ -17268,6 +17391,24 @@ fn project_image_text_lines_with_constraints(
         );
     }
     true
+}
+
+fn tree_has_forced_break_under_out_of_flow(root: &Component) -> bool {
+    fn walk(component: &Component, under_out_of_flow: bool) -> bool {
+        let under_out_of_flow =
+            under_out_of_flow || matches!(component.style.position, WPos::Absolute | WPos::Fixed);
+        if under_out_of_flow
+            && let ComponentKind::Text { content } = &component.kind
+            && content.contains('\u{2028}')
+        {
+            return true;
+        }
+        component
+            .children
+            .iter()
+            .any(|child| walk(child, under_out_of_flow))
+    }
+    walk(root, false)
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
@@ -20599,6 +20740,7 @@ fn refresh_scroll_container_rects(
 pub(crate) fn scroll_containers_from_layout(
     layouts: &[(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
 ) -> (
     Vec<(usize, LayoutRect, ScrollExtent)>,
     Vec<(usize, LayoutRect)>,
@@ -20722,6 +20864,7 @@ pub(crate) fn scroll_containers_from_layout(
         &scroll_ancestor,
         &mut scrollable,
     );
+    extend_scroll_extents_from_overflow_columns(&shifted_layouts, flat, viewport, &mut scrollable);
     let mut clip_only = Vec::new();
     scrollable.retain(|(index, rect, extent)| {
         if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden_clip[*index] {
@@ -20732,6 +20875,59 @@ pub(crate) fn scroll_containers_from_layout(
         }
     });
     (scrollable, clip_only, scroll_ancestor)
+}
+
+/// Overflow columns are paint-projected (CSS Multicol) and therefore absent
+/// from the descendant border-box extent. They still form the scrollable
+/// overflow rectangle in the inline axis: max scroll is
+/// `column-width+gap` times the fragmentainer count, minus the content box.
+fn extend_scroll_extents_from_overflow_columns(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+    scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
+) {
+    if scrollable.is_empty() {
+        return;
+    }
+    let mut rects = vec![None; flat.len()];
+    for &(rect, index) in layouts {
+        if index < rects.len() {
+            rects[index] = Some(rect);
+        }
+    }
+    let nodes: Vec<(&w3cos_std::style::Style, Option<usize>)> =
+        flat.iter().map(|node| (node.style, node.parent)).collect();
+    let plans = resolve_column_fragment_plans(&nodes, &rects, viewport);
+    for (index, _, extent) in scrollable.iter_mut() {
+        let Some(plan) = plans.get(*index).and_then(|plan| plan.as_ref()) else {
+            continue;
+        };
+        if plan.bands.is_empty() {
+            continue;
+        }
+        let Some(principal) = rects.get(*index).copied().flatten() else {
+            continue;
+        };
+        let style = flat[*index].style;
+        let padding = style.padding_lengths();
+        let left = style.border_left_width.unwrap_or(style.border_width) + padding.left;
+        let right = style.border_right_width.unwrap_or(style.border_width) + padding.right;
+        let port = (principal.width - left - right).max(0.0);
+        let (vw, vh) = viewport.unwrap_or((principal.width, principal.height));
+        let Some(column_width) = used_column_width(style, port, vw, vh) else {
+            continue;
+        };
+        let gap = style.column_gap.unwrap_or(style.font_size).max(0.0);
+        let stride = column_width + gap;
+        if port <= 0.0 || stride <= 0.0 {
+            continue;
+        }
+        let extra = (stride * plan.bands.len() as f32 - port).max(0.0);
+        if extra > 0.0 {
+            extent.max_x = extent.max_x.max(extra);
+        }
+    }
 }
 
 fn extend_scroll_extents_from_descendants(
@@ -21375,6 +21571,7 @@ fn build_taffy_tree(
     table_column: Option<usize>,
     parent_table_height_definite: bool,
     inherited_border_spacing: Option<(f32, f32)>,
+    parent: Option<&Component>,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
@@ -21467,6 +21664,7 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
+        WDim::Lh(value) => Some(value * comp.style.used_line_height_px()),
         WDim::Auto | WDim::Ch(_) | WDim::Vw(_) | WDim::Calc(_) => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
@@ -21813,6 +22011,7 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
+        WDim::Lh(value) => Some(value * comp.style.used_line_height_px()),
         WDim::Auto | WDim::Percent(_) | WDim::Calc(_) => None,
     };
     let absorbs_ua_inline_padding =
@@ -23342,6 +23541,15 @@ fn build_taffy_tree(
             // cap and overflow the grid track.
             leaf_style.box_sizing = BoxSizing::BorderBox;
         }
+        if legacy_prewrap_sole_text_uses_line_width(comp, parent) {
+            // Match the generated line-width constraint, but only on this
+            // Taffy leaf: do not mutate the shared component style.
+            if matches!(comp.style.width, WDim::Auto) {
+                leaf_style.size.width = Dimension::percent(1.0);
+            }
+            leaf_style.min_size.width = Dimension::length(0.0);
+            leaf_style.flex_shrink = 1.0;
+        }
         tree.new_leaf_with_context(leaf_style, my_idx)
     } else {
         let fixed_table_tracks = fixed_table_track_widths(comp, Some(containing_width));
@@ -23449,7 +23657,7 @@ fn build_taffy_tree(
                     } else {
                         comp.style.display
                     }),
-                    Some(comp.style.align_items),
+                    Some(legacy_used_align_items(&comp.style)),
                     Some(comp.style.font_size),
                     viewport_w,
                     viewport_h,
@@ -23488,6 +23696,7 @@ fn build_taffy_tree(
                                     | WDisplay::TableFooterGroup
                             )),
                     active_border_spacing,
+                    Some(comp),
                 )?;
                 if anonymous_block_line
                     && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
@@ -25462,6 +25671,7 @@ fn collect_layouts_fast(
             | WDim::Ch(_)
             | WDim::Vw(_)
             | WDim::Vh(_)
+            | WDim::Lh(_)
             | WDim::Calc(_) => true,
         });
 
@@ -26183,6 +26393,145 @@ fn positioned_percentage_border_box_size(
 // Style conversion helpers
 // ---------------------------------------------------------------------------
 
+/// CSS Contain 2: a size-contained box's auto block size is the
+/// contain-intrinsic-size, or 0. Used width of an in-flow block with
+/// `width: auto` still fills the containing block; only height is pinned
+/// here so descendants cannot inflate the box (scroll-marker-group UA
+/// `contain: size`, and size-contained grids such as
+/// grid-lanes-contain-intrinsic-size-row-002).
+fn size_contained_auto_block_size(s: &w3cos_std::style::Style) -> Option<f32> {
+    let properties = s.custom_properties.as_ref()?;
+    if !properties.contains_key("--w3cos-internal-size-containment") {
+        return None;
+    }
+    if !matches!(s.height, WDim::Auto) {
+        return None;
+    }
+    let height = properties
+        .get("--w3cos-internal-contain-intrinsic-size")
+        .and_then(|value| {
+            let mut axes = value.split_ascii_whitespace();
+            let _width = axes.next()?;
+            axes.next()?.parse().ok()
+        })
+        .unwrap_or(0.0);
+    Some(height)
+}
+
+/// CSS Grid 3 `grid-lanes` default alignment is `start`, not the flex
+/// initial `stretch`. The shared component tree (and NG-on) keep the
+/// computed initial value. On the legacy Taffy path a blanket start
+/// default would change item cross sizes vs main for most lanes pages,
+/// which fall back to the same unrecognized flex box as their
+/// `inline-grid` / `inline grid` references (stretch). The one case
+/// that cannot keep stretch is a shrink-to-fit, auto-height container
+/// whose only tracks are indefinite column keywords: a single flex line
+/// would otherwise stretch every item to the tallest item's height.
+/// `grid-lanes-gap-001` needs start there because its reference is an
+/// `inline-grid` with `place-self: start` (so spanning items stay
+/// content-sized). Definite sizes, row templates, and definite column
+/// tracks keep stretch so those pages still match main.
+fn is_legacy_grid_lanes(style: &w3cos_std::style::Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key("--w3cos-internal-grid-lanes"))
+}
+
+fn legacy_column_template_is_indefinite_keywords(template: &str) -> bool {
+    let mut pending = vec![template.trim()];
+    while let Some(part) = pending.pop() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(rest) = part
+            .strip_prefix("repeat(")
+            .or_else(|| part.strip_prefix("minmax("))
+        {
+            let rest = rest.strip_suffix(')').unwrap_or(rest);
+            if let Some((_, tracks)) = rest.split_once(',') {
+                pending.push(tracks);
+                continue;
+            }
+            return false;
+        }
+        if part.contains(char::is_whitespace) || part.contains('/') {
+            pending.extend(part.split(|c: char| c.is_whitespace() || c == '/'));
+            continue;
+        }
+        if matches!(part, "auto" | "min-content" | "max-content" | "fit-content") {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn legacy_lanes_shrink_to_fit_auto_columns(style: &w3cos_std::style::Style) -> bool {
+    if !matches!(style.width, WDim::Auto) || !matches!(style.height, WDim::Auto) {
+        return false;
+    }
+    if style
+        .grid_rows()
+        .is_some_and(|rows| !rows.is_empty() && !rows.eq_ignore_ascii_case("none"))
+    {
+        return false;
+    }
+    let Some(columns) = style
+        .grid_template_columns
+        .as_deref()
+        .map(str::trim)
+        .filter(|columns| !columns.is_empty() && !columns.eq_ignore_ascii_case("none"))
+    else {
+        return false;
+    };
+    legacy_column_template_is_indefinite_keywords(columns)
+}
+
+fn legacy_used_align_items(style: &w3cos_std::style::Style) -> WAlign {
+    // Only when the process is in NG-off mode. NG-on pages that fall back
+    // to Taffy (ineligible lanes, subgrid, etc.) must keep the previous
+    // flex `stretch` default so they still match zj18.
+    legacy_used_align_items_for_mode(style, crate::layout_ng::mode())
+}
+
+fn legacy_used_align_items_for_mode(
+    style: &w3cos_std::style::Style,
+    mode: crate::layout_ng::Mode,
+) -> WAlign {
+    if matches!(mode, crate::layout_ng::Mode::Off)
+        && is_legacy_grid_lanes(style)
+        && style.align_items == WAlign::Stretch
+        && legacy_lanes_shrink_to_fit_auto_columns(style)
+    {
+        WAlign::FlexStart
+    } else {
+        style.align_items
+    }
+}
+
+/// A coalesced sole text leaf in an auto-width in-flow `pre-wrap` /
+/// `break-spaces` block must wrap at the block's used width. Applied only
+/// when building the legacy Taffy tree so NG-on keeps the shared
+/// component styles unchanged (overflow-wrap-break-word-006).
+fn legacy_prewrap_sole_text_uses_line_width(comp: &Component, parent: Option<&Component>) -> bool {
+    let Some(parent) = parent else {
+        return false;
+    };
+    matches!(comp.kind, ComponentKind::Text { .. })
+        && parent.children.len() == 1
+        && !matches!(comp.style.position, WPos::Absolute | WPos::Fixed)
+        && matches!(parent.style.white_space, WWhiteSpace::PreWrap)
+        && parent.style.break_spaces
+        && matches!(
+            parent.style.display,
+            WDisplay::Block | WDisplay::FlowRoot | WDisplay::ListItem
+        )
+        && parent.style.float == WFloat::None
+        && !matches!(parent.style.position, WPos::Absolute | WPos::Fixed)
+}
+
 fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32) -> Style {
     let (display, flex_grow, flex_shrink, size) = match s.display {
         WDisplay::Flex => (
@@ -26291,6 +26640,22 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
             },
         ),
     };
+    let mut size = size;
+    // Flex items with `contain: size` still receive their used block size
+    // from the flex container (`flex: 1` / leftover space). Pinning a
+    // definite 0px / CIS height here would prevent that growth
+    // (flex-item-contains-size-layout-001). Cap only the automatic
+    // minimum so descendants cannot inflate the item. Other
+    // size-contained auto-height boxes (scroll-marker-group, CIS grids)
+    // keep the used-size pin.
+    let mut size_contained_flex_min_block = None;
+    if let Some(height) = size_contained_auto_block_size(s) {
+        if s.flex_grow > 0.0 {
+            size_contained_flex_min_block = Some(height);
+        } else {
+            size.height = Dimension::length(height);
+        }
+    }
     let mut margin = if s.display == WDisplay::TableCell {
         // CSS table-cell boxes do not accept margins. Taffy's flex fallback
         // would otherwise add those margins to column and row sizing.
@@ -26407,7 +26772,7 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
                 WJustify::SpaceEvenly => JustifyContent::SpaceEvenly,
             }
         }),
-        align_items: Some(match s.align_items {
+        align_items: Some(match legacy_used_align_items(s) {
             WAlign::FlexStart => AlignItems::FlexStart,
             WAlign::FlexEnd => AlignItems::FlexEnd,
             WAlign::Center => AlignItems::Center,
@@ -26478,7 +26843,9 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         size,
         min_size: Size {
             width: to_taffy_dim(s.min_width, &s, viewport_w, viewport_h),
-            height: to_taffy_dim(s.min_height, &s, viewport_w, viewport_h),
+            height: size_contained_flex_min_block
+                .map(Dimension::length)
+                .unwrap_or_else(|| to_taffy_dim(s.min_height, &s, viewport_w, viewport_h)),
         },
         max_size: Size {
             width: to_taffy_dim(s.max_width, &s, viewport_w, viewport_h),
@@ -26707,6 +27074,8 @@ fn to_taffy_spacing(
 ) -> LengthPercentage {
     match spacing {
         WSpacing::Percent(v) => LengthPercentage::percent(v / 100.0),
+        // Legacy keeps reading a mixed calc() padding as zero.
+        WSpacing::PaddingCalc { .. } => LengthPercentage::length(0.0),
         other => LengthPercentage::length(resolve_spacing_for_layout(
             other, 0.0, font_style, viewport_w, viewport_h,
         )),
@@ -26722,6 +27091,8 @@ fn to_taffy_margin(
     match spacing {
         WSpacing::Auto => LengthPercentageAuto::auto(),
         WSpacing::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
+        // Legacy keeps reading a mixed calc() margin as zero.
+        WSpacing::Calc { .. } => LengthPercentageAuto::length(0.0),
         other => LengthPercentageAuto::length(resolve_spacing_for_layout(
             other, 0.0, font_style, viewport_w, viewport_h,
         )),
@@ -26735,6 +27106,7 @@ fn to_taffy_dim(
     viewport_h: f32,
 ) -> Dimension {
     match d {
+        // LayoutNG alone resolves a `calc()` size; legacy keeps `auto`.
         WDim::Auto => Dimension::auto(),
         WDim::Px(v) => Dimension::length(v),
         WDim::Percent(v) => Dimension::percent(v / 100.0),
@@ -26746,6 +27118,7 @@ fn to_taffy_dim(
         WDim::Calc(calc) => {
             Dimension::length(calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h))
         }
+        WDim::Lh(v) => Dimension::length(v * font_style.used_line_height_px()),
     }
 }
 
@@ -26770,6 +27143,7 @@ fn to_taffy_auto(
             viewport_w,
             viewport_h,
         )),
+        WDim::Lh(v) => LengthPercentageAuto::length(v * font_style.used_line_height_px()),
     }
 }
 
@@ -30174,6 +30548,499 @@ mod tests {
             44.0,
             "{layout:?}"
         );
+    }
+
+    #[test]
+    fn auto_table_calc_column_width_is_treated_as_auto() {
+        // css-tables/auto-layout-calc-width-001: `width: calc(20% + 80px)`
+        // on a column is treated as auto, so two empty cells share 200px.
+        let cell = || {
+            Component::boxed(
+                Style {
+                    display: WDisp::TableCell,
+                    padding: w3cos_std::style::Edges::xy(0.0, 0.0),
+                    ..s()
+                },
+                vec![],
+            )
+        };
+        let table = Component::boxed(
+            Style {
+                display: WDisp::Table,
+                width: WDim::Px(200.0),
+                table_layout_fixed: false,
+                border_collapse: true,
+                border_spacing_x: 0.0,
+                border_spacing_y: 0.0,
+                ..s()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: WDisp::TableColumn,
+                        width: WDim::calc_percent_px(20.0, 80.0),
+                        ..s()
+                    },
+                    vec![],
+                ),
+                Component::row(
+                    Style {
+                        display: WDisp::TableRow,
+                        ..s()
+                    },
+                    vec![cell(), cell()],
+                ),
+            ],
+        );
+        let widths = auto_table_track_widths(&table, Some(200.0));
+        assert_eq!(
+            widths,
+            vec![100.0, 100.0],
+            "calc() on a col is auto, so tracks share the 200px table equally: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn grid_lanes_legacy_taffy_defaults_align_items_to_start() {
+        // The shared component style stays Stretch. Only NG-off Taffy
+        // maps the unauthored grid-lanes default to start, and only for
+        // shrink-to-fit auto-height boxes whose tracks are indefinite
+        // column keywords (gap-001). Other lanes fallbacks, and NG-on,
+        // keep Stretch so they still match main / the previous gate.
+        let mut style = Style::default();
+        style.display = WDisp::Flex;
+        style.align_items = WAlign::Stretch;
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-grid-lanes".to_string(), "1".to_string());
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::Off),
+            WAlign::Stretch,
+            "no column template: keep main's stretch fallback"
+        );
+        style.grid_template_columns = Some("repeat(4,auto)".to_string());
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::Off),
+            WAlign::FlexStart
+        );
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::On),
+            WAlign::Stretch
+        );
+        style.height = WDim::Px(120.0);
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::Off),
+            WAlign::Stretch,
+            "definite height keeps stretch"
+        );
+        style.height = WDim::Auto;
+        style.grid_template_columns = Some("40px 30px 20px".to_string());
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::Off),
+            WAlign::Stretch,
+            "definite column tracks keep stretch"
+        );
+        style.grid_template_columns = Some("repeat(4,auto)".to_string());
+        style.grid_ng = Some(Box::new(w3cos_std::style::GridNg {
+            grid_template_rows: Some("repeat(4,auto)".to_string()),
+            ..Default::default()
+        }));
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::Off),
+            WAlign::Stretch,
+            "a row template keeps stretch"
+        );
+        style.grid_ng = None;
+        style.custom_properties = None;
+        assert_eq!(
+            legacy_used_align_items_for_mode(&style, crate::layout_ng::Mode::Off),
+            WAlign::Stretch
+        );
+    }
+
+    #[test]
+    fn break_spaces_auto_width_block_wraps_after_a_leading_space() {
+        // overflow-wrap-break-word-006: " XXXXX " in a 5ch / 20px-Ahem box
+        // must wrap after the leading space so the word stays on the next line.
+        use crate::font_face::{FontFace, FontRegistry, FontSource};
+        const OWNER: u64 = 202611120006;
+        struct FontOwner;
+        impl Drop for FontOwner {
+            fn drop(&mut self) {
+                FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        let _font = FontOwner;
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        ))
+        .expect("Ahem fixture");
+        FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .expect("register Ahem");
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "div",
+            &[
+                ("position", "relative"),
+                ("font-size", "20px"),
+                ("font-family", "Ahem"),
+                ("line-height", "1em"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".red",
+            &[
+                ("position", "absolute"),
+                ("background", "green"),
+                ("color", "red"),
+                ("width", "100px"),
+                ("height", "100px"),
+                ("z-index", "-1"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".test",
+            &[
+                ("color", "green"),
+                ("width", "5ch"),
+                ("white-space", "break-spaces"),
+                ("overflow-wrap", "break-word"),
+            ],
+        );
+        let mut document = w3cos_dom::Document::new();
+        let red = document.create_element("div");
+        red.set_attribute(&mut document, "class", "red");
+        let br = document.create_element("br");
+        red.append_child(&mut document, br);
+        let red_text = document.create_text_node("XXXXX");
+        red.append_child(&mut document, red_text);
+        document.body().append_child(&mut document, red);
+        let test = document.create_element("div");
+        test.set_attribute(&mut document, "class", "test");
+        let text = document.create_text_node(" XXXXX ");
+        test.append_child(&mut document, text);
+        document.body().append_child(&mut document, test);
+        let root = document.to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = legacy_layout_rects(&root, 800.0, 600.0).expect("legacy layout");
+        let rect_of = |index: usize| layout.iter().find(|(_, i)| *i == index).map(|p| p.0);
+        let mut dump = Vec::new();
+        for (index, node) in flat.iter().enumerate() {
+            match &node.kind {
+                ComponentKind::Text { content }
+                    if content.contains("XXXXX")
+                        || content.contains("\u{2028}")
+                        || *content == "\u{2028}"
+                        || content.chars().any(|c| c == '\u{2028}') =>
+                {
+                    dump.push(format!(
+                        "text {content:?} color={:?} z={:?} pos={:?} style_w={:?} ws={:?} marker={:?} rect={:?}",
+                        node.style.color,
+                        node.style.z_index,
+                        node.style.position,
+                        node.style.width,
+                        node.style.white_space,
+                        node.style.custom_properties.as_ref().and_then(|p| p.get("--w3cos-internal-text-line-width").cloned()),
+                        rect_of(index)
+                    ));
+                    if let Some(parent) = node.parent {
+                        let p = &flat[parent];
+                        dump.push(format!(
+                            "parent display={:?} style_w={:?} pos={:?} z={:?} font={} fam={:?} ch={} rect={:?}",
+                            p.style.display,
+                            p.style.width,
+                            p.style.position,
+                            p.style.z_index,
+                            p.style.font_size,
+                            p.style.font_family,
+                            p.style.ch_advance(),
+                            rect_of(parent)
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Also record every text leaf for diagnosis.
+        for (index, node) in flat.iter().enumerate() {
+            if let ComponentKind::Text { content } = &node.kind {
+                dump.push(format!("all-text {content:?} rect={:?}", rect_of(index)));
+            }
+        }
+        let green_ok = flat.iter().enumerate().any(|(index, node)| {
+            matches!(&node.kind, ComponentKind::Text { content } if content.contains("XXXXX") && content.starts_with(' '))
+                && rect_of(index).is_some_and(|r| r.height >= 39.0 && r.width <= 101.0)
+        });
+        assert!(
+            green_ok,
+            "expected a wrapped 5ch/100px two-line green run, got {dump:?}"
+        );
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "cpu-render")]
+    #[test]
+    fn break_spaces_006_headless_paint_covers_the_second_line() {
+        // Same tree as overflow-wrap-break-word-006, painted through the
+        // incremental/headless path the WPT runner uses.
+        use crate::font_face::{FontFace, FontRegistry, FontSource};
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        const OWNER: u64 = 202611120007;
+        struct FontOwner;
+        impl Drop for FontOwner {
+            fn drop(&mut self) {
+                FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        let _font = FontOwner;
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        ))
+        .expect("Ahem fixture");
+        FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: "Ahem".into(),
+                    src: FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .expect("register Ahem");
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "div",
+            &[
+                ("position", "relative"),
+                ("font-size", "20px"),
+                ("font-family", "Ahem"),
+                ("line-height", "1em"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".red",
+            &[
+                ("position", "absolute"),
+                ("background", "green"),
+                ("color", "red"),
+                ("width", "100px"),
+                ("height", "100px"),
+                ("z-index", "-1"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".test",
+            &[
+                ("color", "green"),
+                ("width", "5ch"),
+                ("white-space", "break-spaces"),
+                ("overflow-wrap", "break-word"),
+            ],
+        );
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost),
+            "https://example.test/overflow-wrap-006.html",
+        )
+        .unwrap();
+        parser
+            .write(
+                "<!doctype html><body>                 <p>Test passes if there is a filled green square and no red.</p>                 <div class='red'><br>XXXXX</div>                 <div class='test'> XXXXX </div>                 </body>",
+            )
+            .unwrap();
+        parser.finish().unwrap();
+        let frame =
+            crate::headless::render_document_rgba_cpu(800, 600).expect("headless cpu frame");
+        assert_eq!((frame.width, frame.height), (800, 600));
+        let mut red = Vec::new();
+        let mut green = Vec::new();
+        for y in 0..600u32 {
+            for x in 0..800u32 {
+                let i = ((y * 800 + x) * 4) as usize;
+                let r = frame.rgba[i];
+                let g = frame.rgba[i + 1];
+                let b = frame.rgba[i + 2];
+                if r >= 200 && g < 40 && b < 40 {
+                    red.push((x, y));
+                } else if g >= 100 && r < 40 && b < 40 {
+                    green.push((x, y));
+                }
+            }
+        }
+        let red_desc = if red.is_empty() {
+            "no red".to_string()
+        } else {
+            format!(
+                "red n={} bbox={}..{}x{}..{}",
+                red.len(),
+                red.iter().map(|p| p.0).min().unwrap(),
+                red.iter().map(|p| p.0).max().unwrap(),
+                red.iter().map(|p| p.1).min().unwrap(),
+                red.iter().map(|p| p.1).max().unwrap()
+            )
+        };
+        // The <br> in .red must take a line so the red XXXXX is not on the
+        // first line of the square (y=54-73). Incremental layout used to
+        // skip project_forced_break_lines and paint it there.
+        let first_line_red = red.iter().filter(|(_, y)| (54..74).contains(y)).count();
+        assert_eq!(
+            first_line_red,
+            0,
+            "red XXXXX must sit on the line after <br>, not the first line ({red_desc}, green n={})",
+            green.len()
+        );
+        w3cos_dom::stylesheet::clear_rules();
+        crate::incremental_layout::invalidate();
+    }
+
+    #[test]
+    fn unstyled_scroll_marker_group_does_not_expand_from_in_flow_markers() {
+        // style-remove: after author group styles are gone, contain:size keeps
+        // auto height at 0 and in-flow markers must not paint a full-width bar.
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller",
+            &[
+                ("overflow", "hidden"),
+                ("scroll-marker-group", "after"),
+                ("height", "100px"),
+                ("width", "100px"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(".item", &[("height", "100px"), ("width", "100px")]);
+        w3cos_dom::stylesheet::register_rule(
+            ".item::scroll-marker",
+            &[
+                ("content", "' '"),
+                ("background", "blue"),
+                ("width", "50px"),
+                ("height", "50px"),
+            ],
+        );
+        let mut document = w3cos_dom::Document::new();
+        let scroller = document.create_element("div");
+        scroller.set_attribute(&mut document, "id", "scroller");
+        for _ in 0..2 {
+            let item = document.create_element("div");
+            item.set_attribute(&mut document, "class", "item");
+            scroller.append_child(&mut document, item);
+        }
+        document.body().append_child(&mut document, scroller);
+        let root = document.to_component_tree();
+        let flat = pre_flatten(&root);
+        let layout = legacy_layout_rects(&root, 800.0, 600.0).expect("legacy layout");
+        let groups: Vec<_> =
+            flat.iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let is_group =
+                        node.style.custom_properties.as_ref().is_some_and(|p| {
+                            p.contains_key("--w3cos-internal-scroll-marker-group")
+                        });
+                    is_group.then(|| {
+                        let rect = layout.iter().find(|(_, i)| *i == index).map(|p| p.0);
+                        (node.style.height.clone(), node.style.contain, rect)
+                    })
+                })
+                .collect();
+        assert!(
+            groups
+                .iter()
+                .any(|(_, _, rect)| rect.is_some_and(|r| r.height <= 1.0)),
+            "size-contained unstyled group height must stay 0, got {groups:?}"
+        );
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[cfg(feature = "cpu-render")]
+    #[test]
+    fn unstyled_scroll_marker_group_headless_paint_has_no_full_width_bar() {
+        // style-remove after the class is gone: contain:size must clip the
+        // in-flow markers even when incremental layout skips heavy projections.
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(
+            "#scroller",
+            &[
+                ("overflow", "hidden"),
+                ("scroll-marker-group", "after"),
+                ("height", "100px"),
+                ("width", "100px"),
+            ],
+        );
+        w3cos_dom::stylesheet::register_rule(".item", &[("height", "100px"), ("width", "100px")]);
+        w3cos_dom::stylesheet::register_rule(
+            ".item::scroll-marker",
+            &[
+                ("content", "' '"),
+                ("background", "blue"),
+                ("width", "50px"),
+                ("height", "50px"),
+            ],
+        );
+        let mut parser = StreamingDocumentParser::new_with_script_host(
+            Rc::new(InertParserScriptHost),
+            "https://example.test/scroll-marker-group-style-remove.html",
+        )
+        .unwrap();
+        parser
+            .write(
+                "<!doctype html><body>                 <div id='scroller'>                 <div class='item'>1</div>                 <div class='item'>2</div>                 </div></body>",
+            )
+            .unwrap();
+        parser.finish().unwrap();
+        let frame =
+            crate::headless::render_document_rgba_cpu(800, 600).expect("headless cpu frame");
+        let mut blue = Vec::new();
+        for y in 0..600u32 {
+            for x in 0..800u32 {
+                let i = ((y * 800 + x) * 4) as usize;
+                let (r, g, b) = (frame.rgba[i], frame.rgba[i + 1], frame.rgba[i + 2]);
+                if b >= 200 && r < 40 && g < 40 {
+                    blue.push((x, y));
+                }
+            }
+        }
+        let desc = if blue.is_empty() {
+            "no blue".to_string()
+        } else {
+            format!(
+                "blue n={} bbox={}..{}x{}..{}",
+                blue.len(),
+                blue.iter().map(|p| p.0).min().unwrap(),
+                blue.iter().map(|p| p.0).max().unwrap(),
+                blue.iter().map(|p| p.1).min().unwrap(),
+                blue.iter().map(|p| p.1).max().unwrap()
+            )
+        };
+        assert!(
+            blue.len() < 2000,
+            "unstyled size-contained group must not paint a full-width marker bar ({desc})"
+        );
+        w3cos_dom::stylesheet::clear_rules();
+        crate::incremental_layout::invalidate();
     }
 
     #[test]
@@ -38477,6 +39344,12 @@ mod tests {
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (200.0, 200.0));
         crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn image_without_a_source_is_empty() {
+        let kind = ComponentKind::Image { src: String::new() };
+        assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (0.0, 0.0));
     }
 
     #[test]
