@@ -713,6 +713,16 @@ fn publish_client_rects(
         let w3cos_std::ComponentKind::Text { content } = &component.kind else {
             continue;
         };
+        // Text fragments publish only for split-inline owners: explicit
+        // owner ranges on the run or an inherited synthetic-inline owner.
+        // Without either, wrapping the run again would publish nothing.
+        if inherited_text_owners[index].is_empty()
+            && !info.style.custom_properties.as_ref().is_some_and(|properties| {
+                properties.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+            })
+        {
+            continue;
+        }
         let line_box = info
             .parent
             .and_then(|parent| by_index.get(parent).copied().flatten())
