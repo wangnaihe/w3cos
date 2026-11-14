@@ -166,7 +166,9 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
     }
     let nested = PASSES.with(|passes| !passes.borrow().is_empty());
     let fp = if retain_enabled() && !nested {
-        fingerprints(flat).unwrap_or_default()
+        take_fingerprints(flat)
+            .or_else(|| fingerprints(flat))
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -614,4 +616,77 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
             })
             .collect()
     })
+}
+
+thread_local! {
+    /// Fingerprints computed by the eligibility walk for the flat tree that
+    /// `begin_pass` lays out next: (flat pointer, length, fingerprints).
+    static LAST_FP: RefCell<Option<(usize, usize, Vec<u64>)>> = const { RefCell::new(None) };
+    /// Fingerprints of block-level subtrees the last fully supported
+    /// eligibility walk accepted.
+    static SUPPORTED: RefCell<std::collections::HashSet<u64>> = RefCell::new(Default::default());
+}
+
+fn take_fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
+    LAST_FP.with(|slot| {
+        let (ptr, len, fp) = slot.borrow_mut().take()?;
+        (ptr == flat.as_ptr() as usize && len == flat.len()).then_some(fp)
+    })
+}
+
+/// The eligibility walk for the retained path: a block-level subtree whose
+/// fingerprint the last fully supported walk accepted is skipped. `None`
+/// when the retained cache is off (the caller walks every box).
+pub(super) fn unsupported_tree_retained(
+    flat: &[FlatNodeInfo],
+    node_reason: impl Fn(usize) -> Option<&'static str>,
+) -> Option<Option<&'static str>> {
+    use w3cos_std::style::Display;
+    if !enabled() || !retain_enabled() || PASSES.with(|p| !p.borrow().is_empty()) {
+        return None;
+    }
+    let fp = fingerprints(flat)?;
+    let block_level = |index: usize| {
+        flat[index].style.display != Display::Inline
+            && !matches!(flat[index].kind, w3cos_std::ComponentKind::Text { .. })
+    };
+    let before = SUPPORTED.with(|set| std::mem::take(&mut *set.borrow_mut()));
+    let mut reason = None;
+    let mut index = 0;
+    while index < flat.len() {
+        let info = &flat[index];
+        let end = info.subtree_end.max(index + 1);
+        if info.style.display == Display::None {
+            index = end;
+            continue;
+        }
+        if fp[index] != 0 && block_level(index) && before.contains(&fp[index]) {
+            index = end;
+            continue;
+        }
+        reason = node_reason(index);
+        if reason.is_some() {
+            break;
+        }
+        index += 1;
+    }
+    if reason.is_none() {
+        let mut now = before;
+        now.clear();
+        let mut index = 0;
+        while index < flat.len() {
+            let info = &flat[index];
+            if info.style.display == Display::None {
+                index = info.subtree_end.max(index + 1);
+                continue;
+            }
+            if fp[index] != 0 && block_level(index) {
+                now.insert(fp[index]);
+            }
+            index += 1;
+        }
+        SUPPORTED.with(|set| *set.borrow_mut() = now);
+    }
+    LAST_FP.with(|slot| *slot.borrow_mut() = Some((flat.as_ptr() as usize, flat.len(), fp)));
+    Some(reason)
 }

@@ -2745,6 +2745,11 @@ fn walk_rendered(flat: &[FlatNodeInfo], mut f: impl FnMut(usize) -> bool) {
 /// `None` when every rendered node is a box this stage lays out, otherwise
 /// the first reason the legacy engine must run.
 pub(super) fn unsupported_tree(flat: &[FlatNodeInfo]) -> Option<&'static str> {
+    if let Some(reason) =
+        super::cache::unsupported_tree_retained(flat, |index| node_reason(flat, index))
+    {
+        return reason;
+    }
     let mut reason = None;
     walk_rendered(flat, |index| {
         reason = node_reason(flat, index);
