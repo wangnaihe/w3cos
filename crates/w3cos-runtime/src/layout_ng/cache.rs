@@ -169,6 +169,14 @@ pub(super) fn layout(
     let mut key = *space;
     let hit = with_pass(flat, index, |pass| {
         key = normalize(pass, index, space, false);
+        // A box laid out at a fixed inline size reads the available inline
+        // size only through percentages of it (none in an inline-free
+        // subtree) and its own auto inline margins (Blink
+        // CalculateSizeBasedLayoutCacheStatus compares the resolved inline
+        // size, not the available one).
+        if sized.is_some() && pass.inline_free[index] && !auto_inline_margin(flat, index) {
+            key.available_inline = 0.0;
+        }
         let space = &key;
         pass.layouts[index]
             .iter()
@@ -243,6 +251,12 @@ fn normalize(pass: &Pass, index: usize, space: &ConstraintSpace, min_max: bool) 
         key.available_inline = 0.0;
     }
     key
+}
+
+fn auto_inline_margin(flat: &[FlatNodeInfo], index: usize) -> bool {
+    use w3cos_std::style::Spacing;
+    let margin = &flat[index].style.margin;
+    matches!(margin.left, Spacing::Auto) || matches!(margin.right, Spacing::Auto)
 }
 
 /// Internal markers that carry no size or percentage information.
