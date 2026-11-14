@@ -533,8 +533,12 @@ fn host_id(info: &FlatNodeInfo) -> Option<u32> {
 fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
     crate::dom::try_with_document(|document| {
         let salt = mix(
-            mix(0x5157_4e47, document.serial()),
-            w3cos_dom::stylesheet::generation(),
+            mix(
+                mix(0x5157_4e47, document.serial()),
+                w3cos_dom::stylesheet::generation(),
+            ),
+            // Web fonts that finish loading change text metrics.
+            crate::font_face::FontRegistry::global().revision(),
         );
         let revision = |id: u32| document.style_revision(w3cos_dom::NodeId::from_u32(id));
         // A box with neither a DOM node nor a split-inline owner (and not a
@@ -552,6 +556,18 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                     .as_ref()
                     .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
                     .and_then(|v| v.parse::<u32>().ok());
+                // Replaced and form content reads state no style revision
+                // tracks (an image's natural size arrives when it decodes).
+                if !matches!(
+                    info.kind,
+                    w3cos_std::ComponentKind::Root
+                        | w3cos_std::ComponentKind::Column
+                        | w3cos_std::ComponentKind::Row
+                        | w3cos_std::ComponentKind::Box
+                        | w3cos_std::ComponentKind::Text { .. }
+                ) {
+                    known[index] = false;
+                }
                 match host_id(info) {
                     Some(id) => {
                         h = mix(h, id as u64);
@@ -559,7 +575,7 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                     }
                     None => {
                         h = mix(h, u64::MAX);
-                        known[index] = owner.is_some()
+                        known[index] &= owner.is_some()
                             || matches!(info.kind, w3cos_std::ComponentKind::Text { .. });
                     }
                 }
