@@ -1108,12 +1108,16 @@ fn inline_text_reason(
             WhiteSpace::PreLine => line_width,
             // (line-height: normal mixes the strut's computed line height
             // with the font's line spacing differently in legacy.)
-            // Trailing newlines still stay on legacy (the paragraph
-            // wrapper / letter-spacing-end-of-line path). `line-height:
+            // A trailing newline ends the last line (no empty line after
+            // it; see the preserved-newline split in layout_lines). `line-height:
             // normal` is allowed: the sole-leaf path uses the same strut
             // + face metrics as a specified unit line-height of 1em on
             // Ahem, which is Blink's used line box for these pre leaves.
-            WhiteSpace::Pre | WhiteSpace::PreWrap => line_width || !content.ends_with('\n'),
+            // (A leaf of newlines only stays on legacy: its empty lines
+            // under a line-clamp ancestor differ, line-clamp-026.)
+            WhiteSpace::Pre | WhiteSpace::PreWrap => {
+                line_width || !content.ends_with('\n') || content.contains(|c| c != '\n')
+            }
             // Collapsed (not preserved) newlines are wrap spaces, CSS Text 3
             // 4.1.2. Only take this on a line-clamp container: a general
             // paragraph with source newlines still uses the legacy path
@@ -2819,7 +2823,14 @@ fn layout_lines(
         let (line, baseline) = text_line_metrics(content, style);
         let ascent = strut_ascent.max(baseline);
         let single = ascent + strut_descent.max(line - baseline);
-        let line_count = content.split('\n').count();
+        // A trailing preserved newline ends the last line; it opens no
+        // empty line after it (Blink: a forced break at the end of the
+        // block's content creates no further line box).
+        let line_count = content
+            .strip_suffix('\n')
+            .unwrap_or(content)
+            .split('\n')
+            .count();
         let (clamp_n, use_ellipsis) = match clamp_budget(container, space) {
             Some((n, e)) => (Some(n), e),
             None => (None, false),
