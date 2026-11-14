@@ -53,11 +53,17 @@ struct Cache {
     /// multicol box anywhere: a block subtree's used box cannot depend on
     /// anything but its containing block width.
     splice_ok: bool,
+    /// [`splice_ok`] except that split-inline fragments are allowed: the
+    /// structural splice republishes their CSSOM fragment rects per owner.
+    splice_owners_ok: bool,
     /// Engine flags of the whole tree, reused for a spliced subtree.
     skip_projections: bool,
     measure_text: bool,
     /// The component tree was spliced; `node_ids` and the Taffy tree are stale.
     node_ids_stale: bool,
+    /// Boxes per CSSOM fragment owner in `component` (see
+    /// [`collect_cssom_owners`]); built on the first splice that needs it.
+    owner_counts: Option<HashMap<u32, u32>>,
 }
 
 thread_local! {
@@ -144,8 +150,8 @@ pub fn flush() -> bool {
         let Some(cache) = slot.as_mut() else {
             return false;
         };
-        if !cache.splice_ok || cache.structure == layout_gen {
-            if !cache.splice_ok && splice::debug_enabled() {
+        if !cache.splice_owners_ok || cache.structure == layout_gen {
+            if !cache.splice_owners_ok && splice::debug_enabled() {
                 eprintln!("[splice] retained tree is not spliceable");
             }
             return false;
@@ -158,6 +164,7 @@ pub fn flush() -> bool {
                 eprintln!("[splice] dirty list drained elsewhere");
             }
             cache.splice_ok = false;
+            cache.splice_owners_ok = false;
             taken = Some((after, dirty, after));
             return false;
         }
@@ -192,6 +199,7 @@ pub fn flush() -> bool {
             if !complete {
                 // Another consumer drained mutations this cache never saw.
                 cache.splice_ok = false;
+                cache.splice_owners_ok = false;
             }
         }
         let structure_matches = slot
@@ -298,6 +306,7 @@ fn rebuild(
     let t5 = std::time::Instant::now();
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
+    let splice_owners_ok = splice_ok || splice::tree_is_spliceable_with_owners(&component);
     if phase {
         let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros();
         eprintln!(
@@ -317,9 +326,11 @@ fn rebuild(
         drain_epoch,
         sheet_generation: w3cos_dom::stylesheet::generation(),
         splice_ok,
+        splice_owners_ok,
         skip_projections,
         measure_text,
         node_ids_stale: false,
+        owner_counts: None,
         component,
         engine,
         structure: layout_gen,
@@ -340,6 +351,8 @@ fn patch_and_compute(
     viewport_h: f32,
     geometry_only: bool,
 ) -> bool {
+    // A patch can restyle boxes in place; recount fragment owners lazily.
+    cache.owner_counts = None;
     if dirty.is_empty() {
         // A cascade change with no dirty box can restyle descendants. Rebuild.
         if geometry_only {
@@ -602,6 +615,77 @@ fn publish_client_rects(
     layouts: &[(crate::layout::LayoutRect, usize)],
     ng_text: &[crate::layout_ng::TextFragment],
 ) {
+    let published = client_rects_for(flat, layouts, ng_text);
+    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
+}
+
+/// Every CSSOM fragment owner a box of `component` publishes rects for: the
+/// split-inline owner of a synthetic fragment, block-in-inline box owners,
+/// and the owner ranges of a text run. Counts boxes per owner.
+pub(super) fn collect_cssom_owners(component: &Component, counts: &mut HashMap<u32, u32>) {
+    let mut stack = vec![component];
+    while let Some(component) = stack.pop() {
+        let style = &component.style;
+        if let Some(properties) = style.custom_properties.as_ref() {
+            if let Some(owner) = properties
+                .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                *counts.entry(owner).or_default() += 1;
+            }
+            for owner in w3cos_std::inline_text::cssom_box_owners(style) {
+                *counts.entry(owner).or_default() += 1;
+            }
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                for (owner, _, _) in w3cos_std::inline_text::cssom_owner_ranges(content, style) {
+                    *counts.entry(owner).or_default() += 1;
+                }
+            }
+        }
+        stack.extend(component.children.iter());
+    }
+}
+
+/// Replace the published rects of the owners a splice rebuilt. `removed`
+/// owners lose their entries, `inserted` ones get the subtree's rects moved
+/// by (`dx`, `dy`), and every rect of a `shifted` owner moves down by `dh`.
+pub(super) fn splice_client_rects(
+    removed: impl Iterator<Item = u32>,
+    inserted: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+    dx: f32,
+    dy: f32,
+    shifted: impl Iterator<Item = u32>,
+    dh: f32,
+) {
+    CLIENT_RECTS.with(|rects| {
+        let mut rects = rects.borrow_mut();
+        for owner in removed {
+            rects.remove(&owner);
+        }
+        if dh != 0.0 {
+            for owner in shifted {
+                if let Some(list) = rects.get_mut(&owner) {
+                    for rect in list {
+                        rect.y += dh;
+                    }
+                }
+            }
+        }
+        for (owner, mut list) in inserted {
+            for rect in &mut list {
+                rect.x += dx;
+                rect.y += dy;
+            }
+            rects.insert(owner, list);
+        }
+    });
+}
+
+pub(super) fn client_rects_for(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+    ng_text: &[crate::layout_ng::TextFragment],
+) -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
     let mut by_index = vec![None; flat.len()];
     for (rect, index) in layouts {
         if let Some(slot) = by_index.get_mut(*index) {
@@ -950,8 +1034,9 @@ fn publish_client_rects(
         let zero_after = w3cos_dom::DOMRect::new(union.x, union.y + union.height, 0.0, 0.0);
         *rects = vec![zero_before, middle, zero_after];
     }
-    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
+    published
 }
+
 
 fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
     crate::dom::with_document_mut(|document| {
