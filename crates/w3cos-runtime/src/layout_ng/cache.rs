@@ -70,13 +70,14 @@ thread_local! {
     static RETAINED: RefCell<Retained> = RefCell::new(Retained::default());
 }
 
-/// `W3COS_LAYOUT_NG_RETAIN=1` keeps layout results across flushes.
+/// Layout results are kept across flushes (Blink's CachedLayoutResult on
+/// the box); `W3COS_LAYOUT_NG_RETAIN=0` turns retention off.
 fn retain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("W3COS_LAYOUT_NG_RETAIN").ok().as_deref(),
-            Some("1") | Some("true")
+            Some("0") | Some("false")
         )
     })
 }
