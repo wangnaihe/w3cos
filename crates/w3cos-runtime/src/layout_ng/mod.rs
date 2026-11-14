@@ -69,6 +69,22 @@ pub(crate) fn mode_from_env(
     }
 }
 
+/// A node's style was patched in place (see `cache::note_restyled`).
+pub(crate) fn note_restyled(id: u32) {
+    cache::note_restyled(id);
+}
+
+/// The tree was edited other than by an in-place restyle.
+pub(crate) fn forget_patch_memo() {
+    cache::forget_patch_memo();
+}
+
+/// Mark (or with `None` end) the flush laying out patched `flat` under
+/// structure `key`.
+pub(crate) fn set_patch_hint(flat: Option<(&[crate::layout::FlatNodeInfo], (u64, u64))>) {
+    cache::set_patch_hint(flat);
+}
+
 pub(crate) fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| {

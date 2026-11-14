@@ -146,13 +146,39 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
     let mut block_free = vec![true; flat.len()];
     let mut inline_free = vec![true; flat.len()];
     // Subtree flags: a box is clean when it and every box below it is.
+    // Flags of boxes not restyled since the last patch pass carry over.
+    let hint = PATCH_HINT
+        .with(|hint| hint.get())
+        .filter(|h| h.flat_ptr == flat.as_ptr() as usize && h.flat_len == flat.len());
+    let mut memo = hint.and_then(|h| {
+        OWN_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo
+                .as_ref()
+                .is_some_and(|m| m.epoch == h.epoch && m.flags.len() == flat.len())
+            {
+                memo.take()
+            } else {
+                None
+            }
+        })
+    });
     for index in (0..flat.len()).rev() {
-        let (block_dep, inline_dep) = percent_dependence(&flat[index]);
-        let mut ok = (
-            !super::block::is_author_grid(flat[index].style),
-            !block_dep,
-            !inline_dep,
-        );
+        let own = match memo.as_mut().map(|m| &mut m.flags[index]) {
+            Some(flags) if *flags & FLAGS_VALID != 0 => *flags,
+            slot => {
+                let (block_dep, inline_dep) = percent_dependence(&flat[index]);
+                let flags = FLAGS_VALID
+                    | super::block::is_author_grid(flat[index].style) as u8
+                    | (block_dep as u8) << 1
+                    | (inline_dep as u8) << 2;
+                if let Some(slot) = slot {
+                    *slot = flags;
+                }
+                flags
+            }
+        };
+        let mut ok = (own & 1 == 0, own & 2 == 0, own & 4 == 0);
         let end = flat[index].subtree_end.max(index + 1).min(flat.len());
         let mut child = index + 1;
         while child < end {
@@ -164,6 +190,9 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
         cacheable[index] = ok.0;
         block_free[index] = ok.1;
         inline_free[index] = ok.2;
+    }
+    if let Some(memo) = memo {
+        OWN_MEMO.with(|slot| *slot.borrow_mut() = Some(memo));
     }
     let nested = PASSES.with(|passes| !passes.borrow().is_empty());
     let fp = if retain_enabled() && !nested {
@@ -524,6 +553,76 @@ fn host_id(info: &FlatNodeInfo) -> Option<u32> {
     }
 }
 
+/// The flush that lays out a patched tree in place: its flat tree and the
+/// structure generation it was lowered under. Only then do per-box inputs
+/// carry over from the last pass (`OWN_MEMO`).
+#[derive(Clone, Copy)]
+struct PatchHint {
+    key: (u64, u64),
+    epoch: u64,
+    flat_ptr: usize,
+    flat_len: usize,
+}
+
+/// Per-box fingerprint inputs and percent/grid flags from the last pass
+/// over a patched structure.
+struct OwnMemo {
+    key: (u64, u64),
+    epoch: u64,
+    salt: u64,
+    host: Vec<Option<u32>>,
+    owner: Vec<Option<u32>>,
+    text: Vec<(usize, usize)>,
+    own: Vec<u64>,
+    known: Vec<bool>,
+    /// `FLAGS_VALID` plus grid / block-percent / inline-percent bits.
+    flags: Vec<u8>,
+}
+
+const FLAGS_VALID: u8 = 0x80;
+
+thread_local! {
+    static PATCH_HINT: std::cell::Cell<Option<PatchHint>> = const { std::cell::Cell::new(None) };
+    static PATCH_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static OWN_MEMO: RefCell<Option<OwnMemo>> = const { RefCell::new(None) };
+    /// Nodes restyled in place since the last pass recorded `OWN_MEMO`.
+    static RESTYLED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A node's style changed in place (no re-lower).
+pub(super) fn note_restyled(id: u32) {
+    RESTYLED.with(|ids| {
+        let mut ids = ids.borrow_mut();
+        if ids.len() >= 4096 {
+            ids.clear();
+            OWN_MEMO.with(|memo| *memo.borrow_mut() = None);
+        }
+        ids.push(id);
+    });
+}
+
+/// Forget carried-over per-box inputs (the tree changed some other way).
+pub(super) fn forget_patch_memo() {
+    OWN_MEMO.with(|memo| *memo.borrow_mut() = None);
+}
+
+/// Mark (or with `None` end) the patch flush over `flat`.
+pub(super) fn set_patch_hint(flat: Option<(&[FlatNodeInfo], (u64, u64))>) {
+    let hint = flat.map(|(flat, key)| {
+        let epoch = PATCH_EPOCH.with(|epoch| {
+            epoch.set(epoch.get() + 1);
+            epoch.get()
+        });
+        PatchHint {
+            key,
+            epoch,
+            flat_ptr: flat.as_ptr() as usize,
+            flat_len: flat.len(),
+        }
+    });
+    PATCH_HINT.with(|slot| slot.set(hint));
+}
+
 /// Per-box fingerprint of everything a box's layout reads besides its
 /// constraint space (Blink's NeedsLayout bits, computed instead of
 /// tracked): for every box of the subtree its DOM node and that node's
@@ -545,71 +644,142 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
         // A box with neither a DOM node nor a split-inline owner (and not a
         // text leaf, whose style is its parent's) has a style no revision
         // tracks: it and its ancestors are not retained.
+        let hint = PATCH_HINT.with(|hint| hint.get());
+        let hinted =
+            hint.filter(|h| h.flat_ptr == flat.as_ptr() as usize && h.flat_len == flat.len());
+        let mut memo = if hinted.is_some() {
+            OWN_MEMO.with(|memo| memo.borrow_mut().take())
+        } else {
+            None
+        }
+        .filter(|memo| {
+            Some(memo.key) == hinted.map(|h| h.key)
+                && memo.salt == salt
+                && memo.own.len() == flat.len()
+        });
+        let dirty: std::collections::HashSet<u32, w3cos_std::fxhash::FxBuildHasher> =
+            if memo.is_some() {
+                RESTYLED.with(|ids| ids.borrow().iter().copied().collect())
+            } else {
+                Default::default()
+            };
+        let text_key = |info: &FlatNodeInfo| match info.kind {
+            w3cos_std::ComponentKind::Text { content } => {
+                (content.as_ptr() as usize, content.len())
+            }
+            _ => (0, 0),
+        };
+        let compute = |info: &FlatNodeInfo| -> (u64, bool, Option<u32>) {
+            let mut h = salt;
+            let mut ok = true;
+            let owner = info
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
+                .and_then(|v| v.parse::<u32>().ok());
+            // Replaced and form content reads state no style revision
+            // tracks (an image's natural size arrives when it decodes).
+            if !matches!(
+                info.kind,
+                w3cos_std::ComponentKind::Root
+                    | w3cos_std::ComponentKind::Column
+                    | w3cos_std::ComponentKind::Row
+                    | w3cos_std::ComponentKind::Box
+                    | w3cos_std::ComponentKind::Text { .. }
+            ) {
+                ok = false;
+            }
+            match host_id(info) {
+                Some(id) => {
+                    h = mix(h, id as u64);
+                    h = mix(h, revision(id));
+                }
+                None => {
+                    h = mix(h, u64::MAX);
+                    ok &= owner.is_some()
+                        || matches!(info.kind, w3cos_std::ComponentKind::Text { .. });
+                }
+            }
+            if let Some(owner) = owner {
+                h = mix(h, owner as u64);
+                h = mix(h, revision(owner));
+            }
+            let style = info.style;
+            h = mix(h, style.display as u64);
+            h = mix(h, style.position as u64);
+            h = mix(h, style.float as u64);
+            h = mix(h, {
+                use std::hash::{Hash, Hasher};
+                let mut kind = std::collections::hash_map::DefaultHasher::new();
+                std::mem::discriminant(info.kind).hash(&mut kind);
+                kind.finish()
+            });
+            if let w3cos_std::ComponentKind::Text { content } = info.kind {
+                h = hash_bytes(h, content.as_bytes());
+                // (A lowered text leaf carries its parent's style; a
+                // leaf built with its own keeps the fields text
+                // measure reads.)
+                h = mix(h, style.font_size.to_bits() as u64);
+                h = mix(h, style.line_height.to_bits() as u64);
+                h = mix(h, style.line_height_is_normal as u64);
+                h = mix(h, style.writing_mode as u64);
+                h = mix(h, style.white_space as u64);
+                h = mix(h, style.direction as u64);
+                h = hash_bytes(h, style.font_family.as_deref().unwrap_or("").as_bytes());
+            }
+            (h, ok, owner)
+        };
         let mut known = vec![true; flat.len()];
-        let own: Vec<u64> = flat
-            .iter()
-            .enumerate()
-            .map(|(index, info)| {
-                let mut h = salt;
-                let owner = info
-                    .style
-                    .custom_properties
-                    .as_ref()
-                    .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
-                    .and_then(|v| v.parse::<u32>().ok());
-                // Replaced and form content reads state no style revision
-                // tracks (an image's natural size arrives when it decodes).
-                if !matches!(
-                    info.kind,
-                    w3cos_std::ComponentKind::Root
-                        | w3cos_std::ComponentKind::Column
-                        | w3cos_std::ComponentKind::Row
-                        | w3cos_std::ComponentKind::Box
-                        | w3cos_std::ComponentKind::Text { .. }
-                ) {
-                    known[index] = false;
-                }
-                match host_id(info) {
-                    Some(id) => {
-                        h = mix(h, id as u64);
-                        h = mix(h, revision(id));
-                    }
-                    None => {
-                        h = mix(h, u64::MAX);
-                        known[index] &= owner.is_some()
-                            || matches!(info.kind, w3cos_std::ComponentKind::Text { .. });
-                    }
-                }
-                if let Some(owner) = owner {
-                    h = mix(h, owner as u64);
-                    h = mix(h, revision(owner));
-                }
-                let style = info.style;
-                h = mix(h, style.display as u64);
-                h = mix(h, style.position as u64);
-                h = mix(h, style.float as u64);
-                h = mix(h, {
-                    use std::hash::{Hash, Hasher};
-                    let mut kind = std::collections::hash_map::DefaultHasher::new();
-                    std::mem::discriminant(info.kind).hash(&mut kind);
-                    kind.finish()
-                });
-                if let w3cos_std::ComponentKind::Text { content } = info.kind {
-                    h = hash_bytes(h, content.as_bytes());
-                    // (A lowered text leaf carries its parent's style; a
-                    // leaf built with its own keeps the fields text
-                    // measure reads.)
-                    h = mix(h, style.font_size.to_bits() as u64);
-                    h = mix(h, style.line_height.to_bits() as u64);
-                    h = mix(h, style.line_height_is_normal as u64);
-                    h = mix(h, style.writing_mode as u64);
-                    h = mix(h, style.white_space as u64);
-                    h = mix(h, style.direction as u64);
-                    h = hash_bytes(h, style.font_family.as_deref().unwrap_or("").as_bytes());
-                }
-                h
-            })
-            .collect();
+        let mut own = vec![0u64; flat.len()];
+        let mut next = OwnMemo {
+            key: hinted.map_or((0, 0), |h| h.key),
+            epoch: hinted.map_or(0, |h| h.epoch),
+            salt,
+            host: Vec::with_capacity(flat.len()),
+            owner: Vec::with_capacity(flat.len()),
+            text: Vec::with_capacity(flat.len()),
+            own: Vec::new(),
+            known: Vec::new(),
+            flags: memo
+                .as_mut()
+                .map(|m| std::mem::take(&mut m.flags))
+                .unwrap_or_else(|| vec![0; flat.len()]),
+        };
+        for (index, info) in flat.iter().enumerate() {
+            let host = host_id(info);
+            let text = text_key(info);
+            // Blink's NeedsLayout, tracked instead of recomputed: a box
+            // whose node was not restyled since the last pass over this
+            // structure keeps its inputs.
+            if let Some(m) = memo.as_ref()
+                && m.host[index] == host
+                && m.text[index] == text
+                && host.is_none_or(|id| !dirty.contains(&id))
+                && m.owner[index].is_none_or(|id| !dirty.contains(&id))
+            {
+                own[index] = m.own[index];
+                known[index] = m.known[index];
+                next.owner.push(m.owner[index]);
+            } else {
+                let (h, ok, owner) = compute(info);
+                own[index] = h;
+                known[index] = ok;
+                next.owner.push(owner);
+                next.flags[index] = 0;
+            }
+            next.host.push(host);
+            next.text.push(text);
+        }
+        if hinted.is_some() {
+            RESTYLED.with(|ids| ids.borrow_mut().clear());
+            next.own = own.clone();
+            next.known = known.clone();
+            OWN_MEMO.with(|slot| *slot.borrow_mut() = Some(next));
+        } else if hint.is_none() {
+            RESTYLED.with(|ids| ids.borrow_mut().clear());
+            OWN_MEMO.with(|slot| *slot.borrow_mut() = None);
+        }
         let mut subtree = vec![0u64; flat.len()];
         for index in (0..flat.len()).rev() {
             let end = flat[index].subtree_end.max(index + 1).min(flat.len());
@@ -667,9 +837,11 @@ pub(super) fn unsupported_tree_retained(
         flat[index].style.display != Display::Inline
             && !matches!(flat[index].kind, w3cos_std::ComponentKind::Text { .. })
     };
-    let before = SUPPORTED.with(|set| std::mem::take(&mut *set.borrow_mut()));
+    let mut before = SUPPORTED.with(|set| std::mem::take(&mut *set.borrow_mut()));
     let mut reason = None;
     let mut index = 0;
+    // Block-level boxes this walk checked itself (not skipped as accepted).
+    let mut walked = Vec::new();
     while index < flat.len() {
         let info = &flat[index];
         let end = info.subtree_end.max(index + 1);
@@ -685,9 +857,18 @@ pub(super) fn unsupported_tree_retained(
         if reason.is_some() {
             break;
         }
+        if fp[index] != 0 && block_level(index) {
+            walked.push(fp[index]);
+        }
         index += 1;
     }
-    if reason.is_none() {
+    // A fingerprint names a subtree's inputs, so an accepted one stays
+    // accepted: add what this walk checked instead of re-inserting every
+    // box. Rebuild when stale entries outgrow the tree.
+    if reason.is_none() && !before.is_empty() && before.len() + walked.len() <= 2 * flat.len() {
+        before.extend(walked);
+        SUPPORTED.with(|set| *set.borrow_mut() = before);
+    } else if reason.is_none() {
         let mut now = before;
         now.clear();
         let mut index = 0;

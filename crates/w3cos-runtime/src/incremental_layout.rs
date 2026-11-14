@@ -473,6 +473,7 @@ fn patch_and_compute(
             viewport_h,
         )
     {
+        crate::layout_ng::forget_patch_memo();
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         return true;
@@ -516,10 +517,12 @@ fn patch_and_compute(
         }
     }
     let compute_started = std::time::Instant::now();
-    let Ok(results) = cache
+    crate::layout_ng::set_patch_hint(Some((&flat, (cache.structure, cache.source_structure))));
+    let computed = cache
         .engine
-        .compute(&cache.component, &flat, viewport_w, viewport_h)
-    else {
+        .compute(&cache.component, &flat, viewport_w, viewport_h);
+    crate::layout_ng::set_patch_hint(None);
+    let Ok(results) = computed else {
         return false;
     };
     let compute_us = compute_started.elapsed().as_micros();
@@ -1320,6 +1323,7 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
+        crate::layout_ng::note_restyled(id);
         let private_metadata = component
             .style
             .custom_properties

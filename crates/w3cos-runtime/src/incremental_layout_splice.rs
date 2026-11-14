@@ -1280,6 +1280,7 @@ pub(super) fn try_splice(
                 }
                 // Engine flags are whole-tree properties: a full rebuild would
                 // derive them from the spliced tree, so the subtree uses those.
+                crate::layout_ng::forget_patch_memo();
                 let old_subtree =
                     std::mem::replace(at_path_mut(&mut cache.component, &plan.path), fresh);
                 let skip = spliced_skip_projections(
@@ -1317,6 +1318,7 @@ pub(super) fn try_splice(
             }
         }
         PlanKind::Tail { keep, tail } => {
+            crate::layout_ng::forget_patch_memo();
             let target = at_path_mut(&mut cache.component, &plan.path);
             let removed = target.children.split_off(keep);
             target.children.extend(tail);
@@ -1326,6 +1328,7 @@ pub(super) fn try_splice(
                 &at_path(&cache.component, &plan.path).children[keep..],
             );
             let measure = text_metric_after_edit(cache, &plan.path);
+            crate::layout_ng::forget_patch_memo();
             let target = at_path_mut(&mut cache.component, &plan.path);
             let tail = target.children.split_off(keep);
             target.children.extend(removed);
@@ -1550,6 +1553,7 @@ pub(super) fn try_splice(
     }
     cache.skip_projections = skip_projections;
     cache.measure_text = measure_text;
+    crate::layout_ng::forget_patch_memo();
     let target = at_path_mut(&mut cache.component, &plan.path);
     SPLICES.with(|count| {
         let (subtree, tail) = count.get();
@@ -1831,6 +1835,7 @@ pub(super) fn try_style_subtree(
         // The text run's line-width mark lives on the children. The element's
         // own style stays the computed style already assigned, so a later
         // background edit is still paint-only.
+        crate::layout_ng::forget_patch_memo();
         at_path_mut(&mut cache.component, &solve_path).children = relowered.children;
     }
     cache.engine.invalidate();
