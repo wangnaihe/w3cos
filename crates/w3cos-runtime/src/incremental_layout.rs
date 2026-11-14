@@ -724,9 +724,28 @@ pub(super) fn client_rects_for(
                     || properties.contains_key("--w3cos-internal-split-inline-fragment")
             })
     };
+    // Read each box's markers once; the text walk below visits every
+    // ancestor of every text leaf.
+    let synthetic: Vec<bool> = flat.iter().map(synthetic_inline).collect();
+    let synthetic_owner: Vec<Option<u32>> = flat
+        .iter()
+        .zip(&synthetic)
+        .map(|(info, &synthetic)| synthetic.then(|| split_inline_owner(info)).flatten())
+        .collect();
+    let any_synthetic_owner = synthetic_owner.iter().any(Option::is_some);
+    // LayoutNG line fragments grouped by box, in emission order.
+    let mut ng_lines_of: HashMap<usize, Vec<&crate::layout_ng::TextFragment>> = HashMap::new();
+    for fragment in ng_text {
+        if !fragment.vertical {
+            ng_lines_of.entry(fragment.index).or_default().push(fragment);
+        }
+    }
     let mut inherited_text_owners = vec![Vec::new(); flat.len()];
     let mut text_line_owners = HashSet::new();
     for (index, info) in flat.iter().enumerate() {
+        if !any_synthetic_owner {
+            break;
+        }
         if !info.component.is_some_and(|component| {
             matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
         }) {
@@ -737,8 +756,7 @@ pub(super) fn client_rects_for(
             let Some(ancestor) = flat.get(parent_index) else {
                 break;
             };
-            if synthetic_inline(ancestor)
-                && let Some(owner) = split_inline_owner(ancestor)
+            if let Some(owner) = synthetic_owner[parent_index]
                 && !inherited_text_owners[index].contains(&owner)
             {
                 inherited_text_owners[index].push(owner);
@@ -748,7 +766,7 @@ pub(super) fn client_rects_for(
         }
     }
     for (index, info) in flat.iter().enumerate() {
-        let synthetic_inline = synthetic_inline(info);
+        let synthetic_inline = synthetic[index];
         let Some(mut rect) = by_index.get(index).copied().flatten() else {
             continue;
         };
@@ -840,17 +858,14 @@ pub(super) fn client_rects_for(
         // LayoutNG laid this text out: its line fragments (byte ranges of
         // `content` with their physical rects) are where the owner ranges
         // sit, so CSSOM reads them instead of re-wrapping the run.
-        let ng_lines = ng_text
-            .iter()
-            .filter(|fragment| fragment.index == index && !fragment.vertical)
-            .collect::<Vec<_>>();
+        let ng_lines = ng_lines_of.get(&index).map(Vec::as_slice).unwrap_or(&[]);
         if !ng_lines.is_empty() {
             let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(content, info.style);
             let explicit_owners = owner_ranges
                 .iter()
                 .map(|(owner, _, _)| *owner)
                 .collect::<HashSet<_>>();
-            for fragment in &ng_lines {
+            for fragment in ng_lines {
                 let (line_start, line_end) = (fragment.start, fragment.end.min(content.len()));
                 if line_start > line_end
                     || !content.is_char_boundary(line_start)

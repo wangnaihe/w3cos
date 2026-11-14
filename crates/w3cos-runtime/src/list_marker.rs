@@ -4,7 +4,6 @@ use crate::layout::{
     inline_font_content_ascent, inline_font_height, inline_style_alignment_keyword,
     inline_style_baseline_offset, relative_flow_offset, resolve_spacing_for_layout,
 };
-use std::collections::HashMap;
 use w3cos_std::style::{Display, Float, Position, TextDirection};
 use w3cos_std::{ComponentKind, Style};
 
@@ -73,7 +72,7 @@ fn in_flow_descendant(flat: &[FlatNodeInfo<'_>], mut index: usize, owner: usize)
 
 fn flow_translation(
     flat: &[FlatNodeInfo<'_>],
-    positions: &HashMap<usize, usize>,
+    positions: &Positions,
     layouts: &[(LayoutRect, usize)],
     mut index: usize,
     context: usize,
@@ -101,6 +100,26 @@ fn flow_translation(
     result
 }
 
+/// Flat index -> position in `layouts` (a dense table: every flushed box
+/// has at most one layout entry).
+struct Positions(Vec<usize>);
+
+impl Positions {
+    fn new(layouts: &[(LayoutRect, usize)], len: usize) -> Self {
+        let mut table = vec![usize::MAX; len];
+        for (position, (_, index)) in layouts.iter().enumerate() {
+            if let Some(slot) = table.get_mut(*index) {
+                *slot = position;
+            }
+        }
+        Self(table)
+    }
+
+    fn get(&self, index: &usize) -> Option<&usize> {
+        self.0.get(*index).filter(|position| **position != usize::MAX)
+    }
+}
+
 pub(crate) fn project(
     layouts: &mut [(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
@@ -117,11 +136,7 @@ pub(crate) fn project(
     if markers.is_empty() {
         return;
     }
-    let positions: HashMap<_, _> = layouts
-        .iter()
-        .enumerate()
-        .map(|(position, (_, index))| (*index, position))
-        .collect();
+    let positions = Positions::new(layouts, flat.len());
     let contexts = float_content_contexts(flat);
     let mut visible = vec![true; flat.len()];
     let mut floats = Vec::new();
