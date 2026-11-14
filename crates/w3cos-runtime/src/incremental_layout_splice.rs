@@ -1816,7 +1816,7 @@ pub(super) fn try_style_subtree(
 }
 
 /// Debug aid: compare every spliced rect with a from-scratch layout.
-fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
+pub(super) fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
     let component = crate::dom::to_component_tree();
     let flat = pre_flatten(&component);
     let mut engine = LayoutEngine::new();
@@ -2674,6 +2674,51 @@ mod tests {
         crate::dom::class_list_remove(items[0], "wide");
         assert!(crate::incremental_layout::flush());
         assert_matches_full("class off");
+        crate::stylesheet::clear_rules();
+    }
+
+    /// A padding class toggle under LayoutNG patches the retained component
+    /// (no Taffy tree to patch) instead of re-lowering the document.
+    #[test]
+    fn class_padding_toggle_keeps_lowered_tree() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".pad", &[("padding", "12px")]);
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        // Row flex messages with auto width (a chat log): the bubble is not
+        // the subtree path's scope, so this exercises the retained compute.
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let row = crate::dom::create_element("div");
+            style(row, &[("display", "flex"), ("gap", "6px")]);
+            let avatar = crate::dom::create_element("div");
+            style(avatar, &[("width", "20px"), ("height", "20px")]);
+            let bubble = crate::dom::create_element("div");
+            style(bubble, &[("min-width", "0px")]);
+            crate::dom::append_child(
+                bubble,
+                crate::dom::create_text_node(&format!(
+                    "message {index} alpha beta gamma delta epsilon zeta eta theta"
+                )),
+            );
+            crate::dom::append_child(row, avatar);
+            crate::dom::append_child(row, bubble);
+            crate::dom::append_child(crate::dom::body_id(), row);
+            items.push(bubble);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("rows initial");
+        crate::dom::class_list_add(items[1], "pad");
+        assert!(crate::incremental_layout::flush());
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            let stats = crate::incremental_layout::last_flush_stats();
+            assert_eq!(stats.kind, "retained", "padding on");
+        }
+        assert_matches_full("padding on");
+        crate::dom::class_list_remove(items[1], "pad");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("padding off");
         crate::stylesheet::clear_rules();
     }
 

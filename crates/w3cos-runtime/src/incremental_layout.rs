@@ -412,6 +412,18 @@ fn patch_and_compute(
             })
             .map(|memo| (memo.rects.clone(), memo.client_rects.clone()))
     });
+    // LayoutNG lays out the patched component itself (no Taffy tree to
+    // patch). Only accept edits that leave the lowered subtree as a fresh
+    // lower would produce it: the DOM's lowering reads the element's
+    // formatting, font, width auto-ness, and text alignment (the sole text
+    // run's line-width marker), so those edits rebuild.
+    // (Checked after the subtree path below, which re-lowers what it needs.)
+    let ng_relower = crate::layout_ng::mode() == crate::layout_ng::Mode::On
+        && !cache.engine.tree_valid()
+        && styles.iter().any(|(id, style)| {
+            component_style(&cache.component, *id)
+                .is_none_or(|old| !ng_lowering_stable(old, style))
+        });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
@@ -446,6 +458,9 @@ fn patch_and_compute(
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         return true;
+    }
+    if ng_relower {
+        return false;
     }
     let phase = phase_log_enabled();
     let flatten_started = std::time::Instant::now();
@@ -490,6 +505,9 @@ fn patch_and_compute(
         );
     }
     note_flush("retained", flat.len() as u32, 0);
+    if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() {
+        splice::verify(viewport_w, viewport_h, styles[0].0);
+    }
     cache.viewport_w_bits = viewport_w.to_bits();
     cache.viewport_h_bits = viewport_h.to_bits();
     if let Some((node, bits)) = single_px_width(&styles) {
@@ -1170,6 +1188,33 @@ fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::S
         && old.direction == new.direction
         && old.writing_mode == new.writing_mode
         && old.logical_overrides == new.logical_overrides
+}
+
+/// A style edit after which the element's lowered children are unchanged.
+fn ng_lowering_stable(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    let internal = |style: &w3cos_std::style::Style| {
+        let mut keys = style
+            .custom_properties
+            .iter()
+            .flat_map(|properties| properties.iter())
+            .filter(|(key, _)| {
+                key.starts_with("--w3cos-internal")
+                    && key.as_str() != w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER
+                    && key.as_str() != w3cos_std::inline_text::CSSOM_OWNER_RANGES
+                    && key.as_str() != w3cos_std::inline_text::CSSOM_BOX_OWNERS
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    };
+    geometry_only_change(old, new)
+        && matches!(old.width, Dimension::Auto) == matches!(new.width, Dimension::Auto)
+        && old.text_indent == new.text_indent
+        && old.text_align == new.text_align
+        && old.overflow_x == new.overflow_x
+        && old.overflow_y == new.overflow_y
+        && internal(old) == internal(new)
 }
 
 fn assign_layout_style(
