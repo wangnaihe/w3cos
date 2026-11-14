@@ -1515,7 +1515,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // Open inline boxes; a top/bottom-aligned subtree must not contain
     // another one (one level of line-relative alignment).
     let mut open: Vec<usize> = Vec::new();
+    // Some earlier leaf holds a forced break or a preserved newline.
+    let mut earlier_break = false;
     for (position, &entry) in entries.iter().enumerate() {
+        let first_line = !earlier_break;
+        if let InlineEntry::Leaf(leaf) = entry
+            && let ComponentKind::Text { content } = &flat[leaf].kind
+            && content.contains(['\n', '\r', '\u{2028}', '\u{2029}'])
+        {
+            earlier_break = true;
+        }
         let child = match entry {
             InlineEntry::Open(b) => {
                 if let Some(reason) = inline_box_reason(flat, &entries[position..], style) {
@@ -1564,11 +1573,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         // On the first line (no forced break or preserved newline in an
         // earlier leaf), a `pre` line never soft-wraps, so the item's line
         // offset is the advance of everything before it.
-        let first_line = !entries[..position].iter().any(|entry| {
-            matches!(entry, InlineEntry::Leaf(earlier)
-                if matches!(&flat[*earlier].kind, ComponentKind::Text { content }
-                    if content.contains(['\n', '\r', '\u{2028}', '\u{2029}'])))
-        });
         if let Some(reason) = inline_text_reason(content, info.style, sole, first_line, style) {
             return Some(reason);
         }
