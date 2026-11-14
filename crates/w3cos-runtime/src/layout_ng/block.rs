@@ -6006,7 +6006,7 @@ pub(super) fn layout_block_in(
             vertical: false,
             width,
             height,
-            children,
+            children: children.into(),
         },
         start_strut,
         end_strut,

@@ -2788,7 +2788,7 @@ fn layout_lines(
                     vertical: false,
                     width: available,
                     height: rect_height,
-                    children: Vec::new(),
+                    children: Default::default(),
                 },
             )],
         });
@@ -2897,7 +2897,7 @@ fn layout_lines(
                         vertical: false,
                         width,
                         height: inline_font_height(style),
-                        children: Vec::new(),
+                        children: Default::default(),
                     },
                 ));
                 start += text.len() + 1;
@@ -2934,7 +2934,7 @@ fn layout_lines(
                     vertical: false,
                     width,
                     height: inline_font_height(style),
-                    children: Vec::new(),
+                    children: Default::default(),
                 },
             )],
         });
@@ -3789,7 +3789,7 @@ fn layout_lines(
                         vertical: false,
                         width: available,
                         height: 0.0,
-                        children: Vec::new(),
+                        children: Default::default(),
                     },
                 ));
                 continue;
@@ -3851,7 +3851,7 @@ fn layout_lines(
                         - e.margin_start
                         - e.margin_end,
                     height: font_height + e.top + e.bottom,
-                    children: Vec::new(),
+                    children: Default::default(),
                 },
             ));
         }
@@ -3870,7 +3870,7 @@ fn layout_lines(
                     vertical: false,
                     width: 0.0,
                     height: 0.0,
-                    children: Vec::new(),
+                    children: Default::default(),
                 },
             ));
         }
@@ -3938,7 +3938,7 @@ fn layout_lines(
                             vertical: false,
                             width: x1 - x0,
                             height: bottom_baseline - ascent + inline_font_height(style) - y0,
-                            children: Vec::new(),
+                            children: Default::default(),
                         },
                     ));
                     continue;
@@ -3955,7 +3955,7 @@ fn layout_lines(
                         vertical: false,
                         width: end - start,
                         height: inline_font_height(style) + e.top + e.bottom,
-                        children: Vec::new(),
+                        children: Default::default(),
                     },
                 ));
             }

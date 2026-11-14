@@ -6692,7 +6692,7 @@ fn layout_impl(
             text_range: None,
             ellipsis: false,
             vertical: false,
-            children,
+            children: children.into(),
         },
         last_baseline: match last_row_baseline {
             Some((_, offset)) if exports_baseline => LastBaseline::At(offset),

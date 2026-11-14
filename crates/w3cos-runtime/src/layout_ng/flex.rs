@@ -3385,7 +3385,7 @@ fn layout_with(
             text_range: None,
             ellipsis: false,
             vertical: false,
-            children,
+            children: children.into(),
         },
         last_baseline: if column_baseline {
             column_last
@@ -4093,7 +4093,7 @@ fn layout_wrapped(
             text_range: None,
             ellipsis: false,
             vertical: false,
-            children,
+            children: children.into(),
         },
         // As in the single-line path, the first baseline is reported for
         // both: an inline-flex uses its first baseline.
