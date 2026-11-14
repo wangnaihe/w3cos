@@ -178,6 +178,12 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // reads them; unsupported values gate as `text:align-last`.
             | "text-align-last"
             | "text-justify"
+            // An outside `::marker` is lowered to an absolutely positioned
+            // box of its list item; list_marker::project places it after
+            // layout (Blink LayoutNGOutsideListMarker: positioned against
+            // the item's first line), on NG as on legacy.
+            | "list-item"
+            | "outside-list-marker"
             // `text-box-trim` / `text-box-edge`: IFC line boxes trim
             // half-leading at the first/last formatted line (CSS Inline 3).
             | "text-box-trim"
@@ -2739,6 +2745,11 @@ fn walk_rendered(flat: &[FlatNodeInfo], mut f: impl FnMut(usize) -> bool) {
 /// `None` when every rendered node is a box this stage lays out, otherwise
 /// the first reason the legacy engine must run.
 pub(super) fn unsupported_tree(flat: &[FlatNodeInfo]) -> Option<&'static str> {
+    if let Some(reason) =
+        super::cache::unsupported_tree_retained(flat, |index| node_reason(flat, index))
+    {
+        return reason;
+    }
     let mut reason = None;
     walk_rendered(flat, |index| {
         reason = node_reason(flat, index);
@@ -3314,6 +3325,17 @@ pub(super) fn intrinsic_sizes(
 /// (`block`), which a flex row's stretched images transfer through their
 /// aspect ratio (CSS Flexbox §9.8).
 pub(super) fn intrinsic_sizes_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
+    super::cache::min_max(flat, index, space, block, || {
+        intrinsic_sizes_uncached(flat, index, space, block)
+    })
+}
+
+fn intrinsic_sizes_uncached(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
@@ -4361,14 +4383,16 @@ pub(super) fn layout_block_sized(
         bfc_y: 0.0,
         ..*space
     };
-    layout_block_in(
-        flat,
-        index,
-        &space,
-        force_bfc_root,
-        sized,
-        &mut ExclusionSpace::default(),
-    )
+    super::cache::layout(flat, index, &space, force_bfc_root, sized, || {
+        layout_block_in(
+            flat,
+            index,
+            &space,
+            force_bfc_root,
+            sized,
+            &mut ExclusionSpace::default(),
+        )
+    })
 }
 
 /// Visits the boxes whose containing block is `index`'s content box: its
@@ -5982,7 +6006,7 @@ pub(super) fn layout_block_in(
             vertical: false,
             width,
             height,
-            children,
+            children: children.into(),
         },
         start_strut,
         end_strut,

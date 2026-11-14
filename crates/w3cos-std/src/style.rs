@@ -1547,9 +1547,26 @@ impl Edges {
         }
     }
 
+    /// Every side a plain px length: no safe-area or keyboard inset can
+    /// apply, so layout's per-item edge reads skip those lookups.
+    fn px_lengths(&self) -> Option<EdgeLengths> {
+        match (self.top, self.right, self.bottom, self.left) {
+            (Spacing::Px(top), Spacing::Px(right), Spacing::Px(bottom), Spacing::Px(left)) => {
+                Some(EdgeLengths {
+                    top: used_box_spacing(top),
+                    right: used_box_spacing(right),
+                    bottom: used_box_spacing(bottom),
+                    left: used_box_spacing(left),
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_lengths_with_style(&self, insets: &SafeAreaInsets, style: &Style) -> EdgeLengths {
         let resolve = |value: Spacing| {
             used_box_spacing(match value {
+                Spacing::Px(value) => value,
                 Spacing::Em(value) => value * style.font_size,
                 Spacing::Ch(value) => value * style.ch_advance(),
                 // A calc() with a zero percentage does not depend on the
@@ -1613,13 +1630,17 @@ impl Style {
     }
 
     pub fn padding_lengths(&self) -> EdgeLengths {
-        self.padding
-            .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        self.padding.px_lengths().unwrap_or_else(|| {
+            self.padding
+                .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        })
     }
 
     pub fn margin_lengths(&self) -> EdgeLengths {
-        self.margin
-            .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        self.margin.px_lengths().unwrap_or_else(|| {
+            self.margin
+                .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        })
     }
 
     pub fn resolved_overflow_x(&self) -> Overflow {

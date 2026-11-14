@@ -1606,6 +1606,28 @@ fn inline_contribution(
 
 /// Min-content block size of `index`'s content (column main axis).
 /// Definite heights sum; auto heights recurse into their content.
+/// A column item whose flex base size is its laid-out content block size
+/// (`flex-basis: auto`, `height: auto`) has that same block size as its
+/// content size suggestion: Blink's FlexLayoutAlgorithm takes the column
+/// item's min-content block size from the layout it already ran
+/// (ComputeMinMainSize / IntrinsicBlockSizeFunc), so the automatic minimum
+/// needs no separate walk of the item's content.
+fn defers_column_content_min(flat: &[FlatNodeInfo], index: usize, row: bool) -> bool {
+    let style = flat[index].style;
+    !row
+        && matches!(style.min_height, Dimension::Auto)
+        && matches!(style.height, Dimension::Auto)
+        && matches!(style.flex_basis, Dimension::Auto)
+        && matches!(style.max_height, Dimension::Auto | Dimension::Px(_))
+        && !has_marker(style, "--w3cos-internal-flex-basis-content")
+        && !has_marker(style, "--w3cos-internal-aspect-ratio")
+        && !block::computed_scrolls_in_axis(style, false)
+        && !block::size_contained(style)
+        && !block::is_replaced(flat[index].kind)
+        && !matches!(flat[index].kind, w3cos_std::ComponentKind::Text { .. })
+        && !matches!(style.display, Display::Table | Display::InlineTable)
+}
+
 fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) -> Option<f32> {
     let info = &flat[index];
     if matches!(info.style.display, Display::Table | Display::InlineTable) {
@@ -1708,12 +1730,32 @@ fn resolve_main_limits(
     flat: &[FlatNodeInfo],
     index: usize,
 ) -> Option<(f32, f32)> {
+    resolve_main_limits_with(style, row, edges, inner, space, flat, index, false)
+}
+
+/// `defer_content_min`: the caller lays the item out for its content-based
+/// flex base size and uses that block size as the content size suggestion
+/// (see [`defers_column_content_min`]); the automatic minimum is left at 0
+/// here and the max limit is still resolved.
+#[allow(clippy::too_many_arguments)]
+fn resolve_main_limits_with(
+    style: &Style,
+    row: bool,
+    edges: f32,
+    inner: Option<f32>,
+    space: &ConstraintSpace,
+    flat: &[FlatNodeInfo],
+    index: usize,
+    defer_content_min: bool,
+) -> Option<(f32, f32)> {
     let (min_dim, max_dim, specified) = if row {
         (style.min_width, style.max_width, style.width)
     } else {
         (style.min_height, style.max_height, style.height)
     };
-    let min = if matches!(min_dim, Dimension::Auto) && block::computed_scrolls_in_axis(style, row) {
+    let min = if matches!(min_dim, Dimension::Auto) && defer_content_min {
+        0.0
+    } else if matches!(min_dim, Dimension::Auto) && block::computed_scrolls_in_axis(style, row) {
         // CSS Flexbox §4.5: the automatic minimum size applies only to items
         // that are not scroll containers; for those `min-*: auto` is 0
         // (FlexLayoutAlgorithm::ShouldApplyMinSizeAutoForChild).
@@ -2545,7 +2587,8 @@ fn layout_with(
         } else {
             space
         };
-        let (min, max) = resolve_main_limits(
+        let defer_content_min = defers_column_content_min(flat, child, row);
+        let (min, max) = resolve_main_limits_with(
             child_style,
             row,
             main_edges,
@@ -2553,6 +2596,7 @@ fn layout_with(
             measure_space,
             flat,
             child,
+            defer_content_min,
         )
         .why("flex:min")?;
         let (main_start, main_end) = main_margin_sides(child_style, direction, flip(style));
@@ -2748,6 +2792,10 @@ fn layout_with(
         // A replaced column item's content size suggestion is its block
         // size transferred from its used width through the aspect ratio,
         // capped by its max main size (CSS Flexbox §4.5).
+        let min = match measured {
+            Some(height) if defer_content_min => height.min(max),
+            _ => min,
+        };
         let min = match (flat[child].kind, measured) {
             (w3cos_std::ComponentKind::Text { .. }, Some(height))
                 if !row && matches!(child_style.min_height, Dimension::Auto) =>
@@ -3385,7 +3433,7 @@ fn layout_with(
             text_range: None,
             ellipsis: false,
             vertical: false,
-            children,
+            children: children.into(),
         },
         last_baseline: if column_baseline {
             column_last
@@ -4093,7 +4141,7 @@ fn layout_wrapped(
             text_range: None,
             ellipsis: false,
             vertical: false,
-            children,
+            children: children.into(),
         },
         // As in the single-line path, the first baseline is reported for
         // both: an inline-flex uses its first baseline.

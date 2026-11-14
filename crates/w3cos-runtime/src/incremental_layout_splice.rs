@@ -86,13 +86,23 @@ fn is_split_inline_fragment(component: &Component) -> bool {
 /// No box anywhere in `root` can make a block subtree depend on more than
 /// its containing block width.
 pub(super) fn tree_is_spliceable(root: &Component) -> bool {
+    spliceable(root, false)
+}
+
+/// [`tree_is_spliceable`], except that split-inline fragments are allowed:
+/// [`try_splice`] republishes the CSSOM fragment rects of the owners it
+/// rebuilds and proves that no other box belongs to them.
+pub(super) fn tree_is_spliceable_with_owners(root: &Component) -> bool {
+    spliceable(root, true)
+}
+
+fn spliceable(root: &Component, owners_ok: bool) -> bool {
     let mut stack = vec![root];
     while let Some(component) = stack.pop() {
         let style = &component.style;
         // The sparse CSSOM fragment map is rebuilt from a complete flattened
-        // tree. Keep split-inline trees on that path until splice publishes
-        // equivalent ordered fragment ownership itself.
-        if is_split_inline_fragment(component)
+        // tree. Only the structural splice republishes it per owner.
+        if (!owners_ok && is_split_inline_fragment(component))
             || style.float != Float::None
             || matches!(style.position, Position::Fixed | Position::Sticky)
             || (style.position == Position::Absolute && !is_outside_list_marker(component))
@@ -320,6 +330,143 @@ fn ancestor_levels(root: &Component, path: &[usize]) -> Option<usize> {
     Some(levels)
 }
 
+/// The vertical-stack parents a structural splice can grow through: those of
+/// [`stacking_parent`], a column flexbox with gaps (a gap is a fixed offset
+/// between items, so followers still only move), and a single-line row
+/// flexbox whose other items have a definite height and start-aligned or
+/// stretched cross axes. A row only grows by the item's height change when
+/// that item is the tallest before and after; [`row_item_stays_tallest`]
+/// checks that once the change is known.
+fn splice_stacking_parent(parent: &Component, child: usize) -> bool {
+    if stacking_parent(parent) {
+        return true;
+    }
+    let style = &parent.style;
+    if style.display != Display::Flex
+        || style.flex_wrap != FlexWrap::NoWrap
+        || !in_flow_static(style)
+        || is_table_like(parent)
+        || !subtree_relayout_enabled()
+    {
+        return false;
+    }
+    match style.flex_direction {
+        FlexDirection::Column => {
+            style.justify_content == JustifyContent::FlexStart
+                && parent
+                    .children
+                    .iter()
+                    .all(|item| item.style.flex_grow == 0.0)
+                && (!matches!(style.height, Dimension::Px(_))
+                    || parent.children.iter().all(|item| item.style.flex_shrink == 0.0))
+        }
+        FlexDirection::Row => {
+            matches!(style.align_items, AlignItems::Stretch | AlignItems::FlexStart)
+                && parent.children.iter().enumerate().all(|(index, item)| {
+                    let item_style = &item.style;
+                    if matches!(item_style.position, Position::Absolute | Position::Fixed) {
+                        return index != child;
+                    }
+                    matches!(
+                        item_style.align_self,
+                        AlignSelf::Auto | AlignSelf::Stretch | AlignSelf::FlexStart
+                    ) && in_flow_static(item_style)
+                        && px_spacing(item_style.margin.top).is_some()
+                        && px_spacing(item_style.margin.bottom).is_some()
+                        && (index == child
+                            || (matches!(item_style.height, Dimension::Px(_))
+                                && host_id(item).is_some()))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn is_row_flex(component: &Component) -> bool {
+    component.style.display == Display::Flex
+        && component.style.flex_direction == FlexDirection::Row
+}
+
+/// [`ancestor_levels`] over [`splice_stacking_parent`].
+fn splice_ancestor_levels(root: &Component, path: &[usize]) -> Option<usize> {
+    let mut levels = 0;
+    for depth in (0..path.len()).rev() {
+        let parent = at_path(root, &path[..depth]);
+        levels += 1;
+        if !splice_stacking_parent(parent, path[depth]) {
+            return None;
+        }
+        let style = &parent.style;
+        match style.height {
+            Dimension::Px(_) => return Some(levels),
+            Dimension::Auto => {}
+            _ => return None,
+        }
+        if !matches!(style.min_height, Dimension::Auto)
+            || !matches!(style.max_height, Dimension::Auto)
+        {
+            return None;
+        }
+    }
+    Some(levels)
+}
+
+/// Every row-flex level a splice grows through keeps the changed item as its
+/// tallest item, before and after the height change `dh`, so the row's
+/// height changes by exactly `dh` and its other items keep their boxes.
+fn row_item_stays_tallest(root: &Component, path: &[usize], levels: usize, dh: f32) -> bool {
+    for level in 0..levels {
+        let depth = path.len() - 1 - level;
+        let parent = at_path(root, &path[..depth]);
+        if !is_row_flex(parent) {
+            continue;
+        }
+        let outer = |item: &Component| {
+            let id = host_id(item)?;
+            let rect = crate::dom::with_document(|document| {
+                document.get_layout_rect(NodeId::from_u32(id))
+            });
+            Some(
+                rect.height
+                    + px_spacing(item.style.margin.top)?
+                    + px_spacing(item.style.margin.bottom)?,
+            )
+        };
+        let Some(item) = outer(&parent.children[path[depth]]) else {
+            return false;
+        };
+        for (index, other) in parent.children.iter().enumerate() {
+            if index == path[depth]
+                || matches!(other.style.position, Position::Absolute | Position::Fixed)
+            {
+                continue;
+            }
+            let Some(other) = outer(other) else {
+                return false;
+            };
+            if item + 0.01 < other || item + dh + 0.01 < other {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn carries_cssom_owner(component: &Component) -> bool {
+    let mut counts = std::collections::HashMap::new();
+    super::collect_cssom_owners(
+        &Component {
+            kind: component.kind.clone(),
+            style: component.style.clone(),
+            children: Vec::new(),
+            on_click: w3cos_std::EventAction::None,
+            sticky_counter_signal: None,
+        },
+        &mut counts,
+    );
+    !counts.is_empty()
+}
+
 fn is_table_like(component: &Component) -> bool {
     super::is_table(component.style.display)
 }
@@ -399,6 +546,11 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
             if let Some(plan) = try_container(cache, document, &chain, node) {
                 return Ok(Some(plan));
             }
+            // A column flex too large for `try_container` keeps its items and
+            // lays out only the appended ones.
+            if let Some(plan) = try_tail_in(cache, document, &chain, &chains, true) {
+                return Ok(Some(plan));
+            }
             chain.pop();
         }
         Err(())
@@ -412,6 +564,38 @@ fn ordinary_block_child(component: &Component) -> bool {
     ) && in_flow_static(&component.style)
 }
 
+/// A LayoutNG column flex container that stacks its items like a block
+/// without margin collapsing: auto height, no wrap, flex-start, stretched
+/// items, document order. Appending items leaves the kept ones in place, so
+/// a flex wrapper holding the last kept item and the new tail reproduces
+/// their positions (Blink's flex algorithm with an indefinite main size).
+fn column_flex_tail_parent(component: &Component) -> bool {
+    let style = &component.style;
+    crate::layout_ng::mode() != crate::layout_ng::Mode::Off
+        && subtree_relayout_enabled()
+        && style.display == Display::Flex
+        && style.flex_direction == FlexDirection::Column
+        && style.flex_wrap == FlexWrap::NoWrap
+        && style.justify_content == JustifyContent::FlexStart
+        && style.align_items == AlignItems::Stretch
+        && style.writing_mode == Default::default()
+        && matches!(style.height, Dimension::Auto)
+        && matches!(style.min_height, Dimension::Auto)
+        && matches!(style.max_height, Dimension::Auto)
+        && !is_table_like(component)
+        && component.children.iter().all(column_flex_tail_item)
+}
+
+fn column_flex_tail_item(item: &Component) -> bool {
+    let style = &item.style;
+    style.flex_grow == 0.0
+        && style.order == 0
+        && in_flow_static(style)
+        && matches!(style.align_self, AlignSelf::Auto | AlignSelf::Stretch)
+        && px_spacing(style.margin.top).is_some()
+        && px_spacing(style.margin.bottom).is_some()
+}
+
 /// Only the trailing children of a block changed. The kept prefix keeps its
 /// cached results (LayoutNG reuses a clean child's layout result); the last
 /// kept child is solved again only to seed sibling margin collapsing.
@@ -420,6 +604,16 @@ fn try_tail(
     document: &w3cos_dom::document::Document,
     chain: &[u32],
     chains: &[Vec<u32>],
+) -> Option<Plan> {
+    try_tail_in(cache, document, chain, chains, false)
+}
+
+fn try_tail_in(
+    cache: &Cache,
+    document: &w3cos_dom::document::Document,
+    chain: &[u32],
+    chains: &[Vec<u32>],
+    flex_column: bool,
 ) -> Option<Plan> {
     if chain.len() <= 1 || chain.last() == Some(&crate::dom::body_id()) {
         return None;
@@ -433,9 +627,14 @@ fn try_tail(
     // A definite height (a scroller such as a chat log) keeps its own box;
     // only its scrollable overflow changes.
     let definite = matches!(style.height, Dimension::Px(_));
-    if !is_block_flow(style.display)
+    let column_flex = flex_column && column_flex_tail_parent(old);
+    if flex_column != column_flex {
+        return None;
+    }
+    if !(is_block_flow(style.display) || column_flex)
         || !in_flow_static(style)
         || !(definite
+            || column_flex
             || (bottom_closed
                 && matches!(style.height, Dimension::Auto)
                 && matches!(style.min_height, Dimension::Auto)
@@ -444,7 +643,7 @@ fn try_tail(
     {
         return None;
     }
-    ancestor_levels(&cache.component, &path)?;
+    splice_ancestor_levels(&cache.component, &path)?;
     let depth = chain.len();
     let touched: Vec<u32> = chains
         .iter()
@@ -491,7 +690,8 @@ fn try_tail(
         let component = document.to_component_subtree(NodeId::from_u32(id));
         if host_id(&component) != Some(id)
             || !ordinary_block_child(&component)
-            || !tree_is_spliceable(&component)
+            || (column_flex && !column_flex_tail_item(&component))
+            || !tree_is_spliceable_with_owners(&component)
         {
             return None;
         }
@@ -543,11 +743,11 @@ fn try_candidate(
     {
         return None;
     }
-    ancestor_levels(&cache.component, &path)?;
+    splice_ancestor_levels(&cache.component, &path)?;
     let fresh = document.to_component_subtree(NodeId::from_u32(node));
     if fresh.style != old.style
         || host_id(&fresh) != Some(node)
-        || !tree_is_spliceable(&fresh)
+        || !tree_is_spliceable_with_owners(&fresh)
         || !edge_blocks_margin_collapse(&fresh, true)
         || !edge_blocks_margin_collapse(&fresh, false)
         || !edge_blocks_margin_collapse(old, true)
@@ -604,11 +804,11 @@ fn try_container(
     {
         return None;
     }
-    ancestor_levels(&cache.component, &path)?;
+    splice_ancestor_levels(&cache.component, &path)?;
     let fresh = document.to_component_subtree(NodeId::from_u32(node));
     if host_id(&fresh) != Some(node)
         || fresh.style != old.style
-        || !tree_is_spliceable(&fresh)
+        || !tree_is_spliceable_with_owners(&fresh)
         || crate::layout::count_nodes(&fresh) > MAX_SOLVE_NODES
     {
         return None;
@@ -670,15 +870,40 @@ fn solve(
     Vec<(u32, crate::layout::LayoutRect)>,
     crate::layout::LayoutRect,
 )> {
+    solve_with_client_rects(wrapper, skip_projections, measure_text, viewport_w, viewport_h, false)
+        .map(|(rects, own, _)| (rects, own))
+}
+
+type ClientRectMap = std::collections::HashMap<u32, Vec<w3cos_dom::DOMRect>>;
+
+/// [`solve`], also returning the CSSOM fragment rects the wrapper's boxes
+/// publish (wrapper coordinates) when `client_rects` is set.
+fn solve_with_client_rects(
+    wrapper: &Component,
+    skip_projections: bool,
+    measure_text: bool,
+    viewport_w: f32,
+    viewport_h: f32,
+    client_rects: bool,
+) -> Option<(
+    Vec<(u32, crate::layout::LayoutRect)>,
+    crate::layout::LayoutRect,
+    ClientRectMap,
+)> {
     let flat = pre_flatten(wrapper);
     // `LayoutEngine::compute` publishes legacy rects when LayoutNG bails.
     // A subtree that bails would then store a legacy line count beside a
     // full NG layout, and followers keep the short y. Under Mode::On, refuse
     // that result so the flush rebuilds with the same engine as `full_rects`.
     if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
-        let (layout_cache, _) =
+        let (layout_cache, texts) =
             crate::layout_ng::layout_tree_with_text(wrapper, &flat, viewport_w, viewport_h)?;
-        return host_rects(&flat, &layout_cache);
+        let published = if client_rects {
+            super::client_rects_for(&flat, &layout_cache, &texts)
+        } else {
+            ClientRectMap::new()
+        };
+        return host_rects(&flat, &layout_cache).map(|(rects, own)| (rects, own, published));
     }
     let mut engine = LayoutEngine::new();
     // Projections repair floats, tables, inline-block and RTL boxes. A
@@ -689,7 +914,12 @@ fn solve(
     let results = engine
         .compute(wrapper, &flat, viewport_w, viewport_h)
         .ok()?;
-    host_rects(&flat, &results.layout_cache)
+    let published = if client_rects {
+        super::client_rects_for(&flat, &results.layout_cache, &results.text_fragments)
+    } else {
+        ClientRectMap::new()
+    };
+    host_rects(&flat, &results.layout_cache).map(|(rects, own)| (rects, own, published))
 }
 
 fn host_rects(
@@ -789,12 +1019,14 @@ fn end_margin_strut(component: &Component) -> Option<f32> {
 /// anchor's end margin strut is equivalent, and costs one box instead of
 /// re-solving its whole subtree (LayoutNG reuses the clean child's layout
 /// result; only its NGMarginStrut matters to what follows).
-fn anchor_stand_in(source: &Component) -> Component {
+fn anchor_stand_in(source: &Component, flex_item: bool) -> Component {
     let height = host_id(source).map(|id| {
         crate::dom::with_document(|document| document.get_layout_rect(NodeId::from_u32(id)).height)
     });
     let strut = || {
-        if edge_blocks_margin_collapse(source, false) {
+        // A flex item is a formatting context root: no child margin
+        // escapes it, and its own margins never collapse.
+        if flex_item || edge_blocks_margin_collapse(source, false) {
             Some(source.style.margin.bottom)
         } else {
             end_margin_strut(source).map(Spacing::Px)
@@ -974,7 +1206,7 @@ pub(super) fn try_splice(
     viewport_w: f32,
     viewport_h: f32,
 ) -> bool {
-    if !cache.splice_ok
+    if !cache.splice_owners_ok
         || cache.viewport_w_bits != viewport_w.to_bits()
         || cache.viewport_h_bits != viewport_h.to_bits()
         || cache.sheet_generation != w3cos_dom::stylesheet::generation()
@@ -989,7 +1221,7 @@ pub(super) fn try_splice(
         Ok(None) => return true,
         Err(()) => return bail("no safe subtree root"),
     };
-    let Some(levels) = ancestor_levels(&cache.component, &plan.path) else {
+    let Some(levels) = splice_ancestor_levels(&cache.component, &plan.path) else {
         return bail("ancestors");
     };
     let node = NodeId::from_u32(plan.node);
@@ -998,7 +1230,7 @@ pub(super) fn try_splice(
     // plan node's border box, and the first path level whose following
     // siblings shift (0: the plan node's siblings; the Tail plan grows the
     // plan node itself and starts there too).
-    let (rects, dx, dy, dh, skip_projections, measure_text, commit): (
+    let (rects, dx, dy, dh, skip_projections, measure_text, commit, client): (
         Vec<(u32, crate::layout::LayoutRect)>,
         f32,
         f32,
@@ -1006,6 +1238,7 @@ pub(super) fn try_splice(
         bool,
         bool,
         PlanKind,
+        Option<ClientRectMap>,
     ) = match plan.kind {
         PlanKind::Subtree(fresh) => {
             if let Some((rects, dx, dy, dh)) =
@@ -1017,7 +1250,7 @@ pub(super) fn try_splice(
                     false
                 };
                 let measure = text_metric_for_fresh(cache, &plan.path, &fresh);
-                (rects, dx, dy, dh, skip, measure, PlanKind::Subtree(fresh))
+                (rects, dx, dy, dh, skip, measure, PlanKind::Subtree(fresh), None)
             } else {
                 let old = at_path(&cache.component, &plan.path);
                 let margins = old.style.margin_lengths();
@@ -1039,8 +1272,9 @@ pub(super) fn try_splice(
                     std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
                 let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
                 let mut wrapper = wrapper_for(parent, width, vec![fresh]);
-                let Some((rects, _)) = solve(&wrapper, skip, measure, viewport_w, viewport_h)
-                else {
+                let Some((rects, _, client)) = solve_with_client_rects(
+                    &wrapper, skip, measure, viewport_w, viewport_h, true,
+                ) else {
                     return bail("solve 568");
                 };
                 let Some(new_rect) = rect_of(&rects, plan.node) else {
@@ -1058,6 +1292,7 @@ pub(super) fn try_splice(
                     skip,
                     measure,
                     PlanKind::Subtree(fresh),
+                    Some(client),
                 )
             }
         }
@@ -1075,7 +1310,8 @@ pub(super) fn try_splice(
             let tail = target.children.split_off(keep);
             target.children.extend(removed);
             let target = at_path(&cache.component, &plan.path);
-            let anchor = anchor_stand_in(&target.children[keep - 1]);
+            let flex_item = is_flex_or_grid(&target.style);
+            let anchor = anchor_stand_in(&target.children[keep - 1], flex_item);
             let Some(anchor_id) = host_id(&anchor) else {
                 return bail("solve 599");
             };
@@ -1093,7 +1329,9 @@ pub(super) fn try_splice(
             children.push(anchor);
             children.extend(tail);
             let mut wrapper = wrapper_for(target, width, children);
-            let Some((rects, own)) = solve(&wrapper, skip, measure, viewport_w, viewport_h) else {
+            let Some((rects, own, client)) =
+                solve_with_client_rects(&wrapper, skip, measure, viewport_w, viewport_h, true)
+            else {
                 return bail("solve 616");
             };
             let Some(anchor_new) = rect_of(&rects, anchor_id) else {
@@ -1131,6 +1369,7 @@ pub(super) fn try_splice(
                 skip,
                 measure,
                 PlanKind::Tail { keep, tail },
+                Some(client),
             )
         }
     };
@@ -1154,12 +1393,20 @@ pub(super) fn try_splice(
             grown.push(plan.node);
         }
     }
+    let mut shifted_owners = std::collections::HashMap::new();
     if dh != 0.0 {
+        if !row_item_stays_tallest(&cache.component, &plan.path, levels, dh) {
+            return bail("row item height");
+        }
         for level in 0..levels {
             let depth = plan.path.len() - 1 - level;
             let parent = at_path(&cache.component, &plan.path[..depth]);
-            for sibling in &parent.children[plan.path[depth] + 1..] {
-                collect_hosts(sibling, &mut shifted);
+            // Items beside the changed one in a row keep their boxes.
+            if !is_row_flex(parent) {
+                for sibling in &parent.children[plan.path[depth] + 1..] {
+                    collect_hosts(sibling, &mut shifted);
+                    super::collect_cssom_owners(sibling, &mut shifted_owners);
+                }
             }
             if let Some(id) = host_id(parent)
                 && !matches!(parent.style.height, Dimension::Px(_))
@@ -1173,6 +1420,61 @@ pub(super) fn try_splice(
     shifted.sort_unstable();
     shifted.dedup();
     let shifted_nodes = shifted.len() as u32;
+
+    // CSSOM fragment rects (Blink keeps them on the fragments; here one map
+    // per owner). Republish the owners of the rebuilt boxes, and move the
+    // owners of shifted boxes, when every box of each such owner is inside
+    // that region. An owner on the path itself would change shape.
+    let (old_region, new_region): (Vec<&Component>, Vec<&Component>) = match &commit {
+        PlanKind::Subtree(fresh) => (vec![at_path(&cache.component, &plan.path)], vec![fresh]),
+        PlanKind::Tail { keep, tail } => (
+            at_path(&cache.component, &plan.path).children[*keep..]
+                .iter()
+                .collect(),
+            tail.iter().collect(),
+        ),
+    };
+    let mut old_owners = std::collections::HashMap::new();
+    let mut new_owners = std::collections::HashMap::new();
+    for component in &old_region {
+        super::collect_cssom_owners(component, &mut old_owners);
+    }
+    for component in &new_region {
+        super::collect_cssom_owners(component, &mut new_owners);
+    }
+    let touches_owners =
+        !old_owners.is_empty() || !new_owners.is_empty() || !shifted_owners.is_empty();
+    if touches_owners {
+        // The roots of the region and every ancestor (for a tail plan, the
+        // target block too) must not be fragments of an owner themselves.
+        let roots_own = old_region
+            .iter()
+            .chain(new_region.iter())
+            .any(|component| carries_cssom_owner(component));
+        let ancestor_depths = match &commit {
+            PlanKind::Subtree(_) => plan.path.len(),
+            PlanKind::Tail { .. } => plan.path.len() + 1,
+        };
+        let ancestors_own = (0..ancestor_depths)
+            .any(|depth| carries_cssom_owner(at_path(&cache.component, &plan.path[..depth])));
+        if client.is_none() || roots_own || ancestors_own {
+            return bail("cssom owner shape");
+        }
+        let totals = cache.owner_counts.get_or_insert_with(|| {
+            let mut counts = std::collections::HashMap::new();
+            super::collect_cssom_owners(&cache.component, &mut counts);
+            counts
+        });
+        let total = |owner: &u32| totals.get(owner).copied().unwrap_or(0);
+        if old_owners.iter().any(|(owner, count)| total(owner) != *count)
+            || new_owners
+                .keys()
+                .any(|owner| total(owner) != old_owners.get(owner).copied().unwrap_or(0))
+            || shifted_owners.iter().any(|(owner, count)| total(owner) != *count)
+        {
+            return bail("cssom owner outside splice");
+        }
+    }
     crate::dom::with_document_mut(|document| {
         for (id, rect) in &rects {
             document.set_layout_rect(
@@ -1193,6 +1495,35 @@ pub(super) fn try_splice(
             document.set_layout_rect(id, rect);
         }
     });
+    if touches_owners {
+        let mut client = client.unwrap_or_default();
+        client.retain(|owner, _| new_owners.contains_key(owner));
+        super::splice_client_rects(
+            old_owners.keys().copied(),
+            client,
+            dx,
+            dy,
+            shifted_owners.keys().copied(),
+            dh,
+        );
+        if let Some(totals) = cache.owner_counts.as_mut() {
+            for (owner, count) in &old_owners {
+                if let Some(total) = totals.get_mut(owner) {
+                    *total -= count;
+                    if *total == 0 {
+                        totals.remove(owner);
+                    }
+                }
+            }
+            for (owner, count) in &new_owners {
+                *totals.entry(*owner).or_default() += count;
+            }
+        }
+    }
+    if !new_owners.is_empty() {
+        // The style-subtree path does not republish CSSOM fragment rects.
+        cache.splice_ok = false;
+    }
     cache.skip_projections = skip_projections;
     cache.measure_text = measure_text;
     let target = at_path_mut(&mut cache.component, &plan.path);
@@ -1485,7 +1816,7 @@ pub(super) fn try_style_subtree(
 }
 
 /// Debug aid: compare every spliced rect with a from-scratch layout.
-fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
+pub(super) fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
     let component = crate::dom::to_component_tree();
     let flat = pre_flatten(&component);
     let mut engine = LayoutEngine::new();
@@ -1531,6 +1862,34 @@ fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
     });
     eprintln!(
         "[splice-verify] root {node}: {} rects, {bad} mismatched",
+        expected.len()
+    );
+    let expected = super::client_rects_for(&flat, &results.layout_cache, &results.text_fragments);
+    let got = super::client_rect_snapshot();
+    let mut bad_owners = 0;
+    let close = |a: &[w3cos_dom::DOMRect], b: &[w3cos_dom::DOMRect]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                (a.x - b.x).abs() <= 0.05
+                    && (a.y - b.y).abs() <= 0.05
+                    && (a.width - b.width).abs() <= 0.05
+                    && (a.height - b.height).abs() <= 0.05
+            })
+    };
+    for (owner, rects) in &expected {
+        if !got.get(owner).is_some_and(|list| close(list, rects)) {
+            if bad_owners < 5 {
+                eprintln!(
+                    "[splice-verify] owner {owner}: got {:?} want {rects:?}",
+                    got.get(owner)
+                );
+            }
+            bad_owners += 1;
+        }
+    }
+    let extra = got.keys().filter(|owner| !expected.contains_key(owner)).count();
+    eprintln!(
+        "[splice-verify] root {node}: {} owners, {bad_owners} mismatched, {extra} extra",
         expected.len()
     );
 }
@@ -1624,6 +1983,190 @@ mod tests {
         crate::dom::append_child(chat, reply);
         assert!(crate::incremental_layout::flush());
         (chat, reply)
+    }
+
+    fn assert_client_rects_match_full(label: &str) {
+        let component = crate::dom::to_component_tree();
+        let flat = pre_flatten(&component);
+        let mut engine = LayoutEngine::new();
+        super::super::configure_engine(&mut engine, &component);
+        let results = engine
+            .compute(&component, &flat, 1024.0, 768.0)
+            .expect("layout");
+        let expected =
+            super::super::client_rects_for(&flat, &results.layout_cache, &results.text_fragments);
+        let got = super::super::client_rect_snapshot();
+        assert!(!expected.is_empty(), "{label}: page publishes no fragment owners");
+        assert_eq!(
+            got.keys().collect::<std::collections::BTreeSet<_>>(),
+            expected.keys().collect::<std::collections::BTreeSet<_>>(),
+            "{label}: owner set"
+        );
+        for (owner, rects) in &expected {
+            let list = &got[owner];
+            assert_eq!(list.len(), rects.len(), "{label}: owner {owner} rect count");
+            for (a, b) in list.iter().zip(rects) {
+                assert!(
+                    (a.x - b.x).abs() < 0.05
+                        && (a.y - b.y).abs() < 0.05
+                        && (a.width - b.width).abs() < 0.05
+                        && (a.height - b.height).abs() < 0.05,
+                    "{label}: owner {owner} spliced {a:?} vs full {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Markdown chat shape: a column flexbox with gaps of row messages
+    /// (fixed avatar + column bubble) whose paragraphs hold strong, code and
+    /// link runs, which publish CSSOM fragment rects per owner.
+    fn markdown_chat_page(avatar_px: u32) -> Vec<(u32, u32)> {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        let chat = crate::dom::create_element("div");
+        style(
+            chat,
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("gap", "12px"),
+                ("padding", "16px"),
+                ("font-size", "14px"),
+                ("line-height", "20px"),
+            ],
+        );
+        crate::dom::append_child(crate::dom::body_id(), chat);
+        let mut streams = Vec::new();
+        for index in 0..3 {
+            let msg = crate::dom::create_element("div");
+            style(msg, &[("display", "flex"), ("flex-direction", "row"), ("gap", "8px")]);
+            let avatar = crate::dom::create_element("div");
+            let avatar_height = format!("{avatar_px}px");
+            style(
+                avatar,
+                &[("width", "32px"), ("height", avatar_height.as_str()), ("flex", "none")],
+            );
+            let bubble = crate::dom::create_element("div");
+            style(
+                bubble,
+                &[
+                    ("flex", "1 1 0"),
+                    ("min-width", "0"),
+                    ("display", "flex"),
+                    ("flex-direction", "column"),
+                    ("padding", "12px"),
+                ],
+            );
+            let p = crate::dom::create_element("p");
+            style(p, &[("margin", "0 0 8px 0")]);
+            let lead = crate::dom::create_text_node(&format!("message {index} lead words "));
+            crate::dom::append_child(p, lead);
+            let strong = crate::dom::create_element("strong");
+            style(strong, &[("font-weight", "700")]);
+            crate::dom::append_child(strong, crate::dom::create_text_node("bold run of words"));
+            crate::dom::append_child(p, strong);
+            crate::dom::append_child(p, crate::dom::create_text_node(" then "));
+            let code = crate::dom::create_element("code");
+            style(code, &[("font-family", "monospace"), ("background", "#f0f0f0")]);
+            crate::dom::append_child(code, crate::dom::create_text_node("fn_call()"));
+            crate::dom::append_child(p, code);
+            crate::dom::append_child(p, crate::dom::create_text_node(" and "));
+            // A passive colored inline coalesces into the paragraph's text
+            // run and keeps CSSOM owner ranges for its bytes.
+            let link = crate::dom::create_element("a");
+            style(link, &[("color", "#0645ad")]);
+            crate::dom::append_child(link, crate::dom::create_text_node("linked words here"));
+            crate::dom::append_child(p, link);
+            let tail = crate::dom::create_text_node(" tail");
+            crate::dom::append_child(p, tail);
+            crate::dom::append_child(bubble, p);
+            let list = crate::dom::create_element("ul");
+            style(list, &[("margin", "0 0 8px 0"), ("padding-left", "24px")]);
+            for item in 0..2 {
+                let li = crate::dom::create_element("li");
+                style(li, &[("display", "list-item")]);
+                crate::dom::append_child(
+                    li,
+                    crate::dom::create_text_node(&format!("list item {item} words")),
+                );
+                crate::dom::append_child(list, li);
+            }
+            crate::dom::append_child(bubble, list);
+            crate::dom::append_child(msg, avatar);
+            crate::dom::append_child(msg, bubble);
+            crate::dom::append_child(chat, msg);
+            streams.push((p, tail));
+        }
+        assert!(crate::incremental_layout::flush());
+        streams
+    }
+
+    #[test]
+    fn split_inline_owner_rects_follow_streamed_splice() {
+        let streams = markdown_chat_page(32);
+        assert_matches_full("initial");
+        assert_client_rects_match_full("initial");
+        // Stream into the first message: the later messages and their
+        // fragment owners shift by the paragraph's height change.
+        let (_p, tail) = streams[0];
+        let before = splice_counts();
+        for step in 0..12 {
+            crate::dom::set_text_content(tail, &" streamed tokens".repeat(step * 3 + 1));
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("step {step}"));
+            assert_client_rects_match_full(&format!("step {step}"));
+        }
+        assert_eq!(splice_counts().0 - before.0, 12, "text edits under row messages must splice");
+    }
+
+    #[test]
+    fn new_paragraph_in_column_flex_bubble_splices_tail() {
+        let streams = markdown_chat_page(32);
+        let bubbles: Vec<u32> = streams
+            .iter()
+            .map(|&(p, _)| crate::dom::with_document(|document| {
+                document.get_node(NodeId::from_u32(p)).parent.unwrap().as_u32()
+            }))
+            .collect();
+        let before = splice_counts();
+        // Append into the middle message (followers shift) and the last one.
+        for (step, &bubble) in [bubbles[1], bubbles[2], bubbles[1]].iter().enumerate() {
+            let p = crate::dom::create_element("p");
+            style(p, &[("margin", "6px 0 10px 0")]);
+            crate::dom::append_child(p, crate::dom::create_text_node("new paragraph words "));
+            let code = crate::dom::create_element("code");
+            style(code, &[("font-family", "monospace"), ("background", "#f0f0f0")]);
+            crate::dom::append_child(code, crate::dom::create_text_node("tail_call()"));
+            crate::dom::append_child(p, code);
+            crate::dom::append_child(bubble, p);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("append {step}"));
+            assert_client_rects_match_full(&format!("append {step}"));
+            let text = crate::dom::create_text_node(&" streamed".repeat(step * 4 + 3));
+            crate::dom::append_child(p, text);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("stream {step}"));
+            assert_client_rects_match_full(&format!("stream {step}"));
+        }
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            let after = splice_counts();
+            assert_eq!(after.1 - before.1, 3, "appends to a column flex bubble splice the tail");
+            assert_eq!(after.0 - before.0, 3, "text edits in the new paragraphs splice");
+        }
+    }
+
+    #[test]
+    fn taller_row_sibling_falls_back_to_rebuild() {
+        // The avatar is taller than the bubble, so the row's height does not
+        // follow the paragraph; the splice must refuse and the result match.
+        let streams = markdown_chat_page(400);
+        let (_p, tail) = streams[1];
+        for step in 0..4 {
+            crate::dom::set_text_content(tail, &" more".repeat(step + 1));
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("step {step}"));
+            assert_client_rects_match_full(&format!("step {step}"));
+        }
     }
 
     #[test]
@@ -2131,6 +2674,51 @@ mod tests {
         crate::dom::class_list_remove(items[0], "wide");
         assert!(crate::incremental_layout::flush());
         assert_matches_full("class off");
+        crate::stylesheet::clear_rules();
+    }
+
+    /// A padding class toggle under LayoutNG patches the retained component
+    /// (no Taffy tree to patch) instead of re-lowering the document.
+    #[test]
+    fn class_padding_toggle_keeps_lowered_tree() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".pad", &[("padding", "12px")]);
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        // Row flex messages with auto width (a chat log): the bubble is not
+        // the subtree path's scope, so this exercises the retained compute.
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let row = crate::dom::create_element("div");
+            style(row, &[("display", "flex"), ("gap", "6px")]);
+            let avatar = crate::dom::create_element("div");
+            style(avatar, &[("width", "20px"), ("height", "20px")]);
+            let bubble = crate::dom::create_element("div");
+            style(bubble, &[("min-width", "0px")]);
+            crate::dom::append_child(
+                bubble,
+                crate::dom::create_text_node(&format!(
+                    "message {index} alpha beta gamma delta epsilon zeta eta theta"
+                )),
+            );
+            crate::dom::append_child(row, avatar);
+            crate::dom::append_child(row, bubble);
+            crate::dom::append_child(crate::dom::body_id(), row);
+            items.push(bubble);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("rows initial");
+        crate::dom::class_list_add(items[1], "pad");
+        assert!(crate::incremental_layout::flush());
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            let stats = crate::incremental_layout::last_flush_stats();
+            assert_eq!(stats.kind, "retained", "padding on");
+        }
+        assert_matches_full("padding on");
+        crate::dom::class_list_remove(items[1], "pad");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("padding off");
         crate::stylesheet::clear_rules();
     }
 

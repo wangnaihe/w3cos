@@ -4855,6 +4855,11 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> bool {
+        if !self.tree_valid && crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            // LayoutNG reads the patched component; a legacy fallback
+            // rebuilds the (invalid) Taffy tree from it.
+            return true;
+        }
         let Some(&node) = self.node_index.get(index) else {
             return false;
         };

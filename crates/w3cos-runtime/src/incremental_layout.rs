@@ -53,11 +53,17 @@ struct Cache {
     /// multicol box anywhere: a block subtree's used box cannot depend on
     /// anything but its containing block width.
     splice_ok: bool,
+    /// [`splice_ok`] except that split-inline fragments are allowed: the
+    /// structural splice republishes their CSSOM fragment rects per owner.
+    splice_owners_ok: bool,
     /// Engine flags of the whole tree, reused for a spliced subtree.
     skip_projections: bool,
     measure_text: bool,
     /// The component tree was spliced; `node_ids` and the Taffy tree are stale.
     node_ids_stale: bool,
+    /// Boxes per CSSOM fragment owner in `component` (see
+    /// [`collect_cssom_owners`]); built on the first splice that needs it.
+    owner_counts: Option<HashMap<u32, u32>>,
 }
 
 thread_local! {
@@ -130,11 +136,12 @@ pub fn flush() -> bool {
         )
     });
     let take = || {
-        crate::dom::with_document_mut(|document| {
+        let (before, dirty, after) = crate::dom::with_document_mut(|document| {
             let before = document.precise_drain_epoch();
             let dirty = document.take_precise_dirty();
             (before, dirty, document.precise_drain_epoch())
-        })
+        });
+        take_paint_drained(before, dirty, after)
     };
     // A retained tree that only needs a structural splice skips the
     // document-wide definite-layout fingerprint below.
@@ -144,8 +151,8 @@ pub fn flush() -> bool {
         let Some(cache) = slot.as_mut() else {
             return false;
         };
-        if !cache.splice_ok || cache.structure == layout_gen {
-            if !cache.splice_ok && splice::debug_enabled() {
+        if !cache.splice_owners_ok || cache.structure == layout_gen {
+            if !cache.splice_owners_ok && splice::debug_enabled() {
                 eprintln!("[splice] retained tree is not spliceable");
             }
             return false;
@@ -158,6 +165,7 @@ pub fn flush() -> bool {
                 eprintln!("[splice] dirty list drained elsewhere");
             }
             cache.splice_ok = false;
+            cache.splice_owners_ok = false;
             taken = Some((after, dirty, after));
             return false;
         }
@@ -192,6 +200,7 @@ pub fn flush() -> bool {
             if !complete {
                 // Another consumer drained mutations this cache never saw.
                 cache.splice_ok = false;
+                cache.splice_owners_ok = false;
             }
         }
         let structure_matches = slot
@@ -261,13 +270,18 @@ fn rebuild(
     viewport_h: f32,
     drain_epoch: u32,
 ) -> bool {
+    let phase = phase_log_enabled();
+    let t0 = std::time::Instant::now();
     let mut component = crate::dom::to_component_tree();
+    let t1 = std::time::Instant::now();
     let mut flat = pre_flatten(&component);
+    let t2 = std::time::Instant::now();
     let mut engine = LayoutEngine::new();
     configure_engine(&mut engine, &component);
     let Ok(mut results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
         return false;
     };
+    let t3 = std::time::Instant::now();
     if sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h)) {
         // Column count is a layout-time fact. Rebuild markers before
         // publishing geometry so scrollWidth / scrollLeft clamp see
@@ -288,9 +302,24 @@ fn rebuild(
             _ => u32::MAX,
         })
         .collect::<Vec<_>>();
+    let t4 = std::time::Instant::now();
     let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
+    let t5 = std::time::Instant::now();
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
+    let splice_owners_ok = splice_ok || splice::tree_is_spliceable_with_owners(&component);
+    if phase {
+        let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros();
+        eprintln!(
+            "[phases] rebuild lower {} flatten {} compute {} ids {} write {} memos {}",
+            us(t0, t1),
+            us(t1, t2),
+            us(t2, t3),
+            us(t3, t4),
+            us(t4, t5),
+            us(t5, std::time::Instant::now())
+        );
+    }
     let skip_projections = can_skip_projections(&component);
     let measure_text = needs_text_metric(&component);
     drop(flat);
@@ -298,9 +327,11 @@ fn rebuild(
         drain_epoch,
         sheet_generation: w3cos_dom::stylesheet::generation(),
         splice_ok,
+        splice_owners_ok,
         skip_projections,
         measure_text,
         node_ids_stale: false,
+        owner_counts: None,
         component,
         engine,
         structure: layout_gen,
@@ -321,6 +352,8 @@ fn patch_and_compute(
     viewport_h: f32,
     geometry_only: bool,
 ) -> bool {
+    // A patch can restyle boxes in place; recount fragment owners lazily.
+    cache.owner_counts = None;
     if dirty.is_empty() {
         // A cascade change with no dirty box can restyle descendants. Rebuild.
         if geometry_only {
@@ -379,6 +412,18 @@ fn patch_and_compute(
             })
             .map(|memo| (memo.rects.clone(), memo.client_rects.clone()))
     });
+    // LayoutNG lays out the patched component itself (no Taffy tree to
+    // patch). Only accept edits that leave the lowered subtree as a fresh
+    // lower would produce it: the DOM's lowering reads the element's
+    // formatting, font, width auto-ness, and text alignment (the sole text
+    // run's line-width marker), so those edits rebuild.
+    // (Checked after the subtree path below, which re-lowers what it needs.)
+    let ng_relower = crate::layout_ng::mode() == crate::layout_ng::Mode::On
+        && !cache.engine.tree_valid()
+        && styles.iter().any(|(id, style)| {
+            component_style(&cache.component, *id)
+                .is_none_or(|old| !ng_lowering_stable(old, style))
+        });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
@@ -413,6 +458,9 @@ fn patch_and_compute(
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         return true;
+    }
+    if ng_relower {
+        return false;
     }
     let phase = phase_log_enabled();
     let flatten_started = std::time::Instant::now();
@@ -457,6 +505,9 @@ fn patch_and_compute(
         );
     }
     note_flush("retained", flat.len() as u32, 0);
+    if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() {
+        splice::verify(viewport_w, viewport_h, styles[0].0);
+    }
     cache.viewport_w_bits = viewport_w.to_bits();
     cache.viewport_h_bits = viewport_h.to_bits();
     if let Some((node, bits)) = single_px_width(&styles) {
@@ -583,6 +634,77 @@ fn publish_client_rects(
     layouts: &[(crate::layout::LayoutRect, usize)],
     ng_text: &[crate::layout_ng::TextFragment],
 ) {
+    let published = client_rects_for(flat, layouts, ng_text);
+    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
+}
+
+/// Every CSSOM fragment owner a box of `component` publishes rects for: the
+/// split-inline owner of a synthetic fragment, block-in-inline box owners,
+/// and the owner ranges of a text run. Counts boxes per owner.
+pub(super) fn collect_cssom_owners(component: &Component, counts: &mut HashMap<u32, u32>) {
+    let mut stack = vec![component];
+    while let Some(component) = stack.pop() {
+        let style = &component.style;
+        if let Some(properties) = style.custom_properties.as_ref() {
+            if let Some(owner) = properties
+                .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                *counts.entry(owner).or_default() += 1;
+            }
+            for owner in w3cos_std::inline_text::cssom_box_owners(style) {
+                *counts.entry(owner).or_default() += 1;
+            }
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                for (owner, _, _) in w3cos_std::inline_text::cssom_owner_ranges(content, style) {
+                    *counts.entry(owner).or_default() += 1;
+                }
+            }
+        }
+        stack.extend(component.children.iter());
+    }
+}
+
+/// Replace the published rects of the owners a splice rebuilt. `removed`
+/// owners lose their entries, `inserted` ones get the subtree's rects moved
+/// by (`dx`, `dy`), and every rect of a `shifted` owner moves down by `dh`.
+pub(super) fn splice_client_rects(
+    removed: impl Iterator<Item = u32>,
+    inserted: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+    dx: f32,
+    dy: f32,
+    shifted: impl Iterator<Item = u32>,
+    dh: f32,
+) {
+    CLIENT_RECTS.with(|rects| {
+        let mut rects = rects.borrow_mut();
+        for owner in removed {
+            rects.remove(&owner);
+        }
+        if dh != 0.0 {
+            for owner in shifted {
+                if let Some(list) = rects.get_mut(&owner) {
+                    for rect in list {
+                        rect.y += dh;
+                    }
+                }
+            }
+        }
+        for (owner, mut list) in inserted {
+            for rect in &mut list {
+                rect.x += dx;
+                rect.y += dy;
+            }
+            rects.insert(owner, list);
+        }
+    });
+}
+
+pub(super) fn client_rects_for(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+    ng_text: &[crate::layout_ng::TextFragment],
+) -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
     let mut by_index = vec![None; flat.len()];
     for (rect, index) in layouts {
         if let Some(slot) = by_index.get_mut(*index) {
@@ -694,6 +816,16 @@ fn publish_client_rects(
         let w3cos_std::ComponentKind::Text { content } = &component.kind else {
             continue;
         };
+        // Text fragments publish only for split-inline owners: explicit
+        // owner ranges on the run or an inherited synthetic-inline owner.
+        // Without either, wrapping the run again would publish nothing.
+        if inherited_text_owners[index].is_empty()
+            && !info.style.custom_properties.as_ref().is_some_and(|properties| {
+                properties.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+            })
+        {
+            continue;
+        }
         let line_box = info
             .parent
             .and_then(|parent| by_index.get(parent).copied().flatten())
@@ -921,8 +1053,9 @@ fn publish_client_rects(
         let zero_after = w3cos_dom::DOMRect::new(union.x, union.y + union.height, 0.0, 0.0);
         *rects = vec![zero_before, middle, zero_after];
     }
-    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
+    published
 }
+
 
 fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
     crate::dom::with_document_mut(|document| {
@@ -1055,6 +1188,33 @@ fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::S
         && old.direction == new.direction
         && old.writing_mode == new.writing_mode
         && old.logical_overrides == new.logical_overrides
+}
+
+/// A style edit after which the element's lowered children are unchanged.
+fn ng_lowering_stable(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    let internal = |style: &w3cos_std::style::Style| {
+        let mut keys = style
+            .custom_properties
+            .iter()
+            .flat_map(|properties| properties.iter())
+            .filter(|(key, _)| {
+                key.starts_with("--w3cos-internal")
+                    && key.as_str() != w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER
+                    && key.as_str() != w3cos_std::inline_text::CSSOM_OWNER_RANGES
+                    && key.as_str() != w3cos_std::inline_text::CSSOM_BOX_OWNERS
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    };
+    geometry_only_change(old, new)
+        && matches!(old.width, Dimension::Auto) == matches!(new.width, Dimension::Auto)
+        && old.text_indent == new.text_indent
+        && old.text_align == new.text_align
+        && old.overflow_x == new.overflow_x
+        && old.overflow_y == new.overflow_y
+        && internal(old) == internal(new)
 }
 
 fn assign_layout_style(
@@ -1248,6 +1408,59 @@ fn note_paint_shift() {}
 /// used-box geometry patch the retained Taffy nodes. Inherited style, tree
 /// shape, and anything `style_patch_is_safe` rejects rebuild from the DOM so
 /// the painted styles stay the ones `to_component_tree` would produce.
+/// Mutations the paint cache drained, kept for the layout cache.
+///
+/// Both caches read the document's single precise dirty list. Without this,
+/// a headless frame between two flushes leaves the retained layout tree
+/// unable to tell what changed, so the next flush rebuilds the document.
+struct PaintDrained {
+    before: u32,
+    after: u32,
+    ids: Vec<NodeId>,
+}
+
+thread_local! {
+    static PAINT_DRAINED: RefCell<Option<PaintDrained>> = const { RefCell::new(None) };
+}
+
+/// Past this many stashed ids a rebuild is cheaper than replaying them.
+const PAINT_DRAINED_MAX: usize = 4096;
+
+fn stash_paint_drained(before: u32, dirty: &[NodeId], after: u32) {
+    PAINT_DRAINED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_mut() {
+            Some(stash) if stash.after == before => {
+                stash.after = after;
+                stash.ids.extend_from_slice(dirty);
+            }
+            _ => {
+                *slot = Some(PaintDrained {
+                    before,
+                    after,
+                    ids: dirty.to_vec(),
+                })
+            }
+        }
+        if slot.as_ref().is_some_and(|stash| stash.ids.len() > PAINT_DRAINED_MAX) {
+            *slot = None;
+        }
+    });
+}
+
+/// Prepend the ids the paint cache drained just before this take, so the
+/// layout cache sees an unbroken run of drains.
+fn take_paint_drained(before: u32, dirty: Vec<NodeId>, after: u32) -> (u32, Vec<NodeId>, u32) {
+    match PAINT_DRAINED.with(|slot| slot.borrow_mut().take()) {
+        Some(stash) if stash.after == before => {
+            let mut ids = stash.ids;
+            ids.extend(dirty);
+            (stash.before, ids, after)
+        }
+        _ => (before, dirty, after),
+    }
+}
+
 pub fn with_paint_layout<R>(
     viewport_w: f32,
     viewport_h: f32,
@@ -1259,7 +1472,12 @@ pub fn with_paint_layout<R>(
             document.cascade_generation(),
         )
     });
-    let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+    let dirty = crate::dom::with_document_mut(|document| {
+        let before = document.precise_drain_epoch();
+        let dirty = document.take_precise_dirty();
+        stash_paint_drained(before, &dirty, document.precise_drain_epoch());
+        dirty
+    });
     // A geometry read can set this and never paint. The paint that follows
     // records its own reason.
     note_paint_reuse(PaintReuse::None);

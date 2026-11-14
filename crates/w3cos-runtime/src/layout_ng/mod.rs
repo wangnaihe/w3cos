@@ -27,6 +27,7 @@
 //! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod cache;
 mod columns;
 mod exclusion;
 mod flex;
@@ -105,7 +106,7 @@ fn trace() -> bool {
 }
 
 /// NGConstraintSpace: the input of every layout algorithm.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ConstraintSpace {
     /// Available inline size (the containing block's content width).
     pub available_inline: f32,
@@ -216,7 +217,70 @@ pub(crate) struct BoxFragment {
     /// glyphs of `text-orientation: mixed`).
     pub vertical: bool,
     /// Children with their border-box offset from this border box.
-    pub children: Vec<(f32, f32, BoxFragment)>,
+    pub children: FragmentChildren,
+}
+
+/// A fragment's children, shared between copies (Blink's
+/// NGPhysicalFragment is ref-counted and immutable once built: a cached
+/// NGLayoutResult hands out the same fragment tree). Copy-on-write: a
+/// mutable borrow of a shared list copies one level.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FragmentChildren(std::rc::Rc<Vec<(f32, f32, BoxFragment)>>);
+
+impl std::ops::Deref for FragmentChildren {
+    type Target = Vec<(f32, f32, BoxFragment)>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FragmentChildren {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::rc::Rc::make_mut(&mut self.0)
+    }
+}
+
+impl From<Vec<(f32, f32, BoxFragment)>> for FragmentChildren {
+    fn from(children: Vec<(f32, f32, BoxFragment)>) -> Self {
+        Self(std::rc::Rc::new(children))
+    }
+}
+
+impl FromIterator<(f32, f32, BoxFragment)> for FragmentChildren {
+    fn from_iter<I: IntoIterator<Item = (f32, f32, BoxFragment)>>(iter: I) -> Self {
+        Self(std::rc::Rc::new(iter.into_iter().collect()))
+    }
+}
+
+impl FragmentChildren {
+    /// The list by value (moved out when unshared).
+    pub fn into_vec(self) -> Vec<(f32, f32, BoxFragment)> {
+        std::rc::Rc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl IntoIterator for FragmentChildren {
+    type Item = (f32, f32, BoxFragment);
+    type IntoIter = std::vec::IntoIter<(f32, f32, BoxFragment)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FragmentChildren {
+    type Item = &'a (f32, f32, BoxFragment);
+    type IntoIter = std::slice::Iter<'a, (f32, f32, BoxFragment)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut FragmentChildren {
+    type Item = &'a mut (f32, f32, BoxFragment);
+    type IntoIter = std::slice::IterMut<'a, (f32, f32, BoxFragment)>;
+    fn into_iter(self) -> Self::IntoIter {
+        std::rc::Rc::make_mut(&mut self.0).iter_mut()
+    }
 }
 
 /// The last line box's baseline (NGBoxFragment::LastBaseline), as an
@@ -691,7 +755,10 @@ fn layout_flat_with_text(
     }
     #[cfg(any(test, feature = "layout-ng-trace"))]
     RUNTIME_REASON.with(|r| r.set(""));
-    let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
+    let pass = cache::begin_pass(flat);
+    let laid = block::layout_root(flat, viewport_w, viewport_h);
+    drop(pass);
+    let Some((x, y, fragment)) = laid else {
         #[cfg(any(test, feature = "layout-ng-trace"))]
         if trace() {
             let reason = RUNTIME_REASON.with(|r| r.get());
@@ -737,6 +804,7 @@ fn layout_flat_with_text(
         }
         out = union_text_pieces(out, &texts);
     }
+    crate::list_marker::project(&mut out, flat, viewport_w, viewport_h);
     Some((out, texts))
 }
 
