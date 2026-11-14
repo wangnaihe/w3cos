@@ -1087,6 +1087,15 @@ impl Document {
     }
 
     /// Identity in [`ChildListChange`] records.
+    /// The node's style revision: changes whenever its computed style may
+    /// have changed (local edit, selector or inherited invalidation).
+    pub fn style_revision(&self, id: NodeId) -> u64 {
+        self.style_revisions
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
     pub fn serial(&self) -> u64 {
         self.serial
     }

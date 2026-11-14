@@ -50,10 +50,35 @@ struct Pass {
     inline_free: Vec<bool>,
     layouts: Vec<Vec<LayoutEntry>>,
     min_max: Vec<Vec<MinMaxEntry>>,
+    /// Cross-flush identity of each box's layout inputs (empty when the
+    /// retained cache is off): see [`fingerprints`].
+    fp: Vec<u64>,
+}
+
+/// Layout results kept across flushes (Blink keeps the last
+/// `NGLayoutResult` on the `LayoutBox` until `NeedsLayout` is set). A box
+/// is found again by the fingerprint of its subtree's inputs, so a box
+/// that moved (a streamed message pushes later ones down) still hits.
+#[derive(Default)]
+struct Retained {
+    layouts: std::collections::HashMap<u64, (usize, Vec<LayoutEntry>)>,
+    min_max: std::collections::HashMap<u64, Vec<MinMaxEntry>>,
 }
 
 thread_local! {
     static PASSES: RefCell<Vec<Pass>> = const { RefCell::new(Vec::new()) };
+    static RETAINED: RefCell<Retained> = RefCell::new(Retained::default());
+}
+
+/// `W3COS_LAYOUT_NG_RETAIN=1` keeps layout results across flushes.
+fn retain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("W3COS_LAYOUT_NG_RETAIN").ok().as_deref(),
+            Some("1") | Some("true")
+        )
+    })
 }
 
 fn enabled() -> bool {
@@ -79,7 +104,16 @@ impl Drop for PassGuard {
     fn drop(&mut self) {
         if self.0 {
             PASSES.with(|passes| {
-                let pass = passes.borrow_mut().pop();
+                let mut passes = passes.borrow_mut();
+                let mut pass = passes.pop();
+                let top_level = passes.is_empty();
+                drop(passes);
+                if top_level
+                    && let Some(pass) = pass.as_mut()
+                    && !pass.fp.is_empty()
+                {
+                    retain(pass);
+                }
                 if let Some(pass) = pass
                     && stats_enabled()
                 {
@@ -130,6 +164,12 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
         block_free[index] = ok.1;
         inline_free[index] = ok.2;
     }
+    let nested = PASSES.with(|passes| !passes.borrow().is_empty());
+    let fp = if retain_enabled() && !nested {
+        fingerprints(flat).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     PASSES.with(|passes| {
         passes.borrow_mut().push(Pass {
             flat_ptr: flat.as_ptr() as usize,
@@ -139,6 +179,7 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             inline_free,
             layouts: (0..flat.len()).map(|_| Vec::new()).collect(),
             min_max: (0..flat.len()).map(|_| Vec::new()).collect(),
+            fp,
         })
     });
     PassGuard(true)
@@ -190,7 +231,10 @@ pub(super) fn layout(
     match hit {
         Some(Some(result)) => Some(result),
         Some(None) => {
-            let result = compute()?;
+            let result = match retained_layout(flat, index, &key, force_bfc_root, sized) {
+                Some(result) => result,
+                None => compute()?,
+            };
             with_pass(flat, index, |pass| {
                 pass.layouts[index].push(LayoutEntry {
                     space: key,
@@ -224,7 +268,10 @@ pub(super) fn min_max(
     match hit {
         Some(Some(result)) => Some(result),
         Some(None) => {
-            let result = compute()?;
+            let result = match retained_min_max(flat, index, &key, block) {
+                Some(result) => result,
+                None => compute()?,
+            };
             with_pass(flat, index, |pass| {
                 pass.min_max[index].push(MinMaxEntry {
                     space: key,
@@ -337,4 +384,234 @@ fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool) {
         || !edges_ok(&style.padding)
         || !edges_ok(&style.margin);
     (block, inline)
+}
+
+/// The pass fingerprint of `index` (0 when the retained cache is off).
+fn pass_fp(flat: &[FlatNodeInfo], index: usize) -> Option<u64> {
+    with_pass(flat, index, |pass| pass.fp.get(index).copied())
+        .flatten()
+        .filter(|&fp| fp != 0)
+}
+
+/// Spaces equal for a retained replay. A result that never read the
+/// parent's exclusion space (`bfc_dependent == false`) does not depend on
+/// its BFC offset, so a box that only moved still matches.
+fn retained_space_matches(entry: &LayoutEntry, space: &ConstraintSpace) -> bool {
+    if entry.space == *space {
+        return true;
+    }
+    if entry.result.bfc_dependent || entry.result.float_overlap {
+        return false;
+    }
+    let mut moved = *space;
+    moved.bfc_x = entry.space.bfc_x;
+    moved.bfc_y = entry.space.bfc_y;
+    entry.space == moved
+}
+
+fn retained_layout(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    force_bfc_root: bool,
+    sized: Sized,
+) -> Option<LayoutResult> {
+    let fp = pass_fp(flat, index)?;
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        let (base, entries) = retained.layouts.get(&fp)?;
+        let entry = entries.iter().find(|entry| {
+            entry.force_bfc_root == force_bfc_root
+                && entry.sized == sized
+                && retained_space_matches(entry, space)
+        })?;
+        let mut result = entry.result.clone();
+        let delta = index as isize - *base as isize;
+        if delta != 0 {
+            shift_indices(&mut result, delta);
+        }
+        Some(result)
+    })
+}
+
+fn retained_min_max(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
+    let fp = pass_fp(flat, index)?;
+    RETAINED.with(|retained| {
+        retained
+            .borrow()
+            .min_max
+            .get(&fp)?
+            .iter()
+            .find(|entry| entry.block == block && entry.space == *space)
+            .map(|entry| entry.result)
+    })
+}
+
+/// Flat indices in a result taken from another flush's tree, where the box
+/// sat `delta` slots away (its subtree is identical, so every index moves
+/// by the same amount).
+fn shift_indices(result: &mut LayoutResult, delta: isize) {
+    fn shift(index: &mut usize, delta: isize) {
+        *index = (*index as isize + delta) as usize;
+    }
+    fn walk(fragment: &mut super::BoxFragment, delta: isize) {
+        shift(&mut fragment.index, delta);
+        for (_, _, child) in &mut fragment.children {
+            walk(child, delta);
+        }
+    }
+    walk(&mut result.fragment, delta);
+    for candidate in &mut result.oof {
+        shift(&mut candidate.index, delta);
+    }
+}
+
+/// Replace the retained results with the ones this top-level pass used.
+fn retain(pass: &mut Pass) {
+    let mut layouts = std::collections::HashMap::new();
+    let mut min_max = std::collections::HashMap::new();
+    for index in 0..pass.fp.len() {
+        let fp = pass.fp[index];
+        if fp == 0 {
+            continue;
+        }
+        let entries = std::mem::take(&mut pass.layouts[index]);
+        if !entries.is_empty() {
+            layouts.insert(fp, (index, entries));
+        }
+        let entries = std::mem::take(&mut pass.min_max[index]);
+        if !entries.is_empty() {
+            min_max.insert(fp, entries);
+        }
+    }
+    RETAINED.with(|retained| *retained.borrow_mut() = Retained { layouts, min_max });
+}
+
+/// Drop every retained result.
+#[allow(dead_code)]
+pub(super) fn clear_retained() {
+    RETAINED.with(|retained| *retained.borrow_mut() = Retained::default());
+}
+
+fn mix(h: u64, v: u64) -> u64 {
+    (h ^ v)
+        .wrapping_mul(0x100_0000_01b3)
+        .rotate_left(29)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+}
+
+fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for chunk in bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h = mix(h, u64::from_le_bytes(word));
+    }
+    mix(h, bytes.len() as u64)
+}
+
+fn host_id(info: &FlatNodeInfo) -> Option<u32> {
+    match info.on_click {
+        w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
+        _ => None,
+    }
+}
+
+/// Per-box fingerprint of everything a box's layout reads besides its
+/// constraint space (Blink's NeedsLayout bits, computed instead of
+/// tracked): for every box of the subtree its DOM node and that node's
+/// style revision, the style revision of the split inline it belongs to,
+/// its kind and text, the subtree shape; plus its parent's node and style
+/// revision (an item reads its container), the document, and the style
+/// sheet generation. `None` when the document is borrowed mutably.
+fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
+    crate::dom::try_with_document(|document| {
+        let salt = mix(
+            mix(0x5157_4e47, document.serial()),
+            w3cos_dom::stylesheet::generation(),
+        );
+        let revision = |id: u32| document.style_revision(w3cos_dom::NodeId::from_u32(id));
+        // A box with neither a DOM node nor a split-inline owner (and not a
+        // text leaf, whose style is its parent's) has a style no revision
+        // tracks: it and its ancestors are not retained.
+        let mut known = vec![true; flat.len()];
+        let own: Vec<u64> = flat
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                let mut h = salt;
+                let owner = info
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
+                    .and_then(|v| v.parse::<u32>().ok());
+                match host_id(info) {
+                    Some(id) => {
+                        h = mix(h, id as u64);
+                        h = mix(h, revision(id));
+                    }
+                    None => {
+                        h = mix(h, u64::MAX);
+                        known[index] = owner.is_some()
+                            || matches!(info.kind, w3cos_std::ComponentKind::Text { .. });
+                    }
+                }
+                if let Some(owner) = owner {
+                    h = mix(h, owner as u64);
+                    h = mix(h, revision(owner));
+                }
+                let style = info.style;
+                h = mix(h, style.display as u64);
+                h = mix(h, style.position as u64);
+                h = mix(h, style.float as u64);
+                h = mix(h, {
+                    use std::hash::{Hash, Hasher};
+                    let mut kind = std::collections::hash_map::DefaultHasher::new();
+                    std::mem::discriminant(info.kind).hash(&mut kind);
+                    kind.finish()
+                });
+                if let w3cos_std::ComponentKind::Text { content } = info.kind {
+                    h = hash_bytes(h, content.as_bytes());
+                    // (A lowered text leaf carries its parent's style; a
+                    // leaf built with its own keeps the fields text
+                    // measure reads.)
+                    h = mix(h, style.font_size.to_bits() as u64);
+                    h = mix(h, style.line_height.to_bits() as u64);
+                    h = mix(h, style.line_height_is_normal as u64);
+                    h = mix(h, style.writing_mode as u64);
+                    h = mix(h, style.white_space as u64);
+                    h = mix(h, style.direction as u64);
+                    h = hash_bytes(h, style.font_family.as_deref().unwrap_or("").as_bytes());
+                }
+                h
+            })
+            .collect();
+        let mut subtree = vec![0u64; flat.len()];
+        for index in (0..flat.len()).rev() {
+            let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+            let mut h = mix(own[index], (end - index) as u64);
+            let mut child = index + 1;
+            while child < end {
+                h = mix(h, subtree[child]);
+                known[index] &= known[child];
+                child = flat[child].subtree_end.max(child + 1);
+            }
+            subtree[index] = h;
+        }
+        (0..flat.len())
+            .map(|index| {
+                let parent = flat[index].parent.map_or(0, |p| own[p]);
+                if known[index] {
+                    mix(subtree[index], parent).max(1)
+                } else {
+                    0
+                }
+            })
+            .collect()
+    })
 }

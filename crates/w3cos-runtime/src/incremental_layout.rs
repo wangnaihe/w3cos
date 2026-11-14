@@ -261,13 +261,18 @@ fn rebuild(
     viewport_h: f32,
     drain_epoch: u32,
 ) -> bool {
+    let phase = phase_log_enabled();
+    let t0 = std::time::Instant::now();
     let mut component = crate::dom::to_component_tree();
+    let t1 = std::time::Instant::now();
     let mut flat = pre_flatten(&component);
+    let t2 = std::time::Instant::now();
     let mut engine = LayoutEngine::new();
     configure_engine(&mut engine, &component);
     let Ok(mut results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
         return false;
     };
+    let t3 = std::time::Instant::now();
     if sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h)) {
         // Column count is a layout-time fact. Rebuild markers before
         // publishing geometry so scrollWidth / scrollLeft clamp see
@@ -288,9 +293,23 @@ fn rebuild(
             _ => u32::MAX,
         })
         .collect::<Vec<_>>();
+    let t4 = std::time::Instant::now();
     let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
+    let t5 = std::time::Instant::now();
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
+    if phase {
+        let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros();
+        eprintln!(
+            "[phases] rebuild lower {} flatten {} compute {} ids {} write {} memos {}",
+            us(t0, t1),
+            us(t1, t2),
+            us(t2, t3),
+            us(t3, t4),
+            us(t4, t5),
+            us(t5, std::time::Instant::now())
+        );
+    }
     let skip_projections = can_skip_projections(&component);
     let measure_text = needs_text_metric(&component);
     drop(flat);
