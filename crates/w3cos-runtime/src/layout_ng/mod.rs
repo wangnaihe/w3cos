@@ -27,6 +27,7 @@
 //! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod cache;
 mod columns;
 mod exclusion;
 mod flex;
@@ -105,7 +106,7 @@ fn trace() -> bool {
 }
 
 /// NGConstraintSpace: the input of every layout algorithm.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ConstraintSpace {
     /// Available inline size (the containing block's content width).
     pub available_inline: f32,
@@ -691,7 +692,10 @@ fn layout_flat_with_text(
     }
     #[cfg(any(test, feature = "layout-ng-trace"))]
     RUNTIME_REASON.with(|r| r.set(""));
-    let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
+    let pass = cache::begin_pass(flat);
+    let laid = block::layout_root(flat, viewport_w, viewport_h);
+    drop(pass);
+    let Some((x, y, fragment)) = laid else {
         #[cfg(any(test, feature = "layout-ng-trace"))]
         if trace() {
             let reason = RUNTIME_REASON.with(|r| r.get());

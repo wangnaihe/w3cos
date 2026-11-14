@@ -3319,6 +3319,17 @@ pub(super) fn intrinsic_sizes_at(
     space: &ConstraintSpace,
     block: Option<f32>,
 ) -> Option<MinMax> {
+    super::cache::min_max(flat, index, space, block, || {
+        intrinsic_sizes_uncached(flat, index, space, block)
+    })
+}
+
+fn intrinsic_sizes_uncached(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
     let info = &flat[index];
     if let Some(flow) = super::orthogonal::root_flow(flat, index) {
         return super::orthogonal::intrinsic(flat, index, flow, space);
@@ -4361,14 +4372,16 @@ pub(super) fn layout_block_sized(
         bfc_y: 0.0,
         ..*space
     };
-    layout_block_in(
-        flat,
-        index,
-        &space,
-        force_bfc_root,
-        sized,
-        &mut ExclusionSpace::default(),
-    )
+    super::cache::layout(flat, index, &space, force_bfc_root, sized, || {
+        layout_block_in(
+            flat,
+            index,
+            &space,
+            force_bfc_root,
+            sized,
+            &mut ExclusionSpace::default(),
+        )
+    })
 }
 
 /// Visits the boxes whose containing block is `index`'s content box: its
