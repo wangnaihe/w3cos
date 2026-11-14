@@ -2860,6 +2860,56 @@ mod tests {
     }
 
     #[test]
+    fn stretched_flex_lines_end_at_the_container_end() {
+        // align-content-stretch-rounding: the last line ends exactly where
+        // the container's content box does, at every 0.1px height.
+        crate::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let flex = crate::dom::create_element("div");
+        style(
+            flex,
+            &[
+                ("display", "flex"),
+                ("flex-wrap", "wrap"),
+                ("width", "10px"),
+                ("height", "40px"),
+                ("align-content", "stretch"),
+            ],
+        );
+        let mut last = 0;
+        for _ in 0..8 {
+            last = crate::dom::create_element("div");
+            style(last, &[("width", "10px"), ("min-height", "5px")]);
+            crate::dom::append_child(flex, last);
+        }
+        crate::dom::append_child(crate::dom::body_id(), flex);
+        assert!(crate::incremental_layout::flush());
+        for step in 0..10 {
+            style(
+                flex,
+                &[("height", &format!("{}px", 40.0 + step as f32 / 10.0))],
+            );
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("step {step}"));
+            let (container, item) = crate::dom::with_document(|document| {
+                (
+                    document.get_layout_rect(NodeId::from_u32(flex)),
+                    document.get_layout_rect(NodeId::from_u32(last)),
+                )
+            });
+            if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+                assert_eq!(
+                    item.y as f64 + item.height as f64,
+                    container.y as f64 + container.height as f64,
+                    "step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn flex_row_width_matches_full_layout() {
         crate::dom::reset_document();
         crate::incremental_layout::invalidate();

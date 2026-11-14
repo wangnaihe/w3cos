@@ -3795,9 +3795,14 @@ fn layout_wrapped(
     {
         let extra = definite - packed;
         if extra > EPS && !line_cross.is_empty() {
-            let share = extra / line_cross.len() as f32;
-            for size in &mut line_cross {
-                *size += share;
+            // Blink divides the free space in LayoutUnits (1/64 px) and the
+            // last line takes what the division leaves, so the last line
+            // ends exactly at the container's end (crbug.com/40437604).
+            let lines = line_cross.len();
+            let share = (extra / lines as f32 * 64.0).floor() / 64.0;
+            let last = extra - share * (lines - 1) as f32;
+            for (line, size) in line_cross.iter_mut().enumerate() {
+                *size += if line + 1 == lines { last } else { share };
             }
         }
     }
