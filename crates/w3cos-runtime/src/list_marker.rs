@@ -116,7 +116,9 @@ impl Positions {
     }
 
     fn get(&self, index: &usize) -> Option<&usize> {
-        self.0.get(*index).filter(|position| **position != usize::MAX)
+        self.0
+            .get(*index)
+            .filter(|position| **position != usize::MAX)
     }
 }
 

@@ -358,33 +358,37 @@ fn splice_stacking_parent(parent: &Component, child: usize) -> bool {
                     .iter()
                     .all(|item| item.style.flex_grow == 0.0)
                 && (!matches!(style.height, Dimension::Px(_))
-                    || parent.children.iter().all(|item| item.style.flex_shrink == 0.0))
+                    || parent
+                        .children
+                        .iter()
+                        .all(|item| item.style.flex_shrink == 0.0))
         }
         FlexDirection::Row => {
-            matches!(style.align_items, AlignItems::Stretch | AlignItems::FlexStart)
-                && parent.children.iter().enumerate().all(|(index, item)| {
-                    let item_style = &item.style;
-                    if matches!(item_style.position, Position::Absolute | Position::Fixed) {
-                        return index != child;
-                    }
-                    matches!(
-                        item_style.align_self,
-                        AlignSelf::Auto | AlignSelf::Stretch | AlignSelf::FlexStart
-                    ) && in_flow_static(item_style)
-                        && px_spacing(item_style.margin.top).is_some()
-                        && px_spacing(item_style.margin.bottom).is_some()
-                        && (index == child
-                            || (matches!(item_style.height, Dimension::Px(_))
-                                && host_id(item).is_some()))
-                })
+            matches!(
+                style.align_items,
+                AlignItems::Stretch | AlignItems::FlexStart
+            ) && parent.children.iter().enumerate().all(|(index, item)| {
+                let item_style = &item.style;
+                if matches!(item_style.position, Position::Absolute | Position::Fixed) {
+                    return index != child;
+                }
+                matches!(
+                    item_style.align_self,
+                    AlignSelf::Auto | AlignSelf::Stretch | AlignSelf::FlexStart
+                ) && in_flow_static(item_style)
+                    && px_spacing(item_style.margin.top).is_some()
+                    && px_spacing(item_style.margin.bottom).is_some()
+                    && (index == child
+                        || (matches!(item_style.height, Dimension::Px(_))
+                            && host_id(item).is_some()))
+            })
         }
         _ => false,
     }
 }
 
 fn is_row_flex(component: &Component) -> bool {
-    component.style.display == Display::Flex
-        && component.style.flex_direction == FlexDirection::Row
+    component.style.display == Display::Flex && component.style.flex_direction == FlexDirection::Row
 }
 
 /// [`ancestor_levels`] over [`splice_stacking_parent`].
@@ -870,8 +874,15 @@ fn solve(
     Vec<(u32, crate::layout::LayoutRect)>,
     crate::layout::LayoutRect,
 )> {
-    solve_with_client_rects(wrapper, skip_projections, measure_text, viewport_w, viewport_h, false)
-        .map(|(rects, own, _)| (rects, own))
+    solve_with_client_rects(
+        wrapper,
+        skip_projections,
+        measure_text,
+        viewport_w,
+        viewport_h,
+        false,
+    )
+    .map(|(rects, own, _)| (rects, own))
 }
 
 type ClientRectMap = std::collections::HashMap<u32, Vec<w3cos_dom::DOMRect>>;
@@ -1250,7 +1261,16 @@ pub(super) fn try_splice(
                     false
                 };
                 let measure = text_metric_for_fresh(cache, &plan.path, &fresh);
-                (rects, dx, dy, dh, skip, measure, PlanKind::Subtree(fresh), None)
+                (
+                    rects,
+                    dx,
+                    dy,
+                    dh,
+                    skip,
+                    measure,
+                    PlanKind::Subtree(fresh),
+                    None,
+                )
             } else {
                 let old = at_path(&cache.component, &plan.path);
                 let margins = old.style.margin_lengths();
@@ -1272,9 +1292,9 @@ pub(super) fn try_splice(
                     std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
                 let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
                 let mut wrapper = wrapper_for(parent, width, vec![fresh]);
-                let Some((rects, _, client)) = solve_with_client_rects(
-                    &wrapper, skip, measure, viewport_w, viewport_h, true,
-                ) else {
+                let Some((rects, _, client)) =
+                    solve_with_client_rects(&wrapper, skip, measure, viewport_w, viewport_h, true)
+                else {
                     return bail("solve 568");
                 };
                 let Some(new_rect) = rect_of(&rects, plan.node) else {
@@ -1466,11 +1486,15 @@ pub(super) fn try_splice(
             counts
         });
         let total = |owner: &u32| totals.get(owner).copied().unwrap_or(0);
-        if old_owners.iter().any(|(owner, count)| total(owner) != *count)
+        if old_owners
+            .iter()
+            .any(|(owner, count)| total(owner) != *count)
             || new_owners
                 .keys()
                 .any(|owner| total(owner) != old_owners.get(owner).copied().unwrap_or(0))
-            || shifted_owners.iter().any(|(owner, count)| total(owner) != *count)
+            || shifted_owners
+                .iter()
+                .any(|(owner, count)| total(owner) != *count)
         {
             return bail("cssom owner outside splice");
         }
@@ -1887,7 +1911,10 @@ pub(super) fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
             bad_owners += 1;
         }
     }
-    let extra = got.keys().filter(|owner| !expected.contains_key(owner)).count();
+    let extra = got
+        .keys()
+        .filter(|owner| !expected.contains_key(owner))
+        .count();
     eprintln!(
         "[splice-verify] root {node}: {} owners, {bad_owners} mismatched, {extra} extra",
         expected.len()
@@ -1996,7 +2023,10 @@ mod tests {
         let expected =
             super::super::client_rects_for(&flat, &results.layout_cache, &results.text_fragments);
         let got = super::super::client_rect_snapshot();
-        assert!(!expected.is_empty(), "{label}: page publishes no fragment owners");
+        assert!(
+            !expected.is_empty(),
+            "{label}: page publishes no fragment owners"
+        );
         assert_eq!(
             got.keys().collect::<std::collections::BTreeSet<_>>(),
             expected.keys().collect::<std::collections::BTreeSet<_>>(),
@@ -2039,12 +2069,23 @@ mod tests {
         let mut streams = Vec::new();
         for index in 0..3 {
             let msg = crate::dom::create_element("div");
-            style(msg, &[("display", "flex"), ("flex-direction", "row"), ("gap", "8px")]);
+            style(
+                msg,
+                &[
+                    ("display", "flex"),
+                    ("flex-direction", "row"),
+                    ("gap", "8px"),
+                ],
+            );
             let avatar = crate::dom::create_element("div");
             let avatar_height = format!("{avatar_px}px");
             style(
                 avatar,
-                &[("width", "32px"), ("height", avatar_height.as_str()), ("flex", "none")],
+                &[
+                    ("width", "32px"),
+                    ("height", avatar_height.as_str()),
+                    ("flex", "none"),
+                ],
             );
             let bubble = crate::dom::create_element("div");
             style(
@@ -2067,7 +2108,10 @@ mod tests {
             crate::dom::append_child(p, strong);
             crate::dom::append_child(p, crate::dom::create_text_node(" then "));
             let code = crate::dom::create_element("code");
-            style(code, &[("font-family", "monospace"), ("background", "#f0f0f0")]);
+            style(
+                code,
+                &[("font-family", "monospace"), ("background", "#f0f0f0")],
+            );
             crate::dom::append_child(code, crate::dom::create_text_node("fn_call()"));
             crate::dom::append_child(p, code);
             crate::dom::append_child(p, crate::dom::create_text_node(" and "));
@@ -2116,7 +2160,11 @@ mod tests {
             assert_matches_full(&format!("step {step}"));
             assert_client_rects_match_full(&format!("step {step}"));
         }
-        assert_eq!(splice_counts().0 - before.0, 12, "text edits under row messages must splice");
+        assert_eq!(
+            splice_counts().0 - before.0,
+            12,
+            "text edits under row messages must splice"
+        );
     }
 
     #[test]
@@ -2124,9 +2172,15 @@ mod tests {
         let streams = markdown_chat_page(32);
         let bubbles: Vec<u32> = streams
             .iter()
-            .map(|&(p, _)| crate::dom::with_document(|document| {
-                document.get_node(NodeId::from_u32(p)).parent.unwrap().as_u32()
-            }))
+            .map(|&(p, _)| {
+                crate::dom::with_document(|document| {
+                    document
+                        .get_node(NodeId::from_u32(p))
+                        .parent
+                        .unwrap()
+                        .as_u32()
+                })
+            })
             .collect();
         let before = splice_counts();
         // Append into the middle message (followers shift) and the last one.
@@ -2135,7 +2189,10 @@ mod tests {
             style(p, &[("margin", "6px 0 10px 0")]);
             crate::dom::append_child(p, crate::dom::create_text_node("new paragraph words "));
             let code = crate::dom::create_element("code");
-            style(code, &[("font-family", "monospace"), ("background", "#f0f0f0")]);
+            style(
+                code,
+                &[("font-family", "monospace"), ("background", "#f0f0f0")],
+            );
             crate::dom::append_child(code, crate::dom::create_text_node("tail_call()"));
             crate::dom::append_child(p, code);
             crate::dom::append_child(bubble, p);
@@ -2150,8 +2207,16 @@ mod tests {
         }
         if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
             let after = splice_counts();
-            assert_eq!(after.1 - before.1, 3, "appends to a column flex bubble splice the tail");
-            assert_eq!(after.0 - before.0, 3, "text edits in the new paragraphs splice");
+            assert_eq!(
+                after.1 - before.1,
+                3,
+                "appends to a column flex bubble splice the tail"
+            );
+            assert_eq!(
+                after.0 - before.0,
+                3,
+                "text edits in the new paragraphs splice"
+            );
         }
     }
 

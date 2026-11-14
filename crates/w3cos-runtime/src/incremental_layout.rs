@@ -421,8 +421,7 @@ fn patch_and_compute(
     let ng_relower = crate::layout_ng::mode() == crate::layout_ng::Mode::On
         && !cache.engine.tree_valid()
         && styles.iter().any(|(id, style)| {
-            component_style(&cache.component, *id)
-                .is_none_or(|old| !ng_lowering_stable(old, style))
+            component_style(&cache.component, *id).is_none_or(|old| !ng_lowering_stable(old, style))
         });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
@@ -737,7 +736,10 @@ pub(super) fn client_rects_for(
     let mut ng_lines_of: HashMap<usize, Vec<&crate::layout_ng::TextFragment>> = HashMap::new();
     for fragment in ng_text {
         if !fragment.vertical {
-            ng_lines_of.entry(fragment.index).or_default().push(fragment);
+            ng_lines_of
+                .entry(fragment.index)
+                .or_default()
+                .push(fragment);
         }
     }
     let mut inherited_text_owners = vec![Vec::new(); flat.len()];
@@ -838,9 +840,13 @@ pub(super) fn client_rects_for(
         // owner ranges on the run or an inherited synthetic-inline owner.
         // Without either, wrapping the run again would publish nothing.
         if inherited_text_owners[index].is_empty()
-            && !info.style.custom_properties.as_ref().is_some_and(|properties| {
-                properties.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES)
-            })
+            && !info
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+                })
         {
             continue;
         }
@@ -1070,7 +1076,6 @@ pub(super) fn client_rects_for(
     }
     published
 }
-
 
 fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
     crate::dom::with_document_mut(|document| {
@@ -1457,7 +1462,10 @@ fn stash_paint_drained(before: u32, dirty: &[NodeId], after: u32) {
                 })
             }
         }
-        if slot.as_ref().is_some_and(|stash| stash.ids.len() > PAINT_DRAINED_MAX) {
+        if slot
+            .as_ref()
+            .is_some_and(|stash| stash.ids.len() > PAINT_DRAINED_MAX)
+        {
             *slot = None;
         }
     });

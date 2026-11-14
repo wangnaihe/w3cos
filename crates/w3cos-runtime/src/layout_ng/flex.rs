@@ -1614,8 +1614,7 @@ fn inline_contribution(
 /// needs no separate walk of the item's content.
 fn defers_column_content_min(flat: &[FlatNodeInfo], index: usize, row: bool) -> bool {
     let style = flat[index].style;
-    !row
-        && matches!(style.min_height, Dimension::Auto)
+    !row && matches!(style.min_height, Dimension::Auto)
         && matches!(style.height, Dimension::Auto)
         && matches!(style.flex_basis, Dimension::Auto)
         && matches!(style.max_height, Dimension::Auto | Dimension::Px(_))
