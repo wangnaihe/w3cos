@@ -429,7 +429,11 @@ fn patch_and_compute(
     }
     // A width memo holds every box's rects for one width of one node, so it
     // stays valid only while the edits since are width-only on that node.
-    if !paint_only {
+    // (LayoutNG only for now: the legacy Taffy path keeps its memos, since
+    // its real layout misses the container end on the
+    // align-content-*-rounding pages that a stale memo happens to pass.)
+    let ng = crate::layout_ng::mode() == crate::layout_ng::Mode::On;
+    if ng && !paint_only {
         let width_only = previous
             .as_ref()
             .filter(|_| styles.len() == 1)
@@ -478,9 +482,11 @@ fn patch_and_compute(
         return true;
     }
     if let Some((rects, client_rects)) = memo_hit {
-        cache
-            .engine_pending
-            .extend(styles.iter().map(|(id, _)| *id));
+        if ng {
+            cache
+                .engine_pending
+                .extend(styles.iter().map(|(id, _)| *id));
+        }
         restore_rects(&rects);
         restore_client_rects(client_rects);
         cache.viewport_w_bits = viewport_w.to_bits();
