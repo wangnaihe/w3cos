@@ -546,6 +546,11 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
             if let Some(plan) = try_container(cache, document, &chain, node) {
                 return Ok(Some(plan));
             }
+            // A column flex too large for `try_container` keeps its items and
+            // lays out only the appended ones.
+            if let Some(plan) = try_tail_in(cache, document, &chain, &chains, true) {
+                return Ok(Some(plan));
+            }
             chain.pop();
         }
         Err(())
@@ -559,6 +564,38 @@ fn ordinary_block_child(component: &Component) -> bool {
     ) && in_flow_static(&component.style)
 }
 
+/// A LayoutNG column flex container that stacks its items like a block
+/// without margin collapsing: auto height, no wrap, flex-start, stretched
+/// items, document order. Appending items leaves the kept ones in place, so
+/// a flex wrapper holding the last kept item and the new tail reproduces
+/// their positions (Blink's flex algorithm with an indefinite main size).
+fn column_flex_tail_parent(component: &Component) -> bool {
+    let style = &component.style;
+    crate::layout_ng::mode() != crate::layout_ng::Mode::Off
+        && subtree_relayout_enabled()
+        && style.display == Display::Flex
+        && style.flex_direction == FlexDirection::Column
+        && style.flex_wrap == FlexWrap::NoWrap
+        && style.justify_content == JustifyContent::FlexStart
+        && style.align_items == AlignItems::Stretch
+        && style.writing_mode == Default::default()
+        && matches!(style.height, Dimension::Auto)
+        && matches!(style.min_height, Dimension::Auto)
+        && matches!(style.max_height, Dimension::Auto)
+        && !is_table_like(component)
+        && component.children.iter().all(column_flex_tail_item)
+}
+
+fn column_flex_tail_item(item: &Component) -> bool {
+    let style = &item.style;
+    style.flex_grow == 0.0
+        && style.order == 0
+        && in_flow_static(style)
+        && matches!(style.align_self, AlignSelf::Auto | AlignSelf::Stretch)
+        && px_spacing(style.margin.top).is_some()
+        && px_spacing(style.margin.bottom).is_some()
+}
+
 /// Only the trailing children of a block changed. The kept prefix keeps its
 /// cached results (LayoutNG reuses a clean child's layout result); the last
 /// kept child is solved again only to seed sibling margin collapsing.
@@ -567,6 +604,16 @@ fn try_tail(
     document: &w3cos_dom::document::Document,
     chain: &[u32],
     chains: &[Vec<u32>],
+) -> Option<Plan> {
+    try_tail_in(cache, document, chain, chains, false)
+}
+
+fn try_tail_in(
+    cache: &Cache,
+    document: &w3cos_dom::document::Document,
+    chain: &[u32],
+    chains: &[Vec<u32>],
+    flex_column: bool,
 ) -> Option<Plan> {
     if chain.len() <= 1 || chain.last() == Some(&crate::dom::body_id()) {
         return None;
@@ -580,9 +627,14 @@ fn try_tail(
     // A definite height (a scroller such as a chat log) keeps its own box;
     // only its scrollable overflow changes.
     let definite = matches!(style.height, Dimension::Px(_));
-    if !is_block_flow(style.display)
+    let column_flex = flex_column && column_flex_tail_parent(old);
+    if flex_column != column_flex {
+        return None;
+    }
+    if !(is_block_flow(style.display) || column_flex)
         || !in_flow_static(style)
         || !(definite
+            || column_flex
             || (bottom_closed
                 && matches!(style.height, Dimension::Auto)
                 && matches!(style.min_height, Dimension::Auto)
@@ -638,6 +690,7 @@ fn try_tail(
         let component = document.to_component_subtree(NodeId::from_u32(id));
         if host_id(&component) != Some(id)
             || !ordinary_block_child(&component)
+            || (column_flex && !column_flex_tail_item(&component))
             || !tree_is_spliceable_with_owners(&component)
         {
             return None;
@@ -966,12 +1019,14 @@ fn end_margin_strut(component: &Component) -> Option<f32> {
 /// anchor's end margin strut is equivalent, and costs one box instead of
 /// re-solving its whole subtree (LayoutNG reuses the clean child's layout
 /// result; only its NGMarginStrut matters to what follows).
-fn anchor_stand_in(source: &Component) -> Component {
+fn anchor_stand_in(source: &Component, flex_item: bool) -> Component {
     let height = host_id(source).map(|id| {
         crate::dom::with_document(|document| document.get_layout_rect(NodeId::from_u32(id)).height)
     });
     let strut = || {
-        if edge_blocks_margin_collapse(source, false) {
+        // A flex item is a formatting context root: no child margin
+        // escapes it, and its own margins never collapse.
+        if flex_item || edge_blocks_margin_collapse(source, false) {
             Some(source.style.margin.bottom)
         } else {
             end_margin_strut(source).map(Spacing::Px)
@@ -1255,7 +1310,8 @@ pub(super) fn try_splice(
             let tail = target.children.split_off(keep);
             target.children.extend(removed);
             let target = at_path(&cache.component, &plan.path);
-            let anchor = anchor_stand_in(&target.children[keep - 1]);
+            let flex_item = is_flex_or_grid(&target.style);
+            let anchor = anchor_stand_in(&target.children[keep - 1], flex_item);
             let Some(anchor_id) = host_id(&anchor) else {
                 return bail("solve 599");
             };
@@ -2061,6 +2117,42 @@ mod tests {
             assert_client_rects_match_full(&format!("step {step}"));
         }
         assert_eq!(splice_counts().0 - before.0, 12, "text edits under row messages must splice");
+    }
+
+    #[test]
+    fn new_paragraph_in_column_flex_bubble_splices_tail() {
+        let streams = markdown_chat_page(32);
+        let bubbles: Vec<u32> = streams
+            .iter()
+            .map(|&(p, _)| crate::dom::with_document(|document| {
+                document.get_node(NodeId::from_u32(p)).parent.unwrap().as_u32()
+            }))
+            .collect();
+        let before = splice_counts();
+        // Append into the middle message (followers shift) and the last one.
+        for (step, &bubble) in [bubbles[1], bubbles[2], bubbles[1]].iter().enumerate() {
+            let p = crate::dom::create_element("p");
+            style(p, &[("margin", "6px 0 10px 0")]);
+            crate::dom::append_child(p, crate::dom::create_text_node("new paragraph words "));
+            let code = crate::dom::create_element("code");
+            style(code, &[("font-family", "monospace"), ("background", "#f0f0f0")]);
+            crate::dom::append_child(code, crate::dom::create_text_node("tail_call()"));
+            crate::dom::append_child(p, code);
+            crate::dom::append_child(bubble, p);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("append {step}"));
+            assert_client_rects_match_full(&format!("append {step}"));
+            let text = crate::dom::create_text_node(&" streamed".repeat(step * 4 + 3));
+            crate::dom::append_child(p, text);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("stream {step}"));
+            assert_client_rects_match_full(&format!("stream {step}"));
+        }
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            let after = splice_counts();
+            assert_eq!(after.1 - before.1, 3, "appends to a column flex bubble splice the tail");
+            assert_eq!(after.0 - before.0, 3, "text edits in the new paragraphs splice");
+        }
     }
 
     #[test]

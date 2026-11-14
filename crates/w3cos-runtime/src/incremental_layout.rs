@@ -136,11 +136,12 @@ pub fn flush() -> bool {
         )
     });
     let take = || {
-        crate::dom::with_document_mut(|document| {
+        let (before, dirty, after) = crate::dom::with_document_mut(|document| {
             let before = document.precise_drain_epoch();
             let dirty = document.take_precise_dirty();
             (before, dirty, document.precise_drain_epoch())
-        })
+        });
+        take_paint_drained(before, dirty, after)
     };
     // A retained tree that only needs a structural splice skips the
     // document-wide definite-layout fingerprint below.
@@ -1362,6 +1363,59 @@ fn note_paint_shift() {}
 /// used-box geometry patch the retained Taffy nodes. Inherited style, tree
 /// shape, and anything `style_patch_is_safe` rejects rebuild from the DOM so
 /// the painted styles stay the ones `to_component_tree` would produce.
+/// Mutations the paint cache drained, kept for the layout cache.
+///
+/// Both caches read the document's single precise dirty list. Without this,
+/// a headless frame between two flushes leaves the retained layout tree
+/// unable to tell what changed, so the next flush rebuilds the document.
+struct PaintDrained {
+    before: u32,
+    after: u32,
+    ids: Vec<NodeId>,
+}
+
+thread_local! {
+    static PAINT_DRAINED: RefCell<Option<PaintDrained>> = const { RefCell::new(None) };
+}
+
+/// Past this many stashed ids a rebuild is cheaper than replaying them.
+const PAINT_DRAINED_MAX: usize = 4096;
+
+fn stash_paint_drained(before: u32, dirty: &[NodeId], after: u32) {
+    PAINT_DRAINED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_mut() {
+            Some(stash) if stash.after == before => {
+                stash.after = after;
+                stash.ids.extend_from_slice(dirty);
+            }
+            _ => {
+                *slot = Some(PaintDrained {
+                    before,
+                    after,
+                    ids: dirty.to_vec(),
+                })
+            }
+        }
+        if slot.as_ref().is_some_and(|stash| stash.ids.len() > PAINT_DRAINED_MAX) {
+            *slot = None;
+        }
+    });
+}
+
+/// Prepend the ids the paint cache drained just before this take, so the
+/// layout cache sees an unbroken run of drains.
+fn take_paint_drained(before: u32, dirty: Vec<NodeId>, after: u32) -> (u32, Vec<NodeId>, u32) {
+    match PAINT_DRAINED.with(|slot| slot.borrow_mut().take()) {
+        Some(stash) if stash.after == before => {
+            let mut ids = stash.ids;
+            ids.extend(dirty);
+            (stash.before, ids, after)
+        }
+        _ => (before, dirty, after),
+    }
+}
+
 pub fn with_paint_layout<R>(
     viewport_w: f32,
     viewport_h: f32,
@@ -1373,7 +1427,12 @@ pub fn with_paint_layout<R>(
             document.cascade_generation(),
         )
     });
-    let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
+    let dirty = crate::dom::with_document_mut(|document| {
+        let before = document.precise_drain_epoch();
+        let dirty = document.take_precise_dirty();
+        stash_paint_drained(before, &dirty, document.precise_drain_epoch());
+        dirty
+    });
     // A geometry read can set this and never paint. The paint that follows
     // records its own reason.
     note_paint_reuse(PaintReuse::None);
