@@ -14,3 +14,9 @@
   > http://labs.creativecommons.org/licenses/zero-waive/1.0/us/legalcode
 
   License URL: http://dev.w3.org/CSS/fonts/ahem/COPYING
+- On Linux, run the oracle with Playwright's `chrome-headless-shell`
+  (`playwright install chromium`, then
+  `W3COS_CHROME=~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell`).
+  The full Linux Chrome build snaps every Ahem run 1/64 px wider, which also
+  changes line breaks on exactly filled lines. The headless shell reproduces
+  the checked-in (macOS Chrome) goldens exactly.

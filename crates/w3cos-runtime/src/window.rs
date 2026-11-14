@@ -3270,6 +3270,24 @@ impl App {
                 .collect(),
         );
 
+        if measurement_pass < 2
+            && self.dom_mode
+            && crate::incremental_layout::sync_column_scroll_marker_counts(
+                &flat,
+                &self.layout_cache,
+                (w, layout_h),
+            )
+        {
+            drop(retained_flat);
+            drop(walked_flat);
+            self.paint_artifact.nodes = old_paint_nodes;
+            self.root = crate::dom::to_component_tree();
+            self.needs_layout = true;
+            self.needs_tree_rebuild = true;
+            self.ensure_layout_pass(measurement_pass + 1);
+            return;
+        }
+
         let (virtual_heights_changed, virtual_anchor_corrections) = measure_virtual_list_rows(
             &flat,
             &self.layout_cache,
@@ -7539,6 +7557,14 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                     let mut effective_clip = clip;
                     effective_clip.x -= outer_sx;
                     effective_clip.y -= outer_sy;
+                    // The document element's scrollport is the viewport: its
+                    // box (shorter than the viewport, or than the content a
+                    // viewport-sized scroller shows) does not bound what the
+                    // descendants paint.
+                    if *anc_idx == 0 {
+                        effective_clip.width = effective_clip.width.max(viewport_w);
+                        effective_clip.height = effective_clip.height.max(viewport_h);
+                    }
                     if let Some(outer_clip) = outer_scrollport_visual_clip(
                         scroll_ancestor.get(*anc_idx).copied().flatten(),
                         scroll_ancestor,

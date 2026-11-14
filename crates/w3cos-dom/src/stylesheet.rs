@@ -838,10 +838,36 @@ fn register_parsed_rules(
     }
 }
 
+fn strip_trailing_pseudo_element_classes(lower: &str) -> (&str, &str) {
+    // CSS Overflow 5 allows :target-current (and related) after
+    // ::scroll-marker. Longer suffixes first.
+    for suffix in [
+        ":target-current",
+        ":target-before",
+        ":target-after",
+        ":focus-visible",
+        ":focus",
+        ":hover",
+        ":active",
+    ] {
+        if lower.ends_with(suffix) {
+            return (&lower[..lower.len() - suffix.len()], suffix);
+        }
+    }
+    (lower, "")
+}
+
 fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
     let selector = selector.trim_end();
     let lower = selector.to_ascii_lowercase();
+    let (base, classes) = strip_trailing_pseudo_element_classes(&lower);
+    // Longer authored forms first so ::column::scroll-marker wins over
+    // ::scroll-marker or ::column.
     for (authored, canonical) in [
+        ("::column::scroll-marker", "::column::scroll-marker"),
+        ("::scroll-marker-group", "::scroll-marker-group"),
+        ("::scroll-marker", "::scroll-marker"),
+        ("::column", "::column"),
         ("::first-letter", "::first-letter"),
         ("::first-line", "::first-line"),
         (":first-letter", "::first-letter"),
@@ -851,14 +877,20 @@ fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
         (":before", "::before"),
         (":after", "::after"),
     ] {
-        if lower.ends_with(authored) {
-            let subject = &selector[..selector.len() - authored.len()];
+        if base.ends_with(authored) {
+            let authored_len = authored.len() + classes.len();
+            let subject = &selector[..selector.len() - authored_len];
             // A pseudo-element without a compound selector has an implicit
             // universal subject. Keep the preceding combinator: `div :after`
             // targets descendants of div, not div's own ::after box.
             let implicit_subject = subject.chars().last().is_some_and(|character| {
                 character.is_ascii_whitespace() || matches!(character, '>' | '+' | '~')
             });
+            let name = if classes.is_empty() {
+                canonical.to_string()
+            } else {
+                format!("{canonical}{classes}")
+            };
             return (
                 if subject.trim().is_empty() {
                     "*".to_string()
@@ -867,7 +899,7 @@ fn strip_terminal_pseudo_element(selector: &str) -> (String, Option<String>) {
                 } else {
                     subject.to_string()
                 },
-                Some(canonical.to_string()),
+                Some(name),
             );
         }
     }
@@ -3833,6 +3865,23 @@ mod tests {
         let element = SelectorContext::new("div", None, &[]);
         assert!(matching_declarations_for_context(&element, &[]).is_empty());
         assert_eq!(rule_count(), 4);
+    }
+
+    #[test]
+    fn scroll_marker_pseudos_are_stripped_from_the_subject() {
+        let (subject, pseudo) = strip_terminal_pseudo_element("#container::scroll-marker-group");
+        assert_eq!(subject, "#container");
+        assert_eq!(pseudo.as_deref(), Some("::scroll-marker-group"));
+        let (subject, pseudo) = strip_terminal_pseudo_element("#container::column::scroll-marker");
+        assert_eq!(subject, "#container");
+        assert_eq!(pseudo.as_deref(), Some("::column::scroll-marker"));
+        let (subject, pseudo) =
+            strip_terminal_pseudo_element("#container::column::scroll-marker:target-current");
+        assert_eq!(subject, "#container");
+        assert_eq!(
+            pseudo.as_deref(),
+            Some("::column::scroll-marker:target-current")
+        );
     }
 
     #[test]

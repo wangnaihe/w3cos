@@ -216,6 +216,7 @@ pub fn merge_style(base: &mut StyleDecl, over: &StyleDecl) {
         overflow_y,
         overscroll_behavior,
         scroll_initial_target,
+        scroll_marker_group,
         display,
         opacity,
         visibility,

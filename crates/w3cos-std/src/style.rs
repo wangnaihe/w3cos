@@ -225,12 +225,27 @@ pub struct Style {
     pub overflow_x: Option<Overflow>,
     #[serde(default)]
     pub overflow_y: Option<Overflow>,
+    /// CSS Overflow 3 `overflow: clip` per axis. Clip is not a scroll
+    /// container and lays out like `visible`, so the axis keeps its
+    /// `Overflow::Visible` value for layout; these flags only add a paint clip.
+    #[serde(default)]
+    pub overflow_clip_x: bool,
+    #[serde(default)]
+    pub overflow_clip_y: bool,
+    /// `overflow-clip-margin`: the reference box (0 padding-box, 1
+    /// content-box, 2 border-box) and the distance the `overflow: clip` edge
+    /// is moved outward from it.
+    #[serde(default)]
+    pub overflow_clip_margin: (u8, f32),
     /// CSS Overscroll Behavior Level 1, block-axis subset.
     #[serde(default)]
     pub overscroll_behavior: OverscrollBehavior,
     /// CSS Scroll Snap Level 2 `scroll-initial-target`.
     #[serde(default)]
     pub scroll_initial_target: ScrollInitialTarget,
+    /// CSS Overflow 5 `scroll-marker-group`.
+    #[serde(default)]
+    pub scroll_marker_group: ScrollMarkerGroup,
     /// CSS `overflow-anchor`; `false` excludes this subtree from UA scroll anchoring.
     #[serde(default = "default_overflow_anchor")]
     pub overflow_anchor: bool,
@@ -348,6 +363,18 @@ pub struct Style {
     pub hanging_punctuation_last: bool,
     #[serde(default)]
     pub direction: TextDirection,
+    /// CSS `writing-mode` (inherited). Blink keeps it in ComputedStyle and
+    /// derives the logical axes from it; the cascade maps logical sizes to
+    /// the physical axes only for `horizontal-tb` (CSS Writing Modes 4).
+    #[serde(default)]
+    pub writing_mode: WritingMode,
+    /// Physical values the element's logical properties (`inline-size`,
+    /// `block-size`, `margin-block-start`, ...) resolve to for the layout
+    /// engine that models them. The fields above keep the declarations
+    /// exactly as the engine that ignores them reads them; see
+    /// [`LogicalOverrides`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_overrides: Option<Box<LogicalOverrides>>,
     #[serde(default)]
     pub unicode_bidi: UnicodeBidi,
 
@@ -462,8 +489,12 @@ impl Default for Style {
             clip: None,
             overflow_x: None,
             overflow_y: None,
+            overflow_clip_x: false,
+            overflow_clip_y: false,
+            overflow_clip_margin: (0, 0.0),
             overscroll_behavior: OverscrollBehavior::Auto,
             scroll_initial_target: ScrollInitialTarget::None,
+            scroll_marker_group: ScrollMarkerGroup::None,
             overflow_anchor: true,
             background: Color::TRANSPARENT,
             background_image: None,
@@ -518,6 +549,8 @@ impl Default for Style {
             line_break: LineBreak::Auto,
             hanging_punctuation_last: false,
             direction: TextDirection::Ltr,
+            writing_mode: WritingMode::HorizontalTb,
+            logical_overrides: None,
             unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
             text_source_run: None,
@@ -639,8 +672,12 @@ impl Style {
             clip,
             overflow_x,
             overflow_y,
+            overflow_clip_x,
+            overflow_clip_y,
+            overflow_clip_margin,
             overscroll_behavior,
             scroll_initial_target,
+            scroll_marker_group,
             overflow_anchor,
             background,
             background_image,
@@ -696,6 +733,8 @@ impl Style {
             break_spaces,
             direction,
             unicode_bidi,
+            writing_mode,
+            logical_overrides,
             custom_properties,
             text_source_run,
             contain,
@@ -766,8 +805,12 @@ impl Style {
             clip: clip_b,
             overflow_x: overflow_x_b,
             overflow_y: overflow_y_b,
+            overflow_clip_x: overflow_clip_x_b,
+            overflow_clip_y: overflow_clip_y_b,
+            overflow_clip_margin: overflow_clip_margin_b,
             overscroll_behavior: overscroll_behavior_b,
             scroll_initial_target: scroll_initial_target_b,
+            scroll_marker_group: scroll_marker_group_b,
             overflow_anchor: overflow_anchor_b,
             background: background_b,
             background_image: background_image_b,
@@ -823,6 +866,8 @@ impl Style {
             break_spaces: break_spaces_b,
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
+            writing_mode: writing_mode_b,
+            logical_overrides: logical_overrides_b,
             custom_properties: custom_properties_b,
             text_source_run: text_source_run_b,
             contain: contain_b,
@@ -891,8 +936,12 @@ impl Style {
             && clip == clip_b
             && overflow_x == overflow_x_b
             && overflow_y == overflow_y_b
+            && overflow_clip_x == overflow_clip_x_b
+            && overflow_clip_y == overflow_clip_y_b
+            && overflow_clip_margin == overflow_clip_margin_b
             && overscroll_behavior == overscroll_behavior_b
             && scroll_initial_target == scroll_initial_target_b
+            && scroll_marker_group == scroll_marker_group_b
             && overflow_anchor == overflow_anchor_b
             && background == background_b
             && background_image == background_image_b
@@ -948,6 +997,8 @@ impl Style {
             && break_spaces == break_spaces_b
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
+            && writing_mode == writing_mode_b
+            && logical_overrides == logical_overrides_b
             && custom_properties == custom_properties_b
             && text_source_run == text_source_run_b
             && contain == contain_b
@@ -1063,6 +1114,7 @@ impl Style {
             Dimension::Ch(value) => value * self.ch_advance(),
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
+            Dimension::Lh(value) => value * self.used_line_height_px(),
             Dimension::Auto => 0.0,
             Dimension::Calc(calc) => calc.resolve(
                 containing_width,
@@ -1172,6 +1224,16 @@ pub enum ScrollInitialTarget {
     #[default]
     None,
     Nearest,
+}
+
+/// CSS Overflow 5 `scroll-marker-group`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScrollMarkerGroup {
+    #[default]
+    None,
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -1343,6 +1405,25 @@ impl Dimension {
     pub fn calc(length: CalcLength) -> Self {
         Dimension::Calc(CalcId::new(length))
     }
+
+    /// A mixed `calc()` of a percentage and a px length (`calc(10% + 5px)`).
+    pub fn calc_percent_px(percent: f32, px: f32) -> Self {
+        Self::calc(CalcLength {
+            percent,
+            px,
+            ..CalcLength::default()
+        })
+    }
+
+    /// The value refers to its percentage basis: a percentage, or a
+    /// `calc()` with a percentage term.
+    pub fn has_percentage(&self) -> bool {
+        match self {
+            Dimension::Percent(_) => true,
+            Dimension::Calc(calc) => calc.percent != 0.0,
+            _ => false,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum Dimension {
@@ -1356,6 +1437,8 @@ pub enum Dimension {
     Ch(f32),
     Vw(f32),
     Vh(f32),
+    /// Used line-height of the element (`lh`, CSS Values 4).
+    Lh(f32),
 }
 
 /// CSS length for padding/margin.
@@ -1374,6 +1457,19 @@ pub enum Spacing {
     Maximum {
         px: f32,
         safe_area: SafeAreaEdge,
+    },
+    /// `calc(P% + Xpx)`, a margin that mixes a percentage and a length.
+    /// Only LayoutNG resolves it; legacy layout reads it as zero.
+    Calc {
+        percent: f32,
+        px: f32,
+    },
+    /// `calc(P% + Xpx)` on a padding side: the same sum, floored at zero
+    /// (padding cannot be negative). Only LayoutNG resolves it; legacy
+    /// layout reads it as zero, as it did when the declaration was dropped.
+    PaddingCalc {
+        percent: f32,
+        px: f32,
     },
     /// `env(keyboard-inset-height)` — virtual keyboard occlusion (logical px).
     KeyboardInsetHeight,
@@ -1395,7 +1491,10 @@ impl Spacing {
     pub fn resolve_env(&self, insets: &SafeAreaInsets, keyboard_bottom: f32) -> f32 {
         match self {
             Spacing::Px(v) => *v,
-            Spacing::Percent(_) | Spacing::Auto => 0.0,
+            Spacing::Percent(_)
+            | Spacing::Calc { .. }
+            | Spacing::PaddingCalc { .. }
+            | Spacing::Auto => 0.0,
             Spacing::Rem(v) => *v * 16.0,
             Spacing::Em(v) => *v * 16.0,
             Spacing::Ch(v) => *v * 8.0,
@@ -1491,6 +1590,10 @@ impl Edges {
             used_box_spacing(match value {
                 Spacing::Em(value) => value * style.font_size,
                 Spacing::Ch(value) => value * style.ch_advance(),
+                // A calc() with a zero percentage does not depend on the
+                // percentage basis (inline-intrinsic-size-calc).
+                Spacing::Calc { percent, px } if percent == 0.0 => px,
+                Spacing::PaddingCalc { percent, px } if percent == 0.0 => px.max(0.0),
                 other => other.resolve(insets),
             })
         };
@@ -1522,6 +1625,29 @@ impl Style {
                 .unwrap_or(self.border_radius),
             self.border_bottom_left_radius.unwrap_or(self.border_radius),
         ]
+    }
+
+    /// Used line-height in px (`lh`). `line-height: normal` is the
+    /// computed ratio times `font-size`; a specified length uses that px.
+    pub fn used_line_height_px(&self) -> f32 {
+        if self.line_height_is_normal {
+            return self.font_size * self.line_height;
+        }
+        if let Some(length) = self.line_height_computed_px {
+            return (length * 64.0).round() / 64.0;
+        }
+        let font_size = (self.font_size * 64.0).round() / 64.0;
+        let units = font_size * self.line_height * 64.0;
+        if !units.is_finite() {
+            return self.font_size * self.line_height;
+        }
+        let nearest = units.round();
+        let units = if (units - nearest).abs() <= f32::EPSILON * units.abs() {
+            nearest
+        } else {
+            units
+        };
+        units.trunc() / 64.0
     }
 
     pub fn padding_lengths(&self) -> EdgeLengths {
@@ -1906,6 +2032,140 @@ pub enum TextDirection {
     Rtl,
 }
 
+/// CSS `writing-mode` (CSS Writing Modes 4). The sideways values are the
+/// vertical modes whose lines run top to bottom with rotated glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WritingMode {
+    #[default]
+    HorizontalTb,
+    VerticalRl,
+    VerticalLr,
+    SidewaysRl,
+    SidewaysLr,
+}
+
+impl WritingMode {
+    /// Block flow is top to bottom and lines are horizontal: the inline size
+    /// is the physical width.
+    pub fn is_horizontal(self) -> bool {
+        self == WritingMode::HorizontalTb
+    }
+
+    /// Parse a computed `writing-mode` keyword, including the SVG 1.1 names
+    /// Blink still accepts (`lr`, `lr-tb`, `rl`, `rl-tb` are horizontal-tb;
+    /// `tb` and `tb-rl` are vertical-rl). `None` for anything else.
+    pub fn from_keyword(value: &str) -> Option<WritingMode> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "horizontal-tb" | "lr" | "lr-tb" | "rl" | "rl-tb" => WritingMode::HorizontalTb,
+            "vertical-rl" | "tb" | "tb-rl" => WritingMode::VerticalRl,
+            "vertical-lr" => WritingMode::VerticalLr,
+            "sideways-rl" => WritingMode::SidewaysRl,
+            "sideways-lr" => WritingMode::SidewaysLr,
+            _ => return None,
+        })
+    }
+}
+
+/// The physical values an element's logical properties resolve to, kept
+/// beside the declared style. The declared fields stay what the engine that
+/// ignores logical properties reads, so a reftest whose test and reference
+/// both relied on that keeps rendering the same; the engine that models them
+/// applies these on top (`apply`) and falls back, with both sides of a
+/// reftest, for the features it does not lay out.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LogicalOverrides {
+    pub width: Option<Dimension>,
+    pub height: Option<Dimension>,
+    pub min_width: Option<Dimension>,
+    pub min_height: Option<Dimension>,
+    pub max_width: Option<Dimension>,
+    pub max_height: Option<Dimension>,
+    /// Top, right, bottom, left.
+    pub margin: [Option<Spacing>; 4],
+    pub padding: [Option<Spacing>; 4],
+    /// Internal marker properties that differ: `None` removes the marker.
+    pub markers: Vec<(String, Option<String>)>,
+}
+
+impl LogicalOverrides {
+    /// The style as the engine that models logical properties reads it.
+    pub fn apply(&self, style: &mut Style) {
+        style.logical_overrides = None;
+        if let Some(v) = self.width {
+            style.width = v;
+        }
+        if let Some(v) = self.height {
+            style.height = v;
+        }
+        if let Some(v) = self.min_width {
+            style.min_width = v;
+        }
+        if let Some(v) = self.min_height {
+            style.min_height = v;
+        }
+        if let Some(v) = self.max_width {
+            style.max_width = v;
+        }
+        if let Some(v) = self.max_height {
+            style.max_height = v;
+        }
+        for (edge, value) in self.margin.iter().enumerate() {
+            let Some(v) = *value else { continue };
+            match edge {
+                0 => style.margin.top = v,
+                1 => style.margin.right = v,
+                2 => style.margin.bottom = v,
+                _ => style.margin.left = v,
+            }
+        }
+        for (edge, value) in self.padding.iter().enumerate() {
+            let Some(v) = *value else { continue };
+            match edge {
+                0 => style.padding.top = v,
+                1 => style.padding.right = v,
+                2 => style.padding.bottom = v,
+                _ => style.padding.left = v,
+            }
+        }
+        for (key, value) in &self.markers {
+            match value {
+                Some(value) => {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(key.clone(), value.clone());
+                }
+                None => {
+                    if let Some(properties) = style.custom_properties.as_mut() {
+                        properties.remove(key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The physical edge a logical block-start edge resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalSide {
+    Top,
+    Right,
+    Left,
+}
+
+impl WritingMode {
+    /// Block-start edge (CSS Writing Modes): top in horizontal-tb, right in
+    /// vertical-rl and sideways-rl, left in vertical-lr and sideways-lr. The
+    /// block-end edge is the opposite one.
+    pub fn block_start_side(self) -> PhysicalSide {
+        match self {
+            WritingMode::HorizontalTb => PhysicalSide::Top,
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => PhysicalSide::Right,
+            WritingMode::VerticalLr | WritingMode::SidewaysLr => PhysicalSide::Left,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum UnicodeBidi {
     #[default]
@@ -2286,6 +2546,9 @@ impl Dimension {
             Dimension::Ch(v) => Some(*v * local_font_size * 0.5),
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
+            // Used `lh` is resolved in LayoutNG (`resolve_dim`) where the
+            // element's used line-height is known.
+            Dimension::Lh(_) => None,
             Dimension::Calc(calc) => {
                 Some(calc.resolve(parent_size, local_font_size, viewport_w, viewport_h))
             }
