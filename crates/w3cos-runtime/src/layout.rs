@@ -11746,12 +11746,16 @@ fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
 /// context, while their own contents and real flex/grid items are isolated.
 pub(crate) fn float_content_contexts(flat: &[FlatNodeInfo<'_>]) -> Vec<usize> {
     let mut contexts = vec![0; flat.len()];
+    // Per parent, read once for all its children: 0 unread, 1 no, 2 yes.
+    let mut track = vec![0u8; flat.len()];
     for (index, node) in flat.iter().enumerate() {
         contexts[index] = if establishes_float_bfc(node.style, node.parent.is_none())
-            || node
-                .parent
-                .is_some_and(|parent| genuine_float_track_container(flat[parent].style))
-        {
+            || node.parent.is_some_and(|parent| {
+                if track[parent] == 0 {
+                    track[parent] = 1 + genuine_float_track_container(flat[parent].style) as u8;
+                }
+                track[parent] == 2
+            }) {
             index
         } else {
             node.parent.map_or(index, |parent| contexts[parent])

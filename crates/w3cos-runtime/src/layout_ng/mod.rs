@@ -457,13 +457,17 @@ pub(crate) fn layout_tree_with_text(
             }
             // The DOM's fallback `px` size of an svg grid item is `auto`
             // for layout (the legacy engine keeps reading the `px`).
-            if node
-                .parent
-                .is_some_and(|parent| block::is_author_grid(flat[parent].style))
+            // (Only a box with a specified size has a fallback one; read
+            // its markers, then its parent's, only then.)
+            if node.style.width == w3cos_std::style::Dimension::Auto
+                && node.style.height == w3cos_std::style::Dimension::Auto
             {
-                return block::svg_fallback_auto_style(node.style).map(|style| (index, style));
+                return None;
             }
-            None
+            let style = block::svg_fallback_auto_style(node.style)?;
+            node.parent
+                .is_some_and(|parent| block::is_author_grid(flat[parent].style))
+                .then_some((index, style))
         })
         .collect();
     if !hidden.is_empty() {

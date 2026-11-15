@@ -4148,10 +4148,11 @@ fn is_run_in(style: &Style) -> bool {
 pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
     let mut styles = Vec::new();
     for (index, info) in flat.iter().enumerate() {
+        if matches!(info.kind, ComponentKind::Text { .. }) {
+            continue;
+        }
         let run_in = is_run_in(info.style) && marker(info.style, RUN_IN_BLOCK).is_some();
-        if matches!(info.kind, ComponentKind::Text { .. })
-            || (!run_in && !is_vertical_webkit_box(info.style))
-        {
+        if !run_in && !is_vertical_webkit_box(info.style) {
             continue;
         }
         let children: Vec<&FlatNodeInfo> = flat[index + 1..info.subtree_end]

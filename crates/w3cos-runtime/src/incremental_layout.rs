@@ -109,7 +109,8 @@ thread_local! {
     static BOX_MARKERS: RefCell<Vec<BoxMarkers>> = const { RefCell::new(Vec::new()) };
     /// Per flat index: a text run's re-wrapped CSSOM rects (the wrap is a
     /// function of the run, its style, the line box width, and the fonts).
-    static TEXT_RECTS: RefCell<HashMap<usize, TextRectsMemo>> = RefCell::new(HashMap::new());
+    static TEXT_RECTS: RefCell<w3cos_std::fxhash::FxHashMap<usize, TextRectsMemo>> =
+        RefCell::new(Default::default());
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
     static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
         const { std::cell::Cell::new(("none", 0, 0)) };
@@ -859,7 +860,8 @@ pub(super) fn client_rects_for(
         .collect();
     let any_synthetic_owner = synthetic_owner.iter().any(Option::is_some);
     // LayoutNG line fragments grouped by box, in emission order.
-    let mut ng_lines_of: HashMap<usize, Vec<&crate::layout_ng::TextFragment>> = HashMap::new();
+    let mut ng_lines_of: w3cos_std::fxhash::FxHashMap<usize, Vec<&crate::layout_ng::TextFragment>> =
+        Default::default();
     for fragment in ng_text {
         if !fragment.vertical {
             ng_lines_of
@@ -869,7 +871,7 @@ pub(super) fn client_rects_for(
         }
     }
     let mut inherited_text_owners = vec![Vec::new(); flat.len()];
-    let mut text_line_owners = HashSet::new();
+    let mut text_line_owners: HashSet<u32, w3cos_std::fxhash::FxBuildHasher> = HashSet::default();
     for (index, info) in flat.iter().enumerate() {
         if !any_synthetic_owner {
             break;

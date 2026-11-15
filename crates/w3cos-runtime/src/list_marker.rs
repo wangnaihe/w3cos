@@ -216,7 +216,9 @@ pub(crate) fn project(
         let item = &flat[owner];
         let rect = layouts[owner_position].0;
         let ascent = inline_font_content_ascent(marker.style).round().max(0.0) as i32;
-        let first_text = (owner + 1..flat.len())
+        // (An in-flow descendant lies inside the item's subtree.)
+        let item_end = item.subtree_end.max(owner + 1).min(flat.len());
+        let first_text = (owner + 1..item_end)
             .filter(|child| {
                 matches!(flat[*child].kind, ComponentKind::Text { content } if !content.is_empty())
                     && in_flow_descendant(flat, *child, owner)
