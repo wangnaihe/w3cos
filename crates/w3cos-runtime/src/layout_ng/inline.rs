@@ -2293,6 +2293,108 @@ fn line_width_of(line: &[&InlineItem]) -> f32 {
     width + snap(slice)
 }
 
+/// `line_width_by`'s sum, kept as it goes.
+#[derive(Clone, Copy)]
+struct WidthSum {
+    width: f32,
+    slice: f32,
+    run: usize,
+}
+
+impl WidthSum {
+    const START: Self = Self {
+        width: 0.0,
+        slice: 0.0,
+        run: usize::MAX,
+    };
+
+    fn add(mut self, run: usize, value: f32) -> Self {
+        if run != self.run {
+            self.width += snap(self.slice);
+            self.slice = 0.0;
+            self.run = run;
+        }
+        self.slice += value;
+        self
+    }
+
+    fn total(self) -> f32 {
+        self.width + snap(self.slice)
+    }
+}
+
+/// The running width of the line being built (NGLineBreaker keeps the
+/// line's position as it adds items rather than measuring the line again
+/// for each one): over items `first..first + len`, all of them at their
+/// full advance, and up to the last one that is not a trailing space or a
+/// forced break.
+struct LineSum {
+    first: usize,
+    len: usize,
+    generation: u64,
+    all: WidthSum,
+    before_last: WidthSum,
+    last: Option<usize>,
+}
+
+fn counts_at_line_end(item: &InlineItem) -> bool {
+    !item.whitespace_only && !item.forced
+}
+
+/// `line_width(items, current + [next])`, the same sum in the same order.
+fn line_width_with(
+    items: &[InlineItem],
+    current: &[usize],
+    next: usize,
+    sum: &mut Option<LineSum>,
+    generation: u64,
+) -> f32 {
+    let contiguous = current
+        .first()
+        .is_none_or(|&first| current[current.len() - 1] == first + current.len() - 1);
+    if !contiguous {
+        let mut line = current.to_vec();
+        line.push(next);
+        return line_width(items, &line);
+    }
+    let first = current.first().copied().unwrap_or(next);
+    let reusable = sum
+        .as_ref()
+        .is_some_and(|s| s.generation == generation && s.first == first && s.len <= current.len());
+    if !reusable {
+        *sum = Some(LineSum {
+            first,
+            len: 0,
+            generation,
+            all: WidthSum::START,
+            before_last: WidthSum::START,
+            last: None,
+        });
+    }
+    let s = sum.as_mut().expect("line sum");
+    for &k in &current[s.len..] {
+        let item = &items[k];
+        let before = s.all;
+        s.all = s.all.add(item.run, item.raw);
+        if counts_at_line_end(item) {
+            s.before_last = before;
+            s.last = Some(k);
+        }
+    }
+    s.len = current.len();
+    let item = &items[next];
+    if counts_at_line_end(item) {
+        s.all.add(item.run, item.raw_hang - item.hang_last).total()
+    } else if let Some(last) = s.last {
+        let last = &items[last];
+        s.before_last
+            .add(last.run, last.raw_hang - last.hang_last)
+            .total()
+    } else {
+        WidthSum::START.total()
+    }
+}
+
 /// One laid-out line: items with their inline offsets and widths.
 struct Line {
     items: Vec<(usize, f32, f32)>,
@@ -3201,6 +3303,8 @@ fn layout_lines(
     );
     let mut lines: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
+    let mut line_sum: Option<LineSum> = None;
+    let mut items_generation = 0u64;
     // NGLineLayoutOpportunity per line: (top, inline offset, inline size).
     let assumed_line = if floats.is_some() {
         if quirks {
@@ -3241,9 +3345,8 @@ fn layout_lines(
             continue;
         }
         let available = opportunity.1;
-        current.push(i);
-        let fits = line_width(&items, &current) <= available + EPSILON;
-        current.pop();
+        let width = line_width_with(&items, &current, i, &mut line_sum, items_generation);
+        let fits = width <= available + EPSILON;
         if !fits && can_wrap && item.internal_break {
             // NGLineBreaker breaks inside the item at its latest opportunity
             // that fits; on an otherwise empty line, at its first one.
@@ -3262,6 +3365,7 @@ fn layout_lines(
             if let Some((a, b)) = split {
                 items[i] = a;
                 items.insert(i + 1, b);
+                items_generation += 1;
                 current.push(i);
                 lines.push(std::mem::take(&mut current));
                 i += 1;
@@ -3370,6 +3474,7 @@ fn layout_lines(
             let k = current[p];
             items[k] = a;
             items.insert(k + 1, b);
+            items_generation += 1;
             let rest: Vec<usize> = std::iter::once(k + 1)
                 .chain(current[p + 1..].iter().map(|&r| r + 1))
                 .collect();
