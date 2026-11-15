@@ -1801,10 +1801,19 @@ fn keep_items(fp: u64, index: usize, kept: &[InlineItem]) {
 }
 
 /// A top-level pass ended: its items are the ones the next pass reuses.
+/// A pass that laid out only a few IFCs (a streamed token's splice) adds
+/// its items to the kept ones instead: freeing every other IFC's items on
+/// each such flush cost more than the splice. (A fingerprint names its
+/// inputs, so an entry no box has any more is only unused.)
 pub(super) fn retire_items() {
     ITEMS.with(|items| {
         let mut items = items.borrow_mut();
-        items[1] = std::mem::take(&mut items[0]);
+        let [current, last] = &mut *items;
+        if current.len() * 4 < last.len() && last.len() + current.len() <= 1 << 16 {
+            last.extend(current.drain());
+        } else {
+            *last = std::mem::take(current);
+        }
     });
 }
 
