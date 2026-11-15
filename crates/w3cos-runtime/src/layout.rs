@@ -20761,10 +20761,19 @@ pub(crate) fn scroll_containers_from_layout(
     Vec<(usize, LayoutRect)>,
     Vec<Option<usize>>,
 ) {
-    let rects = layouts
-        .iter()
-        .map(|(rect, index)| (*index, *rect))
-        .collect::<HashMap<_, _>>();
+    // Flat index -> its (last) entry in `layouts`, as a dense table.
+    let mut layout_slot = vec![u32::MAX; flat.len()];
+    for (slot, (_, index)) in layouts.iter().enumerate() {
+        if let Some(entry) = layout_slot.get_mut(*index) {
+            *entry = slot as u32;
+        }
+    }
+    let slot_of = |index: usize| {
+        layout_slot
+            .get(index)
+            .filter(|slot| **slot != u32::MAX)
+            .map(|slot| *slot as usize)
+    };
     // `inherited[i]`: the scroll container that clips `i`'s children.
     let mut inherited: Vec<Option<usize>> = vec![None; flat.len()];
     let mut scroll_ancestor: Vec<Option<usize>> = vec![None; flat.len()];
@@ -20777,11 +20786,6 @@ pub(crate) fn scroll_containers_from_layout(
     // moves back into the scrollport adds no overflow.
     let mut content_shift: Vec<(f32, f32)> = vec![(0.0, 0.0); flat.len()];
     let mut shifted_layouts = layouts.to_vec();
-    let layout_slot = layouts
-        .iter()
-        .enumerate()
-        .map(|(slot, (_, index))| (*index, slot))
-        .collect::<HashMap<_, _>>();
     let body_host = crate::dom::body_id();
     let root_overflow_visible = flat.first().is_some_and(|root| {
         root.style.resolved_overflow_x() == WOverflow::Visible
@@ -20830,10 +20834,10 @@ pub(crate) fn scroll_containers_from_layout(
         );
         content_shift[index] = own_shift;
         if (own_shift.0 != 0.0 || own_shift.1 != 0.0)
-            && let Some(slot) = layout_slot.get(&index)
+            && let Some(slot) = slot_of(index)
         {
-            shifted_layouts[*slot].0.x += own_shift.0;
-            shifted_layouts[*slot].0.y += own_shift.1;
+            shifted_layouts[slot].0.x += own_shift.0;
+            shifted_layouts[slot].0.y += own_shift.1;
         }
         let overflow_x = info.style.resolved_overflow_x();
         let overflow_y = info.style.resolved_overflow_y();
@@ -20860,10 +20864,10 @@ pub(crate) fn scroll_containers_from_layout(
         {
             inherited[index] = Some(index);
             content_shift[index] = (0.0, 0.0);
-            if let Some(rect) = rects.get(&index) {
+            if let Some(slot) = slot_of(index) {
                 scrollable.push((
                     index,
-                    *rect,
+                    layouts[slot].0,
                     ScrollExtent {
                         max_x: 0.0,
                         max_y: 0.0,
@@ -20902,7 +20906,12 @@ fn extend_scroll_extents_from_overflow_columns(
     viewport: Option<(f32, f32)>,
     scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
 ) {
-    if scrollable.is_empty() {
+    // (Plans exist only for column contexts, decided by style alone.)
+    if scrollable.is_empty()
+        || !flat
+            .iter()
+            .any(|node| establishes_column_context(node.style))
+    {
         return;
     }
     let mut rects = vec![None; flat.len()];
@@ -20951,11 +20960,16 @@ fn extend_scroll_extents_from_descendants(
     scroll_ancestor: &[Option<usize>],
     scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
 ) {
-    let scrollport_positions = scrollable
-        .iter()
-        .enumerate()
-        .map(|(position, (index, _, _))| (*index, position))
-        .collect::<HashMap<_, _>>();
+    if scrollable.is_empty() {
+        return;
+    }
+    // Flat index -> position in `scrollable`, as a dense table.
+    let mut scrollport_positions = vec![u32::MAX; flat.len()];
+    for (position, (index, _, _)) in scrollable.iter().enumerate() {
+        if let Some(entry) = scrollport_positions.get_mut(*index) {
+            *entry = position as u32;
+        }
+    }
     for (child, child_index) in layouts {
         if matches!(
             flat.get(*child_index).map(|entry| entry.style.position),
@@ -20966,10 +20980,14 @@ fn extend_scroll_extents_from_descendants(
         let Some(scroll_index) = scroll_ancestor.get(*child_index).copied().flatten() else {
             continue;
         };
-        let Some(position) = scrollport_positions.get(&scroll_index).copied() else {
+        let Some(position) = scrollport_positions
+            .get(scroll_index)
+            .copied()
+            .filter(|position| *position != u32::MAX)
+        else {
             continue;
         };
-        let (_, scrollport, extent) = &mut scrollable[position];
+        let (_, scrollport, extent) = &mut scrollable[position as usize];
         extent.max_x = extent
             .max_x
             .max(child.x + child.width - (scrollport.x + scrollport.width));

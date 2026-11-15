@@ -27,6 +27,7 @@
 //! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod box_scan;
 mod cache;
 mod columns;
 mod exclusion;
@@ -75,6 +76,7 @@ pub(crate) fn note_restyled(id: u32) {
     if cache::box_tree_enabled() {
         crate::list_marker::note_restyled(id);
         crate::incremental_layout::note_client_restyled(id);
+        box_scan::note_restyled(id);
     }
 }
 
@@ -83,6 +85,8 @@ pub(crate) fn forget_patch_memo() {
     cache::forget_patch_memo();
     crate::list_marker::forget_retained();
     crate::incremental_layout::forget_client_plan();
+    crate::incremental_layout::forget_style_paths();
+    box_scan::forget();
 }
 
 pub(crate) fn box_tree_enabled() -> bool {
@@ -460,10 +464,9 @@ pub(crate) fn layout_tree_with_text(
     // An empty inline text node generates no box at all (CSS Text 3 §4.1:
     // collapsed away; it adds nothing to a line, and a flex or grid parent
     // makes no item of it).
-    let hidden: Vec<(usize, w3cos_std::style::Style)> = flat
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
+    let hidden_entry = |index: usize| -> Option<(usize, w3cos_std::style::Style)> {
+        let node = &flat[index];
+        {
             if is_empty_inline_text(node)
                 && !node
                     .parent
@@ -486,8 +489,15 @@ pub(crate) fn layout_tree_with_text(
             node.parent
                 .is_some_and(|parent| block::is_author_grid(flat[parent].style))
                 .then_some((index, style))
-        })
-        .collect();
+        }
+    };
+    let hidden: Vec<(usize, w3cos_std::style::Style)> =
+        match box_scan::retained(box_scan::Scan::Hidden, flat, |index| {
+            hidden_entry(index).is_some()
+        }) {
+            Some(hits) => hits.into_iter().filter_map(hidden_entry).collect(),
+            None => (0..flat.len()).filter_map(hidden_entry).collect(),
+        };
     if !hidden.is_empty() {
         let flat_hidden = run_in_patched(flat, &hidden);
         let patched: Vec<FlatNodeInfo> = flat_hidden
@@ -503,7 +513,14 @@ pub(crate) fn layout_tree_with_text(
             .collect();
         return layout_tree_balanced(&patched, viewport_w, viewport_h);
     }
-    if flat.iter().any(is_empty_box_leaf) {
+    let empty_leaf = box_scan::retained(box_scan::Scan::EmptyLeaf, flat, |index| {
+        is_empty_box_leaf(&flat[index])
+    })
+    .map_or_else(
+        || flat.iter().any(is_empty_box_leaf),
+        |hits| !hits.is_empty(),
+    );
+    if empty_leaf {
         let patched: Vec<FlatNodeInfo> = flat
             .iter()
             .map(|node| FlatNodeInfo {
@@ -575,10 +592,9 @@ fn layout_tree_balanced(
 /// `wrap-reverse`) with the balance marker, keyed by flat index.
 fn balanced_wrap_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, w3cos_std::style::Style)> {
     use w3cos_std::style::{Display, FlexWrap};
-    flat.iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
-            let style = node.style;
+    let entry = |index: usize| -> Option<(usize, w3cos_std::style::Style)> {
+        {
+            let style = flat[index].style;
             if !matches!(style.display, Display::Flex) {
                 return None;
             }
@@ -611,8 +627,14 @@ fn balanced_wrap_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, w3cos_std::style::
                 properties.insert(flex::BALANCE_MARKER.to_string(), "1".to_string());
             }
             Some((index, style))
-        })
-        .collect()
+        }
+    };
+    match box_scan::retained(box_scan::Scan::Balanced, flat, |index| {
+        entry(index).is_some()
+    }) {
+        Some(hits) => hits.into_iter().filter_map(entry).collect(),
+        None => (0..flat.len()).filter_map(entry).collect(),
+    }
 }
 
 fn layout_logical(
@@ -623,16 +645,20 @@ fn layout_logical(
     // Logical properties (`inline-size`, `block-size`, block-axis margins and
     // padding) resolved per writing mode apply to this engine only; the
     // declared style stays what the legacy engine reads.
-    let logical: Vec<(usize, w3cos_std::style::Style)> = flat
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
-            let overrides = node.style.logical_overrides.as_ref()?;
-            let mut style = node.style.clone();
-            overrides.apply(&mut style);
-            Some((index, style))
-        })
-        .collect();
+    let logical_entry = |index: usize| -> Option<(usize, w3cos_std::style::Style)> {
+        let node = &flat[index];
+        let overrides = node.style.logical_overrides.as_ref()?;
+        let mut style = node.style.clone();
+        overrides.apply(&mut style);
+        Some((index, style))
+    };
+    let logical: Vec<(usize, w3cos_std::style::Style)> =
+        match box_scan::retained(box_scan::Scan::Logical, flat, |index| {
+            flat[index].style.logical_overrides.is_some()
+        }) {
+            Some(hits) => hits.into_iter().filter_map(logical_entry).collect(),
+            None => (0..flat.len()).filter_map(logical_entry).collect(),
+        };
     // `text-spacing-trim` (default `normal`) halves fullwidth punctuation at
     // line ends and between adjacent marks; it is not laid out yet, so a page
     // that sets text in such punctuation keeps ignoring the logical sizes on

@@ -536,8 +536,9 @@ fn patch_and_compute(
     }
     let mut styles = Vec::with_capacity(dirty.len());
     let mut paint_only = true;
+    let key = (cache.structure, cache.source_structure);
     let previous = (dirty.len() == 1)
-        .then(|| component_style(&cache.component, dirty[0].as_u32()).cloned())
+        .then(|| located_style(key, &cache.component, dirty[0].as_u32()).cloned())
         .flatten();
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
@@ -545,14 +546,14 @@ fn patch_and_compute(
             return false;
         }
         if geometry_only {
-            let Some(old) = component_style(&cache.component, id.as_u32()).cloned() else {
+            let Some(old) = located_style(key, &cache.component, id.as_u32()).cloned() else {
                 return false;
             };
             if !geometry_only_change(&old, &style) {
                 return false;
             }
             paint_only &= local_paint_only(&old, &style);
-        } else if let Some(old) = component_style(&cache.component, id.as_u32()) {
+        } else if let Some(old) = located_style(key, &cache.component, id.as_u32()) {
             paint_only &= local_paint_only(old, &style);
         } else {
             paint_only = false;
@@ -599,10 +600,11 @@ fn patch_and_compute(
     let ng_relower = crate::layout_ng::mode() == crate::layout_ng::Mode::On
         && !cache.engine.tree_valid()
         && styles.iter().any(|(id, style)| {
-            component_style(&cache.component, *id).is_none_or(|old| !ng_lowering_stable(old, style))
+            located_style(key, &cache.component, *id)
+                .is_none_or(|old| !ng_lowering_stable(old, style))
         });
     for (id, style) in &styles {
-        if !assign_layout_style(&mut cache.component, *id, style) {
+        if !assign_located(key, &mut cache.component, *id, style) {
             return false;
         }
     }
@@ -1654,6 +1656,115 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
+        assign_style_here(component, id, style);
+        return true;
+    }
+    component
+        .children
+        .iter_mut()
+        .any(|child| assign_layout_style(child, id, style))
+}
+
+/// Box-tree mode: the child-index path from the root to the first box of
+/// each node looked up under one structure key (Blink reaches a
+/// LayoutObject from its node directly instead of searching the tree).
+type StylePaths = ((u64, u64), w3cos_std::fxhash::FxHashMap<u32, Vec<u32>>);
+
+thread_local! {
+    static STYLE_PATHS: RefCell<StylePaths> = RefCell::new(Default::default());
+}
+
+fn find_path(component: &Component, id: u32, path: &mut Vec<u32>) -> bool {
+    if host_id(component) == Some(id) {
+        return true;
+    }
+    for (at, child) in component.children.iter().enumerate() {
+        path.push(at as u32);
+        if find_path(child, id, path) {
+            return true;
+        }
+        path.pop();
+    }
+    false
+}
+
+fn component_at<'a>(mut component: &'a Component, path: &[u32]) -> Option<&'a Component> {
+    for &at in path {
+        component = component.children.get(at as usize)?;
+    }
+    Some(component)
+}
+
+fn component_at_mut<'a>(
+    mut component: &'a mut Component,
+    path: &[u32],
+) -> Option<&'a mut Component> {
+    for &at in path {
+        component = component.children.get_mut(at as usize)?;
+    }
+    Some(component)
+}
+
+/// The tree changed other than by an in-place restyle.
+pub(crate) fn forget_style_paths() {
+    STYLE_PATHS.with(|paths| *paths.borrow_mut() = Default::default());
+}
+
+/// The path to the first box of `id` (the box `component_style` finds).
+fn style_path(key: (u64, u64), component: &Component, id: u32) -> Option<Vec<u32>> {
+    let known = STYLE_PATHS.with(|paths| {
+        let mut paths = paths.borrow_mut();
+        if paths.0 != key || paths.1.len() > 4096 {
+            *paths = (key, Default::default());
+        }
+        paths.1.get(&id).cloned()
+    });
+    if let Some(path) = known
+        && component_at(component, &path).is_some_and(|found| host_id(found) == Some(id))
+    {
+        return Some(path);
+    }
+    let mut path = Vec::new();
+    if !find_path(component, id, &mut path) {
+        return None;
+    }
+    STYLE_PATHS.with(|paths| paths.borrow_mut().1.insert(id, path.clone()));
+    Some(path)
+}
+
+fn located_style(
+    key: (u64, u64),
+    component: &Component,
+    id: u32,
+) -> Option<&w3cos_std::style::Style> {
+    if !crate::layout_ng::box_tree_enabled() {
+        return component_style(component, id);
+    }
+    let path = style_path(key, component, id)?;
+    component_at(component, &path).map(|found| &*found.style)
+}
+
+fn assign_located(
+    key: (u64, u64),
+    component: &mut Component,
+    id: u32,
+    style: &w3cos_std::style::Style,
+) -> bool {
+    if !crate::layout_ng::box_tree_enabled() {
+        return assign_layout_style(component, id, style);
+    }
+    let Some(path) = style_path(key, component, id) else {
+        return false;
+    };
+    let Some(found) = component_at_mut(component, &path) else {
+        return false;
+    };
+    assign_style_here(found, id, style);
+    true
+}
+
+fn assign_style_here(component: &mut Component, id: u32, style: &w3cos_std::style::Style) {
+    {
         crate::layout_ng::note_restyled(id);
         let private_metadata = component
             .style
@@ -1680,12 +1791,7 @@ fn assign_layout_style(
                 properties.insert(key.into(), value);
             }
         }
-        return true;
     }
-    component
-        .children
-        .iter_mut()
-        .any(|child| assign_layout_style(child, id, style))
 }
 
 fn style_patch_is_safe(style: &w3cos_std::style::Style) -> bool {

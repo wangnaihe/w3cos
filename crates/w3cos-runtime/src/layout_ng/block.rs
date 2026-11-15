@@ -4146,14 +4146,28 @@ fn is_run_in(style: &Style) -> bool {
 /// contents need no anonymous boxes: nothing, one inline text, or only
 /// in-flow block-level boxes. Returns the replacement styles by index.
 pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
-    let mut styles = Vec::new();
-    for (index, info) in flat.iter().enumerate() {
+    match super::box_scan::retained(super::box_scan::Scan::RunIn, flat, |index| {
+        run_in_block_style(flat, index).is_some()
+    }) {
+        Some(hits) => hits
+            .into_iter()
+            .filter_map(|index| run_in_block_style(flat, index))
+            .collect(),
+        None => (0..flat.len())
+            .filter_map(|index| run_in_block_style(flat, index))
+            .collect(),
+    }
+}
+
+fn run_in_block_style(flat: &[FlatNodeInfo], index: usize) -> Option<(usize, Style)> {
+    let info = &flat[index];
+    {
         if matches!(info.kind, ComponentKind::Text { .. }) {
-            continue;
+            return None;
         }
         let run_in = is_run_in(info.style) && marker(info.style, RUN_IN_BLOCK).is_some();
         if !run_in && !is_vertical_webkit_box(info.style) {
-            continue;
+            return None;
         }
         let children: Vec<&FlatNodeInfo> = flat[index + 1..info.subtree_end]
             .iter()
@@ -4192,10 +4206,10 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
                     style.custom_properties = None;
                 }
             }
-            styles.push((index, style));
+            return Some((index, style));
         }
     }
-    styles
+    None
 }
 
 /// Legacy `display: -webkit-box` and `-webkit-inline-box`. Both parse as
