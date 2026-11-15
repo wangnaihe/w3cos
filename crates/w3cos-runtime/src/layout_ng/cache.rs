@@ -560,7 +560,7 @@ fn shift_indices(result: &mut LayoutResult, delta: isize) {
     }
 }
 
-/// Replace the retained results with the ones this top-level pass used.
+/// Keep the results this top-level pass used for the next pass.
 fn retain(pass: &mut Pass) {
     let mut layouts = std::collections::HashMap::new();
     let mut min_max = std::collections::HashMap::new();
@@ -584,9 +584,31 @@ fn retain(pass: &mut Pass) {
             min_max.insert(fp, entries);
         }
     }
-    RETAINED.with(|retained| *retained.borrow_mut() = Retained { layouts, min_max });
+    RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        // A pass over a small subtree (a streamed token's splice) adds its
+        // results to the kept ones instead of replacing them, as
+        // `retire_items` does for inline items: the rest of the document's
+        // results stay valid, and dropping them freed the whole document's
+        // fragments on the flush after each paint pass. A pass over the
+        // whole tree used every result the next one can reuse, so it
+        // replaces them. A fingerprint names its inputs, so a kept entry no
+        // box has any more is only unused.
+        let kept = retained.layouts.len() + retained.min_max.len();
+        let fresh = layouts.len() + min_max.len();
+        if pass.flat_len * 4 < kept && kept + fresh <= RETAINED_MERGE_MAX {
+            retained.layouts.extend(layouts);
+            retained.min_max.extend(min_max);
+        } else {
+            *retained = Retained { layouts, min_max };
+        }
+    });
     super::inline::retire_items();
 }
+
+/// Past this many retained entries a small pass replaces them instead of
+/// adding to them (bounds what unused entries can hold on to).
+const RETAINED_MERGE_MAX: usize = 1 << 18;
 
 /// Drop every retained result.
 #[allow(dead_code)]

@@ -1023,11 +1023,16 @@ fn flatten_own(
         })
         .filter(|_| fragment.text_range.is_none());
     if let Some((start, end)) = fragment.text_range.or(whole) {
-        let mut text = match flat[fragment.index].kind {
-            w3cos_std::ComponentKind::Text { content } => content[start..end].to_string(),
-            _ => String::new(),
+        let content = match flat[fragment.index].kind {
+            w3cos_std::ComponentKind::Text { content } => &content[start..end],
+            _ => "",
         };
-        if fragment.ellipsis {
+        // One allocation for the shared text (a `String` first would be
+        // copied again into the `Rc<str>`).
+        let text: FragmentText = if !fragment.ellipsis {
+            content.into()
+        } else {
+            let mut text = content.to_string();
             // (The line's collapsible trailing space goes before the ellipsis.)
             let keep_spaces =
                 flat[fragment.index].style.white_space == w3cos_std::style::WhiteSpace::Pre;
@@ -1038,13 +1043,14 @@ fn flatten_own(
                 .len(),
             );
             text.push('\u{2026}');
-        }
+            text.into()
+        };
         texts.push(TextFragment {
             index: fragment.index,
             start,
             end,
             rect,
-            text: text.into(),
+            text,
             vertical: fragment.vertical,
         });
     }
