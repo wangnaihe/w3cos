@@ -786,9 +786,10 @@ fn patch_and_compute(
     let snaps = if single_px_width(&styles).is_none()
         && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
     {
-        let snaps = host_rect_snaps(&flat, &results.layout_cache);
+        // (No width memo reads the snapshots on this branch.)
+        write_host_rects(&cache.node_ids, &results.layout_cache);
         defer_client_rects(client_key, results.layout_cache, results.text_fragments);
-        snaps
+        Vec::new()
     } else {
         CLIENT_KEY.with(|key| key.set(Some(client_key)));
         let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);

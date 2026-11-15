@@ -819,7 +819,7 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                 known[index] = m.known[index];
                 next.owner.push(m.owner[index]);
             } else {
-                let (h, ok, owner) = own_input(info, salt, &revision);
+                let (h, ok, owner) = own_input(flat, index, salt, &revision);
                 own[index] = h;
                 known[index] = ok;
                 next.owner.push(owner);
@@ -864,20 +864,36 @@ pub(crate) fn box_tree_enabled() -> bool {
     })
 }
 
-/// A box's own fingerprint input: (hash, retainable, split-inline owner).
+/// A box's own fingerprint input: (hash, retainable, the node other than
+/// its own whose style revision it reads: a split-inline owner, or the
+/// list item of an outside marker).
 fn own_input(
-    info: &FlatNodeInfo,
+    flat: &[FlatNodeInfo],
+    index: usize,
     salt: u64,
     revision: &impl Fn(u32) -> u64,
 ) -> (u64, bool, Option<u32>) {
+    let info = &flat[index];
     let mut h = salt;
     let mut ok = true;
-    let owner = info
-        .style
-        .custom_properties
-        .as_ref()
+    let properties = info.style.custom_properties.as_ref();
+    let owner = properties
         .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
-        .and_then(|v| v.parse::<u32>().ok());
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| {
+            // An outside `::marker` box has no node of its own. Its style is
+            // generated from its list item's computed style and the
+            // `list-style` declarations the item's style revision tracks
+            // (an ancestor's style edit invalidates the item's subtree).
+            let kind = properties?.get("--w3cos-internal-outside-list-marker")?;
+            if host_id(info).is_some()
+                || !matches!(info.kind, w3cos_std::ComponentKind::Box)
+                || kind == "image"
+            {
+                return None;
+            }
+            host_id(&flat[info.parent?])
+        });
     // Replaced and form content reads state no style revision
     // tracks (an image's natural size arrives when it decodes).
     if !matches!(
@@ -1008,7 +1024,7 @@ fn patch_fingerprints(
     let mut chain = Vec::new();
     let mut refresh = Vec::new();
     for &index in &dirty {
-        let (h, ok, owner) = own_input(&flat[index], salt, revision);
+        let (h, ok, owner) = own_input(flat, index, salt, revision);
         m.owner[index] = owner;
         m.flags[index] = 0;
         if m.own[index] == h && m.known[index] == ok {
@@ -1079,6 +1095,9 @@ pub(super) fn unsupported_tree_retained(
     let mut index = 0;
     // Block-level boxes this walk checked itself (not skipped as accepted).
     let mut walked = Vec::new();
+    // `node_reason` reads subtree fingerprints through `walk_fingerprint`.
+    let fp_slot = WalkFingerprints::install(flat, fp);
+    let fp = &fp_slot;
     while index < flat.len() {
         let info = &flat[index];
         let end = info.subtree_end.max(index + 1);
@@ -1122,6 +1141,93 @@ pub(super) fn unsupported_tree_retained(
         }
         SUPPORTED.with(|set| *set.borrow_mut() = now);
     }
+    let fp = fp_slot.take();
     LAST_FP.with(|slot| *slot.borrow_mut() = Some((flat.as_ptr() as usize, flat.len(), fp)));
     Some(reason)
+}
+
+thread_local! {
+    /// The fingerprints of the flat tree an eligibility walk is checking.
+    static WALK_FP: RefCell<Option<(usize, usize, std::rc::Rc<Vec<u64>>)>> =
+        const { RefCell::new(None) };
+    /// Subtree fingerprints known to hold no rendered float.
+    static FLOAT_FREE: RefCell<std::collections::HashSet<u64, w3cos_std::fxhash::FxBuildHasher>> =
+        RefCell::new(Default::default());
+}
+
+/// The walk's fingerprints, published to `walk_fingerprint` while it lives.
+struct WalkFingerprints(std::rc::Rc<Vec<u64>>);
+
+impl WalkFingerprints {
+    fn install(flat: &[FlatNodeInfo], fp: Vec<u64>) -> Self {
+        let fp = std::rc::Rc::new(fp);
+        WALK_FP.with(|slot| {
+            *slot.borrow_mut() = Some((flat.as_ptr() as usize, flat.len(), fp.clone()))
+        });
+        Self(fp)
+    }
+
+    fn take(self) -> Vec<u64> {
+        WALK_FP.with(|slot| *slot.borrow_mut() = None);
+        let mut this = self;
+        let fp = std::mem::take(&mut this.0);
+        std::rc::Rc::try_unwrap(fp).unwrap_or_else(|fp| (*fp).clone())
+    }
+}
+
+impl std::ops::Deref for WalkFingerprints {
+    type Target = [u64];
+    fn deref(&self) -> &[u64] {
+        &self.0
+    }
+}
+
+impl Drop for WalkFingerprints {
+    fn drop(&mut self) {
+        WALK_FP.with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = None;
+            }
+        });
+    }
+}
+
+/// Box `index`'s subtree fingerprint during an eligibility walk over
+/// `flat` (it names every input of the subtree, its floats included).
+fn walk_fingerprint(flat: &[FlatNodeInfo], index: usize) -> Option<u64> {
+    WALK_FP.with(|slot| {
+        let slot = slot.borrow();
+        let (ptr, len, fp) = slot.as_ref()?;
+        (*ptr == flat.as_ptr() as usize && *len == flat.len())
+            .then(|| fp.get(index).copied())
+            .flatten()
+            .filter(|fp| *fp != 0)
+    })
+}
+
+/// `scan(flat, index)` (whether the subtree holds a rendered float),
+/// remembered by subtree fingerprint across eligibility walks: a retained
+/// walk re-checks an ancestor flex container whose items did not change.
+pub(super) fn subtree_has_float(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    scan: impl FnOnce() -> bool,
+) -> bool {
+    let fp = walk_fingerprint(flat, index);
+    if let Some(fp) = fp
+        && FLOAT_FREE.with(|set| set.borrow().contains(&fp))
+    {
+        return false;
+    }
+    let has = scan();
+    if !has && let Some(fp) = fp {
+        FLOAT_FREE.with(|set| {
+            let mut set = set.borrow_mut();
+            if set.len() > 2 * flat.len() + 1024 {
+                set.clear();
+            }
+            set.insert(fp);
+        });
+    }
+    has
 }

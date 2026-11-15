@@ -192,7 +192,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("flex:text-space");
         }
-        if subtree_has_float(flat, child) {
+        if super::cache::subtree_has_float(flat, child, || subtree_has_float(flat, child)) {
             return Some("flex:float-descendant");
         }
         // Percentage main sizes on the column item itself cycle through
