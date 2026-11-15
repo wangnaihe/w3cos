@@ -418,6 +418,12 @@ fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool) {
     (block, inline)
 }
 
+/// The fingerprint of `index`'s subtree inputs in this top-level pass, if
+/// it has one (for inputs kept across flushes outside this module).
+pub(super) fn retained_fp(flat: &[FlatNodeInfo], index: usize) -> Option<u64> {
+    pass_fp(flat, index)
+}
+
 /// The pass fingerprint of `index` (0 when the retained cache is off).
 fn pass_fp(flat: &[FlatNodeInfo], index: usize) -> Option<u64> {
     with_pass(flat, index, |pass| pass.fp.get(index).copied())
@@ -522,12 +528,14 @@ fn retain(pass: &mut Pass) {
         }
     }
     RETAINED.with(|retained| *retained.borrow_mut() = Retained { layouts, min_max });
+    super::inline::retire_items();
 }
 
 /// Drop every retained result.
 #[allow(dead_code)]
 pub(super) fn clear_retained() {
     RETAINED.with(|retained| *retained.borrow_mut() = Retained::default());
+    super::inline::clear_items();
 }
 
 fn mix(h: u64, v: u64) -> u64 {

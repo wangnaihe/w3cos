@@ -1754,6 +1754,64 @@ fn text_box_trim_ends(style: &Style) -> (bool, bool) {
     }
 }
 
+thread_local! {
+    /// Items of the IFCs laid out in this top-level pass and in the last
+    /// one, by subtree fingerprint: (flat index then, items).
+    static ITEMS: std::cell::RefCell<[ItemsByFp; 2]> = Default::default();
+}
+
+type ItemsByFp = w3cos_std::fxhash::FxHashMap<u64, (usize, std::rc::Rc<Vec<InlineItem>>)>;
+
+/// The items an IFC with fingerprint `fp` had, moved to flat `index`.
+fn reuse_items(fp: u64, index: usize) -> Option<Vec<InlineItem>> {
+    ITEMS.with(|items| {
+        let mut items = items.borrow_mut();
+        let [current, last] = &mut *items;
+        let (base, kept) = match current.get(&fp) {
+            Some(entry) => entry.clone(),
+            None => {
+                let entry = last.get(&fp)?.clone();
+                current.insert(fp, entry.clone());
+                entry
+            }
+        };
+        let mut kept = (*kept).clone();
+        let delta = index as isize - base as isize;
+        if delta != 0 {
+            let moved = |i: usize| (i as isize + delta) as usize;
+            for item in &mut kept {
+                item.index = moved(item.index);
+                if let Some((root, top)) = item.aligned {
+                    item.aligned = Some((moved(root), top));
+                }
+            }
+        }
+        Some(kept)
+    })
+}
+
+fn keep_items(fp: u64, index: usize, kept: &[InlineItem]) {
+    ITEMS.with(|items| {
+        let mut items = items.borrow_mut();
+        if items[0].len() > 1 << 16 {
+            items[0].clear();
+        }
+        items[0].insert(fp, (index, std::rc::Rc::new(kept.to_vec())));
+    });
+}
+
+/// A top-level pass ended: its items are the ones the next pass reuses.
+pub(super) fn retire_items() {
+    ITEMS.with(|items| {
+        let mut items = items.borrow_mut();
+        items[1] = std::mem::take(&mut items[0]);
+    });
+}
+
+pub(super) fn clear_items() {
+    ITEMS.with(|items| *items.borrow_mut() = Default::default());
+}
+
 #[derive(Debug, Clone)]
 struct InlineItem {
     index: usize,
@@ -3066,235 +3124,255 @@ fn layout_lines(
     }
     // CollectInlines: group word pieces into authored runs and shape each
     // run once.
-    let mut items: Vec<InlineItem> = Vec::with_capacity(children.len());
-    let mut start = 0;
-    let mut run = 0;
-    while start < children.len() {
-        if is_atomic_inline(flat, children[start]) {
-            // NGInlineItem kAtomicInline: a block formatting context root
-            // whose margin box is the item.  Its baseline is its last line
-            // box's, or the bottom margin edge without one (CSS 2.1 10.8.1).
-            let k = start;
-            let child = children[k];
-            let style = flat[child].style;
-            let result =
-                super::block::layout_block(flat, child, space, true).why("atomic-layout")?;
-            if !result.oof.is_empty() {
-                // (Out-of-flow descendants carried through a line box.)
-                return super::bail("inline-oof");
+    // NGInlineNodeData: the IFC's items depend on its content and styles,
+    // not on the space it is laid out in (atomic inlines aside), so a box
+    // whose subtree inputs are unchanged reuses them and only breaks lines
+    // again (a resize).
+    let fp = super::cache::retained_fp(flat, index);
+    let reused = fp.and_then(|fp| reuse_items(fp, index));
+    let mut items = if let Some(items) = reused {
+        items
+    } else {
+        let mut items: Vec<InlineItem> = Vec::with_capacity(children.len());
+        let mut start = 0;
+        let mut run = 0;
+        while start < children.len() {
+            if is_atomic_inline(flat, children[start]) {
+                // NGInlineItem kAtomicInline: a block formatting context root
+                // whose margin box is the item.  Its baseline is its last line
+                // box's, or the bottom margin edge without one (CSS 2.1 10.8.1).
+                let k = start;
+                let child = children[k];
+                let style = flat[child].style;
+                let result =
+                    super::block::layout_block(flat, child, space, true).why("atomic-layout")?;
+                if !result.oof.is_empty() {
+                    // (Out-of-flow descendants carried through a line box.)
+                    return super::bail("inline-oof");
+                }
+                // Authored margins (no CSS2 10.3.3 over-constraint rule; auto is
+                // gated).
+                let side = |m| {
+                    crate::layout::resolve_spacing_for_layout(
+                        m,
+                        if space.percent_unresolved {
+                            0.0
+                        } else {
+                            available
+                        },
+                        style,
+                        space.viewport_w,
+                        space.viewport_h,
+                    )
+                };
+                let margin = [
+                    side(style.margin.top),
+                    side(style.margin.right),
+                    side(style.margin.bottom),
+                    side(style.margin.left),
+                ];
+                let height = margin[0] + result.fragment.height + margin[2];
+                // CSS Align 3 §9.1 / CSS Inline 3 / csswg #4675 (Blink
+                // LayoutNG atomic inlines, BSD-style Chromium license): a
+                // box whose writing mode is orthogonal to the IFC has no
+                // typographic baseline in the line's block axis. Inline-level
+                // boxes synthesize the alphabetic baseline from the under
+                // margin edge; in a horizontal-tb line that is the physical
+                // bottom of the margin box.
+                let orthogonal = container.writing_mode
+                    == w3cos_std::style::WritingMode::HorizontalTb
+                    && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb;
+                let ascent = match result.last_baseline {
+                    // (A button keeps its content baseline, as in block.rs.)
+                    _ if super::block::baseline_is_margin_edge(style)
+                        && !matches!(flat[child].kind, ComponentKind::Button { .. }) =>
+                    {
+                        height
+                    }
+                    _ if orthogonal => height,
+                    LastBaseline::At(b) => {
+                        // A transposed vertical IFC maps block-start to the
+                        // typographic under (`sideways`). Use padding-top +
+                        // descent, not the HTB alphabetic-from-over.
+                        let b = if super::orthogonal::is_transposed(style) {
+                            super::orthogonal::sideways_typographic_ascent(
+                                style,
+                                result.fragment.height,
+                                b,
+                            )
+                        } else {
+                            b
+                        };
+                        margin[0] + b
+                    }
+                    LastBaseline::NoLines => height,
+                    LastBaseline::Unknown => return super::bail("atomic-baseline"),
+                };
+                let box_start = start_edges(&opens[k]);
+                let box_end = end_edges(&closes[k]);
+                let raw = margin[3] + result.fragment.width + margin[1] + box_start + box_end;
+                let parent = parents[k].map_or(container, |b| flat[b].style);
+                let shift = vertical_align_shift(style, ascent, height - ascent, parent)
+                    .why("vertical-align")?;
+                items.push(InlineItem {
+                    index: child,
+                    pos: k,
+                    range: None,
+                    raw,
+                    raw_hang: raw,
+                    hang_last: 0.0,
+                    run,
+                    starts_space: false,
+                    ends_space: false,
+                    whitespace_only: false,
+                    forced: false,
+                    edges: InlineEdges::default(),
+                    box_start,
+                    box_end,
+                    aligned: aligned[k],
+                    internal_break: false,
+                    atomic: Some((result.fragment, margin[3], margin[0])),
+                    bidi: levels[k],
+                    shift,
+                    ascent,
+                    descent: height - ascent,
+                    content_ascent: 0.0,
+                    font_height: 0.0,
+                });
+                run += 1;
+                start += 1;
+                continue;
             }
-            // Authored margins (no CSS2 10.3.3 over-constraint rule; auto is
-            // gated).
-            let side = |m| {
-                crate::layout::resolve_spacing_for_layout(
-                    m,
-                    if space.percent_unresolved {
-                        0.0
-                    } else {
-                        available
-                    },
-                    style,
-                    space.viewport_w,
-                    space.viewport_h,
-                )
-            };
-            let margin = [
-                side(style.margin.top),
-                side(style.margin.right),
-                side(style.margin.bottom),
-                side(style.margin.left),
-            ];
-            let height = margin[0] + result.fragment.height + margin[2];
-            // CSS Align 3 §9.1 / CSS Inline 3 / csswg #4675 (Blink
-            // LayoutNG atomic inlines, BSD-style Chromium license): a
-            // box whose writing mode is orthogonal to the IFC has no
-            // typographic baseline in the line's block axis. Inline-level
-            // boxes synthesize the alphabetic baseline from the under
-            // margin edge; in a horizontal-tb line that is the physical
-            // bottom of the margin box.
-            let orthogonal = container.writing_mode == w3cos_std::style::WritingMode::HorizontalTb
-                && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb;
-            let ascent = match result.last_baseline {
-                // (A button keeps its content baseline, as in block.rs.)
-                _ if super::block::baseline_is_margin_edge(style)
-                    && !matches!(flat[child].kind, ComponentKind::Button { .. }) =>
-                {
-                    height
-                }
-                _ if orthogonal => height,
-                LastBaseline::At(b) => {
-                    // A transposed vertical IFC maps block-start to the
-                    // typographic under (`sideways`). Use padding-top +
-                    // descent, not the HTB alphabetic-from-over.
-                    let b = if super::orthogonal::is_transposed(style) {
-                        super::orthogonal::sideways_typographic_ascent(
-                            style,
-                            result.fragment.height,
-                            b,
-                        )
-                    } else {
-                        b
-                    };
-                    margin[0] + b
-                }
-                LastBaseline::NoLines => height,
-                LastBaseline::Unknown => return super::bail("atomic-baseline"),
-            };
-            let box_start = start_edges(&opens[k]);
-            let box_end = end_edges(&closes[k]);
-            let raw = margin[3] + result.fragment.width + margin[1] + box_start + box_end;
-            let parent = parents[k].map_or(container, |b| flat[b].style);
-            let shift = vertical_align_shift(style, ascent, height - ascent, parent)
-                .why("vertical-align")?;
-            items.push(InlineItem {
-                index: child,
-                pos: k,
-                range: None,
-                raw,
-                raw_hang: raw,
-                hang_last: 0.0,
-                run,
-                starts_space: false,
-                ends_space: false,
-                whitespace_only: false,
-                forced: false,
-                edges: InlineEdges::default(),
-                box_start,
-                box_end,
-                aligned: aligned[k],
-                internal_break: false,
-                atomic: Some((result.fragment, margin[3], margin[0])),
-                bidi: levels[k],
-                shift,
-                ascent,
-                descent: height - ascent,
-                content_ascent: 0.0,
-                font_height: 0.0,
-            });
-            run += 1;
-            start += 1;
-            continue;
-        }
-        let first = flat[children[start]].style;
-        let mut end = start + 1;
-        // A box boundary ends the shaping run; so does a bidi level change
-        // (NGInlineItem segments), and reversed items are shaped alone.
-        while end < children.len()
-            && opens[end].is_empty()
-            && closes[end - 1].is_empty()
-            && same_run(first, flat[children[end]].style)
-            && levels[end].level == levels[start].level
-            && levels[start].level % 2 == 0
-            && !fragments
-        {
-            end += 1;
-        }
-        let texts: Vec<&str> = children[start..end]
-            .iter()
-            .map(|&c| match flat[c].kind {
-                ComponentKind::Text { content } => content.as_str(),
-                _ => "",
-            })
-            .collect();
-        let advances = run_advances(&texts, first);
-        for (offset, &child) in children[start..end].iter().enumerate() {
-            let style = flat[child].style;
-            let content = texts[offset];
-            // A forced break has no advance (kControl item).
-            let edges = InlineEdges::of(style);
-            let inline_edges = edges.start + edges.end;
-            // The text measurement adds a leaf's own padding; an edge item
-            // (its own run) is shaped without its box edges.
-            let bare = (!zero_edges(style)).then(|| {
-                let defaults = Style::default();
-                Style {
-                    padding: defaults.padding,
-                    margin: defaults.margin,
-                    border_width: 0.0,
-                    border_top_width: None,
-                    border_right_width: None,
-                    border_bottom_width: None,
-                    border_left_width: None,
-                    ..style.clone()
-                }
-            });
-            let measure = bare.as_ref().unwrap_or(style);
-            let k = start + offset;
-            let box_start = start_edges(&opens[k]);
-            let box_end = end_edges(&closes[k]);
-            let text_raw = if content == FORCED_BREAK {
-                0.0
-            } else if let Some(advance) =
-                tab_item_advance(content, measure, container, &items, box_start + edges.start)
+            let first = flat[children[start]].style;
+            let mut end = start + 1;
+            // A box boundary ends the shaping run; so does a bidi level change
+            // (NGInlineItem segments), and reversed items are shaped alone.
+            while end < children.len()
+                && opens[end].is_empty()
+                && closes[end - 1].is_empty()
+                && same_run(first, flat[children[end]].style)
+                && levels[end].level == levels[start].level
+                && levels[start].level % 2 == 0
+                && !fragments
             {
-                advance
-            } else if bare.is_some() {
-                text_intrinsic_size(content, measure).0
-            } else {
-                advances[offset]
-            };
-            let raw = text_raw + inline_edges + box_start + box_end;
-            let (height, baseline) = text_line_metrics(content, style);
-            let parent = parents[k].map_or(container, |b| flat[b].style);
-            let shift = vertical_align_shift(style, baseline, height - baseline, parent)
-                .why("vertical-align")?;
-            items.push(InlineItem {
-                index: child,
-                pos: k,
-                range: None,
-                raw,
-                // Preserved spaces (pre) do not hang (CSS Text 3 4.1.3).
-                raw_hang: if container.white_space == WhiteSpace::Pre {
-                    raw
-                } else {
-                    hang_advance(content, text_raw, measure) + inline_edges + box_start + box_end
-                },
-                hang_last: 0.0,
-                run,
-                starts_space: if collapses_whitespace(style) {
-                    content.starts_with(is_collapsible_space)
-                } else {
-                    content.starts_with(' ')
-                },
-                ends_space: if collapses_whitespace(style) {
-                    content.ends_with(is_collapsible_space)
-                } else {
-                    content.ends_with(' ')
-                },
-                whitespace_only: if collapses_whitespace(style) {
-                    content.trim_end_matches(is_collapsible_space).is_empty()
-                } else {
-                    content.trim_end_matches(' ').is_empty()
-                },
-                forced: content == FORCED_BREAK,
-                edges,
-                box_start,
-                box_end,
-                aligned: aligned[k],
-                // Preserved leading spaces (pre-wrap) end in an opportunity
-                // inside the item too; collapsible ones vanish at a line start.
-                internal_break: internal_opportunity(content, style)
-                    || (hang_preserved
-                        && content.starts_with(' ')
-                        && !content.trim_start_matches(' ').is_empty()),
-                bidi: levels[k],
-                shift,
-                atomic: None,
-                ascent: baseline,
-                descent: height - baseline,
-                content_ascent: inline_font_content_ascent(style),
-                font_height: inline_font_height(style),
-            });
-            if content != FORCED_BREAK && content.contains('\u{2028}') {
-                let whole = items.pop().expect("just pushed");
-                split_forced_breaks(content, whole, style, hang_preserved, &mut items)?;
+                end += 1;
             }
+            let texts: Vec<&str> = children[start..end]
+                .iter()
+                .map(|&c| match flat[c].kind {
+                    ComponentKind::Text { content } => content.as_str(),
+                    _ => "",
+                })
+                .collect();
+            let advances = run_advances(&texts, first);
+            for (offset, &child) in children[start..end].iter().enumerate() {
+                let style = flat[child].style;
+                let content = texts[offset];
+                // A forced break has no advance (kControl item).
+                let edges = InlineEdges::of(style);
+                let inline_edges = edges.start + edges.end;
+                // The text measurement adds a leaf's own padding; an edge item
+                // (its own run) is shaped without its box edges.
+                let bare = (!zero_edges(style)).then(|| {
+                    let defaults = Style::default();
+                    Style {
+                        padding: defaults.padding,
+                        margin: defaults.margin,
+                        border_width: 0.0,
+                        border_top_width: None,
+                        border_right_width: None,
+                        border_bottom_width: None,
+                        border_left_width: None,
+                        ..style.clone()
+                    }
+                });
+                let measure = bare.as_ref().unwrap_or(style);
+                let k = start + offset;
+                let box_start = start_edges(&opens[k]);
+                let box_end = end_edges(&closes[k]);
+                let text_raw = if content == FORCED_BREAK {
+                    0.0
+                } else if let Some(advance) =
+                    tab_item_advance(content, measure, container, &items, box_start + edges.start)
+                {
+                    advance
+                } else if bare.is_some() {
+                    text_intrinsic_size(content, measure).0
+                } else {
+                    advances[offset]
+                };
+                let raw = text_raw + inline_edges + box_start + box_end;
+                let (height, baseline) = text_line_metrics(content, style);
+                let parent = parents[k].map_or(container, |b| flat[b].style);
+                let shift = vertical_align_shift(style, baseline, height - baseline, parent)
+                    .why("vertical-align")?;
+                items.push(InlineItem {
+                    index: child,
+                    pos: k,
+                    range: None,
+                    raw,
+                    // Preserved spaces (pre) do not hang (CSS Text 3 4.1.3).
+                    raw_hang: if container.white_space == WhiteSpace::Pre {
+                        raw
+                    } else {
+                        hang_advance(content, text_raw, measure)
+                            + inline_edges
+                            + box_start
+                            + box_end
+                    },
+                    hang_last: 0.0,
+                    run,
+                    starts_space: if collapses_whitespace(style) {
+                        content.starts_with(is_collapsible_space)
+                    } else {
+                        content.starts_with(' ')
+                    },
+                    ends_space: if collapses_whitespace(style) {
+                        content.ends_with(is_collapsible_space)
+                    } else {
+                        content.ends_with(' ')
+                    },
+                    whitespace_only: if collapses_whitespace(style) {
+                        content.trim_end_matches(is_collapsible_space).is_empty()
+                    } else {
+                        content.trim_end_matches(' ').is_empty()
+                    },
+                    forced: content == FORCED_BREAK,
+                    edges,
+                    box_start,
+                    box_end,
+                    aligned: aligned[k],
+                    // Preserved leading spaces (pre-wrap) end in an opportunity
+                    // inside the item too; collapsible ones vanish at a line start.
+                    internal_break: internal_opportunity(content, style)
+                        || (hang_preserved
+                            && content.starts_with(' ')
+                            && !content.trim_start_matches(' ').is_empty()),
+                    bidi: levels[k],
+                    shift,
+                    atomic: None,
+                    ascent: baseline,
+                    descent: height - baseline,
+                    content_ascent: inline_font_content_ascent(style),
+                    font_height: inline_font_height(style),
+                });
+                if content != FORCED_BREAK && content.contains('\u{2028}') {
+                    let whole = items.pop().expect("just pushed");
+                    split_forced_breaks(content, whole, style, hang_preserved, &mut items)?;
+                }
+            }
+            run += 1;
+            start = end;
         }
-        run += 1;
-        start = end;
-    }
 
-    mark_hanging_last(flat, &mut items);
+        mark_hanging_last(flat, &mut items);
+        if let Some(fp) = fp
+            && items.iter().all(|item| item.atomic.is_none())
+        {
+            keep_items(fp, index, &items);
+        }
+        items
+    };
 
     // NGLineBreaker.
     let can_wrap = matches!(
