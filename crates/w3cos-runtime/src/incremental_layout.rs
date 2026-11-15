@@ -132,6 +132,71 @@ thread_local! {
     static TEXT_RECTS_STAMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Nodes restyled in place since `CLIENT_PLAN` was refreshed.
     static CLIENT_RESTYLED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// A retained flush's CSSOM rect inputs, not yet published.
+    static CLIENT_PENDING: RefCell<Option<PendingClientRects>> = const { RefCell::new(None) };
+}
+
+/// The layout a retained flush produced, kept so its CSSOM rects are built
+/// on the first read instead of on every flush (Blink also computes
+/// `getClientRects()` on demand from the current fragments). The retained
+/// component it was laid out from stays unchanged until the next flush,
+/// which either publishes the map whole or settles this first.
+struct PendingClientRects {
+    key: (u64, u64),
+    layouts: Vec<(crate::layout::LayoutRect, usize)>,
+    texts: Vec<crate::layout_ng::TextFragment>,
+}
+
+fn defer_client_rects(
+    key: (u64, u64),
+    layouts: Vec<(crate::layout::LayoutRect, usize)>,
+    texts: Vec<crate::layout_ng::TextFragment>,
+) {
+    CLIENT_PENDING.with(|slot| {
+        *slot.borrow_mut() = Some(PendingClientRects {
+            key,
+            layouts,
+            texts,
+        })
+    });
+}
+
+fn drop_pending_client_rects() {
+    CLIENT_PENDING.with(|slot| drop(slot.borrow_mut().take()));
+}
+
+fn client_rects_pending() -> bool {
+    CLIENT_PENDING.with(|slot| slot.borrow().is_some())
+}
+
+/// Publish the deferred rects of `component`, the retained tree the
+/// deferring flush laid out (call before anything edits it).
+fn settle_client_rects(component: &Component) {
+    let Some(pending) = CLIENT_PENDING.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    let flat = crate::layout::pre_flatten_keyed(
+        component,
+        crate::layout_ng::box_tree_enabled().then_some(pending.key),
+    );
+    CLIENT_KEY.with(|key| key.set(Some(pending.key)));
+    let published = client_rects_for(&flat, &pending.layouts, &pending.texts);
+    CLIENT_KEY.with(|key| key.set(None));
+    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
+}
+
+/// Settle deferred rects against the retained tree, outside a flush.
+fn settle_client_rects_from_cache() {
+    if !client_rects_pending() {
+        return;
+    }
+    CACHE.with(|slot| {
+        if let Ok(slot) = slot.try_borrow()
+            && let Some(cache) = slot.as_ref()
+        {
+            settle_client_rects(&cache.component);
+        }
+    });
 }
 
 /// The boxes `client_rects_for` can publish rects for (a split-inline
@@ -241,14 +306,17 @@ fn refresh_client_plan(
 }
 
 pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
+    settle_client_rects_from_cache();
     CLIENT_RECTS.with(|rects| rects.borrow().get(&node).cloned())
 }
 
 fn client_rect_snapshot() -> ClientRectMap {
+    settle_client_rects_from_cache();
     CLIENT_RECTS.with(|rects| rects.borrow().clone())
 }
 
 fn restore_client_rects(rects: ClientRectMap) {
+    drop_pending_client_rects();
     CLIENT_RECTS.with(|current| *current.borrow_mut() = rects);
 }
 
@@ -281,6 +349,7 @@ fn phase_log_enabled() -> bool {
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     PAINT.with(|cache| *cache.borrow_mut() = None);
+    drop_pending_client_rects();
     CLIENT_RECTS.with(|rects| rects.borrow_mut().clear());
     PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
@@ -335,6 +404,8 @@ pub fn flush() -> bool {
             taken = Some((after, dirty, after));
             return false;
         }
+        // A splice edits the published map in place.
+        settle_client_rects(&cache.component);
         if splice::try_splice(cache, &dirty, viewport_w, viewport_h) {
             cache.structure = layout_gen;
             cache.cascade = cascade;
@@ -608,6 +679,14 @@ fn patch_and_compute(
             located_style(key, &cache.component, *id)
                 .is_none_or(|old| !ng_lowering_stable(old, style))
         });
+    // The subtree path below edits the published map in place: settle it
+    // while the retained tree is still the one it was laid out from.
+    if styles.len() == 1
+        && let Some(old) = previous.as_ref()
+        && splice::style_subtree_may_apply(cache, old, &styles[0].1, viewport_w, viewport_h)
+    {
+        settle_client_rects(&cache.component);
+    }
     for (id, style) in &styles {
         if !assign_located(key, &mut cache.component, *id, style) {
             return false;
@@ -701,9 +780,21 @@ fn patch_and_compute(
     };
     let compute_us = compute_started.elapsed().as_micros();
     let write_started = std::time::Instant::now();
-    CLIENT_KEY.with(|key| key.set(Some((cache.structure, cache.source_structure))));
-    let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
-    CLIENT_KEY.with(|key| key.set(None));
+    // Publish CSSOM rects on first read, unless this flush snapshots them
+    // now (a width memo) or a verifier compares them.
+    let client_key = (cache.structure, cache.source_structure);
+    let snaps = if single_px_width(&styles).is_none()
+        && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
+    {
+        let snaps = host_rect_snaps(&flat, &results.layout_cache);
+        defer_client_rects(client_key, results.layout_cache, results.text_fragments);
+        snaps
+    } else {
+        CLIENT_KEY.with(|key| key.set(Some(client_key)));
+        let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
+        CLIENT_KEY.with(|key| key.set(None));
+        snaps
+    };
     let write_us = write_started.elapsed().as_micros();
     if phase {
         eprintln!(
@@ -787,6 +878,14 @@ fn write_rects(
     text_fragments: &[crate::layout_ng::TextFragment],
 ) -> Vec<(u32, f32, f32, f32, f32)> {
     publish_client_rects(flat, layouts, text_fragments);
+    host_rect_snaps(flat, layouts)
+}
+
+/// Store each host box's layout rect on its DOM node; returns them.
+fn host_rect_snaps(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+) -> Vec<(u32, f32, f32, f32, f32)> {
     let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
@@ -879,6 +978,7 @@ fn publish_client_rects(
     layouts: &[(crate::layout::LayoutRect, usize)],
     ng_text: &[crate::layout_ng::TextFragment],
 ) {
+    drop_pending_client_rects();
     let published = client_rects_for(flat, layouts, ng_text);
     CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
 }
@@ -921,6 +1021,7 @@ pub(super) fn splice_client_rects(
     shifted: impl Iterator<Item = u32>,
     dh: f32,
 ) {
+    debug_assert!(!client_rects_pending());
     CLIENT_RECTS.with(|rects| {
         let mut rects = rects.borrow_mut();
         for owner in removed {

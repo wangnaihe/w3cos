@@ -1688,6 +1688,22 @@ fn follower_shift(component: &Component, path: &[usize], dh: f32) -> Option<(Vec
     Some((shifted, grown))
 }
 
+/// Whether `try_style_subtree` gets past its first precondition.
+pub(super) fn style_subtree_may_apply(
+    cache: &Cache,
+    old: &Style,
+    new: &Style,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> bool {
+    subtree_relayout_enabled()
+        && cache.splice_ok
+        && cache.skip_projections
+        && cache.viewport_w_bits == viewport_w.to_bits()
+        && cache.viewport_h_bits == viewport_h.to_bits()
+        && origin_stable(old, new)
+}
+
 /// A geometry edit on one element. Lay out that element, or its flex/grid
 /// container when siblings share the formatting context, and translate the
 /// tail. Returns false when the result would not match a full solve.
@@ -1699,13 +1715,7 @@ pub(super) fn try_style_subtree(
     viewport_w: f32,
     viewport_h: f32,
 ) -> bool {
-    if !subtree_relayout_enabled()
-        || !cache.splice_ok
-        || !cache.skip_projections
-        || cache.viewport_w_bits != viewport_w.to_bits()
-        || cache.viewport_h_bits != viewport_h.to_bits()
-        || !origin_stable(old, new)
-    {
+    if !style_subtree_may_apply(cache, old, new, viewport_w, viewport_h) {
         return bail("style precondition");
     }
     let Some(root_id) = host_id(&cache.component) else {
