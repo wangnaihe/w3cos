@@ -72,6 +72,9 @@ struct Cache {
 /// The CSSOM line rects one re-wrapped text run published, relative to its
 /// line box, with the inputs they follow from.
 struct TextRectsMemo {
+    /// Unique per insert: a box-tree plan trusts an entry it validated
+    /// only while the entry is that same insert.
+    stamp: u64,
     content: String,
     style: w3cos_std::Style,
     width_bits: u32,
@@ -116,6 +119,120 @@ thread_local! {
         const { std::cell::Cell::new(("none", 0, 0)) };
     static CLIENT_RECTS: RefCell<HashMap<u32, Vec<w3cos_dom::DOMRect>>> =
         RefCell::new(HashMap::new());
+    /// Box-tree mode: the structure key of the patch flush publishing now.
+    static CLIENT_KEY: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// Box-tree mode: which boxes can publish CSSOM rects, kept across the
+    /// patch flushes of one structure.
+    static CLIENT_PLAN: RefCell<Option<ClientPlan>> = const { RefCell::new(None) };
+    static TEXT_RECTS_STAMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Nodes restyled in place since `CLIENT_PLAN` was refreshed.
+    static CLIENT_RESTYLED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The boxes `client_rects_for` can publish rects for (a split-inline
+/// owner, block-in-inline box owners, or a text run with owner ranges or an
+/// inherited synthetic owner) and the owners each text run inherits; a
+/// function of the boxes' CSSOM markers and the tree shape only.
+struct ClientPlan {
+    key: (u64, u64),
+    len: usize,
+    host: Vec<Option<u32>>,
+    publishers: Vec<usize>,
+    /// Per box: the `TextRectsMemo` stamp last matched against this box's
+    /// text and style (0 none); cleared when the box is restyled.
+    validated: Vec<u64>,
+    inherited_text_owners: Vec<Vec<u32>>,
+    text_line_owners: HashSet<u32, w3cos_std::fxhash::FxBuildHasher>,
+}
+
+/// A node's style changed in place (box-tree mode).
+pub(crate) fn note_client_restyled(id: u32) {
+    CLIENT_RESTYLED.with(|ids| {
+        let mut ids = ids.borrow_mut();
+        if ids.len() >= 4096 {
+            ids.clear();
+            CLIENT_PLAN.with(|plan| *plan.borrow_mut() = None);
+        }
+        ids.push(id);
+    });
+}
+
+/// The tree changed other than by an in-place restyle.
+pub(crate) fn forget_client_plan() {
+    CLIENT_PLAN.with(|plan| *plan.borrow_mut() = None);
+    CLIENT_RESTYLED.with(|ids| ids.borrow_mut().clear());
+}
+
+fn box_markers(info: &crate::layout::FlatNodeInfo<'_>) -> BoxMarkers {
+    let Some(now) = info.style.custom_properties.as_ref() else {
+        return BoxMarkers::default();
+    };
+    BoxMarkers {
+        props: Some(now.clone()),
+        synthetic: now.contains_key("--w3cos-internal-split-inline-edge")
+            || now.contains_key("--w3cos-internal-split-inline-fragment"),
+        split_owner: split_inline_owner(info),
+        box_owners: w3cos_std::inline_text::cssom_box_owners(info.style),
+        owner_ranges: now.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES),
+    }
+}
+
+/// Refresh `plan` and `markers` for the boxes of `ids` (and the host-less
+/// boxes lowered below them); `None` when a box's publishing role changed.
+fn refresh_client_plan(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    markers: &mut [BoxMarkers],
+    mut plan: ClientPlan,
+    ids: &[u32],
+) -> Option<ClientPlan> {
+    if ids.len() > 8 {
+        return None;
+    }
+    let mut dirty = Vec::new();
+    if !ids.is_empty() {
+        for index in 0..flat.len() {
+            if markers[index]
+                .split_owner
+                .is_some_and(|id| ids.contains(&id))
+            {
+                dirty.push(index);
+            }
+            if plan.host[index].is_some_and(|id| ids.contains(&id)) {
+                dirty.push(index);
+                let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+                let mut child = index + 1;
+                while child < end {
+                    if plan.host[child].is_some() {
+                        child = flat[child].subtree_end.max(child + 1);
+                    } else {
+                        dirty.push(child);
+                        child += 1;
+                    }
+                }
+            }
+        }
+    }
+    for index in dirty {
+        plan.validated[index] = 0;
+        let info = &flat[index];
+        let slot = &mut markers[index];
+        match (info.style.custom_properties.as_ref(), slot.props.as_ref()) {
+            (None, None) => continue,
+            (Some(now), Some(read)) if now.ptr_eq(read) => continue,
+            _ => {}
+        }
+        let next = box_markers(info);
+        if next.synthetic != slot.synthetic
+            || next.split_owner != slot.split_owner
+            || next.box_owners != slot.box_owners
+            || next.owner_ranges != slot.owner_ranges
+        {
+            *slot = next;
+            return None;
+        }
+        *slot = next;
+    }
+    Some(plan)
 }
 
 pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
@@ -574,7 +691,9 @@ fn patch_and_compute(
     };
     let compute_us = compute_started.elapsed().as_micros();
     let write_started = std::time::Instant::now();
+    CLIENT_KEY.with(|key| key.set(Some((cache.structure, cache.source_structure))));
     let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
+    CLIENT_KEY.with(|key| key.set(None));
     let write_us = write_started.elapsed().as_micros();
     if phase {
         eprintln!(
@@ -816,26 +935,13 @@ pub(super) fn splice_client_rects(
     });
 }
 
-pub(super) fn client_rects_for(
+/// Every box's CSSOM markers (refreshed where their map changed), and the
+/// boxes that can publish rects.
+fn client_plan(
     flat: &[crate::layout::FlatNodeInfo<'_>],
-    layouts: &[(crate::layout::LayoutRect, usize)],
-    ng_text: &[crate::layout_ng::TextFragment],
-) -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
-    let mut by_index = vec![None; flat.len()];
-    for (rect, index) in layouts {
-        if let Some(slot) = by_index.get_mut(*index) {
-            *slot = Some(*rect);
-        }
-    }
-    let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
-    let mut owners_with_inline_fragments = HashSet::new();
-    let mut first_fragment_is_block = HashMap::new();
-    let mut last_fragment_is_block = HashMap::new();
-    // Read each box's markers once (the text walk below visits every
-    // ancestor of every text leaf), and only for a marker map this index
-    // did not read in the last pass.
-    let mut markers = BOX_MARKERS.with(|memo| std::mem::take(&mut *memo.borrow_mut()));
-    markers.resize_with(flat.len(), BoxMarkers::default);
+    markers: &mut [BoxMarkers],
+    key: Option<(u64, u64)>,
+) -> ClientPlan {
     for (info, slot) in flat.iter().zip(markers.iter_mut()) {
         match (info.style.custom_properties.as_ref(), slot.props.as_ref()) {
             (None, None) => {}
@@ -853,23 +959,11 @@ pub(super) fn client_rects_for(
             }
         }
     }
-    let synthetic: Vec<bool> = markers.iter().map(|m| m.synthetic).collect();
     let synthetic_owner: Vec<Option<u32>> = markers
         .iter()
         .map(|m| m.synthetic.then_some(m.split_owner).flatten())
         .collect();
     let any_synthetic_owner = synthetic_owner.iter().any(Option::is_some);
-    // LayoutNG line fragments grouped by box, in emission order.
-    let mut ng_lines_of: w3cos_std::fxhash::FxHashMap<usize, Vec<&crate::layout_ng::TextFragment>> =
-        Default::default();
-    for fragment in ng_text {
-        if !fragment.vertical {
-            ng_lines_of
-                .entry(fragment.index)
-                .or_default()
-                .push(fragment);
-        }
-    }
     let mut inherited_text_owners = vec![Vec::new(); flat.len()];
     let mut text_line_owners: HashSet<u32, w3cos_std::fxhash::FxBuildHasher> = HashSet::default();
     for (index, info) in flat.iter().enumerate() {
@@ -895,8 +989,112 @@ pub(super) fn client_rects_for(
             parent = ancestor.parent;
         }
     }
-    for (index, info) in flat.iter().enumerate() {
-        let synthetic_inline = synthetic[index];
+    let publishers = if key.is_some() {
+        (0..flat.len())
+            .filter(|&index| {
+                let marker = &markers[index];
+                marker.split_owner.is_some()
+                    || !marker.box_owners.is_empty()
+                    || (flat[index].component.is_some_and(|component| {
+                        matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
+                    }) && (!inherited_text_owners[index].is_empty() || marker.owner_ranges))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ClientPlan {
+        key: key.unwrap_or_default(),
+        len: flat.len(),
+        host: if key.is_some() {
+            flat.iter().map(flat_host_id_opt).collect()
+        } else {
+            Vec::new()
+        },
+        validated: if key.is_some() {
+            vec![0; flat.len()]
+        } else {
+            Vec::new()
+        },
+        publishers,
+        inherited_text_owners,
+        text_line_owners,
+    }
+}
+
+fn flat_host_id_opt(info: &crate::layout::FlatNodeInfo<'_>) -> Option<u32> {
+    match info.on_click {
+        w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
+        _ => None,
+    }
+}
+
+pub(super) fn client_rects_for(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+    ng_text: &[crate::layout_ng::TextFragment],
+) -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
+    let mut by_index = vec![None; flat.len()];
+    for (rect, index) in layouts {
+        if let Some(slot) = by_index.get_mut(*index) {
+            *slot = Some(*rect);
+        }
+    }
+    let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
+    let mut owners_with_inline_fragments = HashSet::new();
+    let mut first_fragment_is_block = HashMap::new();
+    let mut last_fragment_is_block = HashMap::new();
+    // Read each box's markers once (the text walk below visits every
+    // ancestor of every text leaf), and only for a marker map this index
+    // did not read in the last pass.
+    let mut markers = BOX_MARKERS.with(|memo| std::mem::take(&mut *memo.borrow_mut()));
+    markers.resize_with(flat.len(), BoxMarkers::default);
+    let plan_key = CLIENT_KEY
+        .with(|key| key.get())
+        .filter(|_| crate::layout_ng::box_tree_enabled());
+    let ids = if plan_key.is_some() {
+        CLIENT_RESTYLED.with(|ids| std::mem::take(&mut *ids.borrow_mut()))
+    } else {
+        Vec::new()
+    };
+    let mut plan = plan_key
+        .and_then(|key| {
+            CLIENT_PLAN
+                .with(|plan| plan.borrow_mut().take())
+                .filter(|plan| plan.key == key && plan.len == flat.len())
+        })
+        .and_then(|plan| refresh_client_plan(flat, &mut markers, plan, &ids))
+        .unwrap_or_else(|| client_plan(flat, &mut markers, plan_key));
+    let mut validated = std::mem::take(&mut plan.validated);
+    let ClientPlan {
+        publishers,
+        inherited_text_owners,
+        text_line_owners,
+        ..
+    } = &plan;
+    let iteration: Box<dyn Iterator<Item = usize>> = if plan_key.is_some() {
+        Box::new(publishers.iter().copied())
+    } else {
+        Box::new(0..flat.len())
+    };
+    // LayoutNG line fragments grouped by box, in emission order.
+    let mut ng_lines_of: w3cos_std::fxhash::FxHashMap<usize, Vec<&crate::layout_ng::TextFragment>> =
+        Default::default();
+    for fragment in ng_text {
+        if !fragment.vertical
+            && (plan_key.is_none()
+                || !inherited_text_owners[fragment.index].is_empty()
+                || markers[fragment.index].owner_ranges)
+        {
+            ng_lines_of
+                .entry(fragment.index)
+                .or_default()
+                .push(fragment);
+        }
+    }
+    for index in iteration {
+        let info = &flat[index];
+        let synthetic_inline = markers[index].synthetic;
         let Some(mut rect) = by_index.get(index).copied().flatten() else {
             continue;
         };
@@ -1084,13 +1282,18 @@ pub(super) fn client_rects_for(
             let Some(entry) = memo.get(&index) else {
                 return false;
             };
+            // (A box-tree plan already matched this entry's text and style
+            // to the box, and the box was not restyled since.)
+            let trusted = validated.get(index) == Some(&entry.stamp);
             if entry.width_bits != width_bits
                 || entry.fonts != fonts
-                || entry.content != *content
                 || entry.owners != inherited_text_owners[index]
-                || entry.style != *info.style
+                || (!trusted && (entry.content != *content || entry.style != *info.style))
             {
                 return false;
+            }
+            if let Some(slot) = validated.get_mut(index) {
+                *slot = entry.stamp;
             }
             replay(
                 &entry.rects,
@@ -1203,9 +1406,17 @@ pub(super) fn client_rects_for(
             if memo.len() > 2 * flat.len() + 64 {
                 memo.clear();
             }
+            let stamp = TEXT_RECTS_STAMP.with(|stamp| {
+                stamp.set(stamp.get() + 1);
+                stamp.get()
+            });
+            if let Some(slot) = validated.get_mut(index) {
+                *slot = stamp;
+            }
             memo.insert(
                 index,
                 TextRectsMemo {
+                    stamp,
                     content: content.to_string(),
                     style: info.style.clone(),
                     width_bits,
@@ -1260,6 +1471,10 @@ pub(super) fn client_rects_for(
         *rects = vec![zero_before, middle, zero_after];
     }
     BOX_MARKERS.with(|memo| *memo.borrow_mut() = markers);
+    if plan_key.is_some() {
+        plan.validated = validated;
+        CLIENT_PLAN.with(|slot| *slot.borrow_mut() = Some(plan));
+    }
     published
 }
 

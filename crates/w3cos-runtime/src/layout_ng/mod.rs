@@ -74,6 +74,7 @@ pub(crate) fn note_restyled(id: u32) {
     cache::note_restyled(id);
     if cache::box_tree_enabled() {
         crate::list_marker::note_restyled(id);
+        crate::incremental_layout::note_client_restyled(id);
     }
 }
 
@@ -81,6 +82,11 @@ pub(crate) fn note_restyled(id: u32) {
 pub(crate) fn forget_patch_memo() {
     cache::forget_patch_memo();
     crate::list_marker::forget_retained();
+    crate::incremental_layout::forget_client_plan();
+}
+
+pub(crate) fn box_tree_enabled() -> bool {
+    cache::box_tree_enabled()
 }
 
 /// Box-tree mode: the structure key of the patch flush laying out `flat`
