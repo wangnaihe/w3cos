@@ -92,7 +92,21 @@ struct TextLineRect {
     font_height: f32,
 }
 
+/// The CSSOM markers `client_rects_for` reads from one box's custom
+/// properties, with the (pinned) map they were read from.
+#[derive(Default)]
+struct BoxMarkers {
+    props: Option<w3cos_std::style::CustomProperties>,
+    synthetic: bool,
+    split_owner: Option<u32>,
+    box_owners: Vec<u32>,
+    owner_ranges: bool,
+}
+
 thread_local! {
+    /// Per flat index: the markers of the box at that index in the last
+    /// pass.
+    static BOX_MARKERS: RefCell<Vec<BoxMarkers>> = const { RefCell::new(Vec::new()) };
     /// Per flat index: a text run's re-wrapped CSSOM rects (the wrap is a
     /// function of the run, its style, the line box width, and the fonts).
     static TEXT_RECTS: RefCell<HashMap<usize, TextRectsMemo>> = RefCell::new(HashMap::new());
@@ -816,22 +830,32 @@ pub(super) fn client_rects_for(
     let mut owners_with_inline_fragments = HashSet::new();
     let mut first_fragment_is_block = HashMap::new();
     let mut last_fragment_is_block = HashMap::new();
-    let synthetic_inline = |info: &crate::layout::FlatNodeInfo<'_>| {
-        info.style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| {
-                properties.contains_key("--w3cos-internal-split-inline-edge")
-                    || properties.contains_key("--w3cos-internal-split-inline-fragment")
-            })
-    };
-    // Read each box's markers once; the text walk below visits every
-    // ancestor of every text leaf.
-    let synthetic: Vec<bool> = flat.iter().map(synthetic_inline).collect();
-    let synthetic_owner: Vec<Option<u32>> = flat
+    // Read each box's markers once (the text walk below visits every
+    // ancestor of every text leaf), and only for a marker map this index
+    // did not read in the last pass.
+    let mut markers = BOX_MARKERS.with(|memo| std::mem::take(&mut *memo.borrow_mut()));
+    markers.resize_with(flat.len(), BoxMarkers::default);
+    for (info, slot) in flat.iter().zip(markers.iter_mut()) {
+        match (info.style.custom_properties.as_ref(), slot.props.as_ref()) {
+            (None, None) => {}
+            (Some(now), Some(read)) if now.ptr_eq(read) => {}
+            (None, Some(_)) => *slot = BoxMarkers::default(),
+            (Some(now), _) => {
+                *slot = BoxMarkers {
+                    props: Some(now.clone()),
+                    synthetic: now.contains_key("--w3cos-internal-split-inline-edge")
+                        || now.contains_key("--w3cos-internal-split-inline-fragment"),
+                    split_owner: split_inline_owner(info),
+                    box_owners: w3cos_std::inline_text::cssom_box_owners(info.style),
+                    owner_ranges: now.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES),
+                };
+            }
+        }
+    }
+    let synthetic: Vec<bool> = markers.iter().map(|m| m.synthetic).collect();
+    let synthetic_owner: Vec<Option<u32>> = markers
         .iter()
-        .zip(&synthetic)
-        .map(|(info, &synthetic)| synthetic.then(|| split_inline_owner(info)).flatten())
+        .map(|m| m.synthetic.then_some(m.split_owner).flatten())
         .collect();
     let any_synthetic_owner = synthetic_owner.iter().any(Option::is_some);
     // LayoutNG line fragments grouped by box, in emission order.
@@ -900,7 +924,7 @@ pub(super) fn client_rects_for(
             rect.width = containing.width;
         }
         let physical = w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height);
-        if let Some(owner) = split_inline_owner(info) {
+        if let Some(owner) = markers[index].split_owner {
             if synthetic_inline {
                 owners_with_inline_fragments.insert(owner);
             }
@@ -927,7 +951,7 @@ pub(super) fn client_rects_for(
                 last_fragment_is_block.insert(owner, is_block);
             }
         }
-        for owner in w3cos_std::inline_text::cssom_box_owners(info.style) {
+        for &owner in &markers[index].box_owners {
             published.entry(owner).or_default().push(physical);
             first_fragment_is_block.entry(owner).or_insert(true);
             last_fragment_is_block.insert(owner, true);
@@ -941,15 +965,7 @@ pub(super) fn client_rects_for(
         // Text fragments publish only for split-inline owners: explicit
         // owner ranges on the run or an inherited synthetic-inline owner.
         // Without either, wrapping the run again would publish nothing.
-        if inherited_text_owners[index].is_empty()
-            && !info
-                .style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|properties| {
-                    properties.contains_key(w3cos_std::inline_text::CSSOM_OWNER_RANGES)
-                })
-        {
+        if inherited_text_owners[index].is_empty() && !markers[index].owner_ranges {
             continue;
         }
         let line_box = info
@@ -1241,6 +1257,7 @@ pub(super) fn client_rects_for(
         let zero_after = w3cos_dom::DOMRect::new(union.x, union.y + union.height, 0.0, 0.0);
         *rects = vec![zero_before, middle, zero_after];
     }
+    BOX_MARKERS.with(|memo| *memo.borrow_mut() = markers);
     published
 }
 

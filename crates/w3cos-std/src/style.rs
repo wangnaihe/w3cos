@@ -118,6 +118,13 @@ pub struct CustomProperties(std::sync::Arc<CustomPropertyMap>);
 pub type CustomPropertyMap = crate::fxhash::FxHashMap<String, String>;
 
 impl CustomProperties {
+    /// Same shared map. While a caller holds a clone, the map cannot change
+    /// in place (every mutation goes through `Arc::make_mut`), so equal
+    /// pointers mean equal contents.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
