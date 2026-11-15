@@ -125,6 +125,27 @@ fn dirty_indices(flat: &[FlatNodeInfo<'_>], key: (u64, u64), ids: &[u32]) -> Vec
     })
 }
 
+/// The restyle-log position now (a memo records it with its contents).
+pub(super) fn log_position() -> u64 {
+    log_seq()
+}
+
+/// The boxes whose style-derived inputs a restyle since `seq` can have
+/// changed (see `dirty_indices`); `None` when the log no longer reaches
+/// back that far or holds too many restyles.
+pub(super) fn changed_since(
+    flat: &[FlatNodeInfo<'_>],
+    key: (u64, u64),
+    seq: u64,
+) -> Option<Vec<usize>> {
+    let ids = log_since(seq).filter(|ids| ids.len() <= 8)?;
+    Some(if ids.is_empty() {
+        Vec::new()
+    } else {
+        dirty_indices(flat, key, &ids)
+    })
+}
+
 /// The indices `pred` selects, in order; `None` outside a box-tree patch
 /// flush over `flat` (the caller scans every box).
 pub(super) fn retained(

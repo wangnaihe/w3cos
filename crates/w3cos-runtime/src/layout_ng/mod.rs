@@ -87,6 +87,24 @@ pub(crate) fn forget_patch_memo() {
     crate::incremental_layout::forget_client_plan();
     crate::incremental_layout::forget_style_paths();
     box_scan::forget();
+    forget_flat_reuse();
+    crate::layout::forget_flat_skeleton();
+    crate::layout::forget_scroll_plan();
+}
+
+/// Box-tree mode: the restyle-log position a memo kept under
+/// `box_tree_key` records.
+pub(crate) fn restyle_position() -> u64 {
+    box_scan::log_position()
+}
+
+/// Box-tree mode: the boxes a restyle since `seq` can have changed.
+pub(crate) fn restyled_boxes_since(
+    flat: &[crate::layout::FlatNodeInfo],
+    key: (u64, u64),
+    seq: u64,
+) -> Option<Vec<usize>> {
+    box_scan::changed_since(flat, key, seq)
 }
 
 pub(crate) fn box_tree_enabled() -> bool {
@@ -419,6 +437,55 @@ fn note(reason: &'static str) {
     let _ = reason;
 }
 
+/// A text fragment's characters, shared by every copy of the fragment
+/// (paint's, and a retained subtree's on the next flush) instead of
+/// copied (Blink's NGPhysicalTextFragment shares its text content).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FragmentText(std::rc::Rc<str>);
+
+impl FragmentText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for FragmentText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for FragmentText {
+    fn from(text: &str) -> Self {
+        Self(text.into())
+    }
+}
+
+impl From<String> for FragmentText {
+    fn from(text: String) -> Self {
+        Self(text.into())
+    }
+}
+
+impl PartialEq<str> for FragmentText {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for FragmentText {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl std::fmt::Display for FragmentText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One line-box piece of a text node broken inside its content, like
 /// Blink's NGPhysicalTextFragment: the node, its [start, end) byte offsets
 /// into the node's text (NGInlineItem start/end offsets) and the piece's
@@ -430,7 +497,7 @@ pub struct TextFragment {
     pub start: usize,
     pub end: usize,
     pub rect: LayoutRect,
-    pub text: String,
+    pub text: FragmentText,
     /// Sideways glyphs of a vertical flow (see `BoxFragment::vertical`).
     pub vertical: bool,
 }
@@ -836,7 +903,10 @@ fn layout_flat_with_text(
     };
     let mut out = Vec::with_capacity(flat.len());
     let mut texts = Vec::new();
-    flatten(&fragment, x, y, flat, &mut out, &mut texts);
+    match box_tree_key(flat) {
+        Some(key) => flatten_retained(&fragment, x, y, flat, key, &mut out, &mut texts),
+        None => flatten(&fragment, x, y, flat, &mut out, &mut texts),
+    }
     if !texts.is_empty() {
         // Paint draws pieces as inline text runs; a block-level text leaf
         // also paints box decorations from its single node rect.
@@ -912,6 +982,21 @@ fn flatten(
     out: &mut Vec<(LayoutRect, usize)>,
     texts: &mut Vec<TextFragment>,
 ) {
+    flatten_own(fragment, x, y, flat, out, texts);
+    for (dx, dy, child) in &fragment.children {
+        flatten(child, x + dx, y + dy, flat, out, texts);
+    }
+}
+
+/// A fragment's own rect entry and its text piece, if any.
+fn flatten_own(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
     let rect = LayoutRect {
         x,
         y,
@@ -947,13 +1032,121 @@ fn flatten(
             start,
             end,
             rect,
-            text,
+            text: text.into(),
             vertical: fragment.vertical,
         });
     }
     out.push((rect, fragment.index));
-    for (dx, dy, child) in &fragment.children {
-        flatten(child, x + dx, y + dy, flat, out, texts);
+}
+
+/// Box-tree mode: the last patch flush's flattened output, and where each
+/// large retained child list's part of it sits (keyed by the list's
+/// address; the list is pinned so the address stays its own).
+struct FlatReuse {
+    key: (u64, u64),
+    len: usize,
+    out: Vec<(LayoutRect, usize)>,
+    texts: Vec<TextFragment>,
+    spans: w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
+}
+
+struct FlatSpan {
+    children: FragmentChildren,
+    x: f32,
+    y: f32,
+    out: (usize, usize),
+    texts: (usize, usize),
+}
+
+thread_local! {
+    static FLAT_REUSE: std::cell::RefCell<Option<FlatReuse>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn forget_flat_reuse() {
+    FLAT_REUSE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// [`flatten`] reusing the output of a child list laid out at the same
+/// position in the last patch flush (the same list, so the same boxes and
+/// offsets; an exact position keeps the sums bit-identical).
+fn flatten_retained(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    key: (u64, u64),
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    let prev = FLAT_REUSE
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|prev| prev.key == key && prev.len == flat.len());
+    let mut spans = w3cos_std::fxhash::FxHashMap::default();
+    flatten_reusing(fragment, x, y, flat, prev.as_ref(), out, texts, &mut spans);
+    FLAT_REUSE.with(|slot| {
+        *slot.borrow_mut() = Some(FlatReuse {
+            key,
+            len: flat.len(),
+            out: out.clone(),
+            texts: texts.clone(),
+            spans,
+        })
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_reusing(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    prev: Option<&FlatReuse>,
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+    spans: &mut w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
+) {
+    // This box's own entries, exactly as `flatten` makes them.
+    flatten_own(fragment, x, y, flat, out, texts);
+    if fragment.children.is_empty() {
+        return;
+    }
+    let address = std::rc::Rc::as_ptr(&fragment.children.0) as usize;
+    if let Some(span) = prev.and_then(|prev| prev.spans.get(&address))
+        && std::rc::Rc::ptr_eq(&span.children.0, &fragment.children.0)
+        && span.x.to_bits() == x.to_bits()
+        && span.y.to_bits() == y.to_bits()
+    {
+        let prev = prev.unwrap();
+        let (out_start, text_start) = (out.len(), texts.len());
+        out.extend_from_slice(&prev.out[span.out.0..span.out.1]);
+        texts.extend_from_slice(&prev.texts[span.texts.0..span.texts.1]);
+        spans.insert(
+            address,
+            FlatSpan {
+                children: fragment.children.clone(),
+                x,
+                y,
+                out: (out_start, out.len()),
+                texts: (text_start, texts.len()),
+            },
+        );
+        return;
+    }
+    let (out_start, text_start) = (out.len(), texts.len());
+    for (dx, dy, child) in fragment.children.iter() {
+        flatten_reusing(child, x + dx, y + dy, flat, prev, out, texts, spans);
+    }
+    if out.len() - out_start >= 16 {
+        spans.insert(
+            address,
+            FlatSpan {
+                children: fragment.children.clone(),
+                x,
+                y,
+                out: (out_start, out.len()),
+                texts: (text_start, texts.len()),
+            },
+        );
     }
 }
 

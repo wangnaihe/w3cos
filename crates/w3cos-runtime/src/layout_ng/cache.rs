@@ -34,6 +34,8 @@ struct MinMaxEntry {
     result: MinMax,
 }
 
+type EntryTables = (Vec<Vec<LayoutEntry>>, Vec<Vec<MinMaxEntry>>);
+
 struct Pass {
     flat_ptr: usize,
     flat_len: usize,
@@ -50,6 +52,9 @@ struct Pass {
     inline_free: Vec<bool>,
     layouts: Vec<Vec<LayoutEntry>>,
     min_max: Vec<Vec<MinMaxEntry>>,
+    /// The boxes holding `layouts` or `min_max` entries, each once (the
+    /// rest of both tables is empty).
+    touched: Vec<usize>,
     /// Cross-flush identity of each box's layout inputs (empty when the
     /// retained cache is off): see [`fingerprints`].
     fp: Vec<u64>,
@@ -67,6 +72,9 @@ struct Retained {
 
 thread_local! {
     static PASSES: RefCell<Vec<Pass>> = const { RefCell::new(Vec::new()) };
+    /// Emptied per-box entry tables of finished passes, reused by the next
+    /// pass instead of allocating and dropping one slot per box.
+    static TABLES: RefCell<Vec<EntryTables>> = const { RefCell::new(Vec::new()) };
     static RETAINED: RefCell<Retained> = RefCell::new(Retained::default());
 }
 
@@ -115,7 +123,7 @@ impl Drop for PassGuard {
                 {
                     retain(pass);
                 }
-                if let Some(pass) = pass
+                if let Some(pass) = pass.as_ref()
                     && stats_enabled()
                 {
                     for (i, (l, m)) in pass.layouts.iter().zip(pass.min_max.iter()).enumerate() {
@@ -133,9 +141,44 @@ impl Drop for PassGuard {
                         }
                     }
                 }
+                if let Some(pass) = pass {
+                    recycle_tables(pass);
+                }
             });
         }
     }
+}
+
+/// Empty `pass`'s entry tables (only its touched slots hold entries) and
+/// keep them for the next pass.
+fn recycle_tables(pass: Pass) {
+    let Pass {
+        mut layouts,
+        mut min_max,
+        touched,
+        ..
+    } = pass;
+    for index in touched {
+        layouts[index].clear();
+        min_max[index].clear();
+    }
+    TABLES.with(|tables| {
+        let mut tables = tables.borrow_mut();
+        if tables.len() < 4 {
+            tables.push((layouts, min_max));
+        }
+    });
+}
+
+fn entry_tables(len: usize) -> EntryTables {
+    let (mut layouts, mut min_max) = TABLES
+        .with(|tables| tables.borrow_mut().pop())
+        .unwrap_or_default();
+    layouts.truncate(len);
+    layouts.resize_with(len, Vec::new);
+    min_max.truncate(len);
+    min_max.resize_with(len, Vec::new);
+    (layouts, min_max)
 }
 
 pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
@@ -202,6 +245,7 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
     } else {
         Vec::new()
     };
+    let (layouts, min_max) = entry_tables(flat.len());
     PASSES.with(|passes| {
         passes.borrow_mut().push(Pass {
             flat_ptr: flat.as_ptr() as usize,
@@ -209,8 +253,9 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             cacheable,
             block_free,
             inline_free,
-            layouts: (0..flat.len()).map(|_| Vec::new()).collect(),
-            min_max: (0..flat.len()).map(|_| Vec::new()).collect(),
+            layouts,
+            min_max,
+            touched: Vec::new(),
             fp,
         })
     });
@@ -268,6 +313,9 @@ pub(super) fn layout(
                 None => compute()?,
             };
             with_pass(flat, index, |pass| {
+                if pass.layouts[index].is_empty() && pass.min_max[index].is_empty() {
+                    pass.touched.push(index);
+                }
                 pass.layouts[index].push(LayoutEntry {
                     space: key,
                     force_bfc_root,
@@ -305,6 +353,9 @@ pub(super) fn min_max(
                 None => compute()?,
             };
             with_pass(flat, index, |pass| {
+                if pass.layouts[index].is_empty() && pass.min_max[index].is_empty() {
+                    pass.touched.push(index);
+                }
                 pass.min_max[index].push(MinMaxEntry {
                     space: key,
                     block,
@@ -513,8 +564,14 @@ fn shift_indices(result: &mut LayoutResult, delta: isize) {
 fn retain(pass: &mut Pass) {
     let mut layouts = std::collections::HashMap::new();
     let mut min_max = std::collections::HashMap::new();
-    for index in 0..pass.fp.len() {
-        let fp = pass.fp[index];
+    // In index order, as a scan of every box would insert them (a later
+    // box with the same fingerprint replaces an earlier one).
+    let mut touched = pass.touched.clone();
+    touched.sort_unstable();
+    for index in touched {
+        let Some(&fp) = pass.fp.get(index) else {
+            continue;
+        };
         if fp == 0 {
             continue;
         }

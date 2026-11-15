@@ -1222,6 +1222,79 @@ pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
     out
 }
 
+thread_local! {
+    /// Box-tree mode: the preorder stable ids of the last patch flush's
+    /// flat tree, under its structure key (ids depend on structure only).
+    static FLAT_SKELETON: std::cell::RefCell<Option<((u64, u64), Vec<u64>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `pre_flatten` for a patch flush over structure `key` (box-tree mode):
+/// reuses the stable ids and node count kept for that structure instead of
+/// counting and rehashing every slot.
+pub(crate) fn pre_flatten_keyed(
+    root: &Component,
+    key: Option<(u64, u64)>,
+) -> Vec<FlatNodeInfo<'_>> {
+    let Some(key) = key else {
+        return pre_flatten(root);
+    };
+    let kept = FLAT_SKELETON.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .filter(|(at, _)| *at == key)
+            .map(|(_, ids)| ids)
+    });
+    let (flat, ids) = match kept {
+        Some(ids) => {
+            install_font_unit_provider();
+            let mut out = Vec::with_capacity(ids.len());
+            pre_flatten_with_ids(root, None, &ids, &mut out);
+            if out.len() == ids.len() {
+                (out, ids)
+            } else {
+                let flat = pre_flatten(root);
+                let ids = flat.iter().map(|node| node.stable_id).collect();
+                (flat, ids)
+            }
+        }
+        None => {
+            let flat = pre_flatten(root);
+            let ids = flat.iter().map(|node| node.stable_id).collect();
+            (flat, ids)
+        }
+    };
+    FLAT_SKELETON.with(|slot| *slot.borrow_mut() = Some((key, ids)));
+    flat
+}
+
+pub(crate) fn forget_flat_skeleton() {
+    FLAT_SKELETON.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn pre_flatten_with_ids<'a>(
+    comp: &'a Component,
+    parent: Option<usize>,
+    ids: &[u64],
+    out: &mut Vec<FlatNodeInfo<'a>>,
+) {
+    let my_idx = out.len();
+    out.push(FlatNodeInfo {
+        component: Some(comp),
+        stable_id: ids.get(my_idx).copied().unwrap_or(0),
+        kind: &comp.kind,
+        style: &comp.style,
+        on_click: &comp.on_click,
+        sticky_counter_signal: comp.sticky_counter_signal,
+        parent,
+        subtree_end: my_idx + 1,
+    });
+    for child in &comp.children {
+        pre_flatten_with_ids(child, Some(my_idx), ids, out);
+    }
+    out[my_idx].subtree_end = out.len();
+}
+
 pub(crate) fn count_nodes(comp: &Component) -> usize {
     if comp.children.is_empty() {
         return 1;
@@ -20752,47 +20825,116 @@ fn refresh_scroll_container_rects(
 /// overflow clip) is a scrollport; its scrollable extent is the farthest
 /// descendant border-box edge past its own border box, as in the legacy
 /// collector. Scrollbars take no space (the legacy engine reserves none).
-pub(crate) fn scroll_containers_from_layout(
-    layouts: &[(LayoutRect, usize)],
-    flat: &[FlatNodeInfo<'_>],
-    viewport: Option<(f32, f32)>,
-) -> (
-    Vec<(usize, LayoutRect, ScrollExtent)>,
-    Vec<(usize, LayoutRect)>,
-    Vec<Option<usize>>,
-) {
-    // Flat index -> its (last) entry in `layouts`, as a dense table.
-    let mut layout_slot = vec![u32::MAX; flat.len()];
-    for (slot, (_, index)) in layouts.iter().enumerate() {
-        if let Some(entry) = layout_slot.get_mut(*index) {
-            *entry = slot as u32;
-        }
-    }
-    let slot_of = |index: usize| {
-        layout_slot
-            .get(index)
-            .filter(|slot| **slot != u32::MAX)
-            .map(|slot| *slot as usize)
+/// The style-derived half of `scroll_containers_from_layout`: per box its
+/// scroll container, the scroll-container candidates (with whether they
+/// clip as `hidden`), and the accumulated transform shifts. Box-tree mode
+/// keeps it per structure (Blink keeps these bits on the LayoutObject).
+struct ScrollPlan {
+    scroll_ancestor: Vec<Option<usize>>,
+    containers: Vec<(usize, bool)>,
+    shifts: Vec<(usize, (f32, f32))>,
+    columns: bool,
+}
+
+struct RetainedScrollPlan {
+    key: (u64, u64),
+    len: usize,
+    seq: u64,
+    inputs: Vec<ScrollInput>,
+    plan: std::rc::Rc<ScrollPlan>,
+}
+
+/// Every style input `scroll_plan` reads from one box.
+#[derive(Clone, Copy, PartialEq)]
+struct ScrollInput {
+    flags: u16,
+    translate: (u32, u32),
+}
+
+fn scroll_input(style: &w3cos_std::style::Style) -> ScrollInput {
+    let overflow = |o: WOverflow| match o {
+        WOverflow::Visible => 0u16,
+        WOverflow::Hidden => 1,
+        WOverflow::Scroll | WOverflow::Auto => 2,
+        #[allow(unreachable_patterns)]
+        _ => 3,
     };
+    let flags = u16::from(matches!(style.position, WPos::Absolute))
+        | u16::from(matches!(style.position, WPos::Static)) << 1
+        | u16::from(style.display.establishes_overflow_clip()) << 2
+        | u16::from(establishes_column_context(style)) << 3
+        | overflow(style.resolved_overflow_x()) << 4
+        | overflow(style.resolved_overflow_y()) << 6;
+    ScrollInput {
+        flags,
+        translate: (
+            style.transform.translate_x.to_bits(),
+            style.transform.translate_y.to_bits(),
+        ),
+    }
+}
+
+thread_local! {
+    static SCROLL_PLAN: std::cell::RefCell<Option<RetainedScrollPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn forget_scroll_plan() {
+    SCROLL_PLAN.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn scroll_plan(flat: &[FlatNodeInfo<'_>]) -> std::rc::Rc<ScrollPlan> {
+    let Some(key) = crate::layout_ng::box_tree_key(flat) else {
+        return std::rc::Rc::new(build_scroll_plan(flat));
+    };
+    let seq = crate::layout_ng::restyle_position();
+    let kept = SCROLL_PLAN
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|kept| kept.key == key && kept.len == flat.len());
+    let reused = kept.and_then(|mut kept| {
+        let dirty = crate::layout_ng::restyled_boxes_since(flat, key, kept.seq)?;
+        for index in dirty {
+            let now = scroll_input(flat[index].style);
+            if kept.inputs[index] != now {
+                return None;
+            }
+        }
+        kept.seq = seq;
+        Some(kept)
+    });
+    let kept = reused.unwrap_or_else(|| RetainedScrollPlan {
+        key,
+        len: flat.len(),
+        seq,
+        inputs: flat.iter().map(|node| scroll_input(node.style)).collect(),
+        plan: std::rc::Rc::new(build_scroll_plan(flat)),
+    });
+    let plan = kept.plan.clone();
+    SCROLL_PLAN.with(|slot| *slot.borrow_mut() = Some(kept));
+    plan
+}
+
+fn build_scroll_plan(flat: &[FlatNodeInfo<'_>]) -> ScrollPlan {
     // `inherited[i]`: the scroll container that clips `i`'s children.
     let mut inherited: Vec<Option<usize>> = vec![None; flat.len()];
     let mut scroll_ancestor: Vec<Option<usize>> = vec![None; flat.len()];
-    let mut scrollable = Vec::new();
-    let mut hidden_clip = vec![false; flat.len()];
+    let mut containers = Vec::new();
+    let mut shifts = Vec::new();
     // Translation accumulated from the transforms of the boxes between a box
     // and its scroll container (the container's own transform moves the
     // container, not its contents). Scrollable overflow is measured on the
     // transformed boxes (CSS Overflow 3), so a descendant that a transform
     // moves back into the scrollport adds no overflow.
     let mut content_shift: Vec<(f32, f32)> = vec![(0.0, 0.0); flat.len()];
-    let mut shifted_layouts = layouts.to_vec();
     let body_host = crate::dom::body_id();
     let root_overflow_visible = flat.first().is_some_and(|root| {
         root.style.resolved_overflow_x() == WOverflow::Visible
             && root.style.resolved_overflow_y() == WOverflow::Visible
     });
+    let mut columns = false;
     for index in 0..flat.len() {
         let info = &flat[index];
+        columns |= establishes_column_context(info.style);
         let current = info.parent.and_then(|parent| inherited[parent]);
         let mut effective = current;
         if matches!(info.style.position, WPos::Absolute) {
@@ -20833,11 +20975,8 @@ pub(crate) fn scroll_containers_from_layout(
             parent_shift.1 + info.style.transform.translate_y,
         );
         content_shift[index] = own_shift;
-        if (own_shift.0 != 0.0 || own_shift.1 != 0.0)
-            && let Some(slot) = slot_of(index)
-        {
-            shifted_layouts[slot].0.x += own_shift.0;
-            shifted_layouts[slot].0.y += own_shift.1;
+        if own_shift.0 != 0.0 || own_shift.1 != 0.0 {
+            shifts.push((index, own_shift));
         }
         let overflow_x = info.style.resolved_overflow_x();
         let overflow_y = info.style.resolved_overflow_y();
@@ -20864,36 +21003,90 @@ pub(crate) fn scroll_containers_from_layout(
         {
             inherited[index] = Some(index);
             content_shift[index] = (0.0, 0.0);
-            if let Some(slot) = slot_of(index) {
-                scrollable.push((
-                    index,
-                    layouts[slot].0,
-                    ScrollExtent {
-                        max_x: 0.0,
-                        max_y: 0.0,
-                    },
-                ));
-                hidden_clip[index] = clips(overflow_x) || clips(overflow_y);
-            }
+            containers.push((index, clips(overflow_x) || clips(overflow_y)));
+        }
+    }
+    ScrollPlan {
+        scroll_ancestor,
+        containers,
+        shifts,
+        columns,
+    }
+}
+
+pub(crate) fn scroll_containers_from_layout(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    // Flat index -> its (last) entry in `layouts`, as a dense table.
+    let mut layout_slot = vec![u32::MAX; flat.len()];
+    for (slot, (_, index)) in layouts.iter().enumerate() {
+        if let Some(entry) = layout_slot.get_mut(*index) {
+            *entry = slot as u32;
+        }
+    }
+    let slot_of = |index: usize| {
+        layout_slot
+            .get(index)
+            .filter(|slot| **slot != u32::MAX)
+            .map(|slot| *slot as usize)
+    };
+    let plan = scroll_plan(flat);
+    let mut shifted = None::<Vec<(LayoutRect, usize)>>;
+    for &(index, shift) in &plan.shifts {
+        if let Some(slot) = slot_of(index) {
+            let layouts = shifted.get_or_insert_with(|| layouts.to_vec());
+            layouts[slot].0.x += shift.0;
+            layouts[slot].0.y += shift.1;
+        }
+    }
+    let shifted_layouts = shifted.as_deref().unwrap_or(layouts);
+    let mut hidden_clip = Vec::new();
+    let mut scrollable = Vec::new();
+    for &(index, hidden) in &plan.containers {
+        if let Some(slot) = slot_of(index) {
+            scrollable.push((
+                index,
+                layouts[slot].0,
+                ScrollExtent {
+                    max_x: 0.0,
+                    max_y: 0.0,
+                },
+            ));
+            hidden_clip.push(hidden);
         }
     }
     extend_scroll_extents_from_descendants(
-        &shifted_layouts,
+        shifted_layouts,
         flat,
-        &scroll_ancestor,
+        &plan.scroll_ancestor,
         &mut scrollable,
     );
-    extend_scroll_extents_from_overflow_columns(&shifted_layouts, flat, viewport, &mut scrollable);
+    if plan.columns {
+        extend_scroll_extents_from_overflow_columns(
+            shifted_layouts,
+            flat,
+            viewport,
+            &mut scrollable,
+        );
+    }
     let mut clip_only = Vec::new();
+    let mut hidden = hidden_clip.into_iter();
     scrollable.retain(|(index, rect, extent)| {
-        if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden_clip[*index] {
+        let hidden = hidden.next().unwrap_or(false);
+        if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden {
             true
         } else {
             clip_only.push((*index, *rect));
             false
         }
     });
-    (scrollable, clip_only, scroll_ancestor)
+    (scrollable, clip_only, plan.scroll_ancestor.clone())
 }
 
 /// Overflow columns are paint-projected (CSS Multicol) and therefore absent

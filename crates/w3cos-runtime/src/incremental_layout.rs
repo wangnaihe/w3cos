@@ -649,7 +649,10 @@ fn patch_and_compute(
     }
     let phase = phase_log_enabled();
     let flatten_started = std::time::Instant::now();
-    let flat = pre_flatten(&cache.component);
+    let flat = crate::layout::pre_flatten_keyed(
+        &cache.component,
+        crate::layout_ng::box_tree_enabled().then_some((cache.structure, cache.source_structure)),
+    );
     let flatten_us = flatten_started.elapsed().as_micros();
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
