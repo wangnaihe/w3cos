@@ -343,10 +343,10 @@ fn place(
     }
 }
 
-/// Box-tree mode (`W3COS_NG_BOX_TREE=1`): what the projection reads besides
-/// geometry, kept across the patch flushes of one structure and refreshed
-/// only on restyled boxes (Blink keeps list-marker roles on its
-/// LayoutObjects instead of rescanning styles every frame).
+/// Box-tree mode (LayoutNG default; `W3COS_NG_BOX_TREE=0` opts out): what the projection reads
+/// besides geometry, kept across the patch flushes of one structure and refreshed only on restyled
+/// boxes (Blink keeps list-marker roles on its LayoutObjects instead of rescanning styles every
+/// frame).
 struct RetainedMarkers {
     key: (u64, u64),
     len: usize,

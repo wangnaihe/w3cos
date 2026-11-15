@@ -1,10 +1,9 @@
-//! Box-tree mode (`W3COS_NG_BOX_TREE=1`): style-derived scans of the flat
-//! tree kept across the patch flushes of one structure. Blink keeps such
-//! per-object bits on its LayoutObjects and updates them on style change;
-//! here each scan keeps the indices it selects and re-evaluates only the
-//! boxes a restyle can affect (the restyled boxes, the host-less boxes
-//! lowered below them, their parents and their children: every scan reads
-//! at most a box, its parent, and its children).
+//! Box-tree mode (LayoutNG default; `W3COS_NG_BOX_TREE=0` opts out): style-derived scans of the
+//! flat tree kept across the patch flushes of one structure. Blink keeps such per-object bits on
+//! its LayoutObjects and updates them on style change; here each scan keeps the indices it selects
+//! and re-evaluates only the boxes a restyle can affect (the restyled boxes, the host-less boxes
+//! lowered below them, their parents and their children: every scan reads at most a box, its
+//! parent, and its children).
 use std::cell::RefCell;
 
 use crate::layout::FlatNodeInfo;

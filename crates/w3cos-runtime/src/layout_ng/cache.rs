@@ -828,16 +828,17 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
     })
 }
 
-/// Opt-in owned box tree (`W3COS_NG_BOX_TREE=1`): per-box derived data kept
-/// across patch flushes and updated only on restyled boxes and their
-/// ancestors, as Blink keeps its LayoutObject tree.
+/// Owned box tree (LayoutNG on; `W3COS_NG_BOX_TREE=0` opts out): per-box
+/// derived data kept across patch flushes and updated only on restyled
+/// boxes and their ancestors, as Blink keeps its LayoutObject tree.
 pub(crate) fn box_tree_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
-            std::env::var("W3COS_NG_BOX_TREE").ok().as_deref(),
-            Some("1") | Some("true")
-        )
+        super::mode() == super::Mode::On
+            && !matches!(
+                std::env::var("W3COS_NG_BOX_TREE").ok().as_deref(),
+                Some("0") | Some("false")
+            )
     })
 }
 
