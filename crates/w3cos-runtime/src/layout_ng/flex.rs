@@ -213,9 +213,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
 /// (the typed enums fold it into `stretch`; `set_last_baseline` writes the
 /// marker).
 fn authored_last_baseline(container: &Style, child: &Style) -> bool {
-    let key = |name: &str| format!("--w3cos-internal-last-baseline-{name}");
-    has_marker(child, &key("align-self"))
-        || (child.align_self == AlignSelf::Auto && has_marker(container, &key("align-items")))
+    has_marker(child, "--w3cos-internal-last-baseline-align-self")
+        || (child.align_self == AlignSelf::Auto
+            && has_marker(container, "--w3cos-internal-last-baseline-align-items"))
 }
 
 /// Whether the item can join the last-baseline group of a horizontal row

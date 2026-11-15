@@ -885,7 +885,7 @@ fn solve(
     .map(|(rects, own, _)| (rects, own))
 }
 
-type ClientRectMap = std::collections::HashMap<u32, Vec<w3cos_dom::DOMRect>>;
+use super::ClientRectMap;
 
 /// [`solve`], also returning the CSSOM fragment rects the wrapper's boxes
 /// publish (wrapper coordinates) when `client_rects` is set.
@@ -912,7 +912,7 @@ fn solve_with_client_rects(
         let published = if client_rects {
             super::client_rects_for(&flat, &layout_cache, &texts)
         } else {
-            ClientRectMap::new()
+            ClientRectMap::default()
         };
         return host_rects(&flat, &layout_cache).map(|(rects, own)| (rects, own, published));
     }
@@ -928,7 +928,7 @@ fn solve_with_client_rects(
     let published = if client_rects {
         super::client_rects_for(&flat, &results.layout_cache, &results.text_fragments)
     } else {
-        ClientRectMap::new()
+        ClientRectMap::default()
     };
     host_rects(&flat, &results.layout_cache).map(|(rects, own)| (rects, own, published))
 }

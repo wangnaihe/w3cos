@@ -2656,11 +2656,133 @@ fn paragraph_height(
     }
 }
 
+/// A run's max-content inline size is remembered by value across layouts
+/// (Blink keeps it with the run's shape result): a box relaid out at a new
+/// width, or restyled without a font change, does not re-measure its text.
+/// A run in the host face is keyed by exactly what measuring it reads (its
+/// text, font size and face); any other run by its text and whole style.
+/// Both are dropped when the registered fonts change.
+struct ContentWidthMemo {
+    fonts: u64,
+    entries: usize,
+    plain: w3cos_std::fxhash::FxHashMap<u64, Vec<(Box<str>, u32, usize, f32)>>,
+    styled: w3cos_std::fxhash::FxHashMap<u64, Vec<(Box<str>, Style, f32)>>,
+}
+
+thread_local! {
+    static CONTENT_WIDTHS: std::cell::RefCell<Option<ContentWidthMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Styled runs shorter than this are measured directly (comparing whole
+/// styles costs about as much as measuring a few characters).
+const CONTENT_WIDTH_MEMO_MIN_LEN: usize = 24;
+const CONTENT_WIDTH_MEMO_MAX: usize = 16_384;
+
+fn content_hash(content: &str, font_size: f32) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
+    hasher.write(content.as_bytes());
+    hasher.write_u32(font_size.to_bits());
+    hasher.finish()
+}
+
+/// Run `f` on the memo for the current fonts (emptied when they changed or
+/// it is full).
+fn with_content_widths<R>(fonts: u64, f: impl FnOnce(&mut ContentWidthMemo) -> R) -> R {
+    CONTENT_WIDTHS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let memo = memo.get_or_insert_with(|| ContentWidthMemo {
+            fonts,
+            entries: 0,
+            plain: Default::default(),
+            styled: Default::default(),
+        });
+        if memo.fonts != fonts || memo.entries >= CONTENT_WIDTH_MEMO_MAX {
+            memo.fonts = fonts;
+            memo.entries = 0;
+            memo.plain.clear();
+            memo.styled.clear();
+        }
+        f(memo)
+    })
+}
+
 /// Unwrapped max-content inline size. With Skia, `text_intrinsic_size` is
 /// that size. Without Skia it wraps at 360px and returns the longest line,
 /// so a paragraph wider than 360px but narrower than the available width
 /// (the runtime-bench text edit) was treated as one line.
 fn max_content_width(content: &str, style: &Style) -> f32 {
+    #[cfg(not(feature = "skia"))]
+    if style.font_family.is_none() {
+        return plain_max_content_width(content, style);
+    }
+    if content.len() < CONTENT_WIDTH_MEMO_MIN_LEN {
+        return measure_max_content_width(content, style);
+    }
+    let fonts = crate::font_face::FontRegistry::global().revision();
+    let hash = content_hash(content, style.font_size);
+    let hit = with_content_widths(fonts, |memo| {
+        memo.styled
+            .get(&hash)?
+            .iter()
+            .find(|(text, run_style, _)| &**text == content && run_style == style)
+            .map(|(_, _, width)| *width)
+    });
+    if let Some(width) = hit {
+        return width;
+    }
+    let width = measure_max_content_width(content, style);
+    with_content_widths(fonts, |memo| {
+        memo.styled
+            .entry(hash)
+            .or_default()
+            .push((content.into(), style.clone(), width));
+        memo.entries += 1;
+    });
+    width
+}
+
+/// `measure_max_content_width` of a run without a named family: the sum of
+/// its characters' advances in its face at its font size, plus its inline
+/// padding.
+#[cfg(not(feature = "skia"))]
+fn plain_max_content_width(content: &str, style: &Style) -> f32 {
+    let padding = style.padding_lengths();
+    let registered = crate::layout::registered_style_font(style);
+    let host;
+    let font = if let Some(face) = registered.as_ref() {
+        face.as_ref()
+    } else {
+        host = crate::layout::layout_font();
+        host
+    };
+    let face = font as *const fontdue::Font as usize;
+    let size = style.font_size.to_bits();
+    let fonts = crate::font_face::FontRegistry::global().revision();
+    let hash = content_hash(content, style.font_size);
+    let hit = with_content_widths(fonts, |memo| {
+        memo.plain
+            .get(&hash)?
+            .iter()
+            .find(|(text, at, at_face, _)| *at == size && *at_face == face && &**text == content)
+            .map(|(_, _, _, inner)| *inner)
+    });
+    let inner = hit.unwrap_or_else(|| {
+        let inner = crate::text_layout::measure_text_width_font(content, style.font_size, font);
+        with_content_widths(fonts, |memo| {
+            memo.plain
+                .entry(hash)
+                .or_default()
+                .push((content.into(), size, face, inner));
+            memo.entries += 1;
+        });
+        inner
+    });
+    crate::text_layout::inline_layout_advance(inner.max(0.0)) + padding.left + padding.right
+}
+
+fn measure_max_content_width(content: &str, style: &Style) -> f32 {
     #[cfg(feature = "skia")]
     {
         text_intrinsic_size(content, style).0

@@ -6,6 +6,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
+/// CSSOM fragment rects per owner node (read per owner, never in order: a
+/// fast hasher).
+pub(crate) type ClientRectMap = w3cos_std::fxhash::FxHashMap<u32, Vec<w3cos_dom::DOMRect>>;
+
 type FxHashSet<T> = std::collections::HashSet<T, w3cos_std::fxhash::FxBuildHasher>;
 
 use w3cos_dom::node::NodeId;
@@ -27,7 +31,7 @@ struct WidthMemo {
     viewport_w_bits: u32,
     viewport_h_bits: u32,
     rects: Vec<(u32, f32, f32, f32, f32)>,
-    client_rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+    client_rects: ClientRectMap,
 }
 
 struct Cache {
@@ -119,8 +123,7 @@ thread_local! {
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
     static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
         const { std::cell::Cell::new(("none", 0, 0)) };
-    static CLIENT_RECTS: RefCell<HashMap<u32, Vec<w3cos_dom::DOMRect>>> =
-        RefCell::new(HashMap::new());
+    static CLIENT_RECTS: RefCell<ClientRectMap> = RefCell::new(Default::default());
     /// Box-tree mode: the structure key of the patch flush publishing now.
     static CLIENT_KEY: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
     /// Box-tree mode: which boxes can publish CSSOM rects, kept across the
@@ -241,11 +244,11 @@ pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
     CLIENT_RECTS.with(|rects| rects.borrow().get(&node).cloned())
 }
 
-fn client_rect_snapshot() -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
+fn client_rect_snapshot() -> ClientRectMap {
     CLIENT_RECTS.with(|rects| rects.borrow().clone())
 }
 
-fn restore_client_rects(rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>) {
+fn restore_client_rects(rects: ClientRectMap) {
     CLIENT_RECTS.with(|current| *current.borrow_mut() = rects);
 }
 
@@ -912,7 +915,7 @@ pub(super) fn collect_cssom_owners(component: &Component, counts: &mut HashMap<u
 /// by (`dx`, `dy`), and every rect of a `shifted` owner moves down by `dh`.
 pub(super) fn splice_client_rects(
     removed: impl Iterator<Item = u32>,
-    inserted: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+    inserted: ClientRectMap,
     dx: f32,
     dy: f32,
     shifted: impl Iterator<Item = u32>,
@@ -1040,14 +1043,14 @@ pub(super) fn client_rects_for(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
     ng_text: &[crate::layout_ng::TextFragment],
-) -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
+) -> ClientRectMap {
     let mut by_index = vec![None; flat.len()];
     for (rect, index) in layouts {
         if let Some(slot) = by_index.get_mut(*index) {
             *slot = Some(*rect);
         }
     }
-    let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
+    let mut published = ClientRectMap::default();
     // (Per-owner bookkeeping, read per owner: a fast hasher, no order.)
     let mut owners_with_inline_fragments: FxHashSet<u32> = FxHashSet::default();
     let mut first_fragment_is_block: w3cos_std::fxhash::FxHashMap<u32, bool> = Default::default();
@@ -1262,7 +1265,7 @@ pub(super) fn client_rects_for(
         let width_bits = line_box.width.to_bits();
         let replay =
             |rects: &[TextLineRect],
-             published: &mut HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+             published: &mut ClientRectMap,
              owners_with_inline_fragments: &mut FxHashSet<u32>,
              first_fragment_is_block: &mut w3cos_std::fxhash::FxHashMap<u32, bool>,
              last_fragment_is_block: &mut w3cos_std::fxhash::FxHashMap<u32, bool>| {
