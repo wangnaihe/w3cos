@@ -30,8 +30,16 @@ struct WidthMemo {
     width_bits: u32,
     viewport_w_bits: u32,
     viewport_h_bits: u32,
-    rects: Vec<(u32, f32, f32, f32, f32)>,
-    client_rects: ClientRectMap,
+    rects: std::rc::Rc<Vec<(u32, f32, f32, f32, f32)>>,
+    client_rects: MemoClientRects,
+}
+
+/// A width memo's CSSOM rects: the published map, or the layout they are
+/// built from on first read (shared, not copied, per memo).
+#[derive(Clone)]
+enum MemoClientRects {
+    Map(std::rc::Rc<ClientRectMap>),
+    Pending(std::rc::Rc<PendingClientRects>),
 }
 
 struct Cache {
@@ -133,7 +141,7 @@ thread_local! {
     /// Nodes restyled in place since `CLIENT_PLAN` was refreshed.
     static CLIENT_RESTYLED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// A retained flush's CSSOM rect inputs, not yet published.
-    static CLIENT_PENDING: RefCell<Option<PendingClientRects>> = const { RefCell::new(None) };
+    static CLIENT_PENDING: RefCell<Option<std::rc::Rc<PendingClientRects>>> = const { RefCell::new(None) };
 }
 
 /// The layout a retained flush produced, kept so its CSSOM rects are built
@@ -142,27 +150,39 @@ thread_local! {
 /// component it was laid out from stays unchanged until the next flush,
 /// which either publishes the map whole or settles this first.
 struct PendingClientRects {
-    key: (u64, u64),
+    /// The patch flush's structure key (`None`: a viewport recompute,
+    /// published without the box-tree plan).
+    key: Option<(u64, u64)>,
     layouts: Vec<(crate::layout::LayoutRect, usize)>,
     texts: Vec<crate::layout_ng::TextFragment>,
 }
 
 fn defer_client_rects(
-    key: (u64, u64),
+    key: Option<(u64, u64)>,
     layouts: Vec<(crate::layout::LayoutRect, usize)>,
     texts: Vec<crate::layout_ng::TextFragment>,
 ) {
     CLIENT_PENDING.with(|slot| {
-        *slot.borrow_mut() = Some(PendingClientRects {
+        *slot.borrow_mut() = Some(std::rc::Rc::new(PendingClientRects {
             key,
             layouts,
             texts,
-        })
+        }))
     });
 }
 
 fn drop_pending_client_rects() {
     CLIENT_PENDING.with(|slot| drop(slot.borrow_mut().take()));
+}
+
+/// The deferred rects, shared (for a width memo).
+fn pending_client_rects() -> Option<std::rc::Rc<PendingClientRects>> {
+    CLIENT_PENDING.with(|slot| slot.borrow().clone())
+}
+
+/// Defer to rects a width memo kept unbuilt (its tree is the current one).
+fn restore_pending_client_rects(pending: std::rc::Rc<PendingClientRects>) {
+    CLIENT_PENDING.with(|slot| *slot.borrow_mut() = Some(pending));
 }
 
 fn client_rects_pending() -> bool {
@@ -177,9 +197,9 @@ fn settle_client_rects(component: &Component) {
     };
     let flat = crate::layout::pre_flatten_keyed(
         component,
-        crate::layout_ng::box_tree_enabled().then_some(pending.key),
+        pending.key.filter(|_| crate::layout_ng::box_tree_enabled()),
     );
-    CLIENT_KEY.with(|key| key.set(Some(pending.key)));
+    CLIENT_KEY.with(|key| key.set(pending.key));
     let published = client_rects_for(&flat, &pending.layouts, &pending.texts);
     CLIENT_KEY.with(|key| key.set(None));
     CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
@@ -706,7 +726,10 @@ fn patch_and_compute(
                 .extend(styles.iter().map(|(id, _)| *id));
         }
         restore_rects(&rects);
-        restore_client_rects(client_rects);
+        match client_rects {
+            MemoClientRects::Map(map) => restore_client_rects((*map).clone()),
+            MemoClientRects::Pending(pending) => restore_pending_client_rects(pending),
+        }
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         note_flush("memo", 0, 0);
@@ -783,13 +806,22 @@ fn patch_and_compute(
     // Publish CSSOM rects on first read, unless this flush snapshots them
     // now (a width memo) or a verifier compares them.
     let client_key = (cache.structure, cache.source_structure);
-    let snaps = if single_px_width(&styles).is_none()
-        && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
-    {
-        // (No width memo reads the snapshots on this branch.)
-        write_host_rects(&cache.node_ids, &results.layout_cache);
-        defer_client_rects(client_key, results.layout_cache, results.text_fragments);
-        Vec::new()
+    // (A width memo keeps the deferred inputs; the legacy path, whose
+    // memos outlive other edits, keeps a built map.)
+    let width_memo = single_px_width(&styles).is_some();
+    let snaps = if (!width_memo || ng) && std::env::var_os("W3COS_SPLICE_VERIFY").is_none() {
+        let snaps = if width_memo {
+            host_rect_snaps(&flat, &results.layout_cache)
+        } else {
+            write_host_rects(&cache.node_ids, &results.layout_cache);
+            Vec::new()
+        };
+        defer_client_rects(
+            Some(client_key),
+            results.layout_cache,
+            results.text_fragments,
+        );
+        snaps
     } else {
         CLIENT_KEY.with(|key| key.set(Some(client_key)));
         let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
@@ -867,10 +899,20 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     else {
         return false;
     };
-    write_rects(&flat, &results.layout_cache, &results.text_fragments);
     // A changed column count needs a tree rebuild so overflow-column
     // scroll geometry and ::column::scroll-marker siblings stay in sync.
-    !sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h))
+    let resync =
+        sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h));
+    if crate::layout_ng::mode() == crate::layout_ng::Mode::On
+        && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
+    {
+        // CSSOM rects on first read, as for a patch flush.
+        let _ = host_rect_snaps(&flat, &results.layout_cache);
+        defer_client_rects(None, results.layout_cache, results.text_fragments);
+    } else {
+        write_rects(&flat, &results.layout_cache, &results.text_fragments);
+    }
+    !resync
 }
 
 fn write_rects(
@@ -1651,8 +1693,11 @@ fn remember_width(
         width_bits: bits,
         viewport_w_bits,
         viewport_h_bits,
-        rects,
-        client_rects: client_rect_snapshot(),
+        rects: std::rc::Rc::new(rects),
+        client_rects: pending_client_rects().map_or_else(
+            || MemoClientRects::Map(std::rc::Rc::new(client_rect_snapshot())),
+            MemoClientRects::Pending,
+        ),
     });
 }
 
@@ -1668,6 +1713,11 @@ fn memos_for_tree(
     nodes.truncate(8);
     let viewport_w_bits = viewport_w.to_bits();
     let viewport_h_bits = viewport_h.to_bits();
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    let rects = std::rc::Rc::new(rects);
+    let client_rects = MemoClientRects::Map(std::rc::Rc::new(client_rect_snapshot()));
     nodes
         .into_iter()
         .map(|(node, width_bits)| WidthMemo {
@@ -1677,7 +1727,7 @@ fn memos_for_tree(
             viewport_w_bits,
             viewport_h_bits,
             rects: rects.clone(),
-            client_rects: client_rect_snapshot(),
+            client_rects: client_rects.clone(),
         })
         .collect()
 }

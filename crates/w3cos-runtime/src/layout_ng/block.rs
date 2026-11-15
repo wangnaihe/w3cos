@@ -4446,9 +4446,15 @@ pub(super) fn stretch_child_styles(
     // so its inline `stretch` stays auto (as for flex, grid and table
     // items, which do not resolve the keyword either).
     let mut has_float = false;
+    let mut any_stretch = false;
     for_each_cb_child(flat, index, &mut |child| {
-        has_float |= flat[child].style.float != Float::None;
+        let style = flat[child].style;
+        has_float |= style.float != Float::None;
+        any_stretch |= style.custom_properties.is_some() && marker(style, STRETCH).is_some();
     });
+    if !any_stretch {
+        return out;
+    }
     for_each_cb_child(flat, index, &mut |child| {
         let style = flat[child].style;
         let Some(tokens) = marker(style, STRETCH) else {
