@@ -16,6 +16,7 @@ pub(super) enum Scan {
     Balanced,
     Logical,
     RunIn,
+    Vertical,
 }
 
 struct ScanMemo {
@@ -29,13 +30,16 @@ struct BoxIndex {
     key: (u64, u64),
     len: usize,
     host: Vec<Option<u32>>,
+    /// Host id -> its boxes (a split inline has several).
+    boxes_of: w3cos_std::fxhash::FxHashMap<u32, Vec<usize>>,
 }
 
 thread_local! {
     /// In-place restyles: (sequence number of the first entry, ids).
     static RESTYLE_LOG: RefCell<(u64, Vec<u32>)> = const { RefCell::new((0, Vec::new())) };
     static BOX_INDEX: RefCell<Option<BoxIndex>> = const { RefCell::new(None) };
-    static SCANS: RefCell<[Option<ScanMemo>; 5]> = const { RefCell::new([None, None, None, None, None]) };
+    static SCANS: RefCell<[Option<ScanMemo>; 6]> =
+        const { RefCell::new([None, None, None, None, None, None]) };
 }
 
 pub(super) fn note_restyled(id: u32) {
@@ -82,18 +86,31 @@ fn dirty_indices(flat: &[FlatNodeInfo<'_>], key: (u64, u64), ids: &[u32]) -> Vec
             .as_ref()
             .is_some_and(|index| index.key == key && index.len == flat.len())
         {
+            let host: Vec<Option<u32>> = flat.iter().map(host_id).collect();
+            let mut boxes_of = w3cos_std::fxhash::FxHashMap::<u32, Vec<usize>>::default();
+            for (index, id) in host.iter().enumerate() {
+                if let Some(id) = id {
+                    boxes_of.entry(*id).or_default().push(index);
+                }
+            }
             *slot = Some(BoxIndex {
                 key,
                 len: flat.len(),
-                host: flat.iter().map(host_id).collect(),
+                host,
+                boxes_of,
             });
         }
-        let host = &slot.as_ref().unwrap().host;
+        let BoxIndex { host, boxes_of, .. } = slot.as_ref().unwrap();
+        let mut hosts: Vec<usize> = ids
+            .iter()
+            .filter_map(|id| boxes_of.get(id))
+            .flatten()
+            .copied()
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
         let mut boxes = Vec::new();
-        for index in 0..flat.len() {
-            if !host[index].is_some_and(|id| ids.contains(&id)) {
-                continue;
-            }
+        for index in hosts {
             boxes.push(index);
             let end = flat[index].subtree_end.max(index + 1).min(flat.len());
             let mut child = index + 1;

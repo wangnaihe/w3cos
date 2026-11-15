@@ -818,13 +818,25 @@ fn layout_with_run_in(
     };
     // Vertical-writing-mode flex and grid containers lay out with transposed
     // axes.
-    let mut vertical = grid::vertical_grid_styles(base);
-    let taken: Vec<usize> = vertical.iter().map(|(index, _)| *index).collect();
-    vertical.extend(
-        flex::vertical_flex_styles(base)
-            .into_iter()
-            .filter(|(index, _)| !taken.contains(index)),
-    );
+    // Both read only boxes in a vertical writing mode: a tree without one
+    // has nothing to transpose (box-tree mode keeps that set).
+    let no_vertical = box_scan::retained(box_scan::Scan::Vertical, base, |index| {
+        !base[index].style.writing_mode.is_horizontal()
+    })
+    .is_some_and(|hits| hits.is_empty());
+    let mut vertical = if no_vertical {
+        Vec::new()
+    } else {
+        grid::vertical_grid_styles(base)
+    };
+    if !no_vertical {
+        let taken: Vec<usize> = vertical.iter().map(|(index, _)| *index).collect();
+        vertical.extend(
+            flex::vertical_flex_styles(base)
+                .into_iter()
+                .filter(|(index, _)| !taken.contains(index)),
+        );
+    }
     if vertical.is_empty() {
         return layout_flat_with_text(base, viewport_w, viewport_h);
     }

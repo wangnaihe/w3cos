@@ -750,12 +750,19 @@ pub(crate) fn invalidate() {
 /// returns false so Taffy still owns flex, grid, floats, and inline layout.
 fn try_apply_authored(viewport_w: f32) -> bool {
     crate::dom::with_document_mut(|document| {
-        let key = authored_fingerprint(document);
-        let remembered = AUTHORED.with(|slot| {
-            slot.borrow()
-                .iter()
-                .find(|memo| memo.key == key)
-                .map(|memo| memo.rects.clone())
+        // The fingerprint walks the whole document; with nothing remembered
+        // it is only needed once a layout succeeds (the walk below does not
+        // change what it hashes).
+        let key = AUTHORED
+            .with(|slot| !slot.borrow().is_empty())
+            .then(|| authored_fingerprint(document));
+        let remembered = key.and_then(|key| {
+            AUTHORED.with(|slot| {
+                slot.borrow()
+                    .iter()
+                    .find(|memo| memo.key == key)
+                    .map(|memo| memo.rects.clone())
+            })
         });
         if let Some(rects) = remembered {
             for (id, rect) in rects {
@@ -779,6 +786,7 @@ fn try_apply_authored(viewport_w: f32) -> bool {
         if laid_out.is_none() {
             return false;
         }
+        let key = key.unwrap_or_else(|| authored_fingerprint(document));
         for (id, rect) in &rects {
             document.set_layout_rect(*id, *rect);
         }

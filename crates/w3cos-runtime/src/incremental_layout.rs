@@ -6,6 +6,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
+type FxHashSet<T> = std::collections::HashSet<T, w3cos_std::fxhash::FxBuildHasher>;
+
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
@@ -1046,9 +1048,10 @@ pub(super) fn client_rects_for(
         }
     }
     let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
-    let mut owners_with_inline_fragments = HashSet::new();
-    let mut first_fragment_is_block = HashMap::new();
-    let mut last_fragment_is_block = HashMap::new();
+    // (Per-owner bookkeeping, read per owner: a fast hasher, no order.)
+    let mut owners_with_inline_fragments: FxHashSet<u32> = FxHashSet::default();
+    let mut first_fragment_is_block: w3cos_std::fxhash::FxHashMap<u32, bool> = Default::default();
+    let mut last_fragment_is_block: w3cos_std::fxhash::FxHashMap<u32, bool> = Default::default();
     // Read each box's markers once (the text walk below visits every
     // ancestor of every text leaf), and only for a marker map this index
     // did not read in the last pass.
@@ -1193,7 +1196,7 @@ pub(super) fn client_rects_for(
             let explicit_owners = owner_ranges
                 .iter()
                 .map(|(owner, _, _)| *owner)
-                .collect::<HashSet<_>>();
+                .collect::<FxHashSet<_>>();
             for fragment in ng_lines {
                 let (line_start, line_end) = (fragment.start, fragment.end.min(content.len()));
                 if line_start > line_end
@@ -1257,31 +1260,32 @@ pub(super) fn client_rects_for(
         // keep-all leaves fall back to the legacy layout and keep its mode.
         let fonts = crate::font_face::FontRegistry::global().revision();
         let width_bits = line_box.width.to_bits();
-        let replay = |rects: &[TextLineRect],
-                      published: &mut HashMap<u32, Vec<w3cos_dom::DOMRect>>,
-                      owners_with_inline_fragments: &mut HashSet<u32>,
-                      first_fragment_is_block: &mut HashMap<u32, bool>,
-                      last_fragment_is_block: &mut HashMap<u32, bool>| {
-            for rect in rects {
-                let x = if rect.rtl {
-                    line_box.x + line_box.width - rect.prefix - rect.width
-                } else {
-                    line_box.x + rect.prefix
-                };
-                owners_with_inline_fragments.insert(rect.owner);
-                published
-                    .entry(rect.owner)
-                    .or_default()
-                    .push(w3cos_dom::DOMRect::new(
-                        x,
-                        line_box.y + rect.line_top + rect.font_top,
-                        rect.width,
-                        rect.font_height,
-                    ));
-                first_fragment_is_block.entry(rect.owner).or_insert(false);
-                last_fragment_is_block.insert(rect.owner, false);
-            }
-        };
+        let replay =
+            |rects: &[TextLineRect],
+             published: &mut HashMap<u32, Vec<w3cos_dom::DOMRect>>,
+             owners_with_inline_fragments: &mut FxHashSet<u32>,
+             first_fragment_is_block: &mut w3cos_std::fxhash::FxHashMap<u32, bool>,
+             last_fragment_is_block: &mut w3cos_std::fxhash::FxHashMap<u32, bool>| {
+                for rect in rects {
+                    let x = if rect.rtl {
+                        line_box.x + line_box.width - rect.prefix - rect.width
+                    } else {
+                        line_box.x + rect.prefix
+                    };
+                    owners_with_inline_fragments.insert(rect.owner);
+                    published
+                        .entry(rect.owner)
+                        .or_default()
+                        .push(w3cos_dom::DOMRect::new(
+                            x,
+                            line_box.y + rect.line_top + rect.font_top,
+                            rect.width,
+                            rect.font_height,
+                        ));
+                    first_fragment_is_block.entry(rect.owner).or_insert(false);
+                    last_fragment_is_block.insert(rect.owner, false);
+                }
+            };
         let hit = TEXT_RECTS.with(|memo| {
             let memo = memo.borrow();
             let Some(entry) = memo.get(&index) else {
@@ -1338,7 +1342,7 @@ pub(super) fn client_rects_for(
             let explicit_owners = owner_ranges
                 .iter()
                 .map(|(owner, _, _)| *owner)
-                .collect::<HashSet<_>>();
+                .collect::<FxHashSet<_>>();
             for (owner, start, end) in owner_ranges {
                 // Resolve every owner boundary together during layout
                 // writeback. Contextual backends shape one physical run and
