@@ -72,11 +72,23 @@ pub(crate) fn mode_from_env(
 /// A node's style was patched in place (see `cache::note_restyled`).
 pub(crate) fn note_restyled(id: u32) {
     cache::note_restyled(id);
+    if cache::box_tree_enabled() {
+        crate::list_marker::note_restyled(id);
+    }
 }
 
 /// The tree was edited other than by an in-place restyle.
 pub(crate) fn forget_patch_memo() {
     cache::forget_patch_memo();
+    crate::list_marker::forget_retained();
+}
+
+/// Box-tree mode: the structure key of the patch flush laying out `flat`
+/// (per-box data kept under it stays valid but for restyled boxes).
+pub(crate) fn box_tree_key(flat: &[crate::layout::FlatNodeInfo]) -> Option<(u64, u64)> {
+    cache::box_tree_enabled()
+        .then(|| cache::patch_key(flat))
+        .flatten()
 }
 
 /// Mark (or with `None` end) the flush laying out patched `flat` under
@@ -824,7 +836,7 @@ fn layout_flat_with_text(
         }
         out = union_text_pieces(out, &texts);
     }
-    crate::list_marker::project(&mut out, flat, viewport_w, viewport_h);
+    crate::list_marker::project_retained(&mut out, flat, viewport_w, viewport_h);
     Some((out, texts))
 }
 

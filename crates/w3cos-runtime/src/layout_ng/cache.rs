@@ -585,6 +585,10 @@ struct OwnMemo {
     known: Vec<bool>,
     /// `FLAGS_VALID` plus grid / block-percent / inline-percent bits.
     flags: Vec<u8>,
+    /// Box-tree mode: subtree hashes, subtree retainability, fingerprints.
+    subtree: Vec<u64>,
+    known_sub: Vec<bool>,
+    fp: Vec<u64>,
 }
 
 const FLAGS_VALID: u8 = 0x80;
@@ -612,6 +616,14 @@ pub(super) fn note_restyled(id: u32) {
 /// Forget carried-over per-box inputs (the tree changed some other way).
 pub(super) fn forget_patch_memo() {
     OWN_MEMO.with(|memo| *memo.borrow_mut() = None);
+}
+
+/// The structure key of the patch flush over `flat`, if this is one.
+pub(super) fn patch_key(flat: &[FlatNodeInfo]) -> Option<(u64, u64)> {
+    PATCH_HINT
+        .with(|hint| hint.get())
+        .filter(|h| h.flat_ptr == flat.as_ptr() as usize && h.flat_len == flat.len())
+        .map(|h| h.key)
 }
 
 /// Mark (or with `None` end) the patch flush over `flat`.
@@ -665,6 +677,22 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                 && memo.salt == salt
                 && memo.own.len() == flat.len()
         });
+        if let (Some(m), Some(h)) = (memo.as_mut(), hinted)
+            && box_tree_enabled()
+            && m.fp.len() == flat.len()
+        {
+            let ids: Vec<u32> = RESTYLED.with(|ids| ids.borrow().clone());
+            if ids.len() <= 8 {
+                // Same structure key: the tree is the one the memo saw, with
+                // only the restyled nodes' styles patched in place.
+                let fp = patch_fingerprints(flat, m, &ids, salt, &revision);
+                m.epoch = h.epoch;
+                RESTYLED.with(|ids| ids.borrow_mut().clear());
+                let memo = memo.take();
+                OWN_MEMO.with(|slot| *slot.borrow_mut() = memo);
+                return fp;
+            }
+        }
         let dirty: std::collections::HashSet<u32, w3cos_std::fxhash::FxBuildHasher> =
             if memo.is_some() {
                 RESTYLED.with(|ids| ids.borrow().iter().copied().collect())
@@ -676,67 +704,6 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                 (content.as_ptr() as usize, content.len())
             }
             _ => (0, 0),
-        };
-        let compute = |info: &FlatNodeInfo| -> (u64, bool, Option<u32>) {
-            let mut h = salt;
-            let mut ok = true;
-            let owner = info
-                .style
-                .custom_properties
-                .as_ref()
-                .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
-                .and_then(|v| v.parse::<u32>().ok());
-            // Replaced and form content reads state no style revision
-            // tracks (an image's natural size arrives when it decodes).
-            if !matches!(
-                info.kind,
-                w3cos_std::ComponentKind::Root
-                    | w3cos_std::ComponentKind::Column
-                    | w3cos_std::ComponentKind::Row
-                    | w3cos_std::ComponentKind::Box
-                    | w3cos_std::ComponentKind::Text { .. }
-            ) {
-                ok = false;
-            }
-            match host_id(info) {
-                Some(id) => {
-                    h = mix(h, id as u64);
-                    h = mix(h, revision(id));
-                }
-                None => {
-                    h = mix(h, u64::MAX);
-                    ok &= owner.is_some()
-                        || matches!(info.kind, w3cos_std::ComponentKind::Text { .. });
-                }
-            }
-            if let Some(owner) = owner {
-                h = mix(h, owner as u64);
-                h = mix(h, revision(owner));
-            }
-            let style = info.style;
-            h = mix(h, style.display as u64);
-            h = mix(h, style.position as u64);
-            h = mix(h, style.float as u64);
-            h = mix(h, {
-                use std::hash::{Hash, Hasher};
-                let mut kind = std::collections::hash_map::DefaultHasher::new();
-                std::mem::discriminant(info.kind).hash(&mut kind);
-                kind.finish()
-            });
-            if let w3cos_std::ComponentKind::Text { content } = info.kind {
-                h = hash_bytes(h, content.as_bytes());
-                // (A lowered text leaf carries its parent's style; a
-                // leaf built with its own keeps the fields text
-                // measure reads.)
-                h = mix(h, style.font_size.to_bits() as u64);
-                h = mix(h, style.line_height.to_bits() as u64);
-                h = mix(h, style.line_height_is_normal as u64);
-                h = mix(h, style.writing_mode as u64);
-                h = mix(h, style.white_space as u64);
-                h = mix(h, style.direction as u64);
-                h = hash_bytes(h, style.font_family.as_deref().unwrap_or("").as_bytes());
-            }
-            (h, ok, owner)
         };
         let mut known = vec![true; flat.len()];
         let mut own = vec![0u64; flat.len()];
@@ -753,6 +720,9 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                 .as_mut()
                 .map(|m| std::mem::take(&mut m.flags))
                 .unwrap_or_else(|| vec![0; flat.len()]),
+            subtree: Vec::new(),
+            known_sub: Vec::new(),
+            fp: Vec::new(),
         };
         for (index, info) in flat.iter().enumerate() {
             let host = host_id(info);
@@ -770,7 +740,7 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                 known[index] = m.known[index];
                 next.owner.push(m.owner[index]);
             } else {
-                let (h, ok, owner) = compute(info);
+                let (h, ok, owner) = own_input(info, salt, &revision);
                 own[index] = h;
                 known[index] = ok;
                 next.owner.push(owner);
@@ -779,38 +749,217 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
             next.host.push(host);
             next.text.push(text);
         }
-        if hinted.is_some() {
-            RESTYLED.with(|ids| ids.borrow_mut().clear());
+        let keep = hinted.is_some();
+        if keep {
             next.own = own.clone();
             next.known = known.clone();
+        }
+        let (subtree, known_sub, fp) = subtree_fingerprints(flat, &own, known);
+        if keep {
+            RESTYLED.with(|ids| ids.borrow_mut().clear());
+            if box_tree_enabled() {
+                next.subtree = subtree;
+                next.known_sub = known_sub;
+                next.fp = fp.clone();
+            }
             OWN_MEMO.with(|slot| *slot.borrow_mut() = Some(next));
         } else if hint.is_none() {
             RESTYLED.with(|ids| ids.borrow_mut().clear());
             OWN_MEMO.with(|slot| *slot.borrow_mut() = None);
         }
-        let mut subtree = vec![0u64; flat.len()];
-        for index in (0..flat.len()).rev() {
-            let end = flat[index].subtree_end.max(index + 1).min(flat.len());
-            let mut h = mix(own[index], (end - index) as u64);
-            let mut child = index + 1;
-            while child < end {
-                h = mix(h, subtree[child]);
-                known[index] &= known[child];
-                child = flat[child].subtree_end.max(child + 1);
-            }
-            subtree[index] = h;
-        }
-        (0..flat.len())
-            .map(|index| {
-                let parent = flat[index].parent.map_or(0, |p| own[p]);
-                if known[index] {
-                    mix(subtree[index], parent).max(1)
-                } else {
-                    0
-                }
-            })
-            .collect()
+        fp
     })
+}
+
+/// Opt-in owned box tree (`W3COS_NG_BOX_TREE=1`): per-box derived data kept
+/// across patch flushes and updated only on restyled boxes and their
+/// ancestors, as Blink keeps its LayoutObject tree.
+pub(crate) fn box_tree_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("W3COS_NG_BOX_TREE").ok().as_deref(),
+            Some("1") | Some("true")
+        )
+    })
+}
+
+/// A box's own fingerprint input: (hash, retainable, split-inline owner).
+fn own_input(
+    info: &FlatNodeInfo,
+    salt: u64,
+    revision: &impl Fn(u32) -> u64,
+) -> (u64, bool, Option<u32>) {
+    let mut h = salt;
+    let mut ok = true;
+    let owner = info
+        .style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
+        .and_then(|v| v.parse::<u32>().ok());
+    // Replaced and form content reads state no style revision
+    // tracks (an image's natural size arrives when it decodes).
+    if !matches!(
+        info.kind,
+        w3cos_std::ComponentKind::Root
+            | w3cos_std::ComponentKind::Column
+            | w3cos_std::ComponentKind::Row
+            | w3cos_std::ComponentKind::Box
+            | w3cos_std::ComponentKind::Text { .. }
+    ) {
+        ok = false;
+    }
+    match host_id(info) {
+        Some(id) => {
+            h = mix(h, id as u64);
+            h = mix(h, revision(id));
+        }
+        None => {
+            h = mix(h, u64::MAX);
+            ok &= owner.is_some() || matches!(info.kind, w3cos_std::ComponentKind::Text { .. });
+        }
+    }
+    if let Some(owner) = owner {
+        h = mix(h, owner as u64);
+        h = mix(h, revision(owner));
+    }
+    let style = info.style;
+    h = mix(h, style.display as u64);
+    h = mix(h, style.position as u64);
+    h = mix(h, style.float as u64);
+    h = mix(h, {
+        use std::hash::{Hash, Hasher};
+        let mut kind = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(info.kind).hash(&mut kind);
+        kind.finish()
+    });
+    if let w3cos_std::ComponentKind::Text { content } = info.kind {
+        h = hash_bytes(h, content.as_bytes());
+        // (A lowered text leaf carries its parent's style; a
+        // leaf built with its own keeps the fields text
+        // measure reads.)
+        h = mix(h, style.font_size.to_bits() as u64);
+        h = mix(h, style.line_height.to_bits() as u64);
+        h = mix(h, style.line_height_is_normal as u64);
+        h = mix(h, style.writing_mode as u64);
+        h = mix(h, style.white_space as u64);
+        h = mix(h, style.direction as u64);
+        h = hash_bytes(h, style.font_family.as_deref().unwrap_or("").as_bytes());
+    }
+    (h, ok, owner)
+}
+
+/// One box's subtree hash and whether its whole subtree is retainable.
+fn subtree_entry(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    own: &[u64],
+    known: &[bool],
+    subtree: &[u64],
+    known_sub: &[bool],
+) -> (u64, bool) {
+    let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+    let mut h = mix(own[index], (end - index) as u64);
+    let mut ok = known[index];
+    let mut child = index + 1;
+    while child < end {
+        h = mix(h, subtree[child]);
+        ok &= known_sub[child];
+        child = flat[child].subtree_end.max(child + 1);
+    }
+    (h, ok)
+}
+
+fn fingerprint_entry(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    own: &[u64],
+    subtree: &[u64],
+    known_sub: &[bool],
+) -> u64 {
+    let parent = flat[index].parent.map_or(0, |p| own[p]);
+    if known_sub[index] {
+        mix(subtree[index], parent).max(1)
+    } else {
+        0
+    }
+}
+
+/// Subtree hashes, subtree retainability, and fingerprints of every box.
+fn subtree_fingerprints(
+    flat: &[FlatNodeInfo],
+    own: &[u64],
+    known: Vec<bool>,
+) -> (Vec<u64>, Vec<bool>, Vec<u64>) {
+    let mut subtree = vec![0u64; flat.len()];
+    let mut known_sub = known;
+    for index in (0..flat.len()).rev() {
+        let (h, ok) = subtree_entry(flat, index, own, &known_sub, &subtree, &known_sub);
+        subtree[index] = h;
+        known_sub[index] = ok;
+    }
+    let fp = (0..flat.len())
+        .map(|index| fingerprint_entry(flat, index, own, &subtree, &known_sub))
+        .collect();
+    (subtree, known_sub, fp)
+}
+
+/// Fingerprints after restyling `ids` in place: recompute the own inputs of
+/// their boxes, the subtree entries of those boxes' ancestors, and the
+/// fingerprints that read either (Blink's containing-block chain marking).
+fn patch_fingerprints(
+    flat: &[FlatNodeInfo],
+    m: &mut OwnMemo,
+    ids: &[u32],
+    salt: u64,
+    revision: &impl Fn(u32) -> u64,
+) -> Vec<u64> {
+    let mut dirty = Vec::new();
+    if !ids.is_empty() {
+        for index in 0..flat.len() {
+            if m.host[index].is_some_and(|id| ids.contains(&id))
+                || m.owner[index].is_some_and(|id| ids.contains(&id))
+            {
+                dirty.push(index);
+            }
+        }
+    }
+    let mut chain = Vec::new();
+    let mut refresh = Vec::new();
+    for &index in &dirty {
+        let (h, ok, owner) = own_input(&flat[index], salt, revision);
+        m.owner[index] = owner;
+        m.flags[index] = 0;
+        if m.own[index] == h && m.known[index] == ok {
+            continue;
+        }
+        m.own[index] = h;
+        m.known[index] = ok;
+        let mut at = Some(index);
+        while let Some(i) = at {
+            chain.push(i);
+            at = flat[i].parent;
+        }
+        // Children read their parent's own input.
+        let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+        let mut child = index + 1;
+        while child < end {
+            refresh.push(child);
+            child = flat[child].subtree_end.max(child + 1);
+        }
+    }
+    chain.sort_unstable_by(|a, b| b.cmp(a));
+    chain.dedup();
+    for &index in &chain {
+        let (h, ok) = subtree_entry(flat, index, &m.own, &m.known, &m.subtree, &m.known_sub);
+        m.subtree[index] = h;
+        m.known_sub[index] = ok;
+    }
+    for &index in chain.iter().chain(&refresh) {
+        m.fp[index] = fingerprint_entry(flat, index, &m.own, &m.subtree, &m.known_sub);
+    }
+    m.fp.clone()
 }
 
 thread_local! {

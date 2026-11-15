@@ -11705,7 +11705,7 @@ fn project_simple_float_margin_boxes(
     visit(root, 0, layouts, &layout_position, viewport_w, viewport_h);
 }
 
-fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
+pub(crate) fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
     // Only consulted for flex/grid boxes; probing the custom property map
     // for every box in every float pass dominated this predicate.
     let anonymous = || {
@@ -11732,7 +11732,7 @@ fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
         ) && !anonymous())
 }
 
-fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
+pub(crate) fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
     matches!(
         style.display,
         WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
