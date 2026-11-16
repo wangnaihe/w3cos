@@ -58,6 +58,9 @@ struct Pass {
     /// Box-tree mode: marker bits read this pass are also kept in the
     /// patch memo's flag slots (valid until the box is restyled).
     marker_memo: bool,
+    /// Per box, filled on first read: `MARKERS_READ` plus the summary bits
+    /// of the boxes it is the containing block for (`cb_child_bits`).
+    cb_bits: Vec<u8>,
     /// The boxes holding `layouts` or `min_max` entries, each once (the
     /// rest of both tables is empty).
     touched: Vec<usize>,
@@ -296,6 +299,7 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             min_max,
             markers,
             marker_memo,
+            cb_bits: Vec::new(),
             touched: Vec::new(),
             fp,
         })
@@ -362,6 +366,35 @@ fn begin_pass_flags(
 }
 
 const MARKERS_READ: u8 = 0x80;
+
+/// Summary bits of the boxes `index` is the containing block for (`read`
+/// computes them from their styles, which do not change within a pass),
+/// kept for the rest of the innermost pass over `flat`.
+pub(super) fn cb_child_bits(flat: &[FlatNodeInfo], index: usize, read: impl FnOnce() -> u8) -> u8 {
+    let same = |p: &&mut Pass| p.flat_ptr == flat.as_ptr() as usize && p.flat_len == flat.len();
+    let hit = PASSES.with(|passes| {
+        let mut passes = passes.borrow_mut();
+        let pass = passes.last_mut().filter(same)?;
+        pass.cb_bits
+            .get(index)
+            .copied()
+            .filter(|b| b & MARKERS_READ != 0)
+    });
+    if let Some(bits) = hit {
+        return bits & !MARKERS_READ;
+    }
+    let bits = read() & !MARKERS_READ;
+    PASSES.with(|passes| {
+        let mut passes = passes.borrow_mut();
+        if let Some(pass) = passes.last_mut().filter(same) {
+            if pass.cb_bits.len() != flat.len() {
+                pass.cb_bits = vec![0; flat.len()];
+            }
+            pass.cb_bits[index] = bits | MARKERS_READ;
+        }
+    });
+    bits
+}
 
 /// Box `index`'s style-marker bits (`read` computes them), kept for the
 /// rest of the innermost pass over `flat`.

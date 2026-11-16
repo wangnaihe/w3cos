@@ -4455,6 +4455,27 @@ fn for_each_cb_child_marked(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnM
     }
 }
 
+const CB_ANY_STRETCH: u8 = 1;
+const CB_HAS_FLOAT: u8 = 2;
+
+/// Whether any box whose containing block is `index`'s content box
+/// carries `stretch` (`CB_ANY_STRETCH`) or floats (`CB_HAS_FLOAT`), read
+/// in one walk and kept for the rest of the pass.
+fn cb_child_bits(flat: &[FlatNodeInfo], index: usize) -> u8 {
+    super::cache::cb_child_bits(flat, index, || {
+        let mut bits = 0;
+        for_each_cb_child_marked(flat, index, &mut |child, markers| {
+            if flat[child].style.float != Float::None {
+                bits |= CB_HAS_FLOAT;
+            }
+            if markers & MARK_STRETCH != 0 {
+                bits |= CB_ANY_STRETCH;
+            }
+        });
+        bits
+    })
+}
+
 /// Replacement styles for the in-flow and floated children of block
 /// container `index` that carry `stretch`; `cb` is its content box.
 /// `ignore_top` / `ignore_bottom`: the container has no top (bottom)
@@ -4472,13 +4493,9 @@ pub(super) fn stretch_child_styles(
     // against the space the float leaves; that avoidance is not modelled,
     // so its inline `stretch` stays auto (as for flex, grid and table
     // items, which do not resolve the keyword either).
-    let mut has_float = false;
-    let mut any_stretch = false;
-    for_each_cb_child_marked(flat, index, &mut |child, markers| {
-        has_float |= flat[child].style.float != Float::None;
-        any_stretch |= markers & MARK_STRETCH != 0;
-    });
-    if !any_stretch {
+    let bits = cb_child_bits(flat, index);
+    let has_float = bits & CB_HAS_FLOAT != 0;
+    if bits & CB_ANY_STRETCH == 0 {
         return out;
     }
     for_each_cb_child(flat, index, &mut |child| {
@@ -4947,10 +4964,7 @@ pub(super) fn layout_block_in(
         !bfc_root && bb == 0.0 && pb == 0.0,
     );
     let orig_flat = flat;
-    let mut container_has_float = false;
-    for_each_cb_child(flat, index, &mut |child| {
-        container_has_float |= flat[child].style.float != Float::None;
-    });
+    let container_has_float = cb_child_bits(flat, index) & CB_HAS_FLOAT != 0;
     let stretched_flat;
     let flat = if stretch_styles.is_empty() {
         flat

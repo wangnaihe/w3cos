@@ -8213,28 +8213,34 @@ impl Document {
                 _ => None,
             }
         };
-        let inline_before = child_ids[..index]
-            .iter()
-            .rev()
-            .find_map(|sibling| {
-                sibling_inline_state(*sibling, true).map(|inline| {
-                    let already_has_space = self.inline_ends_with_collapsible_space(*sibling);
-                    inline && !already_has_space && !self.inline_ends_with_forced_break(*sibling)
+        // The neighbours only decide whether edge whitespace survives; text
+        // without leading (trailing) collapsible whitespace needs no look.
+        let inline_before = raw.chars().next().is_some_and(is_css_whitespace)
+            && child_ids[..index]
+                .iter()
+                .rev()
+                .find_map(|sibling| {
+                    sibling_inline_state(*sibling, true).map(|inline| {
+                        let already_has_space = self.inline_ends_with_collapsible_space(*sibling);
+                        inline
+                            && !already_has_space
+                            && !self.inline_ends_with_forced_break(*sibling)
+                    })
                 })
-            })
-            .unwrap_or_else(|| {
-                child
-                    .parent
-                    .is_some_and(|parent| self.inline_flow_needs_leading_space(parent))
-            });
-        let inline_after = child_ids[index + 1..]
-            .iter()
-            .find_map(|sibling| sibling_inline_state(*sibling, false))
-            .unwrap_or_else(|| {
-                child
-                    .parent
-                    .is_some_and(|parent| self.inline_flow_continues_after(parent))
-            });
+                .unwrap_or_else(|| {
+                    child
+                        .parent
+                        .is_some_and(|parent| self.inline_flow_needs_leading_space(parent))
+                });
+        let inline_after = raw.chars().next_back().is_some_and(is_css_whitespace)
+            && child_ids[index + 1..]
+                .iter()
+                .find_map(|sibling| sibling_inline_state(*sibling, false))
+                .unwrap_or_else(|| {
+                    child
+                        .parent
+                        .is_some_and(|parent| self.inline_flow_continues_after(parent))
+                });
         if parent_style.white_space == WhiteSpace::PreLine {
             // Pre-line collapses spaces, but a text node is not necessarily a
             // whole line. Keep its edge space when an adjoining inline box
