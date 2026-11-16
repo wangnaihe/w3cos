@@ -5766,6 +5766,11 @@ impl Document {
                 memo.key = Some(key);
                 memo.styles.clear();
             }
+            // A layout walk reads most elements: size the table once
+            // (`clear` keeps the capacity) instead of rehashing as it grows.
+            if memo.styles.capacity() == 0 {
+                memo.styles.reserve(self.nodes.len().min(65_536));
+            }
             if let Some(style) = memo.styles.get(&id.0) {
                 #[cfg(test)]
                 self.computed_style_cache_hits
@@ -15511,37 +15516,38 @@ fn group_unbroken_ascii_inline_words(
     if parent.unicode_bidi != UnicodeBidi::Normal {
         return children;
     }
+    // A length vertical-align is lowered to a synthetic vertical margin.
+    // That margin changes the line box, not the word-break opportunities.
+    // Borders decorate an inline fragment; they do not add a word break.
+    let style_ok = |style: &Style| {
+        style.display == Display::Inline
+            && style.position == Position::Static
+            && style.float == Float::None
+            && style.word_break == WordBreak::Normal
+            && style.unicode_bidi == UnicodeBidi::Normal
+            && style.direction == parent.direction
+            && ((style.margin.top == Spacing::Px(0.0) && style.margin.bottom == Spacing::Px(0.0))
+                || (style.margin.left == Spacing::Px(0.0)
+                    && style.margin.right == Spacing::Px(0.0)
+                    && style.custom_properties.as_ref().is_some_and(|properties| {
+                        properties.contains_key("--w3cos-internal-vertical-align-length")
+                    })))
+            && style.width == Dimension::Auto
+    };
     let eligible = |child: &Component| {
-        // A length vertical-align is lowered to a synthetic vertical margin.
-        // That margin changes the line box, not the word-break opportunities.
-        let synthetic_vertical_margin = || {
-            child
-                .style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|properties| {
-                    properties.contains_key("--w3cos-internal-vertical-align-length")
-                })
-        };
         matches!(&child.kind, ComponentKind::Text { content }
             if !content.is_empty() && (content.chars().all(|ch| ch.is_ascii_alphanumeric())
                 || child.style.custom_properties.as_ref().is_some_and(|p|
                     p.contains_key("--w3cos-internal-generated-quote"))
                     && content.chars().all(|ch| matches!(ch,
                         '"' | '\'' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '\u{00ab}' | '\u{00bb}'))))
-            && child.style.display == Display::Inline
-            && child.style.position == Position::Static
-            && child.style.float == Float::None
-            && child.style.word_break == WordBreak::Normal
-            && child.style.unicode_bidi == UnicodeBidi::Normal
-            && child.style.direction == parent.direction
-            && ((child.style.margin.top == Spacing::Px(0.0)
-                && child.style.margin.bottom == Spacing::Px(0.0))
-                || (child.style.margin.left == Spacing::Px(0.0)
-                    && child.style.margin.right == Spacing::Px(0.0)
-                    && synthetic_vertical_margin()))
-            && child.style.width == Dimension::Auto
-        // Borders decorate an inline fragment; they do not add a word break.
+            && style_ok(&child.style)
+    };
+    // A text leaf with only ASCII alphanumerics and `child`'s style: what
+    // `eligible` says of it is `style_ok` of that style.
+    let split_text = |child: &Component, content: String| Component {
+        kind: ComponentKind::Text { content },
+        ..child.clone()
     };
     let mut output = Vec::with_capacity(children.len());
     let mut word = Vec::new();
@@ -15571,33 +15577,34 @@ fn group_unbroken_ascii_inline_words(
         }
     };
     let mut source = children.into_iter().peekable();
-    let mut fragments = Vec::new();
+    // Each fragment with whether it is `eligible`.
+    let mut fragments: Vec<(Component, bool)> = Vec::with_capacity(source.len() + 4);
+    let mut next_ok: Option<bool> = None;
     while let Some(mut child) = source.next() {
+        let child_ok = next_ok.take();
         if child.style.padding == Edges::ZERO
-            && fragments.last().is_some_and(|previous| eligible(previous))
+            && fragments.last().is_some_and(|previous| previous.1)
             && let ComponentKind::Text { content } = &child.kind
             && content.starts_with(' ')
+            && content.len() > 1
             && content[1..]
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric())
+            && style_ok(&child.style)
         {
             // Keep the soft separator outside the preceding unbroken word,
             // so line-edge whitespace can disappear without moving its glyphs.
-            let mut suffix = child.clone();
-            suffix.kind = ComponentKind::Text {
-                content: content[1..].to_string(),
+            let suffix = split_text(&child, content[1..].to_string());
+            child.kind = ComponentKind::Text {
+                content: " ".to_string(),
             };
-            if eligible(&suffix) {
-                child.kind = ComponentKind::Text {
-                    content: " ".to_string(),
-                };
-                fragments.push(child);
-                fragments.push(suffix);
-                continue;
-            }
+            fragments.push((child, false));
+            fragments.push((suffix, true));
+            continue;
         }
         if child.style.padding == Edges::ZERO
-            && source.peek().is_some_and(|next| eligible(next))
+            && let Some(next) = source.peek()
+            && *next_ok.insert(eligible(next))
             && let ComponentKind::Text { content } = &child.kind
             && let Some(space) = content.rfind(|character: char| character.is_ascii_whitespace())
             && !content[space + 1..].is_empty()
@@ -15605,23 +15612,22 @@ fn group_unbroken_ascii_inline_words(
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric())
         {
-            let mut suffix = child.clone();
-            suffix.kind = ComponentKind::Text {
-                content: content[space + 1..].to_string(),
-            };
+            let suffix = style_ok(&child.style)
+                .then(|| split_text(&child, content[space + 1..].to_string()));
             child.kind = ComponentKind::Text {
                 content: content[..space + 1].to_string(),
             };
-            if eligible(&suffix) {
-                fragments.push(child);
-                fragments.push(suffix);
+            if let Some(suffix) = suffix {
+                fragments.push((child, false));
+                fragments.push((suffix, true));
                 continue;
             }
         }
-        fragments.push(child);
+        let ok = child_ok.unwrap_or_else(|| eligible(&child));
+        fragments.push((child, ok));
     }
-    for child in fragments {
-        if eligible(&child) {
+    for (child, ok) in fragments {
+        if ok {
             word.push(child);
         } else {
             flush(&mut word, &mut output);

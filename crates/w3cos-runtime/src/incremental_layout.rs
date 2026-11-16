@@ -881,7 +881,16 @@ fn patch_pending(
 }
 
 fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
-    let flat = pre_flatten(&cache.component);
+    // The tree is the one the last flush laid out (no box was restyled):
+    // as a patch flush with nothing to patch, keep the per-box data held
+    // under its structure key (Blink keeps its LayoutObjects on resize).
+    let key = (cache.structure, cache.source_structure);
+    let box_tree = crate::layout_ng::box_tree_enabled();
+    let flat = if box_tree {
+        crate::layout::pre_flatten_keyed(&cache.component, Some(key))
+    } else {
+        pre_flatten(&cache.component)
+    };
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
         cache.engine.invalidate();
@@ -902,10 +911,14 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     {
         return false;
     }
-    let Ok(results) = cache
+    if box_tree && flat.len() == cache.node_ids.len() {
+        crate::layout_ng::set_patch_hint(Some((&flat, key)));
+    }
+    let computed = cache
         .engine
-        .compute(&cache.component, &flat, viewport_w, viewport_h)
-    else {
+        .compute(&cache.component, &flat, viewport_w, viewport_h);
+    crate::layout_ng::set_patch_hint(None);
+    let Ok(results) = computed else {
         return false;
     };
     // A changed column count needs a tree rebuild so overflow-column

@@ -55,6 +55,9 @@ struct Pass {
     /// Per box, filled on first read: `MARKERS_READ` plus style-marker bits
     /// (styles do not change within a pass).
     markers: Vec<u8>,
+    /// Box-tree mode: marker bits read this pass are also kept in the
+    /// patch memo's flag slots (valid until the box is restyled).
+    marker_memo: bool,
     /// The boxes holding `layouts` or `min_max` entries, each once (the
     /// rest of both tables is empty).
     touched: Vec<usize>,
@@ -253,6 +256,23 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             &mut inline_free,
         );
     }
+    // Box-tree mode: style-marker bits kept since the last pass over this
+    // tree (reset with the box's flags when it is restyled).
+    let marker_memo = memo.is_some() && box_tree_enabled();
+    let markers = match memo.as_ref() {
+        Some(m) if marker_memo => m
+            .flags
+            .iter()
+            .map(|&f| {
+                if f & MEMO_MARKERS_VALID != 0 {
+                    MARKERS_READ | (f >> MEMO_MARKERS_SHIFT) & MEMO_MARKERS_MASK
+                } else {
+                    0
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     if let Some(memo) = memo {
         OWN_MEMO.with(|slot| *slot.borrow_mut() = Some(memo));
     }
@@ -274,7 +294,8 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             inline_free,
             layouts,
             min_max,
-            markers: Vec::new(),
+            markers,
+            marker_memo,
             touched: Vec::new(),
             fp,
         })
@@ -286,11 +307,11 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
 /// block-percent and inline-percent bits), kept in `slot` once read.
 fn own_flags(flat: &[FlatNodeInfo], index: usize, slot: &mut u8) -> u8 {
     if *slot & FLAGS_VALID != 0 {
-        return *slot;
+        return *slot & OWN_FLAG_BITS;
     }
     let (block_dep, inline_dep, grid) = percent_dependence(&flat[index]);
     let flags = FLAGS_VALID | grid as u8 | (block_dep as u8) << 1 | (inline_dep as u8) << 2;
-    *slot = flags;
+    *slot = (*slot & !OWN_FLAG_BITS) | flags;
     flags
 }
 
@@ -362,6 +383,15 @@ pub(super) fn marker_bits(flat: &[FlatNodeInfo], index: usize, read: impl FnOnce
         }
         let bits = read() & !MARKERS_READ;
         pass.markers[index] = bits | MARKERS_READ;
+        if pass.marker_memo && bits <= MEMO_MARKERS_MASK {
+            OWN_MEMO.with(|memo| {
+                if let Some(m) = memo.borrow_mut().as_mut()
+                    && m.flags.len() == flat.len()
+                {
+                    m.flags[index] |= MEMO_MARKERS_VALID | bits << MEMO_MARKERS_SHIFT;
+                }
+            });
+        }
         bits
     })
 }
@@ -735,9 +765,14 @@ fn mix(h: u64, v: u64) -> u64 {
 }
 
 fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
-    for chunk in bytes.chunks(8) {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        h = mix(h, u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
         let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
+        word[..rest.len()].copy_from_slice(rest);
         h = mix(h, u64::from_le_bytes(word));
     }
     mix(h, bytes.len() as u64)
@@ -785,6 +820,12 @@ struct OwnMemo {
 }
 
 const FLAGS_VALID: u8 = 0x80;
+/// The `own_flags` bits of a memo flag slot; the others keep the box's
+/// style-marker bits (`marker_bits`) under `MEMO_MARKERS_VALID`.
+const OWN_FLAG_BITS: u8 = FLAGS_VALID | 7;
+const MEMO_MARKERS_VALID: u8 = 0x40;
+const MEMO_MARKERS_SHIFT: u8 = 3;
+const MEMO_MARKERS_MASK: u8 = 7;
 const SUB_CACHEABLE: u8 = 1;
 const SUB_BLOCK_FREE: u8 = 2;
 const SUB_INLINE_FREE: u8 = 4;
