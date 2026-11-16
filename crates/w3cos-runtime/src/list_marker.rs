@@ -72,7 +72,7 @@ fn in_flow_descendant(flat: &[FlatNodeInfo<'_>], mut index: usize, owner: usize)
 
 fn flow_translation(
     flat: &[FlatNodeInfo<'_>],
-    positions: &Positions,
+    positions: &Positions<'_>,
     layouts: &[(LayoutRect, usize)],
     mut index: usize,
     context: usize,
@@ -84,11 +84,11 @@ fn flow_translation(
         let Some(parent) = flat[index].parent else {
             break;
         };
-        if let Some(position) = positions.get(&parent) {
+        if let Some(position) = positions.get(parent) {
             let offset = relative_flow_offset(
                 flat[index].style,
                 flat[parent].style,
-                layouts[*position].0,
+                layouts[position].0,
                 viewport_w,
                 viewport_h,
             );
@@ -101,24 +101,21 @@ fn flow_translation(
 }
 
 /// Flat index -> position in `layouts` (a dense table: every flushed box
-/// has at most one layout entry).
-struct Positions(Vec<usize>);
+/// has at most one layout entry), built here or handed in by the flush.
+struct Positions<'a>(std::borrow::Cow<'a, [u32]>);
 
-impl Positions {
+impl Positions<'_> {
     fn new(layouts: &[(LayoutRect, usize)], len: usize) -> Self {
-        let mut table = vec![usize::MAX; len];
-        for (position, (_, index)) in layouts.iter().enumerate() {
-            if let Some(slot) = table.get_mut(*index) {
-                *slot = position;
-            }
-        }
-        Self(table)
+        Self(std::borrow::Cow::Owned(crate::layout::layout_slots(
+            layouts, len,
+        )))
     }
 
-    fn get(&self, index: &usize) -> Option<&usize> {
+    fn get(&self, index: usize) -> Option<usize> {
         self.0
-            .get(*index)
-            .filter(|position| **position != usize::MAX)
+            .get(index)
+            .filter(|position| **position != u32::MAX)
+            .map(|position| *position as usize)
     }
 }
 
@@ -156,6 +153,7 @@ pub(crate) fn project(
         &markers,
         &contexts,
         &floats,
+        None,
         |index| property(flat[index].style, "--w3cos-internal-list-item").is_some(),
     );
 }
@@ -174,13 +172,17 @@ fn place(
     markers: &[(usize, &str)],
     contexts: &[usize],
     float_boxes: &[usize],
+    slots: Option<&[u32]>,
     list_item: impl Fn(usize) -> bool,
 ) {
-    let positions = Positions::new(layouts, flat.len());
+    let positions = match slots {
+        Some(slots) => Positions(std::borrow::Cow::Borrowed(slots)),
+        None => Positions::new(layouts, flat.len()),
+    };
     let mut floats = Vec::new();
     for &index in float_boxes {
         let node = &flat[index];
-        let (Some(parent), Some(position)) = (node.parent, positions.get(&index)) else {
+        let (Some(parent), Some(position)) = (node.parent, positions.get(index)) else {
             continue;
         };
         let mut containing = parent;
@@ -191,11 +193,11 @@ fn place(
             containing = ancestor;
         }
         let basis = positions
-            .get(&containing)
-            .map_or(viewport_w, |position| layouts[*position].0.width);
+            .get(containing)
+            .map_or(viewport_w, |position| layouts[position].0.width);
         let spacing =
             |value| resolve_spacing_for_layout(value, basis, node.style, viewport_w, viewport_h);
-        let rect = layouts[*position].0;
+        let rect = layouts[position].0;
         let margin = node.style.margin;
         let ml = spacing(margin.left);
         let mr = spacing(margin.right);
@@ -226,7 +228,7 @@ fn place(
     }
     for &(index, kind) in markers {
         let marker = &flat[index];
-        let Some(&position) = positions.get(&index) else {
+        let Some(position) = positions.get(index) else {
             continue;
         };
         let mut owner = marker.parent;
@@ -239,7 +241,7 @@ fn place(
         let Some(owner) = owner else {
             continue;
         };
-        let Some(&owner_position) = positions.get(&owner) else {
+        let Some(owner_position) = positions.get(owner) else {
             continue;
         };
         let item = &flat[owner];
@@ -255,8 +257,8 @@ fn place(
             })
             .find_map(|child| {
                 positions
-                    .get(&child)
-                    .map(|position| (child, layouts[*position].0))
+                    .get(child)
+                    .map(|position| (child, layouts[position].0))
             });
         let baseline = first_text
             .map(|(child, rect)| {
@@ -564,10 +566,12 @@ fn ids_index(host: &[Option<u32>], owner: &[Option<u32>]) -> Vec<(u32, u32)> {
 }
 
 /// [`project`] for the LayoutNG flush, reusing the retained marker roles on
-/// a patch flush in box-tree mode.
+/// a patch flush in box-tree mode. `slots` is `layouts`' dense flat index ->
+/// position table ([`crate::layout::layout_slots`]).
 pub(crate) fn project_retained(
     layouts: &mut [(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
+    slots: &[u32],
     viewport_w: f32,
     viewport_h: f32,
 ) {
@@ -589,6 +593,7 @@ pub(crate) fn project_retained(
             &retained.markers,
             &retained.contexts,
             &retained.floats,
+            Some(slots),
             |index| retained.roles[index] & 1 << 3 != 0,
         );
     }

@@ -962,7 +962,12 @@ fn layout_flat_with_text(
         }
         out = union_text_pieces(out, &texts, flat.len());
     }
-    crate::list_marker::project_retained(&mut out, flat, viewport_w, viewport_h);
+    // One flat index -> entry table for the marker projection and the
+    // scroll containers `LayoutEngine::compute` derives next (projection
+    // moves rects, never entries).
+    let slots = crate::layout::layout_slots(&out, flat.len());
+    crate::list_marker::project_retained(&mut out, flat, &slots, viewport_w, viewport_h);
+    crate::layout::stash_layout_slots(&out, flat.len(), slots);
     Some((out, texts))
 }
 

@@ -4974,11 +4974,16 @@ impl LayoutEngine {
                     Some((layout_cache, text_fragments)) => {
                         // The legacy Taffy tree no longer matches this output.
                         self.tree_valid = false;
+                        // The flush's own entries: its flat index table
+                        // still holds.
+                        let slots = take_layout_slots(&layout_cache, flat.len())
+                            .unwrap_or_else(|| layout_slots(&layout_cache, flat.len()));
                         let (scrollable_nodes, clip_only_nodes, scroll_ancestor) =
-                            scroll_containers_from_layout(
+                            scroll_containers_with_slots(
                                 &layout_cache,
                                 flat,
                                 Some((viewport_w, viewport_h)),
+                                slots,
                             );
                         Ok(LayoutResults {
                             layout_cache,
@@ -21025,6 +21030,42 @@ fn build_scroll_plan(flat: &[FlatNodeInfo<'_>]) -> ScrollPlan {
     }
 }
 
+/// Flat index -> its (last) entry in `layouts`, as a dense table
+/// (`u32::MAX`: none).
+pub(crate) fn layout_slots(layouts: &[(LayoutRect, usize)], len: usize) -> Vec<u32> {
+    let mut table = vec![u32::MAX; len];
+    for (slot, (_, index)) in layouts.iter().enumerate() {
+        if let Some(entry) = table.get_mut(*index) {
+            *entry = slot as u32;
+        }
+    }
+    table
+}
+
+thread_local! {
+    /// The LayoutNG flush's [`layout_slots`] for the entries it returned:
+    /// (entries pointer, entries length, flat length, table).
+    static LAYOUT_SLOTS: std::cell::RefCell<Option<(usize, usize, usize, Vec<u32>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keep `slots` for the [`scroll_containers_from_layout`] call on these
+/// same entries.
+pub(crate) fn stash_layout_slots(layouts: &[(LayoutRect, usize)], len: usize, slots: Vec<u32>) {
+    LAYOUT_SLOTS.with(|slot| {
+        *slot.borrow_mut() = Some((layouts.as_ptr() as usize, layouts.len(), len, slots));
+    });
+}
+
+/// The stashed table, if it is for these entries. Only a caller holding
+/// the very entries the flush returned may use it (a copy can reuse their
+/// allocation).
+fn take_layout_slots(layouts: &[(LayoutRect, usize)], len: usize) -> Option<Vec<u32>> {
+    let (ptr, entries, flat_len, slots) = LAYOUT_SLOTS.with(|slot| slot.borrow_mut().take())?;
+    (ptr == layouts.as_ptr() as usize && entries == layouts.len() && flat_len == len)
+        .then_some(slots)
+}
+
 pub(crate) fn scroll_containers_from_layout(
     layouts: &[(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
@@ -21034,13 +21075,20 @@ pub(crate) fn scroll_containers_from_layout(
     Vec<(usize, LayoutRect)>,
     Vec<Option<usize>>,
 ) {
-    // Flat index -> its (last) entry in `layouts`, as a dense table.
-    let mut layout_slot = vec![u32::MAX; flat.len()];
-    for (slot, (_, index)) in layouts.iter().enumerate() {
-        if let Some(entry) = layout_slot.get_mut(*index) {
-            *entry = slot as u32;
-        }
-    }
+    scroll_containers_with_slots(layouts, flat, viewport, layout_slots(layouts, flat.len()))
+}
+
+fn scroll_containers_with_slots(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+    layout_slot: Vec<u32>,
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    debug_assert_eq!(layout_slot, layout_slots(layouts, flat.len()));
     let slot_of = |index: usize| {
         layout_slot
             .get(index)
