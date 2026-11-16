@@ -82,6 +82,7 @@ pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
         .custom_properties
         .as_ref()
+        .filter(|p| p.may_contain(key))
         .and_then(|p| p.get(key))
         .map(String::as_str)
 }
