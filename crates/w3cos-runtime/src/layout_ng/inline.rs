@@ -4233,11 +4233,14 @@ fn layout_lines_uncached(
     // (line, inline offset, width, baseline) of each placed item.
     // Keyed by leaf position: the first piece of a split leaf opens its
     // boxes, the last one closes them.
-    let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
-    let mut placed_last: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
+    // (Only inline boxes read the placements.)
+    let slots = if has_boxes { opens.len() } else { 0 };
+    let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; slots];
+    let mut placed_last: Vec<Option<(usize, f32, f32, f32)>> = vec![None; slots];
     // Every placed piece as (leaf position, line, offset, width, baseline):
     // a box split across lines spans the pieces of its leaves per line.
-    let mut placed_all: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
+    let mut placed_all: Vec<(usize, usize, f32, f32, f32)> =
+        Vec::with_capacity(if has_boxes { items.len() } else { 0 });
     let lines_used = built.len();
     for (line_index, line) in built.into_iter().enumerate() {
         if floats.is_some() {
@@ -4289,9 +4292,11 @@ fn layout_lines_uncached(
                 continue;
             }
             let at = Some((line_index, offset + x, width, baseline));
-            placed[item.pos] = placed[item.pos].or(at);
-            placed_last[item.pos] = at;
-            placed_all.push((item.pos, line_index, offset + x, width, baseline));
+            if has_boxes {
+                placed[item.pos] = placed[item.pos].or(at);
+                placed_last[item.pos] = at;
+                placed_all.push((item.pos, line_index, offset + x, width, baseline));
+            }
             // The item's own baseline after its vertical-align shift (the
             // enclosing boxes stay on the unshifted one).
             let baseline = baseline + item.shift;
@@ -4312,30 +4317,32 @@ fn layout_lines_uncached(
             // face grows a line-height: normal line, the rect is that line
             // box (NGLineHeightMetrics of the item) rather than the primary
             // font box, so the glyphs sit on the line's baseline.
-            let (content_ascent, font_height) = match flat[item.index].kind {
-                ComponentKind::Text { content }
-                    if item.ascent > item.content_ascent + EPSILON
-                        && fallback_grows_line(
-                            item.range.map_or(content, |(a, b)| &content[a..b]),
-                            flat[item.index].style,
-                        ) =>
-                {
-                    (item.ascent, item.ascent + item.descent)
-                }
-                _ => (item.content_ascent, item.font_height),
+            // (The item's own metrics are checked before its node is read.)
+            let (content_ascent, font_height) = if item.ascent > item.content_ascent + EPSILON
+                && let ComponentKind::Text { content } = flat[item.index].kind
+                && fallback_grows_line(
+                    item.range.map_or(content, |(a, b)| &content[a..b]),
+                    flat[item.index].style,
+                ) {
+                (item.ascent, item.ascent + item.descent)
+            } else {
+                (item.content_ascent, item.font_height)
             };
             out.push((
                 offset + x + item.box_start + e.margin_start,
                 baseline - content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
-                    text_range: match (ellipsis_range, item.range, clamped, &flat[item.index].kind)
-                    {
-                        (Some(range), _, true, _) => Some(range),
-                        (None, None, true, ComponentKind::Text { content }) => {
-                            Some((0, content.len()))
+                    text_range: if !clamped {
+                        item.range
+                    } else {
+                        match (ellipsis_range, item.range, &flat[item.index].kind) {
+                            (Some(range), ..) => Some(range),
+                            (None, None, ComponentKind::Text { content }) => {
+                                Some((0, content.len()))
+                            }
+                            (_, range, _) => range,
                         }
-                        (_, range, ..) => range,
                     },
                     ellipsis: clamped,
                     vertical: false,
