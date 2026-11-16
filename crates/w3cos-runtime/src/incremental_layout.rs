@@ -820,7 +820,7 @@ fn patch_and_compute(
     let width_memo = single_px_width(&styles).is_some();
     let snaps = if (!width_memo || ng) && std::env::var_os("W3COS_SPLICE_VERIFY").is_none() {
         let snaps = if width_memo {
-            host_rect_snaps(&flat, &results.layout_cache)
+            host_rect_snaps_by_ids(&flat, &cache.node_ids, &results.layout_cache)
         } else {
             write_host_rects(&cache.node_ids, &results.layout_cache);
             Vec::new()
@@ -929,7 +929,12 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
         && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
     {
         // CSSOM rects on first read, as for a patch flush.
-        let _ = host_rect_snaps(&flat, &results.layout_cache);
+        if flat.len() == cache.node_ids.len() {
+            debug_assert!(node_ids_match(&flat, &cache.node_ids));
+            write_host_rects(&cache.node_ids, &results.layout_cache);
+        } else {
+            let _ = host_rect_snaps(&flat, &results.layout_cache);
+        }
         defer_client_rects(None, results.layout_cache, results.text_fragments);
     } else {
         write_rects(&flat, &results.layout_cache, &results.text_fragments);
@@ -971,6 +976,42 @@ fn host_rect_snaps(
         }
     });
     snaps
+}
+
+/// [`host_rect_snaps`] reading the host ids the cache keeps per flat
+/// index (`flat_host_id`) instead of each entry's component.
+fn host_rect_snaps_by_ids(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    node_ids: &[u32],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+) -> Vec<(u32, f32, f32, f32, f32)> {
+    if node_ids.len() != flat.len() {
+        return host_rect_snaps(flat, layouts);
+    }
+    debug_assert!(node_ids_match(flat, node_ids));
+    let mut snaps = Vec::with_capacity(layouts.len());
+    crate::dom::with_document_mut(|document| {
+        for (rect, index) in layouts {
+            let Some(&node_id) = node_ids.get(*index) else {
+                continue;
+            };
+            if node_id == u32::MAX {
+                continue;
+            }
+            snaps.push((node_id, rect.x, rect.y, rect.width, rect.height));
+            document.set_layout_rect(
+                NodeId::from_u32(node_id),
+                w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
+            );
+        }
+    });
+    snaps
+}
+
+fn node_ids_match(flat: &[crate::layout::FlatNodeInfo<'_>], node_ids: &[u32]) -> bool {
+    flat.iter()
+        .zip(node_ids)
+        .all(|(info, &id)| flat_host_id(info) == id)
 }
 
 fn split_inline_owner(info: &crate::layout::FlatNodeInfo<'_>) -> Option<u32> {
