@@ -188,7 +188,7 @@ struct Cache {
     cascade: u64,
     viewport_w_bits: u32,
     viewport_h_bits: u32,
-    node_ids: Vec<u32>,
+    node_ids: HostIds,
     /// Full rect snapshots keyed by one node's px width. Repeat flushes of
     /// the same width restore the rects instead of solving Taffy again.
     width_memos: Vec<WidthMemo>,
@@ -737,7 +737,7 @@ fn rebuild(
         structure: layout_gen,
         source_structure: structure,
         cascade,
-        node_ids,
+        node_ids: node_ids.into(),
         width_memos,
         engine_pending: Vec::new(),
         viewport_w_bits: viewport_w.to_bits(),
@@ -948,7 +948,7 @@ fn patch_and_compute(
         .engine
         .compute(component, &flat, viewport_w, viewport_h);
     crate::layout_ng::set_patch_hint(None);
-    let Ok(results) = computed else {
+    let Ok(mut results) = computed else {
         return false;
     };
     let compute_us = compute_started.elapsed().as_micros();
@@ -963,14 +963,20 @@ fn patch_and_compute(
         let snaps = if width_memo {
             host_rect_snaps_by_ids(&flat, &cache.node_ids, &results.layout_cache)
         } else {
-            write_host_rects(&cache.node_ids, &results.layout_cache);
+            if !lazy_dom_rects() {
+                write_host_rects(&cache.node_ids, &results.layout_cache);
+            }
             Vec::new()
         };
+        let slots = results.layout_slots.take();
         defer_client_rects(
             Some(client_key),
             results.layout_cache,
             results.text_fragments,
         );
+        if !width_memo && lazy_dom_rects() {
+            publish_host_rects(&cache.node_ids, slots);
+        }
         snaps
     } else {
         CLIENT_KEY.with(|key| key.set(Some(client_key)));
@@ -1064,7 +1070,7 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
         .engine
         .compute(component, &flat, viewport_w, viewport_h);
     crate::layout_ng::set_patch_hint(None);
-    let Ok(results) = computed else {
+    let Ok(mut results) = computed else {
         return false;
     };
     // A changed column count needs a tree rebuild so overflow-column
@@ -1075,13 +1081,20 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
         && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
     {
         // CSSOM rects on first read, as for a patch flush.
+        let lazy = lazy_dom_rects() && flat.len() == cache.node_ids.len();
         if flat.len() == cache.node_ids.len() {
             debug_assert!(node_ids_match(flat, &cache.node_ids));
-            write_host_rects(&cache.node_ids, &results.layout_cache);
+            if !lazy {
+                write_host_rects(&cache.node_ids, &results.layout_cache);
+            }
         } else {
             let _ = host_rect_snaps(flat, &results.layout_cache);
         }
+        let slots = results.layout_slots.take();
         defer_client_rects(None, results.layout_cache, results.text_fragments);
+        if lazy {
+            publish_host_rects(&cache.node_ids, slots);
+        }
     } else {
         write_rects(flat, &results.layout_cache, &results.text_fragments);
     }
@@ -2841,6 +2854,188 @@ fn write_host_rects(node_ids: &[u32], layouts: &[(crate::layout::LayoutRect, usi
                 w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
             );
         }
+    });
+}
+
+/// A flush's DOM host id per flat index (`u32::MAX` for none), with its
+/// hosts grouped by DOM id on first use.
+struct HostIds {
+    ids: Vec<u32>,
+    groups: std::cell::OnceCell<std::rc::Rc<HostGroups>>,
+}
+
+/// The flat indices of each DOM host id (CSR: `members[starts[g]..starts[g
+/// + 1]]` are the flat indices of `ids[g]`, ascending).
+struct HostGroups {
+    ids: Vec<u32>,
+    starts: Vec<u32>,
+    members: Vec<u32>,
+}
+
+impl From<Vec<u32>> for HostIds {
+    fn from(ids: Vec<u32>) -> Self {
+        Self {
+            ids,
+            groups: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl FromIterator<u32> for HostIds {
+    fn from_iter<I: IntoIterator<Item = u32>>(iter: I) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Deref for HostIds {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        &self.ids
+    }
+}
+
+impl HostIds {
+    fn groups(&self) -> &std::rc::Rc<HostGroups> {
+        self.groups.get_or_init(|| {
+            let mut pairs = self
+                .ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id != u32::MAX)
+                .map(|(index, id)| (*id, index as u32))
+                .collect::<Vec<_>>();
+            pairs.sort_unstable();
+            let mut groups = HostGroups {
+                ids: Vec::new(),
+                starts: Vec::new(),
+                members: Vec::with_capacity(pairs.len()),
+            };
+            for (id, index) in pairs {
+                if groups.ids.last() != Some(&id) {
+                    groups.ids.push(id);
+                    groups.starts.push(groups.members.len() as u32);
+                }
+                groups.members.push(index);
+            }
+            groups.starts.push(groups.members.len() as u32);
+            std::rc::Rc::new(groups)
+        })
+    }
+}
+
+impl HostGroups {
+    /// Each host's last entry in `slots` (u32::MAX: no entry), as
+    /// [`write_host_rects`] leaves it: the latest write of a DOM id wins.
+    fn last_slots<'a>(&'a self, slots: &'a [u32]) -> impl Iterator<Item = (u32, u32)> + 'a {
+        self.ids.iter().enumerate().map(move |(group, id)| {
+            let members =
+                &self.members[self.starts[group] as usize..self.starts[group + 1] as usize];
+            let last = members
+                .iter()
+                .map(|index| slots[*index as usize])
+                .filter(|slot| *slot != u32::MAX)
+                .max()
+                .unwrap_or(u32::MAX);
+            (*id, last)
+        })
+    }
+}
+
+/// `W3COS_LAZY_DOM_RECTS=1`: a retained flush stores DOM layout rects on
+/// their first read instead of on every flush.
+fn lazy_dom_rects() -> bool {
+    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LAZY.get_or_init(|| std::env::var_os("W3COS_LAZY_DOM_RECTS").is_some_and(|v| v == "1"))
+}
+
+/// A retained flush's host rects, stored when the document first reads one.
+struct LazyHostRects {
+    groups: std::rc::Rc<HostGroups>,
+    slots: Vec<u32>,
+    pending: std::rc::Rc<PendingClientRects>,
+}
+
+impl w3cos_dom::document::PendingLayoutRects for LazyHostRects {
+    fn for_each(&self, f: &mut dyn FnMut(NodeId, w3cos_dom::DOMRect)) {
+        for (id, slot) in self.groups.last_slots(&self.slots) {
+            if let Some((rect, _)) = self.pending.layouts.get(slot as usize) {
+                f(
+                    NodeId::from_u32(id),
+                    w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height),
+                );
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The last deferred host rects: their groups and which groups they
+    /// write (a later flush writing the same ones supersedes them).
+    static LAST_HOST_DEFER: RefCell<Option<(usize, Vec<u64>)>> = const { RefCell::new(None) };
+}
+
+/// [`write_host_rects`] for the flush whose rects were just deferred
+/// (`defer_client_rects`), stored on first read.
+fn publish_host_rects(node_ids: &HostIds, slots: Option<Vec<u32>>) {
+    let Some(pending) = pending_client_rects() else {
+        return;
+    };
+    let Some(slots) = slots.filter(|slots| slots.len() == node_ids.len()) else {
+        LAST_HOST_DEFER.with(|last| *last.borrow_mut() = None);
+        write_host_rects(node_ids, &pending.layouts);
+        return;
+    };
+    debug_assert_eq!(
+        slots,
+        crate::layout::layout_slots(&pending.layouts, node_ids.len())
+    );
+    let groups = node_ids.groups().clone();
+    let mut written = vec![0u64; groups.ids.len().div_ceil(64)];
+    for (group, (_, slot)) in groups.last_slots(&slots).enumerate() {
+        if slot != u32::MAX {
+            written[group / 64] |= 1 << (group % 64);
+        }
+    }
+    let key = std::rc::Rc::as_ptr(&groups) as usize;
+    let supersedes = LAST_HOST_DEFER.with(|last| {
+        let mut last = last.borrow_mut();
+        let same = last
+            .as_ref()
+            .is_some_and(|(prev, bits)| *prev == key && *bits == written);
+        *last = Some((key, written));
+        same
+    });
+    let lazy = LazyHostRects {
+        groups,
+        slots,
+        pending,
+    };
+    #[cfg(debug_assertions)]
+    {
+        // The final rect per node, as `write_host_rects` stores them.
+        let mut eager = HashMap::new();
+        for (rect, index) in &lazy.pending.layouts {
+            if let Some(&id) = node_ids.get(*index)
+                && id != u32::MAX
+            {
+                eager.insert(id, *rect);
+            }
+        }
+        let mut deferred = HashMap::new();
+        w3cos_dom::document::PendingLayoutRects::for_each(&lazy, &mut |id, rect| {
+            deferred.insert(id.as_u32(), (rect.x, rect.y, rect.width, rect.height));
+        });
+        debug_assert_eq!(eager.len(), deferred.len());
+        for (id, rect) in eager {
+            debug_assert_eq!(
+                deferred.get(&id),
+                Some(&(rect.x, rect.y, rect.width, rect.height))
+            );
+        }
+    }
+    crate::dom::with_document_mut(|document| {
+        document.defer_layout_rects(Box::new(lazy), supersedes)
     });
 }
 

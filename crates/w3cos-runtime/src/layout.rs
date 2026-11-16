@@ -4879,6 +4879,10 @@ pub struct LayoutResults {
     /// (NGPhysicalTextFragment), in fragment order. `layout_cache` holds the
     /// union rect for such a node; paint draws the pieces instead.
     pub text_fragments: Vec<crate::layout_ng::TextFragment>,
+    /// [`layout_slots`] for `layout_cache` (flat index -> its last entry),
+    /// when the producer built one. Valid while `layout_cache` keeps its
+    /// order and length.
+    pub(crate) layout_slots: Option<Vec<u32>>,
 }
 
 impl LayoutResults {
@@ -4889,6 +4893,7 @@ impl LayoutResults {
             clip_only_nodes: Vec::new(),
             scroll_ancestor: Vec::new(),
             text_fragments: Vec::new(),
+            layout_slots: None,
         }
     }
 }
@@ -4983,7 +4988,7 @@ impl LayoutEngine {
                                 &layout_cache,
                                 flat,
                                 Some((viewport_w, viewport_h)),
-                                slots,
+                                &slots,
                             );
                         Ok(LayoutResults {
                             layout_cache,
@@ -4991,6 +4996,7 @@ impl LayoutEngine {
                             clip_only_nodes,
                             scroll_ancestor,
                             text_fragments,
+                            layout_slots: Some(slots),
                         })
                     }
                     None => self.compute_legacy(root, flat, viewport_w, viewport_h),
@@ -5154,6 +5160,7 @@ impl LayoutEngine {
                 clip_only_nodes: clip_only,
                 scroll_ancestor,
                 text_fragments: Vec::new(),
+                layout_slots: None,
             });
         }
 
@@ -5434,6 +5441,7 @@ impl LayoutEngine {
             clip_only_nodes: clip_only,
             scroll_ancestor,
             text_fragments: Vec::new(),
+            layout_slots: None,
         })
     }
 }
@@ -6178,6 +6186,7 @@ pub fn compute_with_scroll_details(
         clip_only_nodes: clip_only,
         scroll_ancestor,
         text_fragments: Vec::new(),
+        layout_slots: None,
     })
 }
 
@@ -21075,14 +21084,14 @@ pub(crate) fn scroll_containers_from_layout(
     Vec<(usize, LayoutRect)>,
     Vec<Option<usize>>,
 ) {
-    scroll_containers_with_slots(layouts, flat, viewport, layout_slots(layouts, flat.len()))
+    scroll_containers_with_slots(layouts, flat, viewport, &layout_slots(layouts, flat.len()))
 }
 
 fn scroll_containers_with_slots(
     layouts: &[(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
     viewport: Option<(f32, f32)>,
-    layout_slot: Vec<u32>,
+    layout_slot: &[u32],
 ) -> (
     Vec<(usize, LayoutRect, ScrollExtent)>,
     Vec<(usize, LayoutRect)>,

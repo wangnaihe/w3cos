@@ -811,6 +811,30 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
     }
 }
 
+/// A layout pass's rects, stored on demand ([`Document::defer_layout_rects`]).
+/// `for_each` yields each node's final rect from the pass.
+pub trait PendingLayoutRects {
+    fn for_each(&self, f: &mut dyn FnMut(NodeId, DOMRect));
+}
+
+/// Mark `id` and its ancestors' cached extents dirty, stopping at one
+/// already dirty (no cached extent: nothing to invalidate).
+fn mark_extent_chain(nodes: &[Option<DomNode>], extent: &mut ExtentCache, id: NodeId) {
+    if extent.clean == 0 {
+        return;
+    }
+    let mut current = Some(id);
+    while let Some(node) = current {
+        if !extent.mark(node.0 as usize) {
+            break;
+        }
+        current = nodes
+            .get(node.0 as usize)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|node| node.parent);
+    }
+}
+
 /// Per-node subtree extent cache (see `Document::extent`).
 #[derive(Default)]
 struct ExtentCache {
@@ -901,7 +925,11 @@ pub struct Document {
     extent: std::cell::RefCell<ExtentCache>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
-    layout_rects: Vec<DOMRect>,
+    layout_rects: RefCell<Vec<DOMRect>>,
+    /// Rects a layout pass produced but has not stored yet: stored on the
+    /// first read or before any other rect write (Blink reads geometry from
+    /// the current fragments on demand).
+    pending_rects: RefCell<Option<Box<dyn PendingLayoutRects>>>,
     /// Scroll offsets (scroll_left, scroll_top) per node.
     scroll_offsets: Vec<(f32, f32)>,
     free_list: Vec<u32>,
@@ -1177,7 +1205,8 @@ impl Document {
             nodes: Vec::new(),
             page_strings: Vec::new(),
             styles: Vec::new(),
-            layout_rects: Vec::new(),
+            layout_rects: RefCell::new(Vec::new()),
+            pending_rects: RefCell::new(None),
             scroll_offsets: Vec::new(),
             free_list: Vec::new(),
             dirty: Vec::new(),
@@ -1628,7 +1657,7 @@ impl Document {
             let extra = PAGE_SLOTS - self.nodes.len();
             self.nodes.reserve(extra);
             self.styles.reserve(extra);
-            self.layout_rects.reserve(extra);
+            self.layout_rects.get_mut().reserve(extra);
             self.scroll_offsets.reserve(extra);
             self.style_revisions.reserve(extra);
             self.dirty.reserve(PAGE_SLOTS);
@@ -1994,7 +2023,7 @@ impl Document {
         let extra = (self.nodes.capacity() / 2).max(count.max(512));
         self.nodes.reserve(extra);
         self.styles.reserve(extra);
-        self.layout_rects.reserve(extra);
+        self.layout_rects.get_mut().reserve(extra);
         self.scroll_offsets.reserve(extra);
         self.style_revisions.reserve(extra);
         self.precise_stamp.reserve(extra);
@@ -2007,7 +2036,7 @@ impl Document {
             let extra = (self.nodes.capacity() / 2).max(512);
             self.nodes.reserve(extra);
             self.styles.reserve(extra);
-            self.layout_rects.reserve(extra);
+            self.layout_rects.get_mut().reserve(extra);
             self.scroll_offsets.reserve(extra);
             self.style_revisions.reserve(extra);
             self.precise_stamp.reserve(extra);
@@ -2017,6 +2046,9 @@ impl Document {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
         self.last_match_change = self.style_revision_clock;
         let style_revision = self.style_revision_clock;
+        // A deferred rect for a recycled slot lands before the slot resets,
+        // as an eager write would have.
+        self.settle_layout_rects();
         let id = if let Some(slot) = self.free_list.pop() {
             node.id = NodeId(slot);
             let idx = slot as usize;
@@ -2026,7 +2058,7 @@ impl Document {
                 node: slot,
             });
             self.styles[idx] = initial_style;
-            self.layout_rects[idx] = DOMRect::zero();
+            self.layout_rects.get_mut()[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
             self.style_revisions[idx] = style_revision;
             self.extent.get_mut().forget(idx);
@@ -2037,7 +2069,7 @@ impl Document {
             let tag = node.tag;
             self.nodes.push(Some(node));
             self.styles.push(initial_style);
-            self.layout_rects.push(DOMRect::zero());
+            self.layout_rects.get_mut().push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
             self.style_revisions.push(style_revision);
             // Update tag index. One reserve covers a page of the same tag.
@@ -2058,22 +2090,62 @@ impl Document {
     /// Get the last computed bounding rect for a node.
     /// Returns `DOMRect::zero()` if no layout has been run yet.
     pub fn get_layout_rect(&self, id: NodeId) -> DOMRect {
+        self.settle_layout_rects();
         self.layout_rects
+            .borrow()
             .get(id.0 as usize)
             .copied()
             .unwrap_or_default()
     }
 
+    /// Defer a layout pass's rects to the first read (or the next rect
+    /// write). `supersedes`: the pass writes exactly the nodes a still
+    /// pending pass would, so that pass's rects are never observable and
+    /// are dropped unstored.
+    pub fn defer_layout_rects(&mut self, pending: Box<dyn PendingLayoutRects>, supersedes: bool) {
+        if !supersedes {
+            self.settle_layout_rects();
+        }
+        *self.pending_rects.get_mut() = Some(pending);
+        self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+    }
+
+    /// Whether a deferred pass's rects are still unstored.
+    pub fn layout_rects_pending(&self) -> bool {
+        self.pending_rects.borrow().is_some()
+    }
+
+    /// Store deferred rects, as [`Self::set_layout_rect`] would have.
+    fn settle_layout_rects(&self) {
+        let Some(pending) = self.pending_rects.borrow_mut().take() else {
+            return;
+        };
+        let mut rects = self.layout_rects.borrow_mut();
+        let mut extent = self.extent.borrow_mut();
+        pending.for_each(&mut |id, rect| {
+            let idx = id.0 as usize;
+            if idx < rects.len() {
+                let moved = rects[idx] != rect;
+                rects[idx] = rect;
+                if moved {
+                    mark_extent_chain(&self.nodes, &mut extent, id);
+                }
+            }
+        });
+    }
+
     /// Store the computed bounding rect for a node.
     /// Called by the layout engine after each layout pass.
     pub fn set_layout_rect(&mut self, id: NodeId, rect: DOMRect) {
+        self.settle_layout_rects();
         let idx = id.0 as usize;
-        if idx < self.layout_rects.len() {
+        let rects = self.layout_rects.get_mut();
+        if idx < rects.len() {
             // Relayout rewrites every rect it visits; an unchanged rect keeps
             // the cached overflow extent of its ancestors valid (Blink only
             // recomputes overflow for boxes whose geometry changed).
-            let moved = self.layout_rects[idx] != rect;
-            self.layout_rects[idx] = rect;
+            let moved = rects[idx] != rect;
+            rects[idx] = rect;
             self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
             if moved {
                 self.mark_extent_dirty(id);
@@ -2082,26 +2154,14 @@ impl Document {
     }
 
     fn mark_extent_dirty(&mut self, id: NodeId) {
-        if self.extent.get_mut().clean == 0 {
-            // No cached extent to invalidate (the walk would change nothing).
-            return;
-        }
-        let mut current = Some(id);
-        while let Some(node) = current {
-            if !self.extent.get_mut().mark(node.0 as usize) {
-                break;
-            }
-            current = self
-                .nodes
-                .get(node.0 as usize)
-                .and_then(|slot| slot.as_ref())
-                .and_then(|node| node.parent);
-        }
+        mark_extent_chain(&self.nodes, self.extent.get_mut(), id);
     }
 
     /// Max (right, bottom) layout edge over the descendants of `id`, or None
     /// without descendants. Clean subtrees answer from the cache.
     pub fn descendant_extent(&self, id: NodeId) -> Option<(f32, f32)> {
+        // (Before the borrow: settling marks the extent cache.)
+        self.settle_layout_rects();
         let mut cache = self.extent.borrow_mut();
         let idx = id.0 as usize;
         if let Some(hit) = cache.clean_descendants(idx) {
