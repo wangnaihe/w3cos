@@ -3048,8 +3048,21 @@ pub(super) fn layout_inline_beside(
     space: &ConstraintSpace,
     floats: Option<LineFloats>,
 ) -> Option<InlineResult> {
-    let mut result = layout_lines(flat, index, space, floats)?;
-    relative_inline_offsets(flat, index, space, &mut result.children);
+    let (mut result, has_relative) = layout_lines(flat, index, space, floats)?;
+    if has_relative {
+        relative_inline_offsets(flat, index, space, &mut result.children);
+    } else {
+        // No relatively positioned box below the container: every offset
+        // is +0.0, which only turns a -0.0 coordinate into +0.0.
+        for i in 0..result.children.len() {
+            let (x, y, _) = result.children[i];
+            if x.to_bits() == (-0.0f32).to_bits() || y.to_bits() == (-0.0f32).to_bits() {
+                let placed = &mut result.children[i];
+                placed.0 = x + 0.0;
+                placed.1 = y + 0.0;
+            }
+        }
+    }
     Some(result)
 }
 
@@ -3105,19 +3118,20 @@ thread_local! {
     /// then layout), and the line box layout does not read the block size
     /// (NGInlineNode reuses its line boxes when only the block constraints
     /// change).
-    static LINES: std::cell::RefCell<w3cos_std::fxhash::FxHashMap<LinesKey, InlineResult>> =
+    static LINES: std::cell::RefCell<w3cos_std::fxhash::FxHashMap<LinesKey, (InlineResult, bool)>> =
         Default::default();
 }
 
 /// `layout_lines_uncached`, reusing this pass's result for an IFC without
 /// floats, atomic inlines or a line clamp laid out again at the same
-/// inline size.
+/// inline size.  Also answers whether a relatively positioned box sits
+/// below the container (kept with the reused result).
 fn layout_lines(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
     floats: Option<LineFloats>,
-) -> Option<InlineResult> {
+) -> Option<(InlineResult, bool)> {
     let key = if floats.is_none() && space.line_clamp.is_none() {
         super::cache::retained_fp(flat, index).map(|fp| {
             (
@@ -3137,6 +3151,9 @@ fn layout_lines(
         return Some(hit);
     }
     let result = layout_lines_uncached(flat, index, space, floats)?;
+    let has_relative = flat[index + 1..flat[index].subtree_end.max(index + 1).min(flat.len())]
+        .iter()
+        .any(|node| node.style.position == Position::Relative);
     fn holds_atomic(flat: &[FlatNodeInfo], children: &[(f32, f32, BoxFragment)]) -> bool {
         children.iter().any(|(_, _, fragment)| {
             is_atomic_inline(flat, fragment.index) || holds_atomic(flat, &fragment.children)
@@ -3150,10 +3167,10 @@ fn layout_lines(
             if lines.len() > 1 << 16 {
                 lines.clear();
             }
-            lines.insert(key, result.clone());
+            lines.insert(key, (result.clone(), has_relative));
         });
     }
-    Some(result)
+    Some((result, has_relative))
 }
 
 fn layout_lines_uncached(
