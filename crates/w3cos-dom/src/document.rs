@@ -821,6 +821,8 @@ struct ExtentCache {
     /// slot was written by `descendant_extent` (scrollWidth/Height of a
     /// container with thousands of clean children answers in O(1)).
     descendants: Vec<Option<Option<(f32, f32)>>>,
+    /// Slots with `dirty[idx] == false`: with none, marking changes nothing.
+    clean: usize,
 }
 
 impl ExtentCache {
@@ -829,6 +831,7 @@ impl ExtentCache {
         match self.dirty.get_mut(idx) {
             Some(slot) if !*slot => {
                 *slot = true;
+                self.clean -= 1;
                 true
             }
             Some(_) => false,
@@ -840,6 +843,9 @@ impl ExtentCache {
 
     fn forget(&mut self, idx: usize) {
         if let Some(slot) = self.dirty.get_mut(idx) {
+            if !*slot {
+                self.clean -= 1;
+            }
             *slot = true;
         }
     }
@@ -853,6 +859,9 @@ impl ExtentCache {
             self.dirty.resize(idx + 1, true);
             self.value.resize(idx + 1, (0.0, 0.0));
             self.descendants.resize(idx + 1, None);
+        }
+        if self.dirty[idx] {
+            self.clean += 1;
         }
         self.dirty[idx] = false;
         self.value[idx] = value;
@@ -2073,6 +2082,10 @@ impl Document {
     }
 
     fn mark_extent_dirty(&mut self, id: NodeId) {
+        if self.extent.get_mut().clean == 0 {
+            // No cached extent to invalidate (the walk would change nothing).
+            return;
+        }
         let mut current = Some(id);
         while let Some(node) = current {
             if !self.extent.get_mut().mark(node.0 as usize) {
