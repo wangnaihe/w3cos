@@ -948,7 +948,7 @@ fn layout_flat_with_text(
             }
             return None;
         }
-        out = union_text_pieces(out, &texts);
+        out = union_text_pieces(out, &texts, flat.len());
     }
     crate::list_marker::project_retained(&mut out, flat, viewport_w, viewport_h);
     Some((out, texts))
@@ -959,14 +959,23 @@ fn layout_flat_with_text(
 fn union_text_pieces(
     out: Vec<(LayoutRect, usize)>,
     texts: &[TextFragment],
+    len: usize,
 ) -> Vec<(LayoutRect, usize)> {
-    let broken: std::collections::HashSet<usize> = texts.iter().map(|t| t.index).collect();
-    let mut slot: std::collections::HashMap<usize, usize> = Default::default();
+    // Flat index -> its merged entry (dense: `UNSEEN` for a broken text
+    // node not yet met, `u32::MAX` for an unbroken box).
+    const UNSEEN: u32 = u32::MAX - 1;
+    let len = len.max(texts.iter().map(|t| t.index + 1).max().unwrap_or(0));
+    let mut slot = vec![u32::MAX; len];
+    for text in texts {
+        slot[text.index] = UNSEEN;
+    }
     let mut merged: Vec<(LayoutRect, usize)> = Vec::with_capacity(out.len());
     for (rect, index) in out {
-        if broken.contains(&index) {
-            if let Some(&at) = slot.get(&index) {
-                let u = &mut merged[at].0;
+        if let Some(entry) = slot.get_mut(index)
+            && *entry != u32::MAX
+        {
+            if *entry != UNSEEN {
+                let u = &mut merged[*entry as usize].0;
                 let x0 = u.x.min(rect.x);
                 let y0 = u.y.min(rect.y);
                 let x1 = (u.x + u.width).max(rect.x + rect.width);
@@ -979,7 +988,7 @@ fn union_text_pieces(
                 };
                 continue;
             }
-            slot.insert(index, merged.len());
+            *entry = merged.len() as u32;
         }
         merged.push((rect, index));
     }

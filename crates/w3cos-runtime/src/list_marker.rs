@@ -149,7 +149,14 @@ pub(crate) fn project(
         }
     }
     place(
-        layouts, flat, viewport_w, viewport_h, &markers, &contexts, &floats,
+        layouts,
+        flat,
+        viewport_w,
+        viewport_h,
+        &markers,
+        &contexts,
+        &floats,
+        |index| property(flat[index].style, "--w3cos-internal-list-item").is_some(),
     );
 }
 
@@ -167,6 +174,7 @@ fn place(
     markers: &[(usize, &str)],
     contexts: &[usize],
     float_boxes: &[usize],
+    list_item: impl Fn(usize) -> bool,
 ) {
     let positions = Positions::new(layouts, flat.len());
     let mut floats = Vec::new();
@@ -223,7 +231,7 @@ fn place(
         };
         let mut owner = marker.parent;
         while let Some(parent) = owner {
-            if property(flat[parent].style, "--w3cos-internal-list-item").is_some() {
+            if list_item(parent) {
                 break;
             }
             owner = flat[parent].parent;
@@ -521,6 +529,7 @@ pub(crate) fn project_retained(
             &retained.markers,
             &retained.contexts,
             &retained.floats,
+            |index| retained.roles[index] & 1 << 3 != 0,
         );
     }
     RETAINED.with(|slot| *slot.borrow_mut() = Some(retained));

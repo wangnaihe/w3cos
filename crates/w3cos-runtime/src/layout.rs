@@ -20831,6 +20831,9 @@ fn refresh_scroll_container_rects(
 /// keeps it per structure (Blink keeps these bits on the LayoutObject).
 struct ScrollPlan {
     scroll_ancestor: Vec<Option<usize>>,
+    /// Per box: the scroll container whose extent it extends (its scroll
+    /// ancestor unless it is fixed), `u32::MAX` for none.
+    extent_ancestor: Vec<u32>,
     containers: Vec<(usize, bool)>,
     shifts: Vec<(usize, (f32, f32))>,
     columns: bool,
@@ -20864,7 +20867,8 @@ fn scroll_input(style: &w3cos_std::style::Style) -> ScrollInput {
         | u16::from(style.display.establishes_overflow_clip()) << 2
         | u16::from(establishes_column_context(style)) << 3
         | overflow(style.resolved_overflow_x()) << 4
-        | overflow(style.resolved_overflow_y()) << 6;
+        | overflow(style.resolved_overflow_y()) << 6
+        | u16::from(matches!(style.position, WPos::Fixed)) << 8;
     ScrollInput {
         flags,
         translate: (
@@ -20918,6 +20922,7 @@ fn build_scroll_plan(flat: &[FlatNodeInfo<'_>]) -> ScrollPlan {
     // `inherited[i]`: the scroll container that clips `i`'s children.
     let mut inherited: Vec<Option<usize>> = vec![None; flat.len()];
     let mut scroll_ancestor: Vec<Option<usize>> = vec![None; flat.len()];
+    let mut extent_ancestor = vec![u32::MAX; flat.len()];
     let mut containers = Vec::new();
     let mut shifts = Vec::new();
     // Translation accumulated from the transforms of the boxes between a box
@@ -20966,6 +20971,11 @@ fn build_scroll_plan(flat: &[FlatNodeInfo<'_>]) -> ScrollPlan {
             }
         }
         scroll_ancestor[index] = effective;
+        if !matches!(info.style.position, WPos::Fixed)
+            && let Some(clip) = effective
+        {
+            extent_ancestor[index] = clip as u32;
+        }
         inherited[index] = effective;
         let parent_shift = info
             .parent
@@ -21008,6 +21018,7 @@ fn build_scroll_plan(flat: &[FlatNodeInfo<'_>]) -> ScrollPlan {
     }
     ScrollPlan {
         scroll_ancestor,
+        extent_ancestor,
         containers,
         shifts,
         columns,
@@ -21061,12 +21072,7 @@ pub(crate) fn scroll_containers_from_layout(
             hidden_clip.push(hidden);
         }
     }
-    extend_scroll_extents_from_descendants(
-        shifted_layouts,
-        flat,
-        &plan.scroll_ancestor,
-        &mut scrollable,
-    );
+    extend_scroll_extents_planned(shifted_layouts, &plan.extent_ancestor, &mut scrollable);
     if plan.columns {
         extend_scroll_extents_from_overflow_columns(
             shifted_layouts,
@@ -21144,6 +21150,42 @@ fn extend_scroll_extents_from_overflow_columns(
         if extra > 0.0 {
             extent.max_x = extent.max_x.max(extra);
         }
+    }
+}
+
+/// `extend_scroll_extents_from_descendants` over a plan's precomputed
+/// extent ancestors (no style reads per box).
+fn extend_scroll_extents_planned(
+    layouts: &[(LayoutRect, usize)],
+    extent_ancestor: &[u32],
+    scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
+) {
+    if scrollable.is_empty() {
+        return;
+    }
+    let mut scrollport_positions = vec![u32::MAX; extent_ancestor.len()];
+    for (position, (index, _, _)) in scrollable.iter().enumerate() {
+        if let Some(entry) = scrollport_positions.get_mut(*index) {
+            *entry = position as u32;
+        }
+    }
+    for (child, child_index) in layouts {
+        let Some(&scroll_index) = extent_ancestor.get(*child_index) else {
+            continue;
+        };
+        let Some(&position) = scrollport_positions.get(scroll_index as usize) else {
+            continue;
+        };
+        if position == u32::MAX {
+            continue;
+        }
+        let (_, scrollport, extent) = &mut scrollable[position as usize];
+        extent.max_x = extent
+            .max_x
+            .max(child.x + child.width - (scrollport.x + scrollport.width));
+        extent.max_y = extent
+            .max_y
+            .max(child.y + child.height - (scrollport.y + scrollport.height));
     }
 }
 

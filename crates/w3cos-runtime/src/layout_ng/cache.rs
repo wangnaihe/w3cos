@@ -206,33 +206,49 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             }
         })
     });
-    for index in (0..flat.len()).rev() {
-        let own = match memo.as_mut().map(|m| &mut m.flags[index]) {
-            Some(flags) if *flags & FLAGS_VALID != 0 => *flags,
-            slot => {
-                let (block_dep, inline_dep) = percent_dependence(&flat[index]);
-                let flags = FLAGS_VALID
-                    | super::block::is_author_grid(flat[index].style) as u8
-                    | (block_dep as u8) << 1
-                    | (inline_dep as u8) << 2;
-                if let Some(slot) = slot {
-                    *slot = flags;
-                }
-                flags
+    // Box-tree mode: the subtree bits of the last pass over this tree hold
+    // for every box but the reset ones and their ancestors.
+    if let Some(m) = memo.as_mut()
+        && m.sub.len() == flat.len()
+    {
+        let mut sub = std::mem::take(&mut m.sub);
+        let mut chain = Vec::new();
+        for index in std::mem::take(&mut m.flag_dirty) {
+            let mut at = Some(index);
+            while let Some(i) = at {
+                chain.push(i);
+                at = flat[i].parent;
             }
-        };
-        let mut ok = (own & 1 == 0, own & 2 == 0, own & 4 == 0);
-        let end = flat[index].subtree_end.max(index + 1).min(flat.len());
-        let mut child = index + 1;
-        while child < end {
-            ok.0 &= cacheable[child];
-            ok.1 &= block_free[child];
-            ok.2 &= inline_free[child];
-            child = flat[child].subtree_end.max(child + 1);
         }
-        cacheable[index] = ok.0;
-        block_free[index] = ok.1;
-        inline_free[index] = ok.2;
+        chain.sort_unstable_by(|a, b| b.cmp(a));
+        chain.dedup();
+        for index in chain {
+            let flags = own_flags(flat, index, &mut m.flags[index]);
+            let mut bits = (flags & 1 == 0) as u8 * SUB_CACHEABLE
+                | (flags & 2 == 0) as u8 * SUB_BLOCK_FREE
+                | (flags & 4 == 0) as u8 * SUB_INLINE_FREE;
+            let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+            let mut child = index + 1;
+            while child < end {
+                bits &= sub[child];
+                child = flat[child].subtree_end.max(child + 1);
+            }
+            sub[index] = bits;
+        }
+        for (index, bits) in sub.iter().enumerate() {
+            cacheable[index] = bits & SUB_CACHEABLE != 0;
+            block_free[index] = bits & SUB_BLOCK_FREE != 0;
+            inline_free[index] = bits & SUB_INLINE_FREE != 0;
+        }
+        m.sub = sub;
+    } else {
+        begin_pass_flags(
+            flat,
+            memo.as_mut(),
+            &mut cacheable,
+            &mut block_free,
+            &mut inline_free,
+        );
     }
     if let Some(memo) = memo {
         OWN_MEMO.with(|slot| *slot.borrow_mut() = Some(memo));
@@ -260,6 +276,67 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
         })
     });
     PassGuard(true)
+}
+
+/// One box's own cache-dependence flags (`FLAGS_VALID` plus grid,
+/// block-percent and inline-percent bits), kept in `slot` once read.
+fn own_flags(flat: &[FlatNodeInfo], index: usize, slot: &mut u8) -> u8 {
+    if *slot & FLAGS_VALID != 0 {
+        return *slot;
+    }
+    let (block_dep, inline_dep) = percent_dependence(&flat[index]);
+    let flags = FLAGS_VALID
+        | super::block::is_author_grid(flat[index].style) as u8
+        | (block_dep as u8) << 1
+        | (inline_dep as u8) << 2;
+    *slot = flags;
+    flags
+}
+
+/// Subtree cacheability bits of every box, bottom up (also recorded in
+/// the memo, when there is one, for the next pass over the same tree).
+fn begin_pass_flags(
+    flat: &[FlatNodeInfo],
+    mut memo: Option<&mut OwnMemo>,
+    cacheable: &mut [bool],
+    block_free: &mut [bool],
+    inline_free: &mut [bool],
+) {
+    let record = memo
+        .as_ref()
+        .is_some_and(|m| m.flags.len() == flat.len() && box_tree_enabled());
+    let mut sub = if record {
+        vec![0u8; flat.len()]
+    } else {
+        Vec::new()
+    };
+    for index in (0..flat.len()).rev() {
+        let own = match memo.as_mut() {
+            Some(m) if m.flags.len() == flat.len() => own_flags(flat, index, &mut m.flags[index]),
+            _ => own_flags(flat, index, &mut 0),
+        };
+        let mut ok = (own & 1 == 0, own & 2 == 0, own & 4 == 0);
+        let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+        let mut child = index + 1;
+        while child < end {
+            ok.0 &= cacheable[child];
+            ok.1 &= block_free[child];
+            ok.2 &= inline_free[child];
+            child = flat[child].subtree_end.max(child + 1);
+        }
+        cacheable[index] = ok.0;
+        block_free[index] = ok.1;
+        inline_free[index] = ok.2;
+        if record {
+            sub[index] = ok.0 as u8 * SUB_CACHEABLE
+                | ok.1 as u8 * SUB_BLOCK_FREE
+                | ok.2 as u8 * SUB_INLINE_FREE;
+        }
+    }
+    if let Some(m) = memo {
+        m.sub = sub;
+        m.flag_dirty.clear();
+    }
 }
 
 fn with_pass<R>(flat: &[FlatNodeInfo], index: usize, f: impl FnOnce(&mut Pass) -> R) -> Option<R> {
@@ -668,9 +745,16 @@ struct OwnMemo {
     subtree: Vec<u64>,
     known_sub: Vec<bool>,
     fp: Vec<u64>,
+    /// Box-tree mode: per box, the subtree bits `begin_pass` derived from
+    /// `flags` (`SUB_*`), and the boxes whose `flags` were reset since.
+    sub: Vec<u8>,
+    flag_dirty: Vec<usize>,
 }
 
 const FLAGS_VALID: u8 = 0x80;
+const SUB_CACHEABLE: u8 = 1;
+const SUB_BLOCK_FREE: u8 = 2;
+const SUB_INLINE_FREE: u8 = 4;
 
 thread_local! {
     static PATCH_HINT: std::cell::Cell<Option<PatchHint>> = const { std::cell::Cell::new(None) };
@@ -802,6 +886,8 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
             subtree: Vec::new(),
             known_sub: Vec::new(),
             fp: Vec::new(),
+            sub: Vec::new(),
+            flag_dirty: Vec::new(),
         };
         for (index, info) in flat.iter().enumerate() {
             let host = host_id(info);
@@ -1027,6 +1113,7 @@ fn patch_fingerprints(
         let (h, ok, owner) = own_input(flat, index, salt, revision);
         m.owner[index] = owner;
         m.flags[index] = 0;
+        m.flag_dirty.push(index);
         if m.own[index] == h && m.known[index] == ok {
             continue;
         }
