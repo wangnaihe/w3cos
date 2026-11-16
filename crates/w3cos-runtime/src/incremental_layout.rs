@@ -560,7 +560,16 @@ fn rebuild(
         })
         .collect::<Vec<_>>();
     let t4 = std::time::Instant::now();
-    let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
+    let snaps = if crate::layout_ng::mode() == crate::layout_ng::Mode::On
+        && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
+    {
+        // CSSOM rects on first read, as for a patch flush or a recompute.
+        let snaps = host_rect_snaps(&flat, &results.layout_cache);
+        defer_client_rects(None, results.layout_cache, results.text_fragments);
+        snaps
+    } else {
+        write_rects(&flat, &results.layout_cache, &results.text_fragments)
+    };
     let t5 = std::time::Instant::now();
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
@@ -1717,7 +1726,11 @@ fn memos_for_tree(
         return Vec::new();
     }
     let rects = std::rc::Rc::new(rects);
-    let client_rects = MemoClientRects::Map(std::rc::Rc::new(client_rect_snapshot()));
+    // (A rebuild that deferred its rects keeps them unbuilt here too.)
+    let client_rects = pending_client_rects().map_or_else(
+        || MemoClientRects::Map(std::rc::Rc::new(client_rect_snapshot())),
+        MemoClientRects::Pending,
+    );
     nodes
         .into_iter()
         .map(|(node, width_bits)| WidthMemo {

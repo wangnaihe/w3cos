@@ -52,6 +52,9 @@ struct Pass {
     inline_free: Vec<bool>,
     layouts: Vec<Vec<LayoutEntry>>,
     min_max: Vec<Vec<MinMaxEntry>>,
+    /// Per box, filled on first read: `MARKERS_READ` plus style-marker bits
+    /// (styles do not change within a pass).
+    markers: Vec<u8>,
     /// The boxes holding `layouts` or `min_max` entries, each once (the
     /// rest of both tables is empty).
     touched: Vec<usize>,
@@ -271,6 +274,7 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             inline_free,
             layouts,
             min_max,
+            markers: Vec::new(),
             touched: Vec::new(),
             fp,
         })
@@ -284,11 +288,8 @@ fn own_flags(flat: &[FlatNodeInfo], index: usize, slot: &mut u8) -> u8 {
     if *slot & FLAGS_VALID != 0 {
         return *slot;
     }
-    let (block_dep, inline_dep) = percent_dependence(&flat[index]);
-    let flags = FLAGS_VALID
-        | super::block::is_author_grid(flat[index].style) as u8
-        | (block_dep as u8) << 1
-        | (inline_dep as u8) << 2;
+    let (block_dep, inline_dep, grid) = percent_dependence(&flat[index]);
+    let flags = FLAGS_VALID | grid as u8 | (block_dep as u8) << 1 | (inline_dep as u8) << 2;
     *slot = flags;
     flags
 }
@@ -337,6 +338,32 @@ fn begin_pass_flags(
         m.sub = sub;
         m.flag_dirty.clear();
     }
+}
+
+const MARKERS_READ: u8 = 0x80;
+
+/// Box `index`'s style-marker bits (`read` computes them), kept for the
+/// rest of the innermost pass over `flat`.
+pub(super) fn marker_bits(flat: &[FlatNodeInfo], index: usize, read: impl FnOnce() -> u8) -> u8 {
+    PASSES.with(|passes| {
+        let mut passes = passes.borrow_mut();
+        let Some(pass) = passes
+            .last_mut()
+            .filter(|p| p.flat_ptr == flat.as_ptr() as usize && p.flat_len == flat.len())
+        else {
+            return read();
+        };
+        if pass.markers.len() != flat.len() {
+            pass.markers = vec![0; flat.len()];
+        }
+        let bits = pass.markers[index];
+        if bits & MARKERS_READ != 0 {
+            return bits & !MARKERS_READ;
+        }
+        let bits = read() & !MARKERS_READ;
+        pass.markers[index] = bits | MARKERS_READ;
+        bits
+    })
 }
 
 fn with_pass<R>(flat: &[FlatNodeInfo], index: usize, f: impl FnOnce(&mut Pass) -> R) -> Option<R> {
@@ -479,9 +506,10 @@ const SIZE_FREE_MARKERS: &[&str] = &[
 ];
 
 /// (depends on the block-size percentage basis, depends on the inline-size
-/// percentage basis) for one box. Conservative: anything not known to be
-/// free counts as dependent.
-fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool) {
+/// percentage basis, is an author grid) for one box. Conservative: anything
+/// not known to be free counts as dependent. The grid and lanes markers are
+/// not size-free, so with only size-free markers a grid is `display: grid`.
+fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool, bool) {
     use w3cos_std::style::{Dimension, Display, Position, Spacing, WritingMode};
     let style = info.style;
     let pct = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
@@ -543,7 +571,12 @@ fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool) {
         || !matches!(style.column_width, Dimension::Auto)
         || !edges_ok(&style.padding)
         || !edges_ok(&style.margin);
-    (block, inline)
+    let grid = if markers_ok {
+        style.display == Display::Grid
+    } else {
+        super::block::is_author_grid(style)
+    };
+    (block, inline, grid)
 }
 
 /// The fingerprint of `index`'s subtree inputs in this top-level pass, if
@@ -1012,7 +1045,7 @@ fn own_input(
     h = mix(h, style.float as u64);
     h = mix(h, {
         use std::hash::{Hash, Hasher};
-        let mut kind = std::collections::hash_map::DefaultHasher::new();
+        let mut kind = w3cos_std::fxhash::FxHasher::default();
         std::mem::discriminant(info.kind).hash(&mut kind);
         kind.finish()
     });

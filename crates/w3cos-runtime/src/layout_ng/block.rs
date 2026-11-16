@@ -122,7 +122,12 @@ pub(super) fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
 }
 
 pub(super) fn is_value_carrier_marker(key: &str) -> bool {
-    let name = key.trim_start_matches("--w3cos-internal-");
+    // (`strip_prefix` compares bytes; `trim_start_matches` with a string
+    // pattern builds a substring searcher per call.)
+    let mut name = key;
+    while let Some(rest) = name.strip_prefix("--w3cos-internal-") {
+        name = rest;
+    }
     // `last baseline` alignment: grid reads it, the typed fields keep the
     // fallback value every other layout mode already used.
     name.starts_with("last-baseline-")
@@ -4412,13 +4417,28 @@ pub(super) fn layout_block_sized(
 
 /// Visits the boxes whose containing block is `index`'s content box: its
 /// rendered children, looking through synthetic float rows.
+const MARK_FLOAT_GROUP: u8 = 1;
+const MARK_STRETCH: u8 = 2;
+
+/// The float-group and `stretch` markers of box `index` (read once per pass).
+fn child_markers(flat: &[FlatNodeInfo], index: usize) -> u8 {
+    super::cache::marker_bits(flat, index, || {
+        let style = flat[index].style;
+        if style.custom_properties.is_none() {
+            return 0;
+        }
+        (is_float_group(style) as u8) * MARK_FLOAT_GROUP
+            | (marker(style, STRETCH).is_some() as u8) * MARK_STRETCH
+    })
+}
+
 fn for_each_cb_child(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usize)) {
     let end = flat[index].subtree_end;
     let mut child = index + 1;
     while child < end {
         let next = flat[child].subtree_end.max(child + 1);
         if flat[child].style.display != Display::None {
-            if is_float_group(flat[child].style) {
+            if child_markers(flat, child) & MARK_FLOAT_GROUP != 0 {
                 for_each_cb_child(flat, child, f);
             } else {
                 f(child);
@@ -4450,7 +4470,7 @@ pub(super) fn stretch_child_styles(
     for_each_cb_child(flat, index, &mut |child| {
         let style = flat[child].style;
         has_float |= style.float != Float::None;
-        any_stretch |= style.custom_properties.is_some() && marker(style, STRETCH).is_some();
+        any_stretch |= child_markers(flat, child) & MARK_STRETCH != 0;
     });
     if !any_stretch {
         return out;
