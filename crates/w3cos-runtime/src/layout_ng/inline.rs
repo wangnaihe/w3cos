@@ -1865,7 +1865,7 @@ struct InlineItem {
     internal_break: bool,
     /// An atomic inline: its laid-out fragment and inline-start / block-
     /// start margins (the item's advance and metrics are its margin box).
-    atomic: Option<(BoxFragment, f32, f32)>,
+    atomic: Option<Box<(BoxFragment, f32, f32)>>,
     /// Resolved bidi level and trailing-space level change (LeafLevel).
     bidi: LeafLevel,
     /// Baseline shift (down) from vertical-align: middle.
@@ -1960,16 +1960,14 @@ fn same_font(a: &Style, b: &Style) -> bool {
 /// Shaping identity of a word piece: pieces of one authored text node with
 /// the same font are shaped as one run.
 fn same_run(a: &Style, b: &Style) -> bool {
-    let source = |s: &Style| {
+    fn source(s: &Style) -> Option<&String> {
         s.custom_properties
             .as_ref()
             .and_then(|p| p.get(w3cos_std::inline_text::SOURCE_RUN))
-            .cloned()
-    };
+    }
     // An inline box edge ends the shaping run (its item starts or ends a
     // box fragment).
-    source(a).is_some()
-        && source(a) == source(b)
+    source(a).is_some_and(|run| source(b) == Some(run))
         && zero_edges(a)
         && zero_edges(b)
         && a.font_family == b.font_family
@@ -3366,7 +3364,7 @@ fn layout_lines(
                     box_end,
                     aligned: aligned[k],
                     internal_break: false,
-                    atomic: Some((result.fragment, margin[3], margin[0])),
+                    atomic: Some(Box::new((result.fragment, margin[3], margin[0]))),
                     bidi: levels[k],
                     shift,
                     ascent,
@@ -4126,7 +4124,7 @@ fn layout_lines(
             // The item's own baseline after its vertical-align shift (the
             // enclosing boxes stay on the unshifted one).
             let baseline = baseline + item.shift;
-            if let Some((fragment, margin_start, margin_top)) = &item.atomic {
+            if let Some((fragment, margin_start, margin_top)) = item.atomic.as_deref() {
                 out.push((
                     offset + x + item.box_start + margin_start,
                     baseline - item.ascent + margin_top,

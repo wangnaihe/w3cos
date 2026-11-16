@@ -4422,26 +4422,33 @@ const MARK_STRETCH: u8 = 2;
 
 /// The float-group and `stretch` markers of box `index` (read once per pass).
 fn child_markers(flat: &[FlatNodeInfo], index: usize) -> u8 {
+    // (No custom properties, no markers: skip the pass table.)
+    if flat[index].style.custom_properties.is_none() {
+        return 0;
+    }
     super::cache::marker_bits(flat, index, || {
         let style = flat[index].style;
-        if style.custom_properties.is_none() {
-            return 0;
-        }
         (is_float_group(style) as u8) * MARK_FLOAT_GROUP
             | (marker(style, STRETCH).is_some() as u8) * MARK_STRETCH
     })
 }
 
 fn for_each_cb_child(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usize)) {
+    for_each_cb_child_marked(flat, index, &mut |child, _| f(child));
+}
+
+/// `for_each_cb_child`, also passing each child's `child_markers`.
+fn for_each_cb_child_marked(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usize, u8)) {
     let end = flat[index].subtree_end;
     let mut child = index + 1;
     while child < end {
         let next = flat[child].subtree_end.max(child + 1);
         if flat[child].style.display != Display::None {
-            if child_markers(flat, child) & MARK_FLOAT_GROUP != 0 {
-                for_each_cb_child(flat, child, f);
+            let markers = child_markers(flat, child);
+            if markers & MARK_FLOAT_GROUP != 0 {
+                for_each_cb_child_marked(flat, child, f);
             } else {
-                f(child);
+                f(child, markers);
             }
         }
         child = next;
@@ -4467,10 +4474,9 @@ pub(super) fn stretch_child_styles(
     // items, which do not resolve the keyword either).
     let mut has_float = false;
     let mut any_stretch = false;
-    for_each_cb_child(flat, index, &mut |child| {
-        let style = flat[child].style;
-        has_float |= style.float != Float::None;
-        any_stretch |= child_markers(flat, child) & MARK_STRETCH != 0;
+    for_each_cb_child_marked(flat, index, &mut |child, markers| {
+        has_float |= flat[child].style.float != Float::None;
+        any_stretch |= markers & MARK_STRETCH != 0;
     });
     if !any_stretch {
         return out;
