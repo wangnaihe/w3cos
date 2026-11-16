@@ -1101,6 +1101,11 @@ thread_local! {
     static FLAT_REUSE: std::cell::RefCell<Option<FlatReuse>> = const { std::cell::RefCell::new(None) };
 }
 
+/// See [`cache::forget_walk_fingerprints`].
+pub(crate) fn forget_walk_fingerprints() {
+    cache::forget_walk_fingerprints();
+}
+
 pub(crate) fn forget_flat_reuse() {
     FLAT_REUSE.with(|slot| *slot.borrow_mut() = None);
 }

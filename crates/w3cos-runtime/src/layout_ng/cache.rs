@@ -1286,6 +1286,12 @@ thread_local! {
     static SUPPORTED: RefCell<std::collections::HashSet<u64>> = RefCell::new(Default::default());
 }
 
+/// Drop fingerprints a walk left for a pass that never began (a flat tree
+/// kept across flushes would otherwise match them by address).
+pub(super) fn forget_walk_fingerprints() {
+    LAST_FP.with(|slot| *slot.borrow_mut() = None);
+}
+
 fn take_fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
     LAST_FP.with(|slot| {
         let (ptr, len, fp) = slot.borrow_mut().take()?;

@@ -42,8 +42,79 @@ enum MemoClientRects {
     Pending(std::rc::Rc<PendingClientRects>),
 }
 
+/// The tree the last flush laid out, with its preorder flat view kept
+/// across relayouts that do not edit it (Blink keeps its LayoutObjects
+/// across a resize instead of rebuilding them).
+struct RetainedTree {
+    /// `pre_flatten_keyed(root, key)`. It borrows the nodes under `root`, so
+    /// any edit (`DerefMut`) drops it first, as does dropping the tree.
+    flat: Option<((u64, u64), Vec<crate::layout::FlatNodeInfo<'static>>)>,
+    /// Owned like a `Box` (freed in `Drop`), but kept as a raw pointer so
+    /// moving the tree does not reassert unique access over the nodes the
+    /// flat view borrows.
+    root: std::ptr::NonNull<Component>,
+}
+
+impl RetainedTree {
+    fn new(component: Component) -> Self {
+        Self {
+            flat: None,
+            root: std::ptr::NonNull::from(Box::leak(Box::new(component))),
+        }
+    }
+
+    /// The tree and its flat view under structure `key`, flattened only when
+    /// the tree was edited (or the key changed) since the last call.
+    fn flat(&mut self, key: (u64, u64)) -> (&Component, &[crate::layout::FlatNodeInfo<'_>]) {
+        // SAFETY: `root` is the live allocation this tree owns; only
+        // `deref_mut` hands out unique access, and it drops `flat` first.
+        let root: &Component = unsafe { self.root.as_ref() };
+        if self.flat.as_ref().is_none_or(|(at, _)| *at != key) {
+            let flat = crate::layout::pre_flatten_keyed(root, Some(key));
+            // SAFETY: the entries borrow nodes of `*root`, which outlive
+            // them: `flat` is cleared before any edit and before the free.
+            let flat = unsafe {
+                std::mem::transmute::<
+                    Vec<crate::layout::FlatNodeInfo<'_>>,
+                    Vec<crate::layout::FlatNodeInfo<'static>>,
+                >(flat)
+            };
+            self.flat = Some((key, flat));
+        } else {
+            // (A fresh flatten installs it; the kept view skips that.)
+            crate::layout::install_font_unit_provider();
+        }
+        let flat = &self.flat.as_ref().expect("flat view").1;
+        (root, flat)
+    }
+}
+
+impl std::ops::Deref for RetainedTree {
+    type Target = Component;
+    fn deref(&self) -> &Component {
+        // SAFETY: see `flat`.
+        unsafe { self.root.as_ref() }
+    }
+}
+
+impl std::ops::DerefMut for RetainedTree {
+    fn deref_mut(&mut self) -> &mut Component {
+        self.flat = None;
+        // SAFETY: the flat view (the only other borrow) was just dropped.
+        unsafe { self.root.as_mut() }
+    }
+}
+
+impl Drop for RetainedTree {
+    fn drop(&mut self) {
+        self.flat = None;
+        // SAFETY: `root` came from `Box::leak` in `new` and is freed once.
+        drop(unsafe { Box::from_raw(self.root.as_ptr()) });
+    }
+}
+
 struct Cache {
-    component: Component,
+    component: RetainedTree,
     engine: LayoutEngine,
     /// `Document::layout_generation`. Repaint-only text does not bump it.
     structure: u64,
@@ -598,7 +669,7 @@ fn rebuild(
         measure_text,
         node_ids_stale: false,
         owner_counts: None,
-        component,
+        component: RetainedTree::new(component),
         engine,
         structure: layout_gen,
         source_structure: structure,
@@ -886,10 +957,15 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     // under its structure key (Blink keeps its LayoutObjects on resize).
     let key = (cache.structure, cache.source_structure);
     let box_tree = crate::layout_ng::box_tree_enabled();
-    let flat = if box_tree {
-        crate::layout::pre_flatten_keyed(&cache.component, Some(key))
+    let fresh;
+    let (component, flat) = if box_tree {
+        // The flat view outlives this flush: nothing may take it for the
+        // one an earlier flush's eligibility walk left behind.
+        crate::layout_ng::forget_walk_fingerprints();
+        cache.component.flat(key)
     } else {
-        pre_flatten(&cache.component)
+        fresh = pre_flatten(&cache.component);
+        (&*cache.component, &fresh[..])
     };
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
@@ -897,12 +973,12 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
         cache.engine_pending.clear();
         cache.node_ids_stale = false;
     }
-    configure_engine(&mut cache.engine, &cache.component);
+    configure_engine(&mut cache.engine, component);
     if !cache.engine_pending.is_empty()
         && (flat.len() != cache.node_ids.len()
             || !patch_pending(
                 &mut cache.engine,
-                &cache.component,
+                component,
                 &cache.node_ids,
                 &mut cache.engine_pending,
                 viewport_w,
@@ -912,11 +988,11 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
         return false;
     }
     if box_tree && flat.len() == cache.node_ids.len() {
-        crate::layout_ng::set_patch_hint(Some((&flat, key)));
+        crate::layout_ng::set_patch_hint(Some((flat, key)));
     }
     let computed = cache
         .engine
-        .compute(&cache.component, &flat, viewport_w, viewport_h);
+        .compute(component, &flat, viewport_w, viewport_h);
     crate::layout_ng::set_patch_hint(None);
     let Ok(results) = computed else {
         return false;
@@ -924,20 +1000,20 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     // A changed column count needs a tree rebuild so overflow-column
     // scroll geometry and ::column::scroll-marker siblings stay in sync.
     let resync =
-        sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h));
+        sync_column_scroll_marker_counts(flat, &results.layout_cache, (viewport_w, viewport_h));
     if crate::layout_ng::mode() == crate::layout_ng::Mode::On
         && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
     {
         // CSSOM rects on first read, as for a patch flush.
         if flat.len() == cache.node_ids.len() {
-            debug_assert!(node_ids_match(&flat, &cache.node_ids));
+            debug_assert!(node_ids_match(flat, &cache.node_ids));
             write_host_rects(&cache.node_ids, &results.layout_cache);
         } else {
-            let _ = host_rect_snaps(&flat, &results.layout_cache);
+            let _ = host_rect_snaps(flat, &results.layout_cache);
         }
         defer_client_rects(None, results.layout_cache, results.text_fragments);
     } else {
-        write_rects(&flat, &results.layout_cache, &results.text_fragments);
+        write_rects(flat, &results.layout_cache, &results.text_fragments);
     }
     !resync
 }
