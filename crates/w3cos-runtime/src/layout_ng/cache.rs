@@ -875,6 +875,12 @@ struct OwnMemo {
     /// `flags` (`SUB_*`), and the boxes whose `flags` were reset since.
     sub: Vec<u8>,
     flag_dirty: Vec<usize>,
+    /// Box-tree patch path: (DOM id, box) for every box whose `host` or
+    /// `owner` is that id, sorted. Built on the second patch over this
+    /// memo (a memo patched once is not worth a sort) and cleared when an
+    /// owner changes; empty means scan every box.
+    by_id: Vec<(u32, u32)>,
+    patches: u32,
 }
 
 const FLAGS_VALID: u8 = 0x80;
@@ -1020,6 +1026,8 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
             fp: Vec::new(),
             sub: Vec::new(),
             flag_dirty: Vec::new(),
+            by_id: Vec::new(),
+            patches: 0,
         };
         for (index, info) in flat.iter().enumerate() {
             let host = host_id(info);
@@ -1231,18 +1239,49 @@ fn patch_fingerprints(
 ) -> Vec<u64> {
     let mut dirty = Vec::new();
     if !ids.is_empty() {
-        for index in 0..flat.len() {
-            if m.host[index].is_some_and(|id| ids.contains(&id))
-                || m.owner[index].is_some_and(|id| ids.contains(&id))
-            {
-                dirty.push(index);
+        if m.by_id.is_empty() && m.patches > 0 {
+            m.by_id = by_id_index(&m.host, &m.owner);
+        }
+        m.patches = m.patches.saturating_add(1);
+        if m.by_id.is_empty() {
+            for index in 0..flat.len() {
+                if m.host[index].is_some_and(|id| ids.contains(&id))
+                    || m.owner[index].is_some_and(|id| ids.contains(&id))
+                {
+                    dirty.push(index);
+                }
             }
+        } else {
+            for &id in ids {
+                let start = m.by_id.partition_point(|&(key, _)| key < id);
+                dirty.extend(
+                    m.by_id[start..]
+                        .iter()
+                        .take_while(|&&(key, _)| key == id)
+                        .map(|&(_, index)| index as usize),
+                );
+            }
+            // The scan's order: ascending, each box once.
+            dirty.sort_unstable();
+            dirty.dedup();
+            debug_assert_eq!(
+                dirty,
+                (0..flat.len())
+                    .filter(|&i| {
+                        m.host[i].is_some_and(|id| ids.contains(&id))
+                            || m.owner[i].is_some_and(|id| ids.contains(&id))
+                    })
+                    .collect::<Vec<_>>()
+            );
         }
     }
     let mut chain = Vec::new();
     let mut refresh = Vec::new();
     for &index in &dirty {
         let (h, ok, owner) = own_input(flat, index, salt, revision);
+        if m.owner[index] != owner {
+            m.by_id.clear();
+        }
         m.owner[index] = owner;
         m.flags[index] = 0;
         m.flag_dirty.push(index);
@@ -1275,6 +1314,24 @@ fn patch_fingerprints(
         m.fp[index] = fingerprint_entry(flat, index, &m.own, &m.subtree, &m.known_sub);
     }
     m.fp.clone()
+}
+
+/// `OwnMemo::by_id` for these per-box ids.
+fn by_id_index(host: &[Option<u32>], owner: &[Option<u32>]) -> Vec<(u32, u32)> {
+    let mut by_id = Vec::with_capacity(host.len());
+    for (index, (host, owner)) in host.iter().zip(owner).enumerate() {
+        let index = index as u32;
+        if let Some(id) = *host {
+            by_id.push((id, index));
+        }
+        if let Some(id) = *owner
+            && *owner != *host
+        {
+            by_id.push((id, index));
+        }
+    }
+    by_id.sort_unstable();
+    by_id
 }
 
 thread_local! {
