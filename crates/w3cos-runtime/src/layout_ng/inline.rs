@@ -1923,6 +1923,7 @@ fn keep_items(
 /// each such flush cost more than the splice. (A fingerprint names its
 /// inputs, so an entry no box has any more is only unused.)
 pub(super) fn retire_items() {
+    LINES.with(|lines| lines.borrow_mut().clear());
     ITEMS.with(|items| {
         let mut items = items.borrow_mut();
         let [current, last] = &mut *items;
@@ -1935,6 +1936,7 @@ pub(super) fn retire_items() {
 }
 
 pub(super) fn clear_items() {
+    LINES.with(|lines| lines.borrow_mut().clear());
     ITEMS.with(|items| *items.borrow_mut() = Default::default());
 }
 
@@ -2670,6 +2672,7 @@ fn align_offset_by(style: &Style, align: TextAlign, free: f32) -> f32 {
 
 /// Result of laying out an inline formatting context: content-box height
 /// and the text fragments with offsets from the content-box origin.
+#[derive(Clone)]
 pub(super) struct InlineResult {
     pub height: f32,
     pub children: Vec<(f32, f32, BoxFragment)>,
@@ -3084,7 +3087,67 @@ fn relative_inline_offsets(
     }
 }
 
+type LinesKey = (usize, usize, u64, usize, u32);
+
+thread_local! {
+    /// IFC layouts of this top-level pass by (flat, fingerprint, index,
+    /// available inline size): the flex and block algorithms lay a box out
+    /// again at the same inline size with another block size (measure,
+    /// then layout), and the line box layout does not read the block size
+    /// (NGInlineNode reuses its line boxes when only the block constraints
+    /// change).
+    static LINES: std::cell::RefCell<w3cos_std::fxhash::FxHashMap<LinesKey, InlineResult>> =
+        Default::default();
+}
+
+/// `layout_lines_uncached`, reusing this pass's result for an IFC without
+/// floats, atomic inlines or a line clamp laid out again at the same
+/// inline size.
 fn layout_lines(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    floats: Option<LineFloats>,
+) -> Option<InlineResult> {
+    let key = if floats.is_none() && space.line_clamp.is_none() {
+        super::cache::retained_fp(flat, index).map(|fp| {
+            (
+                flat.as_ptr() as usize,
+                flat.len(),
+                fp,
+                index,
+                space.available_inline.to_bits(),
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(key) = key
+        && let Some(hit) = LINES.with(|lines| lines.borrow().get(&key).cloned())
+    {
+        return Some(hit);
+    }
+    let result = layout_lines_uncached(flat, index, space, floats)?;
+    fn holds_atomic(flat: &[FlatNodeInfo], children: &[(f32, f32, BoxFragment)]) -> bool {
+        children.iter().any(|(_, _, fragment)| {
+            is_atomic_inline(flat, fragment.index) || holds_atomic(flat, &fragment.children)
+        })
+    }
+    if let Some(key) = key
+        && !holds_atomic(flat, &result.children)
+    {
+        LINES.with(|lines| {
+            let mut lines = lines.borrow_mut();
+            if lines.len() > 1 << 16 {
+                lines.clear();
+            }
+            lines.insert(key, result.clone());
+        });
+    }
+    Some(result)
+}
+
+fn layout_lines_uncached(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
