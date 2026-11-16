@@ -367,9 +367,17 @@ fn begin_pass_flags(
 
 const MARKERS_READ: u8 = 0x80;
 
+thread_local! {
+    /// `cb_child_bits` across passes by subtree fingerprint: the bits read
+    /// only the subtree's styles, which the fingerprint names.
+    static CB_BITS_BY_FP: std::cell::RefCell<w3cos_std::fxhash::FxHashMap<u64, u8>> =
+        Default::default();
+}
+
 /// Summary bits of the boxes `index` is the containing block for (`read`
 /// computes them from their styles, which do not change within a pass),
-/// kept for the rest of the innermost pass over `flat`.
+/// kept for the rest of the innermost pass over `flat`, and for later
+/// passes under the box's subtree fingerprint.
 pub(super) fn cb_child_bits(flat: &[FlatNodeInfo], index: usize, read: impl FnOnce() -> u8) -> u8 {
     let same = |p: &&mut Pass| p.flat_ptr == flat.as_ptr() as usize && p.flat_len == flat.len();
     let hit = PASSES.with(|passes| {
@@ -383,7 +391,24 @@ pub(super) fn cb_child_bits(flat: &[FlatNodeInfo], index: usize, read: impl FnOn
     if let Some(bits) = hit {
         return bits & !MARKERS_READ;
     }
-    let bits = read() & !MARKERS_READ;
+    let fp = pass_fp(flat, index);
+    let kept = fp.and_then(|fp| CB_BITS_BY_FP.with(|kept| kept.borrow().get(&fp).copied()));
+    let bits = match kept {
+        Some(bits) => bits,
+        None => {
+            let bits = read() & !MARKERS_READ;
+            if let Some(fp) = fp {
+                CB_BITS_BY_FP.with(|kept| {
+                    let mut kept = kept.borrow_mut();
+                    if kept.len() > 1 << 16 {
+                        kept.clear();
+                    }
+                    kept.insert(fp, bits);
+                });
+            }
+            bits
+        }
+    };
     PASSES.with(|passes| {
         let mut passes = passes.borrow_mut();
         if let Some(pass) = passes.last_mut().filter(same) {
