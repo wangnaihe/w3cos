@@ -4415,6 +4415,18 @@ pub(super) fn layout_block_sized(
     })
 }
 
+/// Moves adopted IFC children (`ifc_children`) to the front of the owned
+/// list before it is edited.
+fn own_ifc_children(
+    children: &mut Vec<(f32, f32, BoxFragment)>,
+    ifc_children: &mut Option<super::FragmentChildren>,
+) {
+    if let Some(shared) = ifc_children.take() {
+        let rest = std::mem::replace(children, shared.into_vec());
+        children.extend(rest);
+    }
+}
+
 /// Visits the boxes whose containing block is `index`'s content box: its
 /// rendered children, looking through synthetic float rows.
 const MARK_FLOAT_GROUP: u8 = 1;
@@ -4991,6 +5003,9 @@ pub(super) fn layout_block_in(
     // PreviousInflowPosition::self_collapsing_child_had_clearance.
     let mut last_cleared_self_collapsing = false;
     let mut children = Vec::new();
+    // An inline formatting context's adopted (shared) children; anything
+    // that edits `children` takes them over first (`own_ifc_children`).
+    let mut ifc_children: Option<super::FragmentChildren> = None;
     let mut column_monoliths = Vec::new();
     // Offset of the content box from the border box.
     let content_top = bt + pt;
@@ -5063,12 +5078,20 @@ pub(super) fn layout_block_in(
                 *cap = (*cap - result.height).max(0.0);
             }
         }
-        children.extend(
-            result
-                .children
-                .into_iter()
-                .map(|(x, y, fragment)| (bl + pl + x, bt + pt + y, fragment)),
-        );
+        let (dx, dy) = (bl + pl, bt + pt);
+        if children.is_empty() && dx.to_bits() == 0 && dy.to_bits() == 0 {
+            // No border or padding before the content: the line boxes'
+            // fragments are this box's children as they are (Blink keeps
+            // the line box fragments of a reused NGInlineNode layout).
+            ifc_children = Some(result.children);
+        } else {
+            children.extend(
+                result
+                    .children
+                    .into_iter()
+                    .map(|(x, y, fragment)| (dx + x, dy + y, fragment)),
+            );
+        }
     }
     let mut child = if image_size.is_some() || inline::is_inline_container(flat, index) {
         info.subtree_end
@@ -5995,6 +6018,7 @@ pub(super) fn layout_block_in(
         // baseline is the content's last line, else the content-box
         // bottom, whatever the overflow.
         let shift = ((content_height - auto_content) / 2.0).max(0.0);
+        own_ifc_children(&mut children, &mut ifc_children);
         for placed in &mut children {
             placed.1 += shift;
         }
@@ -6033,6 +6057,7 @@ pub(super) fn layout_block_in(
             space.viewport_h,
         )
         .why("oof-resolve")?;
+        own_ifc_children(&mut children, &mut ifc_children);
         children.extend(placed);
         oof_candidates = rest;
     }
@@ -6067,7 +6092,13 @@ pub(super) fn layout_block_in(
             vertical: false,
             width,
             height,
-            children: children.into(),
+            children: match ifc_children {
+                Some(shared) if children.is_empty() => shared,
+                shared => {
+                    own_ifc_children(&mut children, &mut { shared });
+                    children.into()
+                }
+            },
         },
         start_strut,
         end_strut,

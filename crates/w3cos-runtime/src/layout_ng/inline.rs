@@ -2675,7 +2675,9 @@ fn align_offset_by(style: &Style, align: TextAlign, free: f32) -> f32 {
 #[derive(Clone)]
 pub(super) struct InlineResult {
     pub height: f32,
-    pub children: Vec<(f32, f32, BoxFragment)>,
+    /// Shared like any fragment list: a reused line layout hands out the
+    /// same list, and a container that adds no offset adopts it as is.
+    pub children: super::FragmentChildren,
     /// The last line box's baseline from the content-box top.
     pub last_baseline: LastBaseline,
     /// The first line box's baseline from the content-box top.
@@ -3062,7 +3064,7 @@ fn relative_inline_offsets(
     flat: &[FlatNodeInfo],
     container: usize,
     space: &ConstraintSpace,
-    children: &mut [(f32, f32, BoxFragment)],
+    children: &mut super::FragmentChildren,
 ) {
     let offset_of = |mut node: usize| {
         let (mut dx, mut dy) = (0.0f32, 0.0f32);
@@ -3080,10 +3082,17 @@ fn relative_inline_offsets(
         }
         (dx, dy)
     };
-    for (x, y, fragment) in children.iter_mut() {
+    // Only a fragment whose position changes (bit for bit) unshares the
+    // list.
+    for i in 0..children.len() {
+        let (x, y, ref fragment) = children[i];
         let (dx, dy) = offset_of(fragment.index);
-        *x += dx;
-        *y += dy;
+        let (nx, ny) = (x + dx, y + dy);
+        if nx.to_bits() != x.to_bits() || ny.to_bits() != y.to_bits() {
+            let placed = &mut children[i];
+            placed.0 = nx;
+            placed.1 = ny;
+        }
     }
 }
 
@@ -3236,7 +3245,8 @@ fn layout_lines_uncached(
                     height: rect_height,
                     children: Default::default(),
                 },
-            )],
+            )]
+            .into(),
         });
     }
 
@@ -3304,7 +3314,7 @@ fn layout_lines_uncached(
                     max_line_width: 0.0,
                     last_baseline: LastBaseline::NoLines,
                     first_baseline: LastBaseline::NoLines,
-                    children: Vec::new(),
+                    children: Default::default(),
                 });
             }
             let ellipsis = text_intrinsic_size("\u{2026}", style).0;
@@ -3354,7 +3364,7 @@ fn layout_lines_uncached(
                 max_line_width: widest,
                 last_baseline: LastBaseline::At(ascent + single * (n - 1) as f32),
                 first_baseline: LastBaseline::At(ascent),
-                children: pieces,
+                children: pieces.into(),
             });
         }
         let lines = line_count as f32;
@@ -3382,7 +3392,8 @@ fn layout_lines_uncached(
                     height: inline_font_height(style),
                     children: Default::default(),
                 },
-            )],
+            )]
+            .into(),
         });
     }
 
@@ -4430,7 +4441,7 @@ fn layout_lines_uncached(
     Some(InlineResult {
         lines_used,
         height: top,
-        children: out,
+        children: out.into(),
         last_baseline: last_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
         first_baseline: first_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
         max_line_width,
