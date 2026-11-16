@@ -280,8 +280,20 @@ pub(crate) struct BoxFragment {
 /// NGPhysicalFragment is ref-counted and immutable once built: a cached
 /// NGLayoutResult hands out the same fragment tree). Copy-on-write: a
 /// mutable borrow of a shared list copies one level.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct FragmentChildren(std::rc::Rc<Vec<(f32, f32, BoxFragment)>>);
+
+impl Default for FragmentChildren {
+    /// Leaf fragments share one empty list (no allocation per leaf; the
+    /// first push copies it like any shared list).
+    fn default() -> Self {
+        thread_local! {
+            static EMPTY: std::rc::Rc<Vec<(f32, f32, BoxFragment)>> =
+                std::rc::Rc::new(Vec::new());
+        }
+        Self(EMPTY.with(std::rc::Rc::clone))
+    }
+}
 
 impl std::ops::Deref for FragmentChildren {
     type Target = Vec<(f32, f32, BoxFragment)>;

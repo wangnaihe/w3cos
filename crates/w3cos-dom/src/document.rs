@@ -383,7 +383,18 @@ impl MatchedPropertiesCache {
 #[derive(Default)]
 struct StyleForMemo {
     key: Option<(u64, u64, u64)>,
-    styles: HashMap<u32, w3cos_std::style::Style>,
+    /// FxHash for the integer node ids.
+    styles: w3cos_std::fxhash::FxHashMap<u32, w3cos_std::style::Style>,
+}
+
+/// The fields of a computed style that inline whitespace and boundary
+/// checks read.
+#[derive(Clone, Copy)]
+pub(crate) struct FlowStyle {
+    pub display: w3cos_std::style::Display,
+    pub float: w3cos_std::style::Float,
+    pub position: w3cos_std::style::Position,
+    pub white_space: w3cos_std::style::WhiteSpace,
 }
 
 /// Immutable, reference-counted computed style (Blink's scoped_refptr<const
@@ -5723,6 +5734,27 @@ impl Document {
     }
 
     pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+        self.with_computed_style_for(id, Clone::clone)
+    }
+
+    /// The flow-relevant fields of [`Self::computed_style_for`], read in
+    /// place from the per-epoch memo (no `Style` copy).
+    pub(crate) fn computed_flow_style(&self, id: NodeId) -> FlowStyle {
+        self.with_computed_style_for(id, |style| FlowStyle {
+            display: style.display,
+            float: style.float,
+            position: style.position,
+            white_space: style.white_space,
+        })
+    }
+
+    /// Run `read` on [`Self::computed_style_for`]'s style in the memo.
+    /// `read` must not reenter style resolution.
+    fn with_computed_style_for<R>(
+        &self,
+        id: NodeId,
+        read: impl FnOnce(&w3cos_std::style::Style) -> R,
+    ) -> R {
         let key = (
             self.style_revision_clock,
             stylesheet::generation(),
@@ -5738,7 +5770,7 @@ impl Document {
                 #[cfg(test)]
                 self.computed_style_cache_hits
                     .set(self.computed_style_cache_hits.get() + 1);
-                return style.clone();
+                return read(style);
             }
         }
         let mut ancestor_ids = Vec::new();
@@ -5774,11 +5806,8 @@ impl Document {
             inherited = Some(style);
         }
         let style = self.computed_style(id, &[], inherited.as_ref());
-        self.style_for_memo
-            .borrow_mut()
-            .styles
-            .insert(id.0, style.clone());
-        style
+        let mut memo = self.style_for_memo.borrow_mut();
+        read(memo.styles.entry(id.0).insert_entry(style).get())
     }
 
     /// Cascade one element from an already-computed parent style.
@@ -7638,7 +7667,7 @@ impl Document {
         let node = self.get_node(id);
         if node.node_type == NodeType::Text {
             if !matches!(
-                self.computed_style_for(id).white_space,
+                self.computed_flow_style(id).white_space,
                 w3cos_std::style::WhiteSpace::Normal
                     | w3cos_std::style::WhiteSpace::NoWrap
                     | w3cos_std::style::WhiteSpace::PreLine
@@ -7667,7 +7696,7 @@ impl Document {
                             return true;
                         }
                     } else if sibling.node_type == NodeType::Element {
-                        let style = self.computed_style_for(previous_id);
+                        let style = self.computed_flow_style(previous_id);
                         if style.display == w3cos_std::style::Display::None
                             || style.float != w3cos_std::style::Float::None
                             || matches!(
@@ -7690,7 +7719,7 @@ impl Document {
                 let Some(parent) = self.get_node(cursor).parent else {
                     break;
                 };
-                if self.computed_style_for(parent).display != w3cos_std::style::Display::Inline {
+                if self.computed_flow_style(parent).display != w3cos_std::style::Display::Inline {
                     break;
                 }
                 cursor = parent;
@@ -7698,7 +7727,7 @@ impl Document {
             return false;
         }
         if node.node_type != NodeType::Element
-            || self.computed_style_for(id).display != w3cos_std::style::Display::Inline
+            || self.computed_flow_style(id).display != w3cos_std::style::Display::Inline
         {
             return false;
         }
@@ -7707,7 +7736,7 @@ impl Document {
             let node = self.get_node(id);
             child = crate::node::sib(node.prev_sibling);
             if node.node_type == NodeType::Element {
-                let style = self.computed_style_for(id);
+                let style = self.computed_flow_style(id);
                 if style.display == w3cos_std::style::Display::None
                     || style.float != w3cos_std::style::Float::None
                     || matches!(
@@ -7752,7 +7781,7 @@ impl Document {
                 let sibling = self.get_node(previous_id);
                 previous = crate::node::sib(sibling.prev_sibling);
                 if sibling.node_type == NodeType::Element {
-                    let style = self.computed_style_for(previous_id);
+                    let style = self.computed_flow_style(previous_id);
                     if style.display == w3cos_std::style::Display::None
                         || style.float != w3cos_std::style::Float::None
                         || matches!(
@@ -7773,7 +7802,7 @@ impl Document {
             let Some(parent) = self.get_node(cursor).parent else {
                 break;
             };
-            if self.computed_style_for(parent).display != w3cos_std::style::Display::Inline {
+            if self.computed_flow_style(parent).display != w3cos_std::style::Display::Inline {
                 break;
             }
             cursor = parent;
@@ -7785,7 +7814,7 @@ impl Document {
         let node = self.get_node(id);
         if node.node_type == NodeType::Text {
             if !matches!(
-                self.computed_style_for(id).white_space,
+                self.computed_flow_style(id).white_space,
                 w3cos_std::style::WhiteSpace::Pre
                     | w3cos_std::style::WhiteSpace::PreWrap
                     | w3cos_std::style::WhiteSpace::PreLine
@@ -7800,7 +7829,7 @@ impl Document {
                 .ends_with(['\n', '\r']);
         }
         if node.node_type != NodeType::Element
-            || self.computed_style_for(id).display != w3cos_std::style::Display::Inline
+            || self.computed_flow_style(id).display != w3cos_std::style::Display::Inline
         {
             return false;
         }
@@ -7809,7 +7838,7 @@ impl Document {
             let child_node = self.get_node(child_id);
             child = crate::node::sib(child_node.prev_sibling);
             if child_node.node_type == NodeType::Element {
-                let style = self.computed_style_for(child_id);
+                let style = self.computed_flow_style(child_id);
                 if style.display == w3cos_std::style::Display::None
                     || style.float != w3cos_std::style::Float::None
                     || matches!(
@@ -7831,7 +7860,7 @@ impl Document {
         use w3cos_std::style::{Display, Float, Position};
         let mut preceding_space = false;
         loop {
-            if self.computed_style_for(inline_id).display != Display::Inline {
+            if self.computed_flow_style(inline_id).display != Display::Inline {
                 return false;
             }
             let mut sibling = crate::node::sib(self.get_node(inline_id).prev_sibling);
@@ -7845,7 +7874,7 @@ impl Document {
                         // collapsed separator. A following nowrap space owns
                         // its advance until line layout discards a line edge.
                         if !raw.is_empty()
-                            && self.computed_style_for(id).white_space
+                            && self.computed_flow_style(id).white_space
                                 == w3cos_std::style::WhiteSpace::Pre
                             && !raw.ends_with(['\n', '\r'])
                         {
@@ -7858,7 +7887,7 @@ impl Document {
                         && !self.inline_ends_with_collapsible_space(id)
                         && !self.inline_ends_with_forced_break(id);
                 } else if node.node_type == NodeType::Element {
-                    let style = self.computed_style_for(id);
+                    let style = self.computed_flow_style(id);
                     if style.display == Display::None
                         || style.float != Float::None
                         || matches!(style.position, Position::Absolute | Position::Fixed)
@@ -7886,7 +7915,7 @@ impl Document {
     fn inline_flow_continues_after(&self, mut inline_id: NodeId) -> bool {
         use w3cos_std::style::{Display, Float, Position};
         loop {
-            if self.computed_style_for(inline_id).display != Display::Inline {
+            if self.computed_flow_style(inline_id).display != Display::Inline {
                 return false;
             }
             let mut sibling = crate::node::sib(self.get_node(inline_id).next_sibling);
@@ -7902,7 +7931,7 @@ impl Document {
                         return true;
                     }
                 } else if node.node_type == NodeType::Element {
-                    let style = self.computed_style_for(id);
+                    let style = self.computed_flow_style(id);
                     if style.display == Display::None
                         || style.float != Float::None
                         || matches!(style.position, Position::Absolute | Position::Fixed)
@@ -16067,8 +16096,10 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
     };
     let can_flatten_painted = |child: &w3cos_std::Component| {
         let bordered = has_border(&child.style);
-        let mut principal = child.style.clone();
-        if bordered {
+        // (Only a bordered child is checked through a stripped principal
+        // copy; the copy is the cost of this walk otherwise.)
+        let principal = || {
+            let mut principal = child.style.clone();
             principal.background = w3cos_std::Color::TRANSPARENT;
             principal.padding = w3cos_std::style::Edges::ZERO;
             principal.margin = w3cos_std::style::Edges::ZERO;
@@ -16077,7 +16108,8 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             principal.border_right_width = Some(0.0);
             principal.border_bottom_width = Some(0.0);
             principal.border_left_width = Some(0.0);
-        }
+            principal
+        };
         child.style.display == Display::Inline
             && child.style.position == Position::Static
             && child.style.float == w3cos_std::style::Float::None
@@ -16087,7 +16119,7 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 | w3cos_std::style::AlignSelf::Baseline)
             && matches!(child.style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
             && if bordered {
-                principal_box_can_merge_generated_inline_text(&principal)
+                principal_box_can_merge_generated_inline_text(&principal())
             } else {
                 painted_inline_text_box_can_merge(&child.style)
             }

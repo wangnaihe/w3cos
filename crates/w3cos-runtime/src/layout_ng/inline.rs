@@ -1763,7 +1763,7 @@ thread_local! {
 type ItemsByFp = w3cos_std::fxhash::FxHashMap<u64, (usize, std::rc::Rc<Vec<InlineItem>>)>;
 
 /// The items an IFC with fingerprint `fp` had, moved to flat `index`.
-fn reuse_items(fp: u64, index: usize) -> Option<Vec<InlineItem>> {
+fn reuse_items(fp: u64, index: usize) -> Option<std::rc::Rc<Vec<InlineItem>>> {
     ITEMS.with(|items| {
         let mut items = items.borrow_mut();
         let [current, last] = &mut *items;
@@ -1775,9 +1775,13 @@ fn reuse_items(fp: u64, index: usize) -> Option<Vec<InlineItem>> {
                 entry
             }
         };
-        let mut kept = (*kept).clone();
         let delta = index as isize - base as isize;
-        if delta != 0 {
+        if delta == 0 {
+            // Same position: share the kept list (copied on first split).
+            return Some(kept);
+        }
+        let mut kept = (*kept).clone();
+        {
             let moved = |i: usize| (i as isize + delta) as usize;
             for item in &mut kept {
                 item.index = moved(item.index);
@@ -1786,17 +1790,17 @@ fn reuse_items(fp: u64, index: usize) -> Option<Vec<InlineItem>> {
                 }
             }
         }
-        Some(kept)
+        Some(std::rc::Rc::new(kept))
     })
 }
 
-fn keep_items(fp: u64, index: usize, kept: &[InlineItem]) {
+fn keep_items(fp: u64, index: usize, kept: &std::rc::Rc<Vec<InlineItem>>) {
     ITEMS.with(|items| {
         let mut items = items.borrow_mut();
         if items[0].len() > 1 << 16 {
             items[0].clear();
         }
-        items[0].insert(fp, (index, std::rc::Rc::new(kept.to_vec())));
+        items[0].insert(fp, (index, kept.clone()));
     });
 }
 
@@ -3497,6 +3501,7 @@ fn layout_lines(
         }
 
         mark_hanging_last(flat, &mut items);
+        let items = std::rc::Rc::new(items);
         if let Some(fp) = fp
             && items.iter().all(|item| item.atomic.is_none())
         {
@@ -3572,8 +3577,9 @@ fn layout_lines(
                 line_width_of(&probe) <= available + EPSILON
             });
             if let Some((a, b)) = split {
-                items[i] = a;
-                items.insert(i + 1, b);
+                let list = std::rc::Rc::make_mut(&mut items);
+                list[i] = a;
+                list.insert(i + 1, b);
                 items_generation += 1;
                 current.push(i);
                 lines.push(std::mem::take(&mut current));
@@ -3681,8 +3687,9 @@ fn layout_lines(
             // The line ends inside current[p]; its rest and the items after
             // it start the next line, which retries the overflowing item.
             let k = current[p];
-            items[k] = a;
-            items.insert(k + 1, b);
+            let list = std::rc::Rc::make_mut(&mut items);
+            list[k] = a;
+            list.insert(k + 1, b);
             items_generation += 1;
             let rest: Vec<usize> = std::iter::once(k + 1)
                 .chain(current[p + 1..].iter().map(|&r| r + 1))
