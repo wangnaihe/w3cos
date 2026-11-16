@@ -365,6 +365,11 @@ struct RetainedMarkers {
     markers: Vec<(usize, &'static str)>,
     contexts: Vec<usize>,
     floats: Vec<usize>,
+    /// (DOM id, box) for every box whose `host` or `owner` is that id,
+    /// sorted: built on the second refresh (one refresh is not worth a
+    /// sort); empty means scan every box.
+    by_id: Vec<(u32, u32)>,
+    refreshes: u32,
 }
 
 thread_local! {
@@ -459,6 +464,8 @@ fn retain_markers(flat: &[FlatNodeInfo<'_>], key: (u64, u64)) -> RetainedMarkers
         markers,
         contexts,
         floats,
+        by_id: Vec::new(),
+        refreshes: 0,
     }
 }
 
@@ -466,7 +473,7 @@ fn retain_markers(flat: &[FlatNodeInfo<'_>], key: (u64, u64)) -> RetainedMarkers
 /// lowering produced below them); `None` when a role changed.
 fn refresh_markers(
     flat: &[FlatNodeInfo<'_>],
-    retained: RetainedMarkers,
+    mut retained: RetainedMarkers,
     ids: &[u32],
 ) -> Option<RetainedMarkers> {
     if ids.is_empty() {
@@ -475,8 +482,12 @@ fn refresh_markers(
     if ids.len() > 8 {
         return None;
     }
+    if retained.by_id.is_empty() && retained.refreshes > 0 {
+        retained.by_id = ids_index(&retained.host, &retained.owner);
+    }
+    retained.refreshes = retained.refreshes.saturating_add(1);
     let mut dirty = Vec::new();
-    for index in 0..flat.len() {
+    let visit = |index: usize, dirty: &mut Vec<usize>| {
         if retained.owner[index].is_some_and(|id| ids.contains(&id)) {
             dirty.push(index);
         }
@@ -493,6 +504,37 @@ fn refresh_markers(
                 }
             }
         }
+    };
+    if retained.by_id.is_empty() {
+        for index in 0..flat.len() {
+            visit(index, &mut dirty);
+        }
+    } else {
+        // Only boxes whose host or owner is restyled add anything to the
+        // scan; visit them in its order.
+        let mut boxes = Vec::new();
+        for &id in ids {
+            let start = retained.by_id.partition_point(|&(key, _)| key < id);
+            boxes.extend(
+                retained.by_id[start..]
+                    .iter()
+                    .take_while(|&&(key, _)| key == id)
+                    .map(|&(_, index)| index as usize),
+            );
+        }
+        boxes.sort_unstable();
+        boxes.dedup();
+        for index in boxes {
+            visit(index, &mut dirty);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut scan = Vec::new();
+            for index in 0..flat.len() {
+                visit(index, &mut scan);
+            }
+            debug_assert_eq!(dirty, scan);
+        }
     }
     for index in dirty {
         let node = &flat[index];
@@ -501,6 +543,24 @@ fn refresh_markers(
         }
     }
     Some(retained)
+}
+
+/// `RetainedMarkers::by_id` for these per-box ids.
+fn ids_index(host: &[Option<u32>], owner: &[Option<u32>]) -> Vec<(u32, u32)> {
+    let mut by_id = Vec::with_capacity(host.len());
+    for (index, (host, owner)) in host.iter().zip(owner).enumerate() {
+        let index = index as u32;
+        if let Some(id) = *host {
+            by_id.push((id, index));
+        }
+        if let Some(id) = *owner
+            && *owner != *host
+        {
+            by_id.push((id, index));
+        }
+    }
+    by_id.sort_unstable();
+    by_id
 }
 
 /// [`project`] for the LayoutNG flush, reusing the retained marker roles on
