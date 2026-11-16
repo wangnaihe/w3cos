@@ -1760,14 +1760,119 @@ thread_local! {
     static ITEMS: std::cell::RefCell<[ItemsByFp; 2]> = Default::default();
 }
 
-type ItemsByFp = w3cos_std::fxhash::FxHashMap<u64, (usize, std::rc::Rc<Vec<InlineItem>>)>;
+type ItemsByFp =
+    w3cos_std::fxhash::FxHashMap<u64, (usize, std::rc::Rc<Vec<InlineItem>>, std::rc::Rc<Prelude>)>;
+
+/// The IFC's inline structure (NGInlineNode CollectInlines): its leaves,
+/// the inline boxes opened before / closed after each, and each leaf's
+/// top/bottom-aligned root and vertical-align parent. Like the items it
+/// depends only on the subtree, so a kept IFC reuses it.
+struct Prelude {
+    entry_count: usize,
+    children: Vec<usize>,
+    opens: Vec<Vec<usize>>,
+    closes: Vec<Vec<usize>>,
+    aligned: Vec<Option<(usize, bool)>>,
+    parents: Vec<Option<usize>>,
+    /// A leaf placed in visual order (bidi fragments).
+    fragments: bool,
+    /// A text leaf holding a tab.
+    any_tab: bool,
+}
+
+impl Prelude {
+    fn build(flat: &[FlatNodeInfo], index: usize) -> Option<Self> {
+        let entries = collect_inlines(flat, index);
+        let children: Vec<usize> = entries
+            .iter()
+            .filter_map(|e| match *e {
+                InlineEntry::Leaf(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        // Each leaf's open tags before it (outer first) and close tags after
+        // it (inner first).
+        let mut opens: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
+        let mut closes: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
+        let mut aligned: Vec<Option<(usize, bool)>> = vec![None; children.len()];
+        // Each leaf's innermost inline box (its vertical-align parent).
+        let mut parents: Vec<Option<usize>> = vec![None; children.len()];
+        let mut leaf = 0;
+        let mut pending = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for entry in &entries {
+            match *entry {
+                InlineEntry::Open(b) => {
+                    pending.push(b);
+                    stack.push(b);
+                }
+                InlineEntry::Leaf(c) => {
+                    opens[leaf] = std::mem::take(&mut pending);
+                    parents[leaf] = stack.last().copied();
+                    aligned[leaf] = stack
+                        .iter()
+                        .chain(std::iter::once(&c))
+                        .find_map(|&n| line_relative_align(flat[n].style).map(|top| (n, top)));
+                    leaf += 1;
+                }
+                InlineEntry::Close(b) => {
+                    if leaf == 0 {
+                        return super::bail("inline-empty-box");
+                    }
+                    closes[leaf - 1].push(b);
+                    stack.pop();
+                }
+            }
+        }
+        if !pending.is_empty() {
+            return super::bail("inline-unclosed");
+        }
+        let fragments = children.iter().any(|&c| bidi_fragment(flat[c].style));
+        let any_tab = children.iter().any(
+            |&c| matches!(&flat[c].kind, ComponentKind::Text { content } if content.contains('\t')),
+        );
+        Some(Self {
+            entry_count: entries.len(),
+            fragments,
+            any_tab,
+            children,
+            opens,
+            closes,
+            aligned,
+            parents,
+        })
+    }
+
+    /// The same structure with every flat index moved by `delta`.
+    fn moved(&self, delta: isize) -> Self {
+        let m = |i: usize| (i as isize + delta) as usize;
+        let ms = |v: &Vec<usize>| v.iter().map(|&i| m(i)).collect::<Vec<_>>();
+        Self {
+            entry_count: self.entry_count,
+            children: ms(&self.children),
+            opens: self.opens.iter().map(ms).collect(),
+            closes: self.closes.iter().map(ms).collect(),
+            aligned: self
+                .aligned
+                .iter()
+                .map(|a| a.map(|(n, t)| (m(n), t)))
+                .collect(),
+            parents: self.parents.iter().map(|p| p.map(m)).collect(),
+            fragments: self.fragments,
+            any_tab: self.any_tab,
+        }
+    }
+}
 
 /// The items an IFC with fingerprint `fp` had, moved to flat `index`.
-fn reuse_items(fp: u64, index: usize) -> Option<std::rc::Rc<Vec<InlineItem>>> {
+fn reuse_items(
+    fp: u64,
+    index: usize,
+) -> Option<(std::rc::Rc<Vec<InlineItem>>, std::rc::Rc<Prelude>)> {
     ITEMS.with(|items| {
         let mut items = items.borrow_mut();
         let [current, last] = &mut *items;
-        let (base, kept) = match current.get(&fp) {
+        let (base, kept, prelude) = match current.get(&fp) {
             Some(entry) => entry.clone(),
             None => {
                 let entry = last.get(&fp)?.clone();
@@ -1778,7 +1883,7 @@ fn reuse_items(fp: u64, index: usize) -> Option<std::rc::Rc<Vec<InlineItem>>> {
         let delta = index as isize - base as isize;
         if delta == 0 {
             // Same position: share the kept list (copied on first split).
-            return Some(kept);
+            return Some((kept, prelude));
         }
         let mut kept = (*kept).clone();
         {
@@ -1790,17 +1895,25 @@ fn reuse_items(fp: u64, index: usize) -> Option<std::rc::Rc<Vec<InlineItem>>> {
                 }
             }
         }
-        Some(std::rc::Rc::new(kept))
+        Some((
+            std::rc::Rc::new(kept),
+            std::rc::Rc::new(prelude.moved(delta)),
+        ))
     })
 }
 
-fn keep_items(fp: u64, index: usize, kept: &std::rc::Rc<Vec<InlineItem>>) {
+fn keep_items(
+    fp: u64,
+    index: usize,
+    kept: &std::rc::Rc<Vec<InlineItem>>,
+    prelude: &std::rc::Rc<Prelude>,
+) {
     ITEMS.with(|items| {
         let mut items = items.borrow_mut();
         if items[0].len() > 1 << 16 {
             items[0].clear();
         }
-        items[0].insert(fp, (index, kept.clone()));
+        items[0].insert(fp, (index, kept.clone(), prelude.clone()));
     });
 }
 
@@ -2980,54 +3093,27 @@ fn layout_lines(
     let available = space.available_inline;
     let container = flat[index].style;
     let quirks = quirks_mode(flat);
-    let entries = collect_inlines(flat, index);
-    let children: Vec<usize> = entries
-        .iter()
-        .filter_map(|e| match *e {
-            InlineEntry::Leaf(c) => Some(c),
-            _ => None,
-        })
-        .collect();
-    let has_boxes = children.len() != entries.len();
-    // Each leaf's open tags before it (outer first) and close tags after it
-    // (inner first).
-    let mut opens: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
-    let mut closes: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
-    let mut aligned: Vec<Option<(usize, bool)>> = vec![None; children.len()];
-    // Each leaf's innermost inline box (its vertical-align parent).
-    let mut parents: Vec<Option<usize>> = vec![None; children.len()];
-    {
-        let mut leaf = 0;
-        let mut pending = Vec::new();
-        let mut stack: Vec<usize> = Vec::new();
-        for entry in &entries {
-            match *entry {
-                InlineEntry::Open(b) => {
-                    pending.push(b);
-                    stack.push(b);
-                }
-                InlineEntry::Leaf(c) => {
-                    opens[leaf] = std::mem::take(&mut pending);
-                    parents[leaf] = stack.last().copied();
-                    aligned[leaf] = stack
-                        .iter()
-                        .chain(std::iter::once(&c))
-                        .find_map(|&n| line_relative_align(flat[n].style).map(|top| (n, top)));
-                    leaf += 1;
-                }
-                InlineEntry::Close(b) => {
-                    if leaf == 0 {
-                        return super::bail("inline-empty-box");
-                    }
-                    closes[leaf - 1].push(b);
-                    stack.pop();
-                }
-            }
-        }
-        if !pending.is_empty() {
-            return super::bail("inline-unclosed");
-        }
-    }
+    // NGInlineNodeData: the IFC's items and inline structure depend on its
+    // content and styles, not on the space it is laid out in (atomic
+    // inlines aside), so a box whose subtree inputs are unchanged reuses
+    // them and only breaks lines again (a resize).
+    let fp = super::cache::retained_fp(flat, index);
+    let reused = fp.and_then(|fp| reuse_items(fp, index));
+    let prelude = match &reused {
+        Some((_, prelude)) => prelude.clone(),
+        None => std::rc::Rc::new(Prelude::build(flat, index)?),
+    };
+    let Prelude {
+        entry_count,
+        ref children,
+        ref opens,
+        ref closes,
+        ref aligned,
+        ref parents,
+        fragments,
+        any_tab,
+    } = *prelude;
+    let has_boxes = children.len() != entry_count;
     let start_edges = |boxes: &[usize]| -> f32 {
         boxes
             .iter()
@@ -3245,7 +3331,6 @@ fn layout_lines(
     // script gate rejects, resolves to level 0 throughout).
     // Visual-order fragments are placed in the given order (one line per
     // estimated line: a soft wrap here falls back below).
-    let fragments = children.iter().any(|&c| bidi_fragment(flat[c].style));
     let levels = if container.direction == TextDirection::Rtl && !fragments {
         leaf_bidi_levels(flat, &children, container).ok()?
     } else {
@@ -3257,13 +3342,7 @@ fn layout_lines(
     }
     // CollectInlines: group word pieces into authored runs and shape each
     // run once.
-    // NGInlineNodeData: the IFC's items depend on its content and styles,
-    // not on the space it is laid out in (atomic inlines aside), so a box
-    // whose subtree inputs are unchanged reuses them and only breaks lines
-    // again (a resize).
-    let fp = super::cache::retained_fp(flat, index);
-    let reused = fp.and_then(|fp| reuse_items(fp, index));
-    let mut items = if let Some(items) = reused {
+    let mut items = if let Some((items, _)) = reused {
         items
     } else {
         let mut items: Vec<InlineItem> = Vec::with_capacity(children.len());
@@ -3503,7 +3582,7 @@ fn layout_lines(
         if let Some(fp) = fp
             && items.iter().all(|item| item.atomic.is_none())
         {
-            keep_items(fp, index, &items);
+            keep_items(fp, index, &items, &prelude);
         }
         items
     };
@@ -3743,8 +3822,9 @@ fn layout_lines(
         matches!(&flat[items[*i].index].kind, ComponentKind::Text { content }
             if content.contains('\t'))
     };
-    if lines.iter().skip(1).flatten().any(has_tab)
-        || (floats.is_some() && lines.iter().flatten().any(has_tab))
+    if any_tab
+        && (lines.iter().skip(1).flatten().any(has_tab)
+            || (floats.is_some() && lines.iter().flatten().any(has_tab)))
     {
         return super::bail("text:tab-wrapped");
     }
@@ -4058,7 +4138,7 @@ fn layout_lines(
     let mut top = 0.0f32;
     let mut first_line_baseline = None;
     let mut last_line_baseline = None;
-    let mut out = Vec::with_capacity(items.len() + entries.len() - children.len());
+    let mut out = Vec::with_capacity(items.len() + entry_count - children.len());
     // (line, inline offset, width, baseline) of each placed item.
     // Keyed by leaf position: the first piece of a split leaf opens its
     // boxes, the last one closes them.
