@@ -45,7 +45,7 @@ fn has_marker(style: &Style, key: &str) -> bool {
     style
         .custom_properties
         .as_ref()
-        .is_some_and(|props| props.contains_key(key))
+        .is_some_and(|props| props.may_contain(key) && props.contains_key(key))
 }
 
 pub(super) const IFC_MARKER: &str = "--w3cos-internal-inline-formatting-context";

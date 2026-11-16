@@ -381,10 +381,10 @@ pub(super) fn block_unicode_bidi_ok(style: &Style) -> bool {
 /// carriers and the markers the current stage interprets (`allowed`).
 /// The DOM's mark on a fieldset's first legend child (HTML §15.3.13).
 fn is_rendered_legend(style: &Style) -> bool {
-    style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key("--w3cos-internal-rendered-legend"))
+    style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain("--w3cos-internal-rendered-legend")
+            && props.contains_key("--w3cos-internal-rendered-legend")
+    })
 }
 
 pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'static str> {
@@ -433,10 +433,11 @@ pub(super) const FLOAT_GROUP_MARKERS: [&str; 2] = [
 ];
 
 pub(super) fn is_float_group(style: &Style) -> bool {
-    style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| FLOAT_GROUP_MARKERS.iter().any(|m| props.contains_key(*m)))
+    style.custom_properties.as_ref().is_some_and(|props| {
+        FLOAT_GROUP_MARKERS
+            .iter()
+            .any(|m| props.may_contain(m) && props.contains_key(*m))
+    })
 }
 
 fn float_group_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -3564,10 +3565,10 @@ fn intrinsic_sizes_uncached(
 /// Percentage basis that a box gives its in-flow children: its definite
 /// content height after min/max (CSS 2.1 10.5), or `None`.
 fn child_percentage_block(style: &Style, space: &ConstraintSpace) -> Option<f32> {
-    let anonymous_block = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
+    let anonymous_block = style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain(inline::ANONYMOUS_BLOCK_MARKER)
+            && props.contains_key(inline::ANONYMOUS_BLOCK_MARKER)
+    });
     if anonymous_block {
         return space.percentage_block;
     }
@@ -4792,11 +4793,10 @@ pub(super) fn layout_block_in(
     // line-height` so its flex-row form keeps the initial strut.  The NG
     // line box already contains that strut (in LayoutUnits), so the
     // synthetic floor is not a real constraint here.
-    let synthetic_strut_floor = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(inline::IFC_MARKER))
-        && style.min_height == Dimension::Px(style.font_size * style.line_height)
+    let synthetic_strut_floor = style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain(inline::IFC_MARKER) && props.contains_key(inline::IFC_MARKER)
+    }) && style.min_height
+        == Dimension::Px(style.font_size * style.line_height)
         && style.height == Dimension::Auto
         && style.max_height == Dimension::Auto;
     let min_h = if synthetic_strut_floor {
@@ -4887,10 +4887,10 @@ pub(super) fn layout_block_in(
             }
         }
     }
-    let anonymous_block = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
+    let anonymous_block = style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain(inline::ANONYMOUS_BLOCK_MARKER)
+            && props.contains_key(inline::ANONYMOUS_BLOCK_MARKER)
+    });
     // Multicol: children size against the used column width; the principal
     // box keeps the full content width (paint projects fragments).
     let column_width = super::columns::establishes(style)
