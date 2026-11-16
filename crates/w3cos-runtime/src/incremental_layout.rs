@@ -89,6 +89,69 @@ impl RetainedTree {
     }
 }
 
+impl RetainedTree {
+    /// Run `edit` on the box at `path` (child positions from the root),
+    /// keeping the flat view. `edit` may change the box's own fields but
+    /// not its children. The walk reaches the box through raw pointers and
+    /// each child list's buffer pointer (`Vec::as_mut_ptr` makes no slice
+    /// reference), so only the boxes on the path were accessed uniquely:
+    /// their entries are rebuilt, every other entry stays valid.
+    fn edit_at(&mut self, path: &[u32], edit: impl FnOnce(&mut Component)) -> bool {
+        let indices = self.flat.as_ref().and_then(|(_, flat)| {
+            let mut indices = Vec::with_capacity(path.len() + 1);
+            let mut index = 0;
+            indices.push(index);
+            for &at in path {
+                let end = flat.get(index)?.subtree_end;
+                let mut child = index + 1;
+                for _ in 0..at {
+                    child = flat.get(child).filter(|_| child < end)?.subtree_end;
+                }
+                if child >= end {
+                    return None;
+                }
+                index = child;
+                indices.push(index);
+            }
+            Some(indices)
+        });
+        let Some(indices) = indices else {
+            return component_at_mut(self, path).map(edit).is_some();
+        };
+        let mut nodes = Vec::with_capacity(indices.len());
+        let mut node = self.root.as_ptr();
+        // SAFETY: the flat view mirrors the tree (it is dropped on any other
+        // edit), so `path` names live boxes: `indices` found each step
+        // inside its parent's subtree. No reference to a child list's
+        // elements is made, only to the boxes on the path.
+        unsafe {
+            nodes.push(node);
+            for &at in path {
+                node = (*node).children.as_mut_ptr().add(at as usize);
+                nodes.push(node);
+            }
+            let children = ((*node).children.as_ptr(), (*node).children.len());
+            edit(&mut *node);
+            if children != ((*node).children.as_ptr(), (*node).children.len()) {
+                // (Not an in-place restyle: flatten again.)
+                self.flat = None;
+                return true;
+            }
+            let flat = &mut self.flat.as_mut().expect("flat view").1;
+            for (&index, &node) in indices.iter().zip(&nodes) {
+                let node: &'static Component = &*node;
+                let entry = &mut flat[index];
+                entry.component = Some(node);
+                entry.kind = &node.kind;
+                entry.style = node.style.as_style();
+                entry.on_click = &node.on_click;
+                entry.sticky_counter_signal = node.sticky_counter_signal;
+            }
+        }
+        true
+    }
+}
+
 impl std::ops::Deref for RetainedTree {
     type Target = Component;
     fn deref(&self) -> &Component {
@@ -788,7 +851,7 @@ fn patch_and_compute(
         settle_client_rects(&cache.component);
     }
     for (id, style) in &styles {
-        if !assign_located(key, &mut cache.component, *id, style) {
+        if !assign_retained(key, &mut cache.component, *id, style) {
             return false;
         }
     }
@@ -836,10 +899,17 @@ fn patch_and_compute(
     }
     let phase = phase_log_enabled();
     let flatten_started = std::time::Instant::now();
-    let flat = crate::layout::pre_flatten_keyed(
-        &cache.component,
-        crate::layout_ng::box_tree_enabled().then_some((cache.structure, cache.source_structure)),
-    );
+    let fresh;
+    let (component, flat) = if crate::layout_ng::box_tree_enabled() {
+        // (See `recompute`.)
+        crate::layout_ng::forget_walk_fingerprints();
+        cache
+            .component
+            .flat((cache.structure, cache.source_structure))
+    } else {
+        fresh = pre_flatten(&cache.component);
+        (&*cache.component, &fresh[..])
+    };
     let flatten_us = flatten_started.elapsed().as_micros();
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
@@ -850,10 +920,10 @@ fn patch_and_compute(
     if flat.len() != cache.node_ids.len() {
         return false;
     }
-    configure_engine(&mut cache.engine, &cache.component);
+    configure_engine(&mut cache.engine, component);
     if !patch_pending(
         &mut cache.engine,
-        &cache.component,
+        component,
         &cache.node_ids,
         &mut cache.engine_pending,
         viewport_w,
@@ -873,10 +943,10 @@ fn patch_and_compute(
         }
     }
     let compute_started = std::time::Instant::now();
-    crate::layout_ng::set_patch_hint(Some((&flat, (cache.structure, cache.source_structure))));
+    crate::layout_ng::set_patch_hint(Some((flat, (cache.structure, cache.source_structure))));
     let computed = cache
         .engine
-        .compute(&cache.component, &flat, viewport_w, viewport_h);
+        .compute(component, &flat, viewport_w, viewport_h);
     crate::layout_ng::set_patch_hint(None);
     let Ok(results) = computed else {
         return false;
@@ -2066,6 +2136,22 @@ fn assign_located(
     };
     assign_style_here(found, id, style);
     true
+}
+
+/// [`assign_located`] on the retained tree, keeping its flat view.
+fn assign_retained(
+    key: (u64, u64),
+    tree: &mut RetainedTree,
+    id: u32,
+    style: &w3cos_std::style::Style,
+) -> bool {
+    if !crate::layout_ng::box_tree_enabled() {
+        return assign_located(key, tree, id, style);
+    }
+    let Some(path) = style_path(key, tree, id) else {
+        return false;
+    };
+    tree.edit_at(&path, |found| assign_style_here(found, id, style))
 }
 
 fn assign_style_here(component: &mut Component, id: u32, style: &w3cos_std::style::Style) {
@@ -3464,5 +3550,101 @@ mod paint_layout_tests {
             w3cos_std::color::Color::from_css("purple").expect("purple")
         );
         assert_ne!(directed_style.direction, first_style.direction);
+    }
+}
+
+#[cfg(test)]
+mod retained_tree_tests {
+    use super::RetainedTree;
+    use w3cos_std::Component;
+    use w3cos_std::style::{Dimension, Style};
+
+    type Entry = (
+        usize,
+        u64,
+        usize,
+        usize,
+        usize,
+        Option<usize>,
+        Option<usize>,
+        usize,
+    );
+
+    fn entries(flat: &[crate::layout::FlatNodeInfo<'_>]) -> Vec<Entry> {
+        flat.iter()
+            .map(|info| {
+                (
+                    info.component.map_or(0, |c| c as *const Component as usize),
+                    info.stable_id,
+                    info.kind as *const _ as usize,
+                    info.style as *const _ as usize,
+                    info.on_click as *const _ as usize,
+                    info.sticky_counter_signal,
+                    info.parent,
+                    info.subtree_end,
+                )
+            })
+            .collect()
+    }
+
+    fn fresh(tree: &RetainedTree, key: (u64, u64)) -> Vec<Entry> {
+        entries(&crate::layout::pre_flatten_keyed(tree, Some(key)))
+    }
+
+    fn sized(width: f32) -> Style {
+        Style {
+            width: Dimension::Px(width),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn retained_flat_view_follows_every_edit() {
+        let key = (7, 9);
+        let mut tree = RetainedTree::new(Component::column(
+            Style::default(),
+            vec![
+                Component::row(
+                    Style::default(),
+                    vec![
+                        Component::text("a", Style::default()),
+                        Component::text("b", Style::default()),
+                    ],
+                ),
+                Component::column(
+                    Style::default(),
+                    vec![Component::text("c", Style::default())],
+                ),
+            ],
+        ));
+        let kept = tree.flat(key).1.as_ptr() as usize;
+        assert_eq!(entries(tree.flat(key).1), fresh(&tree, key));
+        assert_eq!(tree.flat(key).1.as_ptr() as usize, kept);
+
+        // An in-place restyle keeps the view and rebuilds the path entries.
+        assert!(tree.edit_at(&[1, 0], |node| node.style = sized(5.0).into()));
+        let (_, flat) = tree.flat(key);
+        assert_eq!(flat.as_ptr() as usize, kept);
+        assert_eq!(flat[5].style.width, Dimension::Px(5.0));
+        assert_eq!(entries(flat), fresh(&tree, key));
+        assert!(tree.edit_at(&[], |node| node.style = sized(9.0).into()));
+        assert_eq!(entries(tree.flat(key).1), fresh(&tree, key));
+
+        // A path the tree does not have edits nothing.
+        assert!(!tree.edit_at(&[0, 2], |node| node.style = sized(1.0).into()));
+        assert_eq!(entries(tree.flat(key).1), fresh(&tree, key));
+
+        // An edit of the children, by either route, flattens again.
+        assert!(tree.edit_at(&[0], |node| {
+            node.children.push(Component::text("d", Style::default()))
+        }));
+        assert_eq!(tree.flat(key).1.len(), 7);
+        assert_eq!(entries(tree.flat(key).1), fresh(&tree, key));
+        tree.children[1].children.clear();
+        assert_eq!(tree.flat(key).1.len(), 6);
+        assert_eq!(entries(tree.flat(key).1), fresh(&tree, key));
+
+        // A new structure key flattens again.
+        assert_eq!(entries(tree.flat((7, 10)).1), fresh(&tree, (7, 10)));
     }
 }
