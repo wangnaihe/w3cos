@@ -494,13 +494,46 @@ pub(crate) fn resolved_font_geometry(style: &Style) -> Option<ResolvedFontGeomet
         .map(|(_, face)| face)
         .or(generic.as_ref())
         .or(intrinsic.as_ref())?;
-    let face = if registered.is_none() {
-        typeface_for_character(face, 'x', style.font_weight)
+    let metrics = if registered.is_none() {
+        primary_x_font_geometry(face, style.font_weight, style.font_size)
     } else {
-        face.clone()
+        typeface_font_geometry(face, style.font_size)
     };
-    let metrics = typeface_font_geometry(&face, style.font_size);
     (metrics.height().is_finite() && metrics.height() > 0.0).then_some(metrics)
+}
+
+thread_local! {
+    static PRIMARY_X_GEOMETRY_CACHE: RefCell<
+        w3cos_std::fxhash::FxHashMap<(u32, u16, u32), ResolvedFontGeometry>,
+    > = RefCell::new(Default::default());
+}
+
+/// Geometry of the face that renders 'x' for an unregistered primary.
+///
+/// `typeface_for_character` depends only on the primary face, the character
+/// and the weight, and Skia never reuses a typeface id, so the resolved
+/// geometry is memoized per primary id, weight and size. This skips the
+/// per-call cmap lookup and typeface reference churn on every strut query.
+fn primary_x_font_geometry(
+    primary: &Typeface,
+    font_weight: u16,
+    size: f32,
+) -> ResolvedFontGeometry {
+    let key = (primary.unique_id(), font_weight, size.to_bits());
+    if let Some(metrics) = PRIMARY_X_GEOMETRY_CACHE.with(|cache| cache.borrow().get(&key).copied())
+    {
+        return metrics;
+    }
+    let face = typeface_for_character(primary, 'x', font_weight);
+    let metrics = typeface_font_geometry(&face, size);
+    PRIMARY_X_GEOMETRY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key, metrics);
+    });
+    metrics
 }
 
 /// Normal lines include the concrete fallback faces used by glyph shaping,
@@ -6410,18 +6443,35 @@ fn fallback_font_runs<'a>(
     primary: &Typeface,
     font_weight: u16,
 ) -> Vec<FallbackFontRun<'a>> {
+    // At the default weight a character the primary maps is the primary
+    // (see `typeface_for_character`). Look the whole run up in one cmap call
+    // instead of one call, and one typeface reference, per character.
+    let primary_id = primary.unique_id();
+    let mut primary_glyphs = Vec::new();
+    if font_weight == 400 {
+        let unichars: Vec<i32> = text.chars().map(|c| c as i32).collect();
+        primary_glyphs = vec![0; unichars.len()];
+        primary.unichars_to_glyphs(&unichars, &mut primary_glyphs);
+    }
     let mut runs = Vec::new();
     let mut run_start = 0;
-    let mut run_typeface = primary.clone();
-    let mut run_typeface_id = primary.unique_id();
+    // `None` stands for the primary face itself.
+    let mut run_typeface: Option<Typeface> = None;
+    let mut run_typeface_id = primary_id;
 
-    for (offset, character) in text.char_indices() {
-        let typeface = typeface_for_character(primary, character, font_weight);
-        let typeface_id = typeface.unique_id();
+    for (index, (offset, character)) in text.char_indices().enumerate() {
+        let (typeface, typeface_id) = if primary_glyphs.get(index).is_some_and(|glyph| *glyph != 0)
+        {
+            (None, primary_id)
+        } else {
+            let typeface = typeface_for_character(primary, character, font_weight);
+            let typeface_id = typeface.unique_id();
+            (Some(typeface), typeface_id)
+        };
         if offset > run_start && typeface_id != run_typeface_id {
             runs.push(FallbackFontRun {
                 text: &text[run_start..offset],
-                typeface: run_typeface,
+                typeface: run_typeface.unwrap_or_else(|| primary.clone()),
             });
             run_start = offset;
             run_typeface = typeface;
@@ -6434,7 +6484,7 @@ fn fallback_font_runs<'a>(
     if run_start < text.len() {
         runs.push(FallbackFontRun {
             text: &text[run_start..],
-            typeface: run_typeface,
+            typeface: run_typeface.unwrap_or_else(|| primary.clone()),
         });
     }
     runs
