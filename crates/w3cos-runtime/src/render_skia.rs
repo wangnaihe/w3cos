@@ -1512,23 +1512,45 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         }
         let mut pictures = Vec::with_capacity(cache.tree.layers.len());
         let mut glyph_clip_decisions = Vec::with_capacity(cache.tree.layers.len());
+        let keep: Vec<bool> = (0..cache.tree.layers.len())
+            .map(|layer_index| {
+                reusable
+                    && glyph_clip_decisions_match(
+                        &cache.glyph_clip_decisions[layer_index],
+                        glyph_clips[layer_index],
+                    )
+            })
+            .collect();
+        // Bucket the frame's nodes by layer in one pass (frame order kept),
+        // instead of scanning every layer's client list per node.
+        let mut layer_of: HashMap<usize, Vec<usize>> = HashMap::new();
         for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
-            if reusable
-                && glyph_clip_decisions_match(
-                    &cache.glyph_clip_decisions[layer_index],
-                    glyph_clips[layer_index],
-                )
-            {
+            if keep[layer_index] {
+                continue;
+            }
+            for &client in &layer.client_indices {
+                let layers = layer_of.entry(client).or_default();
+                if layers.last() != Some(&layer_index) {
+                    layers.push(layer_index);
+                }
+            }
+        }
+        let mut nodes_by_layer: Vec<Vec<(usize, LayoutRect, &ComponentKind, &Style)>> =
+            vec![Vec::new(); cache.tree.layers.len()];
+        for node in frame.nodes.iter().copied() {
+            if let Some(layers) = layer_of.get(&node.0) {
+                for &layer_index in layers {
+                    nodes_by_layer[layer_index].push(node);
+                }
+            }
+        }
+        for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
+            if keep[layer_index] {
                 pictures.push(cache.pictures[layer_index].clone());
                 glyph_clip_decisions.push(cache.glyph_clip_decisions[layer_index].clone());
                 continue;
             }
-            let layer_nodes: Vec<_> = frame
-                .nodes
-                .iter()
-                .copied()
-                .filter(|(idx, _, _, _)| layer.client_indices.contains(idx))
-                .collect();
+            let layer_nodes = std::mem::take(&mut nodes_by_layer[layer_index]);
             let mut recorder = PictureRecorder::new();
             let bounds = Rect::new(
                 layer.bounds.x * scale_factor - 64.0,
