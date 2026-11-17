@@ -1089,12 +1089,17 @@ fn inline_text_reason(
     }
     // An rtl paragraph (UAX #9 paragraph level 1): paint orders a paragraph
     // leaf itself; word items get their levels from leaf_bidi_levels and
-    // are reordered per line.  Preserved spaces that hang (pre-wrap) would
-    // hang at the line's left end (L1): legacy.
+    // are reordered per line. Preserved spaces hang at the line's logical
+    // end (the visual left). A visual-order fragment was already broken
+    // per line, so its trailing spaces are not in the fragment and do not
+    // affect alignment. Any other rtl pre-wrap stays on legacy.
+    // `white-space: break-spaces` does not hang; that flag bails below.
     let paragraph = paragraph_leaf(style, sole, container);
     if container.direction == TextDirection::Rtl
         && !paragraph
         && style.white_space == WhiteSpace::PreWrap
+        && !fragment
+        && !style.break_spaces
     {
         return Some("bidi:white-space");
     }
@@ -1135,7 +1140,8 @@ fn inline_text_reason(
         return Some("text:script");
     }
     if line_width {
-        if !sole {
+        // Per-line bidi fragments already carry one visual line each.
+        if !sole && !(fragment && !style.break_spaces) {
             return Some("text:line-width-shared");
         }
     } else {
@@ -1587,8 +1593,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             // font must be the strut's (a <br> in a differently sized inline
             // box would need that box's strut, NGInlineBoxState).  Quirks
             // empty-line rules and preserved spaces before it: legacy.
+            // A frozen pre-wrap bidi line (the `ch` estimate) is a hard
+            // break between already-wrapped visual lines. Trailing spaces
+            // were excluded from those lines, so they hang.
+            let frozen_prewrap = style.white_space == WhiteSpace::PreWrap
+                && style.direction == TextDirection::Rtl
+                && bidi_fragment(info.style)
+                && !style.break_spaces;
             if !same_font(info.style, style)
-                || !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+                || !(matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+                    || frozen_prewrap)
                 || has_marker(flat[0].style, QUIRKS_MARKER)
             {
                 return Some("text:forced-break");

@@ -7686,6 +7686,180 @@ fn inline_min_max_ignores_text_and_inline_box_widths() {
     assert_eq!(rects(&percent), rects(&auto));
 }
 
+/// RTL `white-space: pre-wrap` hangs trailing spaces (CSS Text 3 4.1.3):
+/// they do not change the line break or the alignment. Ahem 20px, content
+/// width 300 (the WPT's 15ch when `ch` is 1em). pre-wrap-align-*-002.
+#[test]
+fn rtl_prewrap_trailing_spaces_hang_and_do_not_affect_alignment() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let source = "one two three four five\nsix seven eight nine ten.\nun deux trois quatre cinq\nsix sept huit neuf dix";
+    let laid = |align: &str, bidi_override: bool| {
+        let mut document = w3cos_dom::Document::new();
+        let html = document.create_element("html");
+        let body = document.body();
+        html.append_child(&mut document, body);
+        body.style_mut(&mut document).set_property("margin", "0");
+        let div = document.create_element("div");
+        div.set_attribute(&mut document, "dir", "rtl");
+        for (k, v) in [
+            ("font-family", "Ahem"),
+            ("font-size", "20px"),
+            ("line-height", "20px"),
+            ("width", "300px"),
+            ("white-space", "pre-wrap"),
+            ("text-align", align),
+            ("padding", "5px"),
+            ("border", "1px solid gray"),
+        ] {
+            div.style_mut(&mut document).set_property(k, v);
+        }
+        if bidi_override {
+            div.style_mut(&mut document)
+                .set_property("unicode-bidi", "bidi-override");
+        }
+        let text = document.create_text_node(source);
+        div.append_child(&mut document, text);
+        document.body().append_child(&mut document, div);
+        let tree = document.to_component_tree();
+        let flat = pre_flatten(&tree);
+        assert!(
+            block::unsupported_reasons(&flat).is_empty(),
+            "{align} override={bidi_override}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&tree, &flat, 800.0, 600.0).unwrap_or_else(|| {
+            panic!(
+                "{align} override={bidi_override} runtime {}",
+                super::RUNTIME_REASON.with(|r| r.get())
+            )
+        });
+        let mut texts = Vec::new();
+        for (i, node) in flat.iter().enumerate() {
+            let w3cos_std::ComponentKind::Text { content } = node.kind else {
+                continue;
+            };
+            if content == "\u{2028}" {
+                continue;
+            }
+            texts.push((content.clone(), rect(&out, i)));
+        }
+        texts
+    };
+    // Border 1 + padding 5. Content width 300.
+    let origin = 6.0;
+    let place = |text_width: f32, align: &str| -> f32 {
+        let free = 300.0 - text_width;
+        origin
+            + match align {
+                "left" | "end" => 0.0,
+                "right" | "start" => free,
+                "center" => free / 2.0,
+                other => panic!("{other}"),
+            }
+    };
+    for align in ["left", "right", "center", "start", "end"] {
+        let texts = laid(align, false);
+        let words: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            words,
+            vec![
+                "one two three",
+                "four five",
+                "six seven eight",
+                ".",
+                "nine ten",
+                "un deux trois",
+                "quatre cinq",
+                "six sept huit",
+                "neuf dix",
+            ],
+            "{align}"
+        );
+        let (first, first_rect) = &texts[0];
+        assert_eq!(first_rect.0, place(first_rect.2, align), "{align} {first}");
+        assert_eq!(first_rect.2, 260.0, "{align}");
+        // The period hangs at the visual left of "nine ten" (logical end).
+        let dot = texts.iter().find(|(t, _)| *t == ".").unwrap().1;
+        let nine = texts.iter().find(|(t, _)| *t == "nine ten").unwrap().1;
+        assert_eq!(dot.1, nine.1, "{align} period line");
+        assert_eq!(dot.0, place(180.0, align), "{align} period");
+        assert_eq!(nine.0, dot.0 + dot.2, "{align} nine ten");
+    }
+    // pre-wrap-align-left-003: bidi-override reverses every line, and the
+    // period stays at the visual left.
+    let reversed_lines = laid("left", true);
+    let reversed: Vec<&str> = reversed_lines.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        reversed,
+        vec![
+            "eerht owt eno",
+            "evif ruof",
+            "thgie neves xis",
+            ".net enin",
+            "siort xued nu",
+            "qnic ertauq",
+            "tiuh tpes xis",
+            "xid fuen",
+        ]
+    );
+}
+
+/// An rtl pre-wrap run that was not already broken per line stays on legacy.
+/// `break-spaces` does not hang.
+#[test]
+fn rtl_prewrap_without_a_line_estimate_stays_on_legacy() {
+    use w3cos_std::style::{TextDirection, WhiteSpace};
+    let text = Component::text(
+        "one two three four",
+        Style {
+            display: Display::Inline,
+            white_space: WhiteSpace::PreWrap,
+            direction: TextDirection::Rtl,
+            ..Style::default()
+        },
+    );
+    let root = node(
+        Style {
+            direction: TextDirection::Rtl,
+            white_space: WhiteSpace::PreWrap,
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![text],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(
+        block::unsupported_reasons(&flat),
+        vec!["bidi:white-space".to_string()]
+    );
+    let spaces = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::PreWrap,
+        direction: TextDirection::Rtl,
+        break_spaces: true,
+        ..Style::default()
+    };
+    let text = Component::text("one two", spaces);
+    let root = node(
+        Style {
+            direction: TextDirection::Rtl,
+            white_space: WhiteSpace::PreWrap,
+            break_spaces: true,
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![text],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| reason == "text:break-spaces" || reason == "bidi:white-space"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+}
+
 /// CSS Text 3 4.1.3: preserved spaces at the end of an unwrapped line hang
 /// only conditionally, so they still count toward a shrink-to-fit float's
 /// max-content size (white-space-intrinsic-size-004).
