@@ -305,6 +305,18 @@ fn defer_client_rects(
     });
 }
 
+/// Take the deferred rects out (cloning them when a width memo shares them).
+fn take_pending_client_rects() -> Option<PendingClientRects> {
+    let pending = CLIENT_PENDING.with(|slot| slot.borrow_mut().take())?;
+    Some(
+        std::rc::Rc::try_unwrap(pending).unwrap_or_else(|shared| PendingClientRects {
+            key: shared.key,
+            layouts: shared.layouts.clone(),
+            texts: shared.texts.clone(),
+        }),
+    )
+}
+
 fn drop_pending_client_rects() {
     CLIENT_PENDING.with(|slot| drop(slot.borrow_mut().take()));
 }
@@ -329,12 +341,23 @@ fn settle_client_rects(component: &Component) {
     let Some(pending) = CLIENT_PENDING.with(|slot| slot.borrow_mut().take()) else {
         return;
     };
+    let start = splice::debug_enabled().then(std::time::Instant::now);
     let flat = crate::layout::pre_flatten_keyed(
         component,
         pending.key.filter(|_| crate::layout_ng::box_tree_enabled()),
     );
+    let flattened = start.map(|start| start.elapsed().as_micros());
     CLIENT_KEY.with(|key| key.set(pending.key));
     let published = client_rects_for(&flat, &pending.layouts, &pending.texts);
+    if let (Some(start), Some(flattened)) = (start, flattened) {
+        eprintln!(
+            "[splice] settle: key {} flatten {flattened}us total {}us ({} boxes, {} owners)",
+            pending.key.is_some(),
+            start.elapsed().as_micros(),
+            flat.len(),
+            published.len()
+        );
+    }
     CLIENT_KEY.with(|key| key.set(None));
     CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
 }
@@ -558,8 +581,12 @@ pub fn flush() -> bool {
             taken = Some((after, dirty, after));
             return false;
         }
-        // A splice edits the published map in place.
-        settle_client_rects(&cache.component);
+        // A splice edits the published map in place. With retained lowering
+        // the splice settles it only once it is known to commit: a rebuild
+        // republishes every rect anyway.
+        if !splice::retain_lowering_enabled() {
+            settle_client_rects(&cache.component);
+        }
         if splice::try_splice(cache, &dirty, viewport_w, viewport_h) {
             cache.structure = layout_gen;
             cache.cascade = cascade;

@@ -837,18 +837,30 @@ fn try_children(
         .count();
     let removed = cached.len() - keep - suffix;
     let inserted_ids = &dom_children[keep..dom_children.len() - suffix];
-    if keep == 0 || (removed == 0 && inserted_ids.is_empty()) {
+    if removed == 0 && inserted_ids.is_empty() {
         return None;
     }
-    let anchor = &old.children[keep - 1];
-    if px_spacing(anchor.style.margin.left).is_none()
-        || px_spacing(anchor.style.margin.right).is_none()
-        || !(document
-            .get_layout_rect(NodeId::from_u32(host_id(anchor)?))
-            .height
-            > 0.0)
-    {
-        return None;
+    if keep == 0 {
+        // No kept item before the edit: the inserted items start at the
+        // container's content box.
+        let style = &old.style;
+        if px_spacing(style.padding.top).is_none()
+            || px_spacing(style.padding.left).is_none()
+            || px_spacing(style.padding.right).is_none()
+        {
+            return None;
+        }
+    } else {
+        let anchor = &old.children[keep - 1];
+        if px_spacing(anchor.style.margin.left).is_none()
+            || px_spacing(anchor.style.margin.right).is_none()
+            || !(document
+                .get_layout_rect(NodeId::from_u32(host_id(anchor)?))
+                .height
+                > 0.0)
+        {
+            return None;
+        }
     }
     // Inserted and removed items must not move any counter or quote that a
     // kept item reads.
@@ -1063,6 +1075,38 @@ fn solve_with_client_rects(
     crate::layout::LayoutRect,
     ClientRectMap,
 )> {
+    solve_raw(
+        wrapper,
+        skip_projections,
+        measure_text,
+        viewport_w,
+        viewport_h,
+        client_rects,
+    )
+    .map(|(rects, own, published, _)| (rects, own, published))
+}
+
+/// The wrapper's own layout results: per flat index rects and text line
+/// fragments, in wrapper coordinates.
+struct RawSolve {
+    layouts: Vec<(crate::layout::LayoutRect, usize)>,
+    texts: Vec<crate::layout_ng::TextFragment>,
+}
+
+/// [`solve_with_client_rects`], also returning the raw results.
+fn solve_raw(
+    wrapper: &Component,
+    skip_projections: bool,
+    measure_text: bool,
+    viewport_w: f32,
+    viewport_h: f32,
+    client_rects: bool,
+) -> Option<(
+    Vec<(u32, crate::layout::LayoutRect)>,
+    crate::layout::LayoutRect,
+    ClientRectMap,
+    RawSolve,
+)> {
     let flat = pre_flatten(wrapper);
     // `LayoutEngine::compute` publishes legacy rects when LayoutNG bails.
     // A subtree that bails would then store a legacy line count beside a
@@ -1076,7 +1120,12 @@ fn solve_with_client_rects(
         } else {
             ClientRectMap::default()
         };
-        return host_rects(&flat, &layout_cache).map(|(rects, own)| (rects, own, published));
+        let (rects, own) = host_rects(&flat, &layout_cache)?;
+        let raw = RawSolve {
+            layouts: layout_cache,
+            texts,
+        };
+        return Some((rects, own, published, raw));
     }
     let mut engine = LayoutEngine::new();
     // Projections repair floats, tables, inline-block and RTL boxes. A
@@ -1092,7 +1141,12 @@ fn solve_with_client_rects(
     } else {
         ClientRectMap::default()
     };
-    host_rects(&flat, &results.layout_cache).map(|(rects, own)| (rects, own, published))
+    let (rects, own) = host_rects(&flat, &results.layout_cache)?;
+    let raw = RawSolve {
+        layouts: results.layout_cache,
+        texts: results.text_fragments,
+    };
+    Some((rects, own, published, raw))
 }
 
 fn host_rects(
@@ -1403,6 +1457,9 @@ pub(super) fn try_splice(
     // plan node's border box, and the first path level whose following
     // siblings shift (0: the plan node's siblings; the Tail plan grows the
     // plan node itself and starts there too).
+    // A child-list splice's raw wrapper results, the inserted items' first
+    // wrapper flat index, and their node count.
+    let mut children_raw: Option<(RawSolve, usize, usize)> = None;
     let (rects, dx, dy, dh, skip_projections, measure_text, commit, client): (
         Vec<(u32, crate::layout::LayoutRect)>,
         f32,
@@ -1584,9 +1641,13 @@ pub(super) fn try_splice(
             target.children.extend(old_items);
             target.children.extend(rest);
             let target = at_path(&cache.component, &plan.path);
-            let anchor = anchor_stand_in(&target.children[keep - 1], true);
-            let Some(anchor_id) = host_id(&anchor) else {
-                return bail("children anchor");
+            let anchor = (keep > 0).then(|| anchor_stand_in(&target.children[keep - 1], true));
+            let anchor_id = match &anchor {
+                Some(anchor) => match host_id(anchor) {
+                    Some(id) => Some(id),
+                    None => return bail("children anchor"),
+                },
+                None => None,
             };
             let next = target
                 .children
@@ -1598,37 +1659,67 @@ pub(super) fn try_splice(
             }
             let (anchor_old, next_old) = crate::dom::with_document(|document| {
                 (
-                    document.get_layout_rect(NodeId::from_u32(anchor_id)),
+                    anchor_id.map(|id| document.get_layout_rect(NodeId::from_u32(id))),
                     next_id.map(|id| document.get_layout_rect(NodeId::from_u32(id))),
                 )
             });
-            let margins = anchor.style.margin_lengths();
-            let width = anchor_old.width + margins.left + margins.right;
-            if !(anchor_old.height > 0.0) || !width.is_finite() || width <= 0.0 {
+            let padding = target.style.padding_lengths();
+            let border_left = border_side(&target.style, 3);
+            let border_top = border_side(&target.style, 0);
+            let width = match (&anchor, anchor_old) {
+                (Some(anchor), Some(anchor_old)) => {
+                    if !(anchor_old.height > 0.0) {
+                        return bail("children anchor height");
+                    }
+                    let margins = anchor.style.margin_lengths();
+                    anchor_old.width + margins.left + margins.right
+                }
+                _ => {
+                    node_rect.width
+                        - padding.left
+                        - padding.right
+                        - border_left
+                        - border_side(&target.style, 1)
+                }
+            };
+            if !width.is_finite() || width <= 0.0 {
                 return bail("children width");
             }
-            // The anchor seeds the position of the first inserted item; a
-            // stand-in for the first following item measures their offset.
+            // The anchor seeds the position of the first inserted item (or
+            // the content box does); a stand-in for the first following item
+            // measures their offset.
+            let inserted_first = 1 + anchor.as_ref().map_or(0, crate::layout::count_nodes);
+            let inserted_len = inserted
+                .iter()
+                .map(crate::layout::count_nodes)
+                .sum::<usize>();
             let mut children = Vec::with_capacity(count + 2);
-            children.push(anchor);
+            children.extend(anchor);
             children.extend(inserted);
             children.extend(next);
             let mut wrapper = wrapper_for(target, width, children);
-            let Some((rects, own, client)) =
-                solve_with_client_rects(&wrapper, skip, measure, viewport_w, viewport_h, true)
+            let Some((rects, own, client, raw)) =
+                solve_raw(&wrapper, skip, measure, viewport_w, viewport_h, true)
             else {
                 return bail("children solve");
             };
-            let Some(anchor_new) = rect_of(&rects, anchor_id) else {
-                return bail("children anchor rect");
+            let (dx, dy) = match (anchor_id, anchor_old) {
+                (Some(id), Some(anchor_old)) => {
+                    let Some(anchor_new) = rect_of(&rects, id) else {
+                        return bail("children anchor rect");
+                    };
+                    if (anchor_new.height - anchor_old.height).abs() > 0.01
+                        || (anchor_new.width - anchor_old.width).abs() > 0.01
+                    {
+                        return bail("children anchor size");
+                    }
+                    (anchor_old.x - anchor_new.x, anchor_old.y - anchor_new.y)
+                }
+                _ => (
+                    node_rect.x + border_left + padding.left - own.x,
+                    node_rect.y + border_top + padding.top - own.y,
+                ),
             };
-            if (anchor_new.height - anchor_old.height).abs() > 0.01
-                || (anchor_new.width - anchor_old.width).abs() > 0.01
-            {
-                return bail("children anchor size");
-            }
-            let dx = anchor_old.x - anchor_new.x;
-            let dy = anchor_old.y - anchor_new.y;
             let dh = match (next_id, next_old) {
                 (Some(id), Some(next_old)) => {
                     let Some(next_new) = rect_of(&rects, id) else {
@@ -1650,14 +1741,17 @@ pub(super) fn try_splice(
             if !dh.is_finite() || node_rect.height + dh <= 0.0 {
                 return bail("children height");
             }
+            children_raw = Some((raw, inserted_first, inserted_len));
             if next_id.is_some() {
                 wrapper.children.pop();
             }
             let mut inserted = std::mem::take(&mut wrapper.children);
-            inserted.remove(0);
+            if anchor_id.is_some() {
+                inserted.remove(0);
+            }
             let rects = rects
                 .into_iter()
-                .filter(|(id, _)| *id != anchor_id && Some(*id) != next_id)
+                .filter(|(id, _)| Some(*id) != anchor_id && Some(*id) != next_id)
                 .collect();
             (
                 rects,
@@ -1695,6 +1789,14 @@ pub(super) fn try_splice(
             grown.push(plan.node);
         }
     }
+    // Deferred CSSOM rects of a child-list splice stay deferred: the pending
+    // fragments move with the boxes (Blink keeps fragment geometry on the
+    // fragments and answers getClientRects() from them on demand), so the
+    // published map needs no per-owner edit.
+    let rebase = retain_lowering_enabled()
+        && matches!(commit, PlanKind::Children { .. })
+        && children_raw.is_some()
+        && super::client_rects_pending();
     let mut shifted_owners = std::collections::HashMap::new();
     if dh != 0.0 {
         if let PlanKind::Children { keep, removed, .. } = &commit {
@@ -1702,7 +1804,9 @@ pub(super) fn try_splice(
             let target = at_path(&cache.component, &plan.path);
             for item in &target.children[keep + removed..] {
                 collect_hosts(item, &mut shifted);
-                super::collect_cssom_owners(item, &mut shifted_owners);
+                if !rebase {
+                    super::collect_cssom_owners(item, &mut shifted_owners);
+                }
             }
         }
         if !row_item_stays_tallest(&cache.component, &plan.path, levels, dh) {
@@ -1715,7 +1819,9 @@ pub(super) fn try_splice(
             if !is_row_flex(parent) {
                 for sibling in &parent.children[plan.path[depth] + 1..] {
                     collect_hosts(sibling, &mut shifted);
-                    super::collect_cssom_owners(sibling, &mut shifted_owners);
+                    if !rebase {
+                        super::collect_cssom_owners(sibling, &mut shifted_owners);
+                    }
                 }
             }
             if let Some(id) = host_id(parent)
@@ -1756,14 +1862,16 @@ pub(super) fn try_splice(
     };
     let mut old_owners = std::collections::HashMap::new();
     let mut new_owners = std::collections::HashMap::new();
-    for component in &old_region {
-        super::collect_cssom_owners(component, &mut old_owners);
+    if !rebase {
+        for component in &old_region {
+            super::collect_cssom_owners(component, &mut old_owners);
+        }
     }
     for component in &new_region {
         super::collect_cssom_owners(component, &mut new_owners);
     }
     let touches_owners =
-        !old_owners.is_empty() || !new_owners.is_empty() || !shifted_owners.is_empty();
+        !rebase && (!old_owners.is_empty() || !new_owners.is_empty() || !shifted_owners.is_empty());
     if touches_owners {
         // The roots of the region and every ancestor (for a tail plan, the
         // target block too) must not be fragments of an owner themselves.
@@ -1797,6 +1905,28 @@ pub(super) fn try_splice(
                 .any(|(owner, count)| total(owner) != *count)
         {
             return bail("cssom owner outside splice");
+        }
+    }
+    if retain_lowering_enabled() {
+        if rebase
+            && let (PlanKind::Children { keep, removed, .. }, Some((raw, first, len))) =
+                (&commit, children_raw.take())
+        {
+            let shift = RebaseShift { dx, dy, dh, levels };
+            rebase_pending_client_rects(
+                cache, &plan.path, *keep, *removed, raw, first, len, &shift,
+            );
+            // Owner totals are recounted when a later splice edits the map.
+            cache.owner_counts = None;
+        } else {
+            let start = debug_enabled().then(std::time::Instant::now);
+            super::settle_client_rects(&cache.component);
+            if let Some(start) = start {
+                eprintln!(
+                    "[splice] settled client rects in {}us",
+                    start.elapsed().as_micros()
+                );
+            }
         }
     }
     crate::dom::with_document_mut(|document| {
@@ -1890,12 +2020,151 @@ pub(super) fn try_splice(
     });
     super::note_flush("splice", solved, shifted_nodes);
     if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() || retain_lowering_verify() {
+        // The flush holds the cache: settle against the spliced tree here.
+        super::settle_client_rects(&cache.component);
         verify(viewport_w, viewport_h, plan.node);
     }
     if retain_lowering_verify() {
         verify_lowering(cache, plan.node);
     }
     true
+}
+
+struct RebaseShift {
+    dx: f32,
+    dy: f32,
+    dh: f32,
+    levels: usize,
+}
+
+/// Move the deferred CSSOM layout of the tree a child-list splice is about
+/// to commit (`cache.component` is still the old tree) onto the spliced
+/// tree: drop the removed items' fragments, add the inserted items' (from
+/// the wrapper solve, at `first..first + len`), renumber the flat indices
+/// after them, and apply the same shift and growth the splice writes to the
+/// DOM rects.
+#[allow(clippy::too_many_arguments)]
+fn rebase_pending_client_rects(
+    cache: &Cache,
+    path: &[usize],
+    keep: usize,
+    removed: usize,
+    raw: RawSolve,
+    first: usize,
+    len: usize,
+    shift: &RebaseShift,
+) {
+    let Some(pending) = super::take_pending_client_rects() else {
+        return;
+    };
+    let root = &*cache.component;
+    let count = crate::layout::count_nodes;
+    // Preorder start of each node on the path, and each one's node count,
+    // counted once bottom-up so the large subtree on the path is walked once.
+    let mut starts = Vec::with_capacity(path.len() + 1);
+    let mut node = root;
+    let mut index = 0;
+    starts.push(0);
+    for &child in path {
+        index += 1 + node.children[..child].iter().map(count).sum::<usize>();
+        starts.push(index);
+        node = &node.children[child];
+    }
+    let target = node;
+    let target_index = index;
+    let child_counts: Vec<usize> = target.children.iter().map(|child| count(child)).collect();
+    let removed_start = target_index + 1 + child_counts[..keep].iter().sum::<usize>();
+    let removed_end = removed_start + child_counts[keep..keep + removed].iter().sum::<usize>();
+    let mut sizes = vec![0; path.len() + 1];
+    sizes[path.len()] = 1 + child_counts.iter().sum::<usize>();
+    for depth in (0..path.len()).rev() {
+        let parent = at_path(root, &path[..depth]);
+        sizes[depth] = 1
+            + sizes[depth + 1]
+            + parent
+                .children
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| *position != path[depth])
+                .map(|(_, child)| count(child))
+                .sum::<usize>();
+    }
+    let target_end = target_index + sizes[path.len()];
+    let mut shifted: Vec<(usize, usize)> = Vec::new();
+    let mut grown: Vec<usize> = Vec::new();
+    if shift.dh != 0.0 {
+        shifted.push((removed_end, target_end));
+        grown.push(target_index);
+        for level in 0..shift.levels {
+            let depth = path.len() - 1 - level;
+            let parent = at_path(root, &path[..depth]);
+            let child_end = starts[depth + 1] + sizes[depth + 1];
+            if !is_row_flex(parent) {
+                shifted.push((child_end, starts[depth] + sizes[depth]));
+            }
+            if host_id(parent).is_some() && !matches!(parent.style.height, Dimension::Px(_)) {
+                grown.push(starts[depth]);
+            }
+        }
+    }
+    let delta = len as isize - (removed_end - removed_start) as isize;
+    let renumber = |index: usize| {
+        if index >= removed_end {
+            (index as isize + delta) as usize
+        } else {
+            index
+        }
+    };
+    let in_shift = |index: usize| shifted.iter().any(|&(a, b)| index >= a && index < b);
+    let removed_range = |index: usize| index >= removed_start && index < removed_end;
+    let mut layouts = Vec::with_capacity(pending.layouts.len() + len);
+    let mut texts = Vec::with_capacity(pending.texts.len());
+    let super::PendingClientRects {
+        layouts: old_layouts,
+        texts: old_texts,
+        ..
+    } = pending;
+    for (mut rect, index) in old_layouts {
+        if removed_range(index) {
+            continue;
+        }
+        if in_shift(index) {
+            rect.y += shift.dh;
+        }
+        if grown.contains(&index) {
+            rect.height += shift.dh;
+        }
+        layouts.push((rect, renumber(index)));
+    }
+    let inserted = |index: usize| index >= first && index < first + len;
+    for (mut rect, index) in raw.layouts {
+        if inserted(index) {
+            rect.x += shift.dx;
+            rect.y += shift.dy;
+            layouts.push((rect, removed_start + index - first));
+        }
+    }
+    for mut fragment in old_texts {
+        if removed_range(fragment.index) {
+            continue;
+        }
+        if in_shift(fragment.index) {
+            fragment.rect.y += shift.dh;
+        }
+        fragment.index = renumber(fragment.index);
+        texts.push(fragment);
+    }
+    for mut fragment in raw.texts {
+        if inserted(fragment.index) {
+            fragment.rect.x += shift.dx;
+            fragment.rect.y += shift.dy;
+            fragment.index = removed_start + fragment.index - first;
+            texts.push(fragment);
+        }
+    }
+    // The box-tree plan is keyed by the old tree: publish without it.
+    super::forget_client_plan();
+    super::defer_client_rects(None, layouts, texts);
 }
 
 /// [`retain_lowering_verify`]: the retained component tree must equal the
@@ -3399,6 +3668,72 @@ mod tests {
                 child_splices() - before,
                 5,
                 "child-list edits keep the items"
+            );
+        }
+    }
+
+    #[test]
+    fn column_flex_prepend_keeps_untouched_items() {
+        let _retain = RetainGuard::on();
+        let (chat, msgs) = chat_items();
+        let before = child_splices();
+        // Load older history above the first message, then drop it, then
+        // move the first message to the end.
+        let older = crate::dom::create_element("div");
+        style(
+            older,
+            &[("padding", "5px 7px"), ("margin", "3px 1px 6px 2px")],
+        );
+        crate::dom::append_child(
+            older,
+            crate::dom::create_text_node(&"older words ".repeat(14)),
+        );
+        crate::dom::insert_before(chat, older, msgs[0]);
+        assert!(crate::incremental_layout::flush());
+        check("prepend");
+        crate::dom::remove_child(chat, older);
+        assert!(crate::incremental_layout::flush());
+        check("remove first");
+        crate::dom::append_child(chat, msgs[0]);
+        assert!(crate::incremental_layout::flush());
+        check("move first to end");
+        crate::dom::remove_child(chat, msgs[1]);
+        crate::dom::remove_child(chat, msgs[2]);
+        crate::dom::remove_child(chat, msgs[0]);
+        assert!(crate::incremental_layout::flush());
+        // No fragment owner is left to compare.
+        assert_matches_full("remove all");
+        assert_lowering_matches_full("remove all");
+        crate::dom::append_child(chat, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("append into empty");
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            assert_eq!(child_splices() - before, 5, "prepends keep the items");
+        }
+    }
+
+    #[test]
+    fn column_flex_child_list_edits_move_deferred_client_rects() {
+        let _retain = RetainGuard::on();
+        // No read between the layout and the edit: the CSSOM rects are still
+        // deferred when each splice lands, so they move with the boxes.
+        let (chat, msgs) = chat_items();
+        let before = child_splices();
+        crate::dom::remove_child(chat, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        crate::dom::insert_before(chat, msgs[1], msgs[0]);
+        assert!(crate::incremental_layout::flush());
+        check("remove then prepend, deferred");
+        crate::incremental_layout::invalidate();
+        assert!(crate::incremental_layout::flush());
+        crate::dom::insert_before(chat, msgs[1], msgs[2]);
+        assert!(crate::incremental_layout::flush());
+        check("move after rebuild, deferred");
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            assert_eq!(
+                child_splices() - before,
+                3,
+                "deferred rects keep the splice"
             );
         }
     }
