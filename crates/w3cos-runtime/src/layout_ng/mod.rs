@@ -375,12 +375,13 @@ pub(crate) fn layout_tree_with_text(
                 style.display = w3cos_std::style::Display::None;
                 return Some((index, style));
             }
-            // The DOM's fallback `px` size of an svg grid item is `auto`
-            // for layout (the legacy engine keeps reading the `px`).
-            if node
-                .parent
-                .is_some_and(|parent| block::is_author_grid(flat[parent].style))
-            {
+            // The DOM's fallback `px` size of an svg grid or flex item is
+            // `auto` for layout (Blink: an svg root without width/height
+            // attributes computes auto). The legacy engine keeps the `px`.
+            if node.parent.is_some_and(|parent| {
+                let parent_style = flat[parent].style;
+                block::is_author_grid(parent_style) || block::is_author_flex(parent_style)
+            }) {
                 return block::svg_fallback_auto_style(node.style).map(|style| (index, style));
             }
             None
