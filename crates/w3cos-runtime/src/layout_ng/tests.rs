@@ -7262,17 +7262,167 @@ fn svg_root_matches_chrome() {
         let r = rect(&out, *index);
         assert_eq!((r.2, r.3), *expected, "{attrs:?} {css:?}");
     }
-    // The DOM's fallback size is not a specified one: a flex item that
-    // has one stays on legacy (the flex algorithm reads the used size).
-    let column = div(&mut document, &[("display", "flex")]);
+    // A viewBox-only svg flex item: the DOM fallback px are auto, and the
+    // ratio fills the flex container's inner width (800). Height is
+    // width / 4.
+    let flex = document.create_element("div");
+    flex.style_mut(&mut document)
+        .set_property("display", "flex");
     let svg = document.create_element("svg");
     svg.set_attribute(&mut document, "viewBox", "0 0 4 1");
-    column.append_child(&mut document, svg);
+    flex.append_child(&mut document, svg);
+    document.body().append_child(&mut document, flex);
     let tree = document.to_component_tree();
     let flat = pre_flatten(&tree);
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("viewBox flex item");
+    let index = (0..flat.len())
+        .rev()
+        .find(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::SvgDocument { .. }))
+        .unwrap();
+    let r = rect(&out, index);
+    assert_eq!((r.2, r.3), (800.0, 200.0));
+
+    // svg-root-as-flex-item-001 .. 005. Chrome: a square viewBox flex item
+    // is a 100px green square in each of these containers.
+    let flex_case = |document: &mut w3cos_dom::Document,
+                     container: &[(&str, &str)],
+                     svg_css: &[(&str, &str)]| {
+        let flex = document.create_element("div");
+        for (k, v) in container {
+            flex.style_mut(document).set_property(k, v);
+        }
+        let svg = document.create_element("svg");
+        svg.set_attribute(document, "viewBox", "0 0 200 200");
+        for (k, v) in svg_css {
+            svg.style_mut(document).set_property(k, v);
+        }
+        flex.append_child(document, svg);
+        document.body().append_child(document, flex);
+    };
+    flex_case(
+        &mut document,
+        &[("display", "flex")],
+        &[("height", "100px")],
+    );
+    flex_case(
+        &mut document,
+        &[("display", "flex"), ("width", "100px")],
+        &[],
+    );
+    flex_case(
+        &mut document,
+        &[("display", "flex"), ("width", "150px")],
+        &[("margin-right", "50px"), ("flex", "1 0 auto")],
+    );
+    flex_case(
+        &mut document,
+        &[
+            ("display", "flex"),
+            ("flex-direction", "column"),
+            ("width", "100px"),
+            ("align-items", "flex-start"),
+        ],
+        &[],
+    );
+    // 005's `flex 1 0 auto` token is invalid CSS, so flex stays 0 1 auto.
+    flex_case(
+        &mut document,
+        &[
+            ("display", "flex"),
+            ("flex-direction", "column"),
+            ("width", "150px"),
+            ("align-items", "flex-start"),
+        ],
+        &[("margin-right", "50px"), ("margin-bottom", "70px")],
+    );
+    // flex-aspect-ratio-img-column-018: transferred max-width.
+    flex_case(
+        &mut document,
+        &[
+            ("display", "flex"),
+            ("flex-direction", "column"),
+            ("align-items", "flex-start"),
+            ("width", "200px"),
+        ],
+        &[("max-width", "100px")],
+    );
+    // flex-aspect-ratio-img-row-015: transferred max-height.
+    flex_case(
+        &mut document,
+        &[
+            ("display", "flex"),
+            ("align-items", "flex-start"),
+            ("height", "200px"),
+        ],
+        &[("max-height", "100px")],
+    );
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("svg flex items");
+    let flex_svgs: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::SvgDocument { .. }))
+        .collect();
+    // The earlier non-flex cases plus the viewBox flex item plus seven more.
+    let flex_items = &flex_svgs[flex_svgs.len() - 7..];
+    for index in flex_items {
+        let r = rect(&out, *index);
+        assert_eq!((r.2, r.3), (100.0, 100.0), "svg flex item {index}");
+    }
+
+    // display-flex-svg-overflow-default: no viewBox, flex-grow 1. The
+    // default svg overflow clips, so the automatic minimum is 0 and the
+    // item fills the 100px container.
+    let mut overflow = w3cos_dom::Document::new();
+    let html = overflow.create_element("html");
+    let body = overflow.body();
+    html.append_child(&mut overflow, body);
+    body.style_mut(&mut overflow).set_property("margin", "0");
+    let flex = overflow.create_element("div");
+    for (k, v) in [("display", "flex"), ("width", "100px"), ("height", "100px")] {
+        flex.style_mut(&mut overflow).set_property(k, v);
+    }
+    let svg = overflow.create_element("svg");
+    svg.style_mut(&mut overflow).set_property("flex-grow", "1");
+    let rect_el = overflow.create_element("rect");
+    rect_el.set_attribute(&mut overflow, "width", "150");
+    rect_el.set_attribute(&mut overflow, "height", "150");
+    svg.append_child(&mut overflow, rect_el);
+    flex.append_child(&mut overflow, svg);
+    overflow.body().append_child(&mut overflow, flex);
+    let tree = overflow.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let out = layout_tree(&tree, &flat, 800.0, 600.0);
+    let index = (0..flat.len())
+        .find(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::SvgDocument { .. }))
+        .unwrap();
+    let got = out.as_ref().map(|out| {
+        let r = rect(out, index);
+        (r.2, r.3)
+    });
     assert_eq!(
-        block::unsupported_reasons(&flat),
-        vec!["svg:flex-fallback-size".to_string()]
+        got,
+        Some((100.0, 100.0)),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+
+    // An author height attribute with no width attribute stays on legacy:
+    // flex would stretch the automatic width instead of the presentation size.
+    let legacy = document.create_element("div");
+    legacy
+        .style_mut(&mut document)
+        .set_property("display", "flex");
+    let svg = document.create_element("svg");
+    svg.set_attribute(&mut document, "height", "100");
+    svg.set_attribute(&mut document, "viewBox", "0 0 1 1");
+    legacy.append_child(&mut document, svg);
+    document.body().append_child(&mut document, legacy);
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    assert!(
+        layout_tree(&tree, &flat, 800.0, 600.0).is_none(),
+        "author height attribute should stay on legacy: {:?}",
+        block::unsupported_reasons(&flat)
     );
 }
 
