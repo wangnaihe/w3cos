@@ -928,7 +928,13 @@ fn layout_flat_with_text(
     let mut out = Vec::with_capacity(flat.len());
     let mut texts = Vec::new();
     match box_tree_key(flat) {
+        Some(key) if flat_shift() => {
+            flatten_retained_shift(&fragment, x, y, flat, key, &mut out, &mut texts)
+        }
         Some(key) => flatten_retained(&fragment, x, y, flat, key, &mut out, &mut texts),
+        None if flat_shift() => {
+            flatten_f64(&fragment, x.into(), y.into(), flat, &mut out, &mut texts)
+        }
         None => flatten(&fragment, x, y, flat, &mut out, &mut texts),
     }
     if !texts.is_empty() {
@@ -1012,6 +1018,8 @@ fn union_text_pieces(
     merged
 }
 
+/// The f32 walk (positions summed in f32 down each chain); without
+/// W3COS_FLAT_SHIFT this is the only one used.
 fn flatten(
     fragment: &BoxFragment,
     x: f32,
@@ -1023,6 +1031,31 @@ fn flatten(
     flatten_own(fragment, x, y, flat, out, texts);
     for (dx, dy, child) in &fragment.children {
         flatten(child, x + dx, y + dy, flat, out, texts);
+    }
+}
+
+/// Positions add up in f64 and round to f32 once per box, so a box's
+/// position is (nearly always exactly) the real sum of the offsets above
+/// it, whatever the path: a moved child list's output can then be shifted
+/// rather than walked again (see [`shift_span`]).
+fn flatten_f64(
+    fragment: &BoxFragment,
+    x: f64,
+    y: f64,
+    flat: &[FlatNodeInfo],
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    flatten_own(fragment, x as f32, y as f32, flat, out, texts);
+    for (dx, dy, child) in &fragment.children {
+        flatten_f64(
+            child,
+            x + f64::from(*dx),
+            y + f64::from(*dy),
+            flat,
+            out,
+            texts,
+        );
     }
 }
 
@@ -1091,19 +1124,130 @@ struct FlatReuse {
     len: usize,
     out: Vec<(LayoutRect, usize)>,
     texts: Vec<TextFragment>,
+    /// The f64 positions behind `out` and `texts` (same indices).
+    pos: Vec<(f64, f64)>,
+    text_pos: Vec<(f64, f64)>,
     spans: w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
 }
 
 struct FlatSpan {
     children: FragmentChildren,
-    x: f32,
-    y: f32,
+    x: f64,
+    y: f64,
     out: (usize, usize),
     texts: (usize, usize),
+    /// Per axis: every position sum inside the span (`x + dx` down each
+    /// chain) was exact, so its positions are the real sums of the span's
+    /// origin and the offsets below it.
+    exact: (bool, bool),
+}
+
+/// `a + b` rounded to `s` without error (round-to-nearest: the sum is
+/// exact iff both differences give the operands back).
+#[inline(always)]
+fn exact_sum(a: f64, b: f64, s: f64) -> bool {
+    s - a == b && s - b == a
+}
+
+/// W3COS_FLAT_SHIFT=1: reuse a retained child list's flattened output at a
+/// moved position by shifting it, when every sum stays exact (see
+/// [`shift_span`]).
+fn flat_shift() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_FLAT_SHIFT").is_some_and(|v| v == "1"))
+}
+
+/// Output buffers of the flatten before last, kept for the next one (a
+/// fresh 1-2 MB allocation per flush faults its pages in again).
+struct FlatSpare {
+    out: Vec<(LayoutRect, usize)>,
+    pos: Vec<(f64, f64)>,
+    text_pos: Vec<(f64, f64)>,
+}
+
+/// Appends `prev`'s entries moved by `(dx, dy)`.  Each old position is the
+/// exact sum of the old origin and the offsets above it (`span.exact`); if
+/// each moved position is exact too, every partial sum of the fresh chain
+/// (each one some ancestor's position) is exact, so the fresh walk would
+/// give these same bits.  An axis that did not move is copied as is.
+/// Returns false (and appends nothing) when a sum would round, or would
+/// give a zero whose sign the fresh walk might not.
+#[allow(clippy::too_many_arguments)]
+fn shift_span(prev: &FlatReuse, span: &FlatSpan, x: f64, y: f64, w: &mut FlatWrite<'_>) -> bool {
+    let (sx, sy) = (
+        x.to_bits() != span.x.to_bits(),
+        y.to_bits() != span.y.to_bits(),
+    );
+    if (sx && !span.exact.0) || (sy && !span.exact.1) {
+        return false;
+    }
+    let (dx, dy) = (x - span.x, y - span.y);
+    if (sx && !exact_sum(span.x, dx, x)) || (sy && !exact_sum(span.y, dy, y)) {
+        return false;
+    }
+    let shift = |v: f64, d: f64, on: bool| -> Option<f64> {
+        if !on {
+            return Some(v);
+        }
+        let s = v + d;
+        (s != 0.0 && exact_sum(v, d, s)).then_some(s)
+    };
+    let (out_start, text_start) = (w.out.len(), w.texts.len());
+    let (src, src_pos) = (
+        &prev.out[span.out.0..span.out.1],
+        &prev.pos[span.out.0..span.out.1],
+    );
+    w.out.reserve(src.len());
+    w.pos.reserve(src.len());
+    for ((rect, index), &(px, py)) in src.iter().zip(src_pos) {
+        let (Some(nx), Some(ny)) = (shift(px, dx, sx), shift(py, dy, sy)) else {
+            w.out.truncate(out_start);
+            w.pos.truncate(out_start);
+            return false;
+        };
+        w.out.push((
+            LayoutRect {
+                x: nx as f32,
+                y: ny as f32,
+                ..*rect
+            },
+            *index,
+        ));
+        w.pos.push((nx, ny));
+    }
+    let (src, src_pos) = (
+        &prev.texts[span.texts.0..span.texts.1],
+        &prev.text_pos[span.texts.0..span.texts.1],
+    );
+    for (text, &(px, py)) in src.iter().zip(src_pos) {
+        let (Some(nx), Some(ny)) = (shift(px, dx, sx), shift(py, dy, sy)) else {
+            w.out.truncate(out_start);
+            w.pos.truncate(out_start);
+            w.texts.truncate(text_start);
+            w.text_pos.truncate(text_start);
+            return false;
+        };
+        let mut text = text.clone();
+        text.rect.x = nx as f32;
+        text.rect.y = ny as f32;
+        w.texts.push(text);
+        w.text_pos.push((nx, ny));
+    }
+    true
+}
+
+/// The outputs [`flatten_reusing`] appends to.
+struct FlatWrite<'a> {
+    out: &'a mut Vec<(LayoutRect, usize)>,
+    texts: &'a mut Vec<TextFragment>,
+    pos: Vec<(f64, f64)>,
+    text_pos: Vec<(f64, f64)>,
+    spans: w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
 }
 
 thread_local! {
     static FLAT_REUSE: std::cell::RefCell<Option<FlatReuse>> = const { std::cell::RefCell::new(None) };
+    static FLAT_SPARE: std::cell::RefCell<Option<FlatSpare>> = const { std::cell::RefCell::new(None) };
 }
 
 /// See [`cache::forget_walk_fingerprints`].
@@ -1113,6 +1257,172 @@ pub(crate) fn forget_walk_fingerprints() {
 
 pub(crate) fn forget_flat_reuse() {
     FLAT_REUSE.with(|slot| *slot.borrow_mut() = None);
+    FLAT_SPARE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// [`flatten`] reusing the output of a child list laid out in the last
+/// patch flush (the same list, so the same boxes and offsets): copied when
+/// at the same position, shifted when moved and exact (W3COS_FLAT_SHIFT).
+fn flatten_retained_shift(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    key: (u64, u64),
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    let prev = FLAT_REUSE
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|prev| prev.key == key && prev.len == flat.len());
+    let spare = FLAT_SPARE.with(|slot| slot.borrow_mut().take());
+    let (mut keep, mut pos, mut text_pos) = match spare {
+        Some(FlatSpare { out, pos, text_pos }) => (out, pos, text_pos),
+        None => Default::default(),
+    };
+    pos.clear();
+    pos.reserve(flat.len());
+    text_pos.clear();
+    let mut w = FlatWrite {
+        out,
+        texts,
+        pos,
+        text_pos,
+        spans: w3cos_std::fxhash::FxHashMap::default(),
+    };
+    flatten_reusing_shift(fragment, x.into(), y.into(), flat, prev.as_ref(), &mut w);
+    let FlatWrite {
+        out,
+        texts,
+        pos,
+        text_pos,
+        spans,
+    } = w;
+    keep.clear();
+    keep.extend_from_slice(out);
+    if let Some(prev) = prev {
+        FLAT_SPARE.with(|slot| {
+            *slot.borrow_mut() = Some(FlatSpare {
+                out: prev.out,
+                pos: prev.pos,
+                text_pos: prev.text_pos,
+            })
+        });
+    }
+    FLAT_REUSE.with(|slot| {
+        *slot.borrow_mut() = Some(FlatReuse {
+            key,
+            len: flat.len(),
+            out: keep,
+            texts: texts.clone(),
+            pos,
+            text_pos,
+            spans,
+        })
+    });
+}
+
+fn flatten_reusing_shift(
+    fragment: &BoxFragment,
+    x: f64,
+    y: f64,
+    flat: &[FlatNodeInfo],
+    prev: Option<&FlatReuse>,
+    w: &mut FlatWrite<'_>,
+) -> (bool, bool) {
+    // This box's own entries, exactly as `flatten` makes them.
+    let text_start = w.texts.len();
+    flatten_own(fragment, x as f32, y as f32, flat, w.out, w.texts);
+    w.pos.push((x, y));
+    if w.texts.len() > text_start {
+        w.text_pos.push((x, y));
+    }
+    if fragment.children.is_empty() {
+        return (true, true);
+    }
+    let address = std::rc::Rc::as_ptr(&fragment.children.0) as usize;
+    if let Some(span) = prev.and_then(|prev| prev.spans.get(&address))
+        && std::rc::Rc::ptr_eq(&span.children.0, &fragment.children.0)
+    {
+        let prev = prev.unwrap();
+        let (out_start, text_start) = (w.out.len(), w.texts.len());
+        let reused = if span.x.to_bits() == x.to_bits() && span.y.to_bits() == y.to_bits() {
+            w.out.extend_from_slice(&prev.out[span.out.0..span.out.1]);
+            w.pos.extend_from_slice(&prev.pos[span.out.0..span.out.1]);
+            w.texts
+                .extend_from_slice(&prev.texts[span.texts.0..span.texts.1]);
+            w.text_pos
+                .extend_from_slice(&prev.text_pos[span.texts.0..span.texts.1]);
+            true
+        } else {
+            shift_span(prev, span, x, y, w)
+        };
+        if reused {
+            #[cfg(debug_assertions)]
+            {
+                let (mut o, mut t) = (Vec::new(), Vec::new());
+                for (dx, dy, child) in fragment.children.iter() {
+                    flatten_f64(
+                        child,
+                        x + f64::from(*dx),
+                        y + f64::from(*dy),
+                        flat,
+                        &mut o,
+                        &mut t,
+                    );
+                }
+                let bits = |r: &LayoutRect| [r.x, r.y, r.width, r.height].map(f32::to_bits);
+                debug_assert_eq!(o.len(), w.out.len() - out_start);
+                for ((a, i), (b, j)) in o.iter().zip(&w.out[out_start..]) {
+                    debug_assert!(i == j && bits(a) == bits(b), "flat reuse {a:?} vs {b:?}");
+                }
+                debug_assert_eq!(t.len(), w.texts.len() - text_start);
+                for (a, b) in t.iter().zip(&w.texts[text_start..]) {
+                    debug_assert!(bits(&a.rect) == bits(&b.rect), "text reuse");
+                }
+            }
+            let exact = span.exact;
+            let children = fragment.children.clone();
+            let (out_end, text_end) = (w.out.len(), w.texts.len());
+            w.spans.insert(
+                address,
+                FlatSpan {
+                    children,
+                    x,
+                    y,
+                    out: (out_start, out_end),
+                    texts: (text_start, text_end),
+                    exact,
+                },
+            );
+            return exact;
+        }
+    }
+    let (out_start, text_start) = (w.out.len(), w.texts.len());
+    let (mut ex, mut ey) = (true, true);
+    for (dx, dy, child) in fragment.children.iter() {
+        let (dx, dy) = (f64::from(*dx), f64::from(*dy));
+        let (cx, cy) = (x + dx, y + dy);
+        let (cex, cey) = flatten_reusing_shift(child, cx, cy, flat, prev, w);
+        ex &= cex & exact_sum(x, dx, cx);
+        ey &= cey & exact_sum(y, dy, cy);
+    }
+    let exact = (ex, ey);
+    if w.out.len() - out_start >= 16 {
+        let (out_end, text_end) = (w.out.len(), w.texts.len());
+        w.spans.insert(
+            address,
+            FlatSpan {
+                children: fragment.children.clone(),
+                x,
+                y,
+                out: (out_start, out_end),
+                texts: (text_start, text_end),
+                exact,
+            },
+        );
+    }
+    exact
 }
 
 /// [`flatten`] reusing the output of a child list laid out at the same
@@ -1138,6 +1448,8 @@ fn flatten_retained(
             len: flat.len(),
             out: out.clone(),
             texts: texts.clone(),
+            pos: Vec::new(),
+            text_pos: Vec::new(),
             spans,
         })
     });
@@ -1162,8 +1474,8 @@ fn flatten_reusing(
     let address = std::rc::Rc::as_ptr(&fragment.children.0) as usize;
     if let Some(span) = prev.and_then(|prev| prev.spans.get(&address))
         && std::rc::Rc::ptr_eq(&span.children.0, &fragment.children.0)
-        && span.x.to_bits() == x.to_bits()
-        && span.y.to_bits() == y.to_bits()
+        && span.x.to_bits() == f64::from(x).to_bits()
+        && span.y.to_bits() == f64::from(y).to_bits()
     {
         let prev = prev.unwrap();
         let (out_start, text_start) = (out.len(), texts.len());
@@ -1173,10 +1485,11 @@ fn flatten_reusing(
             address,
             FlatSpan {
                 children: fragment.children.clone(),
-                x,
-                y,
+                x: x.into(),
+                y: y.into(),
                 out: (out_start, out.len()),
                 texts: (text_start, texts.len()),
+                exact: (false, false),
             },
         );
         return;
@@ -1190,10 +1503,11 @@ fn flatten_reusing(
             address,
             FlatSpan {
                 children: fragment.children.clone(),
-                x,
-                y,
+                x: x.into(),
+                y: y.into(),
                 out: (out_start, out.len()),
                 texts: (text_start, texts.len()),
+                exact: (false, false),
             },
         );
     }
