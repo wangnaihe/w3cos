@@ -58,11 +58,11 @@ fn bail(reason: &str) -> bool {
     false
 }
 
-/// `W3COS_RETAIN_LOWERING=1`: a child-list edit in a column flex container
-/// keeps the lowered components and boxes of the untouched items, lowers and
-/// lays out only the inserted ones, and shifts the following items (Blink
-/// re-attaches only the inserted children's layout objects and lays out only
-/// the dirty children of a flex container). Off by default.
+/// A child-list edit in a column flex container keeps the lowered components
+/// and boxes of the untouched items, lowers and lays out only the inserted
+/// ones, and shifts the following items (Blink re-attaches only the inserted
+/// children's layout objects and lays out only the dirty children of a flex
+/// container). On by default; `W3COS_RETAIN_LOWERING=0` rebuilds instead.
 pub(super) fn retain_lowering_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     #[cfg(test)]
@@ -70,9 +70,10 @@ pub(super) fn retain_lowering_enabled() -> bool {
         return true;
     }
     *ON.get_or_init(|| {
-        std::env::var("W3COS_RETAIN_LOWERING")
-            .ok()
-            .is_some_and(|value| value == "1")
+        !matches!(
+            std::env::var("W3COS_RETAIN_LOWERING").ok().as_deref(),
+            Some("0") | Some("false")
+        )
     })
 }
 
