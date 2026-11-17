@@ -6913,6 +6913,47 @@ impl Document {
         Some(declared)
     }
 
+    /// Inserting or removing `root` cannot renumber or requote any box
+    /// outside its subtree: nothing in it declares a counter or quote inline,
+    /// it holds no `<q>`, and every list item in it sits inside an `ol`/`ul`
+    /// of the subtree (whose `list-item` reset scopes it). The caller checks
+    /// [`stylesheet::has_counter_rules`] for author rules.
+    pub fn subtree_is_counter_neutral(&self, root: NodeId) -> bool {
+        let mut stack = vec![(root, false)];
+        while let Some((id, in_list)) = stack.pop() {
+            let node = self.get_node(id);
+            if node.node_type != NodeType::Element {
+                continue;
+            }
+            let tag = node.tag.as_str();
+            if tag.eq_ignore_ascii_case("q")
+                || self.styles[id.0 as usize]
+                    .inline_declarations
+                    .iter()
+                    .any(|(name, value)| stylesheet::declaration_uses_counters(name, value))
+            {
+                return false;
+            }
+            let list_root = tag.eq_ignore_ascii_case("ol") || tag.eq_ignore_ascii_case("ul");
+            if id == root && list_root {
+                // Its reset scope reaches the following siblings.
+                return false;
+            }
+            if !in_list
+                && (tag.eq_ignore_ascii_case("li")
+                    || self.computed_style_for(id).display == w3cos_std::style::Display::ListItem)
+            {
+                return false;
+            }
+            let mut child = node.first_child;
+            while let Some(next) = child {
+                stack.push((next, in_list || list_root));
+                child = crate::node::sib(self.get_node(next).next_sibling);
+            }
+        }
+        true
+    }
+
     fn counter_reset_value(&self, id: NodeId) -> Option<String> {
         self.declared_counter_value(id, "counter-reset")
             .or_else(|| {

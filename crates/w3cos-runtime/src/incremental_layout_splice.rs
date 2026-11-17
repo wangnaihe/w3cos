@@ -32,6 +32,15 @@ thread_local! {
     static COLUMN_TAIL_REUSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Child-list splices that kept the untouched items' components.
+    static CHILD_SPLICES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn child_splices() -> u32 {
+    CHILD_SPLICES.with(std::cell::Cell::get)
+}
+
 pub(super) fn column_tail_reuses() -> u32 {
     COLUMN_TAIL_REUSES.with(|count| count.get())
 }
@@ -47,6 +56,31 @@ fn bail(reason: &str) -> bool {
         eprintln!("[splice] rebuild: {reason}");
     }
     false
+}
+
+/// `W3COS_RETAIN_LOWERING=1`: a child-list edit in a column flex container
+/// keeps the lowered components and boxes of the untouched items, lowers and
+/// lays out only the inserted ones, and shifts the following items (Blink
+/// re-attaches only the inserted children's layout objects and lays out only
+/// the dirty children of a flex container). Off by default.
+pub(super) fn retain_lowering_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if tests::FORCE_RETAIN.with(std::cell::Cell::get) {
+        return true;
+    }
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_RETAIN_LOWERING")
+            .ok()
+            .is_some_and(|value| value == "1")
+    })
+}
+
+/// `W3COS_RETAIN_LOWERING_VERIFY=1`: after each child-list splice, compare
+/// the retained component tree and the boxes with a fresh full rebuild.
+fn retain_lowering_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_RETAIN_LOWERING_VERIFY").is_some())
 }
 
 /// `W3COS_SUBTREE_RELAYOUT=0` keeps the previous whole-tree fallback so a
@@ -481,6 +515,14 @@ enum PlanKind {
     /// Keep the first `keep` children of the plan node and rebuild the
     /// rest (a streamed tail block replaced or appended).
     Tail { keep: usize, tail: Vec<Component> },
+    /// Replace the `removed` children after the first `keep` by `inserted`
+    /// and keep every other child's component and boxes; the following
+    /// children only move.
+    Children {
+        keep: usize,
+        removed: usize,
+        inserted: Vec<Component>,
+    },
 }
 
 struct Plan {
@@ -541,6 +583,9 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
         let body = crate::dom::body_id();
         while chain.len() > 1 && *chain.last().unwrap() != body {
             let node = *chain.last().unwrap();
+            if let Some(plan) = try_children(cache, document, &chain, &chains) {
+                return Ok(Some(plan));
+            }
             if let Some(plan) = try_tail(cache, document, &chain, &chains) {
                 return Ok(Some(plan));
             }
@@ -721,6 +766,123 @@ fn try_tail_in(
         path,
         node,
         kind: PlanKind::Tail { keep, tail },
+    })
+}
+
+/// A child-list edit (insert, remove, or move of whole items) in a column
+/// flex container: [`column_flex_tail_parent`] stacks items in order with
+/// fixed gaps, so the items before the edit keep their boxes and the items
+/// after it keep their size and move by one offset. Only the inserted
+/// children are lowered and laid out (Blink keeps the layout objects of
+/// untouched siblings and lays out only the children marked for layout).
+fn try_children(
+    cache: &Cache,
+    document: &w3cos_dom::document::Document,
+    chain: &[u32],
+    chains: &[Vec<u32>],
+) -> Option<Plan> {
+    if !retain_lowering_enabled()
+        || chain.len() <= 1
+        || chain.last() == Some(&crate::dom::body_id())
+        // Kept items were lowered against the old sibling order.
+        || w3cos_dom::stylesheet::tree_order_affects_matching()
+        || w3cos_dom::stylesheet::has_counter_rules()
+    {
+        return None;
+    }
+    let node = *chain.last()?;
+    let path = component_path(&cache.component, chain)?;
+    let old = at_path(&cache.component, &path);
+    if !column_flex_tail_parent(old)
+        || !in_flow_static(&old.style)
+        || old.style != document.computed_style_for(NodeId::from_u32(node))
+    {
+        return None;
+    }
+    splice_ancestor_levels(&cache.component, &path)?;
+    let depth = chain.len();
+    let touched: Vec<u32> = chains
+        .iter()
+        .filter(|other| other.len() > depth)
+        .map(|other| other[depth])
+        .collect();
+    let mut dom_children = Vec::new();
+    let mut child = document.get_node(NodeId::from_u32(node)).first_child;
+    while let Some(id) = child {
+        let dom = document.get_node(id);
+        if dom.node_type != NodeType::Element {
+            return None;
+        }
+        dom_children.push(id.as_u32());
+        child = w3cos_dom::node::sib(dom.next_sibling);
+    }
+    let cached = old
+        .children
+        .iter()
+        .map(host_id)
+        .collect::<Option<Vec<_>>>()?;
+    let same = |cached: &u32, live: &u32| cached == live && !touched.contains(cached);
+    let keep = cached
+        .iter()
+        .zip(&dom_children)
+        .take_while(|(cached, live)| same(cached, live))
+        .count();
+    let room = cached.len().min(dom_children.len()) - keep;
+    let suffix = cached
+        .iter()
+        .rev()
+        .zip(dom_children.iter().rev())
+        .take(room)
+        .take_while(|(cached, live)| same(cached, live))
+        .count();
+    let removed = cached.len() - keep - suffix;
+    let inserted_ids = &dom_children[keep..dom_children.len() - suffix];
+    if keep == 0 || (removed == 0 && inserted_ids.is_empty()) {
+        return None;
+    }
+    let anchor = &old.children[keep - 1];
+    if px_spacing(anchor.style.margin.left).is_none()
+        || px_spacing(anchor.style.margin.right).is_none()
+        || !(document
+            .get_layout_rect(NodeId::from_u32(host_id(anchor)?))
+            .height
+            > 0.0)
+    {
+        return None;
+    }
+    // Inserted and removed items must not move any counter or quote that a
+    // kept item reads.
+    let neutral = |id: u32| document.subtree_is_counter_neutral(NodeId::from_u32(id));
+    if !cached[keep..keep + removed].iter().all(|&id| neutral(id))
+        || !inserted_ids.iter().all(|&id| neutral(id))
+    {
+        return None;
+    }
+    let mut inserted = Vec::with_capacity(inserted_ids.len());
+    for &id in inserted_ids {
+        let component = document.to_component_subtree(NodeId::from_u32(id));
+        if host_id(&component) != Some(id)
+            || !column_flex_tail_item(&component)
+            || !tree_is_spliceable_with_owners(&component)
+        {
+            return None;
+        }
+        inserted.push(component);
+    }
+    if debug_enabled() {
+        eprintln!(
+            "[splice] children plan node {node}: keep {keep}, removed {removed}, inserted {}, following {suffix}",
+            inserted.len()
+        );
+    }
+    Some(Plan {
+        path,
+        node,
+        kind: PlanKind::Children {
+            keep,
+            removed,
+            inserted,
+        },
     })
 }
 
@@ -1395,12 +1557,129 @@ pub(super) fn try_splice(
                 Some(client),
             )
         }
+        PlanKind::Children {
+            keep,
+            removed,
+            inserted,
+        } => {
+            // Engine flags are whole-tree properties: derive them from the
+            // spliced child list, then put the old one back until commit.
+            crate::layout_ng::forget_patch_memo();
+            let count = inserted.len();
+            let target = at_path_mut(&mut cache.component, &plan.path);
+            let following = target.children.split_off(keep + removed);
+            let old_items = target.children.split_off(keep);
+            target.children.extend(inserted);
+            target.children.extend(following);
+            let skip = spliced_skip_projections(
+                cache,
+                &old_items,
+                &at_path(&cache.component, &plan.path).children[keep..keep + count],
+            );
+            let measure = text_metric_after_edit(cache, &plan.path);
+            crate::layout_ng::forget_patch_memo();
+            let target = at_path_mut(&mut cache.component, &plan.path);
+            let mut rest = target.children.split_off(keep);
+            let inserted: Vec<Component> = rest.drain(..count).collect();
+            target.children.extend(old_items);
+            target.children.extend(rest);
+            let target = at_path(&cache.component, &plan.path);
+            let anchor = anchor_stand_in(&target.children[keep - 1], true);
+            let Some(anchor_id) = host_id(&anchor) else {
+                return bail("children anchor");
+            };
+            let next = target
+                .children
+                .get(keep + removed)
+                .map(|item| anchor_stand_in(item, true));
+            let next_id = next.as_ref().and_then(host_id);
+            if next.is_some() && next_id.is_none() {
+                return bail("children next");
+            }
+            let (anchor_old, next_old) = crate::dom::with_document(|document| {
+                (
+                    document.get_layout_rect(NodeId::from_u32(anchor_id)),
+                    next_id.map(|id| document.get_layout_rect(NodeId::from_u32(id))),
+                )
+            });
+            let margins = anchor.style.margin_lengths();
+            let width = anchor_old.width + margins.left + margins.right;
+            if !(anchor_old.height > 0.0) || !width.is_finite() || width <= 0.0 {
+                return bail("children width");
+            }
+            // The anchor seeds the position of the first inserted item; a
+            // stand-in for the first following item measures their offset.
+            let mut children = Vec::with_capacity(count + 2);
+            children.push(anchor);
+            children.extend(inserted);
+            children.extend(next);
+            let mut wrapper = wrapper_for(target, width, children);
+            let Some((rects, own, client)) =
+                solve_with_client_rects(&wrapper, skip, measure, viewport_w, viewport_h, true)
+            else {
+                return bail("children solve");
+            };
+            let Some(anchor_new) = rect_of(&rects, anchor_id) else {
+                return bail("children anchor rect");
+            };
+            if (anchor_new.height - anchor_old.height).abs() > 0.01
+                || (anchor_new.width - anchor_old.width).abs() > 0.01
+            {
+                return bail("children anchor size");
+            }
+            let dx = anchor_old.x - anchor_new.x;
+            let dy = anchor_old.y - anchor_new.y;
+            let dh = match (next_id, next_old) {
+                (Some(id), Some(next_old)) => {
+                    let Some(next_new) = rect_of(&rects, id) else {
+                        return bail("children next rect");
+                    };
+                    if (next_new.height - next_old.height).abs() > 0.01 {
+                        return bail("children next size");
+                    }
+                    next_new.y + dy - next_old.y
+                }
+                _ => {
+                    let padding_bottom = target.style.padding_lengths().bottom;
+                    let border_bottom = border_side(&target.style, 2);
+                    own.y + own.height + dy + padding_bottom + border_bottom
+                        - node_rect.y
+                        - node_rect.height
+                }
+            };
+            if !dh.is_finite() || node_rect.height + dh <= 0.0 {
+                return bail("children height");
+            }
+            if next_id.is_some() {
+                wrapper.children.pop();
+            }
+            let mut inserted = std::mem::take(&mut wrapper.children);
+            inserted.remove(0);
+            let rects = rects
+                .into_iter()
+                .filter(|(id, _)| *id != anchor_id && Some(*id) != next_id)
+                .collect();
+            (
+                rects,
+                dx,
+                dy,
+                dh,
+                skip,
+                measure,
+                PlanKind::Children {
+                    keep,
+                    removed,
+                    inserted,
+                },
+                Some(client),
+            )
+        }
     };
 
     // Boxes after the subtree move down by `dh`; auto-height ancestors grow.
     let mut shifted = Vec::new();
     let mut grown = Vec::new();
-    if matches!(commit, PlanKind::Tail { .. }) {
+    if matches!(commit, PlanKind::Tail { .. } | PlanKind::Children { .. }) {
         grown.push(plan.node);
     }
     if matches!(commit, PlanKind::Subtree(_))
@@ -1418,6 +1697,14 @@ pub(super) fn try_splice(
     }
     let mut shifted_owners = std::collections::HashMap::new();
     if dh != 0.0 {
+        if let PlanKind::Children { keep, removed, .. } = &commit {
+            // The kept items after the edit move with the following boxes.
+            let target = at_path(&cache.component, &plan.path);
+            for item in &target.children[keep + removed..] {
+                collect_hosts(item, &mut shifted);
+                super::collect_cssom_owners(item, &mut shifted_owners);
+            }
+        }
         if !row_item_stays_tallest(&cache.component, &plan.path, levels, dh) {
             return bail("row item height");
         }
@@ -1456,6 +1743,16 @@ pub(super) fn try_splice(
                 .collect(),
             tail.iter().collect(),
         ),
+        PlanKind::Children {
+            keep,
+            removed,
+            inserted,
+        } => (
+            at_path(&cache.component, &plan.path).children[*keep..*keep + *removed]
+                .iter()
+                .collect(),
+            inserted.iter().collect(),
+        ),
     };
     let mut old_owners = std::collections::HashMap::new();
     let mut new_owners = std::collections::HashMap::new();
@@ -1476,7 +1773,7 @@ pub(super) fn try_splice(
             .any(|component| carries_cssom_owner(component));
         let ancestor_depths = match &commit {
             PlanKind::Subtree(_) => plan.path.len(),
-            PlanKind::Tail { .. } => plan.path.len() + 1,
+            PlanKind::Tail { .. } | PlanKind::Children { .. } => plan.path.len() + 1,
         };
         let ancestors_own = (0..ancestor_depths)
             .any(|depth| carries_cssom_owner(at_path(&cache.component, &plan.path[..depth])));
@@ -1554,12 +1851,21 @@ pub(super) fn try_splice(
     cache.skip_projections = skip_projections;
     cache.measure_text = measure_text;
     crate::layout_ng::forget_patch_memo();
+    let child_solved = match &commit {
+        PlanKind::Children { inserted, .. } => Some(
+            inserted
+                .iter()
+                .map(crate::layout::count_nodes)
+                .sum::<usize>() as u32,
+        ),
+        _ => None,
+    };
     let target = at_path_mut(&mut cache.component, &plan.path);
     SPLICES.with(|count| {
         let (subtree, tail) = count.get();
         count.set(match commit {
             PlanKind::Subtree(_) => (subtree + 1, tail),
-            PlanKind::Tail { .. } => (subtree, tail + 1),
+            PlanKind::Tail { .. } | PlanKind::Children { .. } => (subtree, tail + 1),
         });
     });
     match commit {
@@ -1568,15 +1874,55 @@ pub(super) fn try_splice(
             target.children.truncate(keep);
             target.children.extend(tail);
         }
+        PlanKind::Children {
+            keep,
+            removed,
+            inserted,
+        } => {
+            CHILD_SPLICES.with(|count| count.set(count.get() + 1));
+            target.children.splice(keep..keep + removed, inserted);
+        }
     }
     cache.node_ids_stale = true;
     cache.width_memos.clear();
-    let solved = crate::layout::count_nodes(at_path(&cache.component, &plan.path)) as u32;
+    let solved = child_solved.unwrap_or_else(|| {
+        crate::layout::count_nodes(at_path(&cache.component, &plan.path)) as u32
+    });
     super::note_flush("splice", solved, shifted_nodes);
-    if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() {
+    if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() || retain_lowering_verify() {
         verify(viewport_w, viewport_h, plan.node);
     }
+    if retain_lowering_verify() {
+        verify_lowering(cache, plan.node);
+    }
     true
+}
+
+/// [`retain_lowering_verify`]: the retained component tree must equal the
+/// one a full rebuild lowers.
+fn verify_lowering(cache: &Cache, node: u32) {
+    let fresh = format!("{:?}", crate::dom::to_component_tree());
+    let kept = format!("{:?}", &*cache.component);
+    if fresh == kept {
+        eprintln!("[retain-verify] root {node}: lowering matches");
+        return;
+    }
+    let at = fresh
+        .bytes()
+        .zip(kept.bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or(fresh.len().min(kept.len()));
+    let start = at.saturating_sub(120);
+    let excerpt = |text: &str| {
+        text.get(start..(at + 120).min(text.len()))
+            .unwrap_or("")
+            .to_string()
+    };
+    eprintln!(
+        "[retain-verify] root {node}: lowering MISMATCH at byte {at}\n  kept  {}\n  fresh {}",
+        excerpt(&kept),
+        excerpt(&fresh)
+    );
 }
 
 /// Whole-tree `needs_text_metric`, without walking nodes the cache already
@@ -2504,6 +2850,9 @@ mod tests {
         assert!(crate::incremental_layout::flush());
         assert_matches_full("long text");
         let before = column_tail_reuses();
+        // Retained lowering keeps the untouched items as a child-list splice.
+        let kept = || retain_lowering_enabled().then(child_splices);
+        let kept_before = kept();
         let extra = crate::dom::create_element("div");
         style(extra, &[("margin", "4px"), ("padding", "4px")]);
         crate::dom::append_child(extra, crate::dom::create_text_node("tail item"));
@@ -2512,7 +2861,7 @@ mod tests {
         assert_matches_full("append after long text");
         if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
             assert!(
-                column_tail_reuses() > before,
+                column_tail_reuses() > before || kept() > kept_before,
                 "append should reuse untouched column items"
             );
         } else {
@@ -2535,11 +2884,12 @@ mod tests {
         assert_matches_full("text edit invalidates the cell");
         assert_eq!(column_tail_reuses(), reused);
         let before_remove = column_tail_reuses();
+        let kept_before = kept();
         crate::dom::remove_child(column, extra);
         assert!(crate::incremental_layout::flush());
         assert_matches_full("remove tail");
         if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
-            assert!(column_tail_reuses() > before_remove);
+            assert!(column_tail_reuses() > before_remove || kept() > kept_before);
         } else {
             assert_eq!(column_tail_reuses(), before_remove);
         }
@@ -2952,5 +3302,131 @@ mod tests {
         crate::dom::set_style_property(items[0], "width", "80px");
         assert!(crate::incremental_layout::flush());
         assert_matches_full("flex row width");
+    }
+
+    thread_local! {
+        pub(super) static FORCE_RETAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    struct RetainGuard;
+
+    impl RetainGuard {
+        fn on() -> Self {
+            FORCE_RETAIN.with(|force| force.set(true));
+            RetainGuard
+        }
+    }
+
+    impl Drop for RetainGuard {
+        fn drop(&mut self) {
+            FORCE_RETAIN.with(|force| force.set(false));
+        }
+    }
+
+    fn assert_lowering_matches_full(label: &str) {
+        let fresh = format!("{:?}", crate::dom::to_component_tree());
+        let kept = super::super::CACHE
+            .with(|slot| format!("{:?}", &*slot.borrow().as_ref().expect("cache").component));
+        assert!(
+            fresh == kept,
+            "{label}: retained lowering differs from a full rebuild"
+        );
+    }
+
+    fn chat_items() -> (u32, Vec<u32>) {
+        let streams = markdown_chat_page(32);
+        let msg = |p: u32| {
+            crate::dom::with_document(|document| {
+                let bubble = document.get_node(NodeId::from_u32(p)).parent.unwrap();
+                document.get_node(bubble).parent.unwrap().as_u32()
+            })
+        };
+        let msgs: Vec<u32> = streams.iter().map(|&(p, _)| msg(p)).collect();
+        let chat = crate::dom::with_document(|document| {
+            document
+                .get_node(NodeId::from_u32(msgs[0]))
+                .parent
+                .unwrap()
+                .as_u32()
+        });
+        (chat, msgs)
+    }
+
+    fn check(label: &str) {
+        assert_matches_full(label);
+        assert_client_rects_match_full(label);
+        assert_lowering_matches_full(label);
+    }
+
+    #[test]
+    fn column_flex_child_list_edits_keep_untouched_items() {
+        let _retain = RetainGuard::on();
+        let (chat, msgs) = chat_items();
+        check("initial");
+        let before = child_splices();
+        // Remove the middle message, put it back, move the last one up,
+        // and insert a new message between kept ones.
+        crate::dom::remove_child(chat, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("remove middle");
+        crate::dom::insert_before(chat, msgs[1], msgs[2]);
+        assert!(crate::incremental_layout::flush());
+        check("reinsert middle");
+        crate::dom::insert_before(chat, msgs[2], msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("move last up");
+        let fresh = crate::dom::create_element("div");
+        style(fresh, &[("padding", "6px"), ("margin", "2px 0 4px 0")]);
+        let p = crate::dom::create_element("p");
+        style(p, &[("margin", "0")]);
+        crate::dom::append_child(
+            p,
+            crate::dom::create_text_node("inserted words ".repeat(9).as_str()),
+        );
+        let strong = crate::dom::create_element("strong");
+        crate::dom::append_child(strong, crate::dom::create_text_node("bold"));
+        crate::dom::append_child(p, strong);
+        crate::dom::append_child(fresh, p);
+        crate::dom::insert_before(chat, fresh, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("insert new");
+        crate::dom::remove_child(chat, fresh);
+        crate::dom::remove_child(chat, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("remove tail two");
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            assert_eq!(
+                child_splices() - before,
+                5,
+                "child-list edits keep the items"
+            );
+        }
+    }
+
+    #[test]
+    fn column_flex_child_list_edit_with_counters_rebuilds() {
+        let _retain = RetainGuard::on();
+        let (chat, msgs) = chat_items();
+        // A list item directly in the column reads a `list-item` count the
+        // removed one changes.
+        let li = crate::dom::create_element("div");
+        style(li, &[("display", "list-item"), ("margin-left", "20px")]);
+        crate::dom::append_child(li, crate::dom::create_text_node("numbered"));
+        crate::dom::insert_before(chat, li, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("insert list item");
+        let before = child_splices();
+        crate::dom::remove_child(chat, li);
+        assert!(crate::incremental_layout::flush());
+        check("remove list item");
+        assert_eq!(child_splices(), before, "a list item edit must rebuild");
+        w3cos_dom::stylesheet::register_rule("div", &[("counter-increment", "msg")]);
+        crate::incremental_layout::invalidate();
+        assert!(crate::incremental_layout::flush());
+        crate::dom::remove_child(chat, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("counter rule");
+        assert_eq!(child_splices(), before, "counter rules must rebuild");
+        w3cos_dom::stylesheet::clear_rules();
     }
 }

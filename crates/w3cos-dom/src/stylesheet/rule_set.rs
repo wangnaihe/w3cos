@@ -19,6 +19,7 @@ pub(super) struct RuleSet {
     has_match_volatile_rules: bool,
     /// Some rule declares `transition*`.
     has_transition_rules: bool,
+    has_counter_rules: bool,
     /// Bits of pseudo-elements that have at least one rule.
     /// `::before` = 1, `::after` = 2, `::first-line` = 4,
     /// `::first-letter` = 8, anything else = 16.
@@ -83,6 +84,7 @@ impl RuleSet {
         self.has_structural_dependencies = false;
         self.has_match_volatile_rules = false;
         self.has_transition_rules = false;
+        self.has_counter_rules = false;
         self.pseudo_kinds = 0;
         for index in 0..self.rules.len() {
             self.index_rule(index);
@@ -115,6 +117,10 @@ impl RuleSet {
             .declarations
             .iter()
             .any(|(property, _)| property.starts_with("transition"));
+        self.has_counter_rules |= self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, value)| declaration_uses_counters(property, value));
         if let Some(pseudo) = &self.rules[index].pseudo_element {
             self.pseudo_kinds |= pseudo_kind_bit(pseudo);
         }
@@ -303,6 +309,10 @@ impl RuleSet {
         self.has_transition_rules
     }
 
+    pub(super) fn has_counter_rules(&self) -> bool {
+        self.has_counter_rules
+    }
+
     pub(super) fn has_match_volatile_rules(&self) -> bool {
         self.has_match_volatile_rules
     }
@@ -314,6 +324,26 @@ impl RuleSet {
     pub(super) fn has_structural_dependencies(&self) -> bool {
         self.has_structural_dependencies
     }
+}
+
+/// A declaration that creates, changes, or reads a CSS counter or the quote
+/// depth: lowering a box then depends on the boxes before it in tree order.
+pub(super) fn declaration_uses_counters(property: &str, value: &str) -> bool {
+    let property = property.trim();
+    if property
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("counter-"))
+    {
+        return true;
+    }
+    if property.eq_ignore_ascii_case("quotes") {
+        return true;
+    }
+    if property.eq_ignore_ascii_case("content") {
+        let value = value.to_ascii_lowercase();
+        return value.contains("counter") || value.contains("quote");
+    }
+    false
 }
 
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {

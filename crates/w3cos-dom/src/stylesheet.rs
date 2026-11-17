@@ -438,6 +438,7 @@ thread_local! {
     static RULES: RefCell<RuleSet> = RefCell::new(RuleSet::default());
     static STYLE_GENERATION: Cell<u64> = const { Cell::new(1) };
     /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural.
+    /// Bit 4: match-volatile. Bit 5: transitions. Bit 6: counters or quotes.
     /// Hot DOM mutations read this cell instead of borrowing `RULES`.
     static RULE_FLAGS: Cell<u8> = const { Cell::new(0) };
 }
@@ -461,6 +462,9 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     }
     if rules.has_transition_rules() {
         flags |= 32;
+    }
+    if rules.has_counter_rules() {
+        flags |= 64;
     }
     flags
 }
@@ -823,6 +827,16 @@ pub(crate) fn matched_rules_survive_inline_style_edits() -> bool {
 /// so callers skip the before/after style snapshots.
 pub fn has_transition_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 32 != 0)
+}
+
+/// Some rule declares `counter-*`, `quotes`, or a `content` that reads a
+/// counter or quote: inserting or removing a box can renumber later boxes.
+pub fn has_counter_rules() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 64 != 0)
+}
+
+pub(crate) fn declaration_uses_counters(property: &str, value: &str) -> bool {
+    rule_set::declaration_uses_counters(property, value)
 }
 
 /// `!important` declarations of the matched rules in cascade order.
