@@ -2942,11 +2942,11 @@ impl HostGroups {
     }
 }
 
-/// `W3COS_LAZY_DOM_RECTS=1`: a retained flush stores DOM layout rects on
-/// their first read instead of on every flush.
+/// A retained flush stores DOM layout rects on their first read instead
+/// of on every flush; on unless `W3COS_LAZY_DOM_RECTS=0`.
 fn lazy_dom_rects() -> bool {
     static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *LAZY.get_or_init(|| std::env::var_os("W3COS_LAZY_DOM_RECTS").is_some_and(|v| v == "1"))
+    *LAZY.get_or_init(|| std::env::var_os("W3COS_LAZY_DOM_RECTS").is_none_or(|v| v != "0"))
 }
 
 /// A retained flush's host rects, stored when the document first reads one.

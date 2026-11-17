@@ -1018,8 +1018,8 @@ fn union_text_pieces(
     merged
 }
 
-/// The f32 walk (positions summed in f32 down each chain); without
-/// W3COS_FLAT_SHIFT this is the only one used.
+/// The f32 walk (positions summed in f32 down each chain); with
+/// W3COS_FLAT_SHIFT=0 this is the only one used.
 fn flatten(
     fragment: &BoxFragment,
     x: f32,
@@ -1149,12 +1149,12 @@ fn exact_sum(a: f64, b: f64, s: f64) -> bool {
     s - a == b && s - b == a
 }
 
-/// W3COS_FLAT_SHIFT=1: reuse a retained child list's flattened output at a
-/// moved position by shifting it, when every sum stays exact (see
-/// [`shift_span`]).
+/// Reuse a retained child list's flattened output at a moved position by
+/// shifting it, when every sum stays exact (see [`shift_span`]); on unless
+/// W3COS_FLAT_SHIFT=0, which keeps the f32 walk.
 fn flat_shift() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("W3COS_FLAT_SHIFT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("W3COS_FLAT_SHIFT").is_none_or(|v| v != "0"))
 }
 
 /// Output buffers of the flatten before last, kept for the next one (a
