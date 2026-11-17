@@ -1460,10 +1460,10 @@ pub(super) fn append_text_leaf_line(
     space: &ConstraintSpace,
 ) -> bool {
     if content.is_empty()
-        || style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|props| props.contains_key("--w3cos-internal-bidi-logical-order"))
+        || style.custom_properties.as_ref().is_some_and(|props| {
+            props.may_contain("--w3cos-internal-bidi-logical-order")
+                && props.contains_key("--w3cos-internal-bidi-logical-order")
+        })
     {
         return false;
     }
@@ -1491,7 +1491,7 @@ pub(super) fn append_text_leaf_line(
             text_range: Some((0, content.len())),
             ellipsis: false,
             vertical: false,
-            children: Vec::new(),
+            children: Default::default(),
         },
     ));
     true
@@ -2584,7 +2584,7 @@ pub(super) fn layout_with_block_size(
             vertical: false,
             width: rect.2,
             height: rect.3,
-            children,
+            children: children.into(),
         }
     }
 

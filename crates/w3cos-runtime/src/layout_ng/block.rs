@@ -82,6 +82,7 @@ pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
         .custom_properties
         .as_ref()
+        .filter(|p| p.may_contain(key))
         .and_then(|p| p.get(key))
         .map(String::as_str)
 }
@@ -122,7 +123,12 @@ pub(super) fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
 }
 
 pub(super) fn is_value_carrier_marker(key: &str) -> bool {
-    let name = key.trim_start_matches("--w3cos-internal-");
+    // (`strip_prefix` compares bytes; `trim_start_matches` with a string
+    // pattern builds a substring searcher per call.)
+    let mut name = key;
+    while let Some(rest) = name.strip_prefix("--w3cos-internal-") {
+        name = rest;
+    }
     // `last baseline` alignment: grid reads it, the typed fields keep the
     // fallback value every other layout mode already used.
     name.starts_with("last-baseline-")
@@ -178,6 +184,12 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // reads them; unsupported values gate as `text:align-last`.
             | "text-align-last"
             | "text-justify"
+            // An outside `::marker` is lowered to an absolutely positioned
+            // box of its list item; list_marker::project places it after
+            // layout (Blink LayoutNGOutsideListMarker: positioned against
+            // the item's first line), on NG as on legacy.
+            | "list-item"
+            | "outside-list-marker"
             // `text-box-trim` / `text-box-edge`: IFC line boxes trim
             // half-leading at the first/last formatted line (CSS Inline 3).
             | "text-box-trim"
@@ -369,10 +381,10 @@ pub(super) fn block_unicode_bidi_ok(style: &Style) -> bool {
 /// carriers and the markers the current stage interprets (`allowed`).
 /// The DOM's mark on a fieldset's first legend child (HTML §15.3.13).
 fn is_rendered_legend(style: &Style) -> bool {
-    style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key("--w3cos-internal-rendered-legend"))
+    style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain("--w3cos-internal-rendered-legend")
+            && props.contains_key("--w3cos-internal-rendered-legend")
+    })
 }
 
 pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'static str> {
@@ -421,10 +433,11 @@ pub(super) const FLOAT_GROUP_MARKERS: [&str; 2] = [
 ];
 
 pub(super) fn is_float_group(style: &Style) -> bool {
-    style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| FLOAT_GROUP_MARKERS.iter().any(|m| props.contains_key(*m)))
+    style.custom_properties.as_ref().is_some_and(|props| {
+        FLOAT_GROUP_MARKERS
+            .iter()
+            .any(|m| props.may_contain(m) && props.contains_key(*m))
+    })
 }
 
 fn float_group_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -2739,6 +2752,11 @@ fn walk_rendered(flat: &[FlatNodeInfo], mut f: impl FnMut(usize) -> bool) {
 /// `None` when every rendered node is a box this stage lays out, otherwise
 /// the first reason the legacy engine must run.
 pub(super) fn unsupported_tree(flat: &[FlatNodeInfo]) -> Option<&'static str> {
+    if let Some(reason) =
+        super::cache::unsupported_tree_retained(flat, |index| node_reason(flat, index))
+    {
+        return reason;
+    }
     let mut reason = None;
     walk_rendered(flat, |index| {
         reason = node_reason(flat, index);
@@ -3319,6 +3337,17 @@ pub(super) fn intrinsic_sizes_at(
     space: &ConstraintSpace,
     block: Option<f32>,
 ) -> Option<MinMax> {
+    super::cache::min_max(flat, index, space, block, || {
+        intrinsic_sizes_uncached(flat, index, space, block)
+    })
+}
+
+fn intrinsic_sizes_uncached(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
     let info = &flat[index];
     if let Some(flow) = super::orthogonal::root_flow(flat, index) {
         return super::orthogonal::intrinsic(flat, index, flow, space);
@@ -3536,10 +3565,10 @@ pub(super) fn intrinsic_sizes_at(
 /// Percentage basis that a box gives its in-flow children: its definite
 /// content height after min/max (CSS 2.1 10.5), or `None`.
 fn child_percentage_block(style: &Style, space: &ConstraintSpace) -> Option<f32> {
-    let anonymous_block = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
+    let anonymous_block = style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain(inline::ANONYMOUS_BLOCK_MARKER)
+            && props.contains_key(inline::ANONYMOUS_BLOCK_MARKER)
+    });
     if anonymous_block {
         return space.percentage_block;
     }
@@ -4124,13 +4153,28 @@ fn is_run_in(style: &Style) -> bool {
 /// contents need no anonymous boxes: nothing, one inline text, or only
 /// in-flow block-level boxes. Returns the replacement styles by index.
 pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
-    let mut styles = Vec::new();
-    for (index, info) in flat.iter().enumerate() {
+    match super::box_scan::retained(super::box_scan::Scan::RunIn, flat, |index| {
+        run_in_block_style(flat, index).is_some()
+    }) {
+        Some(hits) => hits
+            .into_iter()
+            .filter_map(|index| run_in_block_style(flat, index))
+            .collect(),
+        None => (0..flat.len())
+            .filter_map(|index| run_in_block_style(flat, index))
+            .collect(),
+    }
+}
+
+fn run_in_block_style(flat: &[FlatNodeInfo], index: usize) -> Option<(usize, Style)> {
+    let info = &flat[index];
+    {
+        if matches!(info.kind, ComponentKind::Text { .. }) {
+            return None;
+        }
         let run_in = is_run_in(info.style) && marker(info.style, RUN_IN_BLOCK).is_some();
-        if matches!(info.kind, ComponentKind::Text { .. })
-            || (!run_in && !is_vertical_webkit_box(info.style))
-        {
-            continue;
+        if !run_in && !is_vertical_webkit_box(info.style) {
+            return None;
         }
         let children: Vec<&FlatNodeInfo> = flat[index + 1..info.subtree_end]
             .iter()
@@ -4169,10 +4213,10 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
                     style.custom_properties = None;
                 }
             }
-            styles.push((index, style));
+            return Some((index, style));
         }
     }
-    styles
+    None
 }
 
 /// Legacy `display: -webkit-box` and `-webkit-inline-box`. Both parse as
@@ -4361,32 +4405,89 @@ pub(super) fn layout_block_sized(
         bfc_y: 0.0,
         ..*space
     };
-    layout_block_in(
-        flat,
-        index,
-        &space,
-        force_bfc_root,
-        sized,
-        &mut ExclusionSpace::default(),
-    )
+    super::cache::layout(flat, index, &space, force_bfc_root, sized, || {
+        layout_block_in(
+            flat,
+            index,
+            &space,
+            force_bfc_root,
+            sized,
+            &mut ExclusionSpace::default(),
+        )
+    })
+}
+
+/// Moves adopted IFC children (`ifc_children`) to the front of the owned
+/// list before it is edited.
+fn own_ifc_children(
+    children: &mut Vec<(f32, f32, BoxFragment)>,
+    ifc_children: &mut Option<super::FragmentChildren>,
+) {
+    if let Some(shared) = ifc_children.take() {
+        let rest = std::mem::replace(children, shared.into_vec());
+        children.extend(rest);
+    }
 }
 
 /// Visits the boxes whose containing block is `index`'s content box: its
 /// rendered children, looking through synthetic float rows.
+const MARK_FLOAT_GROUP: u8 = 1;
+const MARK_STRETCH: u8 = 2;
+
+/// The float-group and `stretch` markers of box `index` (read once per pass).
+fn child_markers(flat: &[FlatNodeInfo], index: usize) -> u8 {
+    // (No custom properties, no markers: skip the pass table.)
+    if flat[index].style.custom_properties.is_none() {
+        return 0;
+    }
+    super::cache::marker_bits(flat, index, || {
+        let style = flat[index].style;
+        (is_float_group(style) as u8) * MARK_FLOAT_GROUP
+            | (marker(style, STRETCH).is_some() as u8) * MARK_STRETCH
+    })
+}
+
 fn for_each_cb_child(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usize)) {
+    for_each_cb_child_marked(flat, index, &mut |child, _| f(child));
+}
+
+/// `for_each_cb_child`, also passing each child's `child_markers`.
+fn for_each_cb_child_marked(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usize, u8)) {
     let end = flat[index].subtree_end;
     let mut child = index + 1;
     while child < end {
         let next = flat[child].subtree_end.max(child + 1);
         if flat[child].style.display != Display::None {
-            if is_float_group(flat[child].style) {
-                for_each_cb_child(flat, child, f);
+            let markers = child_markers(flat, child);
+            if markers & MARK_FLOAT_GROUP != 0 {
+                for_each_cb_child_marked(flat, child, f);
             } else {
-                f(child);
+                f(child, markers);
             }
         }
         child = next;
     }
+}
+
+const CB_ANY_STRETCH: u8 = 1;
+const CB_HAS_FLOAT: u8 = 2;
+
+/// Whether any box whose containing block is `index`'s content box
+/// carries `stretch` (`CB_ANY_STRETCH`) or floats (`CB_HAS_FLOAT`), read
+/// in one walk and kept for the rest of the pass.
+fn cb_child_bits(flat: &[FlatNodeInfo], index: usize) -> u8 {
+    super::cache::cb_child_bits(flat, index, || {
+        let mut bits = 0;
+        for_each_cb_child_marked(flat, index, &mut |child, markers| {
+            if flat[child].style.float != Float::None {
+                bits |= CB_HAS_FLOAT;
+            }
+            if markers & MARK_STRETCH != 0 {
+                bits |= CB_ANY_STRETCH;
+            }
+        });
+        bits
+    })
 }
 
 /// Replacement styles for the in-flow and floated children of block
@@ -4406,10 +4507,11 @@ pub(super) fn stretch_child_styles(
     // against the space the float leaves; that avoidance is not modelled,
     // so its inline `stretch` stays auto (as for flex, grid and table
     // items, which do not resolve the keyword either).
-    let mut has_float = false;
-    for_each_cb_child(flat, index, &mut |child| {
-        has_float |= flat[child].style.float != Float::None;
-    });
+    let bits = cb_child_bits(flat, index);
+    let has_float = bits & CB_HAS_FLOAT != 0;
+    if bits & CB_ANY_STRETCH == 0 {
+        return out;
+    }
     for_each_cb_child(flat, index, &mut |child| {
         let style = flat[child].style;
         let Some(tokens) = marker(style, STRETCH) else {
@@ -4691,11 +4793,10 @@ pub(super) fn layout_block_in(
     // line-height` so its flex-row form keeps the initial strut.  The NG
     // line box already contains that strut (in LayoutUnits), so the
     // synthetic floor is not a real constraint here.
-    let synthetic_strut_floor = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(inline::IFC_MARKER))
-        && style.min_height == Dimension::Px(style.font_size * style.line_height)
+    let synthetic_strut_floor = style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain(inline::IFC_MARKER) && props.contains_key(inline::IFC_MARKER)
+    }) && style.min_height
+        == Dimension::Px(style.font_size * style.line_height)
         && style.height == Dimension::Auto
         && style.max_height == Dimension::Auto;
     let min_h = if synthetic_strut_floor {
@@ -4786,10 +4887,10 @@ pub(super) fn layout_block_in(
             }
         }
     }
-    let anonymous_block = style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
+    let anonymous_block = style.custom_properties.as_ref().is_some_and(|props| {
+        props.may_contain(inline::ANONYMOUS_BLOCK_MARKER)
+            && props.contains_key(inline::ANONYMOUS_BLOCK_MARKER)
+    });
     // Multicol: children size against the used column width; the principal
     // box keeps the full content width (paint projects fragments).
     let column_width = super::columns::establishes(style)
@@ -4876,10 +4977,7 @@ pub(super) fn layout_block_in(
         !bfc_root && bb == 0.0 && pb == 0.0,
     );
     let orig_flat = flat;
-    let mut container_has_float = false;
-    for_each_cb_child(flat, index, &mut |child| {
-        container_has_float |= flat[child].style.float != Float::None;
-    });
+    let container_has_float = cb_child_bits(flat, index) & CB_HAS_FLOAT != 0;
     let stretched_flat;
     let flat = if stretch_styles.is_empty() {
         flat
@@ -4906,6 +5004,9 @@ pub(super) fn layout_block_in(
     // PreviousInflowPosition::self_collapsing_child_had_clearance.
     let mut last_cleared_self_collapsing = false;
     let mut children = Vec::new();
+    // An inline formatting context's adopted (shared) children; anything
+    // that edits `children` takes them over first (`own_ifc_children`).
+    let mut ifc_children: Option<super::FragmentChildren> = None;
     let mut column_monoliths = Vec::new();
     // Offset of the content box from the border box.
     let content_top = bt + pt;
@@ -4978,12 +5079,20 @@ pub(super) fn layout_block_in(
                 *cap = (*cap - result.height).max(0.0);
             }
         }
-        children.extend(
-            result
-                .children
-                .into_iter()
-                .map(|(x, y, fragment)| (bl + pl + x, bt + pt + y, fragment)),
-        );
+        let (dx, dy) = (bl + pl, bt + pt);
+        if children.is_empty() && dx.to_bits() == 0 && dy.to_bits() == 0 {
+            // No border or padding before the content: the line boxes'
+            // fragments are this box's children as they are (Blink keeps
+            // the line box fragments of a reused NGInlineNode layout).
+            ifc_children = Some(result.children);
+        } else {
+            children.extend(
+                result
+                    .children
+                    .into_iter()
+                    .map(|(x, y, fragment)| (dx + x, dy + y, fragment)),
+            );
+        }
     }
     let mut child = if image_size.is_some() || inline::is_inline_container(flat, index) {
         info.subtree_end
@@ -5910,6 +6019,7 @@ pub(super) fn layout_block_in(
         // baseline is the content's last line, else the content-box
         // bottom, whatever the overflow.
         let shift = ((content_height - auto_content) / 2.0).max(0.0);
+        own_ifc_children(&mut children, &mut ifc_children);
         for placed in &mut children {
             placed.1 += shift;
         }
@@ -5948,6 +6058,7 @@ pub(super) fn layout_block_in(
             space.viewport_h,
         )
         .why("oof-resolve")?;
+        own_ifc_children(&mut children, &mut ifc_children);
         children.extend(placed);
         oof_candidates = rest;
     }
@@ -5982,7 +6093,13 @@ pub(super) fn layout_block_in(
             vertical: false,
             width,
             height,
-            children,
+            children: match ifc_children {
+                Some(shared) if children.is_empty() => shared,
+                shared => {
+                    own_ifc_children(&mut children, &mut { shared });
+                    children.into()
+                }
+            },
         },
         start_strut,
         end_strut,

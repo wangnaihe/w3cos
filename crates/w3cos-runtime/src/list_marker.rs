@@ -4,7 +4,6 @@ use crate::layout::{
     inline_font_content_ascent, inline_font_height, inline_style_alignment_keyword,
     inline_style_baseline_offset, relative_flow_offset, resolve_spacing_for_layout,
 };
-use std::collections::HashMap;
 use w3cos_std::style::{Display, Float, Position, TextDirection};
 use w3cos_std::{ComponentKind, Style};
 
@@ -73,7 +72,7 @@ fn in_flow_descendant(flat: &[FlatNodeInfo<'_>], mut index: usize, owner: usize)
 
 fn flow_translation(
     flat: &[FlatNodeInfo<'_>],
-    positions: &HashMap<usize, usize>,
+    positions: &Positions<'_>,
     layouts: &[(LayoutRect, usize)],
     mut index: usize,
     context: usize,
@@ -85,11 +84,11 @@ fn flow_translation(
         let Some(parent) = flat[index].parent else {
             break;
         };
-        if let Some(position) = positions.get(&parent) {
+        if let Some(position) = positions.get(parent) {
             let offset = relative_flow_offset(
                 flat[index].style,
                 flat[parent].style,
-                layouts[*position].0,
+                layouts[position].0,
                 viewport_w,
                 viewport_h,
             );
@@ -99,6 +98,25 @@ fn flow_translation(
         index = parent;
     }
     result
+}
+
+/// Flat index -> position in `layouts` (a dense table: every flushed box
+/// has at most one layout entry), built here or handed in by the flush.
+struct Positions<'a>(std::borrow::Cow<'a, [u32]>);
+
+impl Positions<'_> {
+    fn new(layouts: &[(LayoutRect, usize)], len: usize) -> Self {
+        Self(std::borrow::Cow::Owned(crate::layout::layout_slots(
+            layouts, len,
+        )))
+    }
+
+    fn get(&self, index: usize) -> Option<usize> {
+        self.0
+            .get(index)
+            .filter(|position| **position != u32::MAX)
+            .map(|position| *position as usize)
+    }
 }
 
 pub(crate) fn project(
@@ -117,24 +135,54 @@ pub(crate) fn project(
     if markers.is_empty() {
         return;
     }
-    let positions: HashMap<_, _> = layouts
-        .iter()
-        .enumerate()
-        .map(|(position, (_, index))| (*index, position))
-        .collect();
     let contexts = float_content_contexts(flat);
     let mut visible = vec![true; flat.len()];
     let mut floats = Vec::new();
     for (index, node) in flat.iter().enumerate() {
         visible[index] =
             node.style.display != Display::None && node.parent.is_none_or(|parent| visible[parent]);
-        if !visible[index]
-            || node.style.float == Float::None
-            || matches!(node.style.position, Position::Absolute | Position::Fixed)
-        {
-            continue;
+        if visible[index] && float_candidate(node.style) {
+            floats.push(index);
         }
-        let (Some(parent), Some(position)) = (node.parent, positions.get(&index)) else {
+    }
+    place(
+        layouts,
+        flat,
+        viewport_w,
+        viewport_h,
+        &markers,
+        &contexts,
+        &floats,
+        None,
+        |index| property(flat[index].style, "--w3cos-internal-list-item").is_some(),
+    );
+}
+
+fn float_candidate(style: &Style) -> bool {
+    style.float != Float::None && !matches!(style.position, Position::Absolute | Position::Fixed)
+}
+
+/// Place the outside `markers` given each box's float context and the
+/// visible floats (in tree order).
+fn place(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport_w: f32,
+    viewport_h: f32,
+    markers: &[(usize, &str)],
+    contexts: &[usize],
+    float_boxes: &[usize],
+    slots: Option<&[u32]>,
+    list_item: impl Fn(usize) -> bool,
+) {
+    let positions = match slots {
+        Some(slots) => Positions(std::borrow::Cow::Borrowed(slots)),
+        None => Positions::new(layouts, flat.len()),
+    };
+    let mut floats = Vec::new();
+    for &index in float_boxes {
+        let node = &flat[index];
+        let (Some(parent), Some(position)) = (node.parent, positions.get(index)) else {
             continue;
         };
         let mut containing = parent;
@@ -145,11 +193,11 @@ pub(crate) fn project(
             containing = ancestor;
         }
         let basis = positions
-            .get(&containing)
-            .map_or(viewport_w, |position| layouts[*position].0.width);
+            .get(containing)
+            .map_or(viewport_w, |position| layouts[position].0.width);
         let spacing =
             |value| resolve_spacing_for_layout(value, basis, node.style, viewport_w, viewport_h);
-        let rect = layouts[*position].0;
+        let rect = layouts[position].0;
         let margin = node.style.margin;
         let ml = spacing(margin.left);
         let mr = spacing(margin.right);
@@ -178,14 +226,14 @@ pub(crate) fn project(
             },
         ));
     }
-    for (index, kind) in markers {
+    for &(index, kind) in markers {
         let marker = &flat[index];
-        let Some(&position) = positions.get(&index) else {
+        let Some(position) = positions.get(index) else {
             continue;
         };
         let mut owner = marker.parent;
         while let Some(parent) = owner {
-            if property(flat[parent].style, "--w3cos-internal-list-item").is_some() {
+            if list_item(parent) {
                 break;
             }
             owner = flat[parent].parent;
@@ -193,13 +241,15 @@ pub(crate) fn project(
         let Some(owner) = owner else {
             continue;
         };
-        let Some(&owner_position) = positions.get(&owner) else {
+        let Some(owner_position) = positions.get(owner) else {
             continue;
         };
         let item = &flat[owner];
         let rect = layouts[owner_position].0;
         let ascent = inline_font_content_ascent(marker.style).round().max(0.0) as i32;
-        let first_text = (owner + 1..flat.len())
+        // (An in-flow descendant lies inside the item's subtree.)
+        let item_end = item.subtree_end.max(owner + 1).min(flat.len());
+        let first_text = (owner + 1..item_end)
             .filter(|child| {
                 matches!(flat[*child].kind, ComponentKind::Text { content } if !content.is_empty())
                     && in_flow_descendant(flat, *child, owner)
@@ -207,8 +257,8 @@ pub(crate) fn project(
             })
             .find_map(|child| {
                 positions
-                    .get(&child)
-                    .map(|position| (child, layouts[*position].0))
+                    .get(child)
+                    .map(|position| (child, layouts[position].0))
             });
         let baseline = first_text
             .map(|(child, rect)| {
@@ -301,6 +351,253 @@ pub(crate) fn project(
         }
         layouts[position].0 = used;
     }
+}
+
+/// Box-tree mode (LayoutNG default; `W3COS_NG_BOX_TREE=0` opts out): what the projection reads
+/// besides geometry, kept across the patch flushes of one structure and refreshed only on restyled
+/// boxes (Blink keeps list-marker roles on its LayoutObjects instead of rescanning styles every
+/// frame).
+struct RetainedMarkers {
+    key: (u64, u64),
+    len: usize,
+    /// Per box: [`role`] bits, DOM node, split-inline owner.
+    roles: Vec<u8>,
+    host: Vec<Option<u32>>,
+    owner: Vec<Option<u32>>,
+    markers: Vec<(usize, &'static str)>,
+    contexts: Vec<usize>,
+    floats: Vec<usize>,
+    /// (DOM id, box) for every box whose `host` or `owner` is that id,
+    /// sorted: built on the second refresh (one refresh is not worth a
+    /// sort); empty means scan every box.
+    by_id: Vec<(u32, u32)>,
+    refreshes: u32,
+}
+
+thread_local! {
+    static RETAINED: std::cell::RefCell<Option<RetainedMarkers>> =
+        const { std::cell::RefCell::new(None) };
+    /// Nodes restyled in place since `RETAINED` was refreshed.
+    static RESTYLED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A node's style changed in place (box-tree mode).
+pub(crate) fn note_restyled(id: u32) {
+    RESTYLED.with(|ids| {
+        let mut ids = ids.borrow_mut();
+        if ids.len() >= 4096 {
+            ids.clear();
+            RETAINED.with(|slot| *slot.borrow_mut() = None);
+        }
+        ids.push(id);
+    });
+}
+
+/// The tree changed other than by an in-place restyle.
+pub(crate) fn forget_retained() {
+    RETAINED.with(|slot| *slot.borrow_mut() = None);
+    RESTYLED.with(|ids| ids.borrow_mut().clear());
+}
+
+const MARKER_KINDS: [&str; 6] = ["disc", "circle", "square", "decimal", "string", "image"];
+
+/// Outside-marker kind code (0 none, 1..=6 a placed kind, 7 another kind).
+fn marker_code(style: &Style) -> u8 {
+    match property(style, "--w3cos-internal-outside-list-marker") {
+        None => 0,
+        Some(kind) => MARKER_KINDS
+            .iter()
+            .position(|known| *known == kind)
+            .map_or(7, |at| at as u8 + 1),
+    }
+}
+
+/// The style-derived bits the projection reads for one box.
+fn role(node: &FlatNodeInfo<'_>) -> u8 {
+    let style = node.style;
+    marker_code(style)
+        | (property(style, "--w3cos-internal-list-item").is_some() as u8) << 3
+        | (crate::layout::establishes_float_bfc(style, node.parent.is_none()) as u8) << 4
+        | (crate::layout::genuine_float_track_container(style) as u8) << 5
+        | ((style.display == Display::None) as u8) << 6
+        | (float_candidate(style) as u8) << 7
+}
+
+fn host_id(node: &FlatNodeInfo<'_>) -> Option<u32> {
+    match node.on_click {
+        w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok(),
+        _ => None,
+    }
+}
+
+fn split_owner(node: &FlatNodeInfo<'_>) -> Option<u32> {
+    property(node.style, w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+        .and_then(|v| v.parse::<u32>().ok())
+}
+
+fn retain_markers(flat: &[FlatNodeInfo<'_>], key: (u64, u64)) -> RetainedMarkers {
+    let roles: Vec<u8> = flat.iter().map(role).collect();
+    let markers = roles
+        .iter()
+        .enumerate()
+        .filter(|(_, role)| (1..=6).contains(&(*role & 7)))
+        .map(|(index, role)| (index, MARKER_KINDS[(role & 7) as usize - 1]))
+        .collect::<Vec<_>>();
+    let (contexts, floats) = if markers.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut visible = vec![true; flat.len()];
+        let mut floats = Vec::new();
+        for (index, node) in flat.iter().enumerate() {
+            visible[index] =
+                roles[index] & 1 << 6 == 0 && node.parent.is_none_or(|parent| visible[parent]);
+            if visible[index] && roles[index] & 1 << 7 != 0 {
+                floats.push(index);
+            }
+        }
+        (float_content_contexts(flat), floats)
+    };
+    RetainedMarkers {
+        key,
+        len: flat.len(),
+        roles,
+        host: flat.iter().map(host_id).collect(),
+        owner: flat.iter().map(split_owner).collect(),
+        markers,
+        contexts,
+        floats,
+        by_id: Vec::new(),
+        refreshes: 0,
+    }
+}
+
+/// Refresh `retained` for the boxes of `ids` (and the host-less boxes their
+/// lowering produced below them); `None` when a role changed.
+fn refresh_markers(
+    flat: &[FlatNodeInfo<'_>],
+    mut retained: RetainedMarkers,
+    ids: &[u32],
+) -> Option<RetainedMarkers> {
+    if ids.is_empty() {
+        return Some(retained);
+    }
+    if ids.len() > 8 {
+        return None;
+    }
+    if retained.by_id.is_empty() && retained.refreshes > 0 {
+        retained.by_id = ids_index(&retained.host, &retained.owner);
+    }
+    retained.refreshes = retained.refreshes.saturating_add(1);
+    let mut dirty = Vec::new();
+    let visit = |index: usize, dirty: &mut Vec<usize>| {
+        if retained.owner[index].is_some_and(|id| ids.contains(&id)) {
+            dirty.push(index);
+        }
+        if retained.host[index].is_some_and(|id| ids.contains(&id)) {
+            dirty.push(index);
+            let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+            let mut child = index + 1;
+            while child < end {
+                if retained.host[child].is_some() {
+                    child = flat[child].subtree_end.max(child + 1);
+                } else {
+                    dirty.push(child);
+                    child += 1;
+                }
+            }
+        }
+    };
+    if retained.by_id.is_empty() {
+        for index in 0..flat.len() {
+            visit(index, &mut dirty);
+        }
+    } else {
+        // Only boxes whose host or owner is restyled add anything to the
+        // scan; visit them in its order.
+        let mut boxes = Vec::new();
+        for &id in ids {
+            let start = retained.by_id.partition_point(|&(key, _)| key < id);
+            boxes.extend(
+                retained.by_id[start..]
+                    .iter()
+                    .take_while(|&&(key, _)| key == id)
+                    .map(|&(_, index)| index as usize),
+            );
+        }
+        boxes.sort_unstable();
+        boxes.dedup();
+        for index in boxes {
+            visit(index, &mut dirty);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut scan = Vec::new();
+            for index in 0..flat.len() {
+                visit(index, &mut scan);
+            }
+            debug_assert_eq!(dirty, scan);
+        }
+    }
+    for index in dirty {
+        let node = &flat[index];
+        if role(node) != retained.roles[index] || split_owner(node) != retained.owner[index] {
+            return None;
+        }
+    }
+    Some(retained)
+}
+
+/// `RetainedMarkers::by_id` for these per-box ids.
+fn ids_index(host: &[Option<u32>], owner: &[Option<u32>]) -> Vec<(u32, u32)> {
+    let mut by_id = Vec::with_capacity(host.len());
+    for (index, (host, owner)) in host.iter().zip(owner).enumerate() {
+        let index = index as u32;
+        if let Some(id) = *host {
+            by_id.push((id, index));
+        }
+        if let Some(id) = *owner
+            && *owner != *host
+        {
+            by_id.push((id, index));
+        }
+    }
+    by_id.sort_unstable();
+    by_id
+}
+
+/// [`project`] for the LayoutNG flush, reusing the retained marker roles on
+/// a patch flush in box-tree mode. `slots` is `layouts`' dense flat index ->
+/// position table ([`crate::layout::layout_slots`]).
+pub(crate) fn project_retained(
+    layouts: &mut [(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    slots: &[u32],
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let Some(key) = crate::layout_ng::box_tree_key(flat) else {
+        return project(layouts, flat, viewport_w, viewport_h);
+    };
+    let ids = RESTYLED.with(|ids| std::mem::take(&mut *ids.borrow_mut()));
+    let retained = RETAINED
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|r| r.key == key && r.len == flat.len())
+        .and_then(|r| refresh_markers(flat, r, &ids))
+        .unwrap_or_else(|| retain_markers(flat, key));
+    if !retained.markers.is_empty() {
+        place(
+            layouts,
+            flat,
+            viewport_w,
+            viewport_h,
+            &retained.markers,
+            &retained.contexts,
+            &retained.floats,
+            Some(slots),
+            |index| retained.roles[index] & 1 << 3 != 0,
+        );
+    }
+    RETAINED.with(|slot| *slot.borrow_mut() = Some(retained));
 }
 
 #[cfg(test)]

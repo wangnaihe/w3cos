@@ -110,7 +110,43 @@ pub struct CssClipRect {
 /// computed style for inheritance no longer deep-copies the map; the first
 /// mutation through `DerefMut` unshares it.
 #[derive(Clone, Default)]
-pub struct CustomProperties(std::sync::Arc<CustomPropertyMap>);
+pub struct CustomProperties(std::sync::Arc<CustomPropertyData>);
+
+/// The shared map and a key signature filter over it, computed on the
+/// first `may_contain` and reset by every mutation: layout probes absent
+/// `--w3cos-internal-*` markers on most boxes, and a filter miss answers
+/// without hashing the key.
+#[derive(Default)]
+struct CustomPropertyData {
+    map: CustomPropertyMap,
+    /// 0: not computed; otherwise `FILTER_READY` | the keys' bits.
+    filter: std::sync::atomic::AtomicU64,
+}
+
+const FILTER_READY: u64 = 1 << 63;
+
+impl Clone for CustomPropertyData {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            filter: std::sync::atomic::AtomicU64::new(
+                self.filter.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+/// One of 63 bits from a key's length and two of its bytes.
+fn key_bit(key: &str) -> u64 {
+    let bytes = key.as_bytes();
+    let n = bytes.len();
+    let (last, mid) = if n == 0 {
+        (0, 0)
+    } else {
+        (bytes[n - 1] as u64, bytes[n / 2] as u64)
+    };
+    1 << (((n as u64) * 31 + last * 7 + mid) % 63)
+}
 
 /// FxHash like Blink's StringHash-keyed HashMap: keys are short CSS names, so a
 /// SipHash per lookup (layout probes `--w3cos-internal-*` markers per box) is
@@ -118,8 +154,36 @@ pub struct CustomProperties(std::sync::Arc<CustomPropertyMap>);
 pub type CustomPropertyMap = crate::fxhash::FxHashMap<String, String>;
 
 impl CustomProperties {
+    /// Same shared map. While a caller holds a clone, the map cannot change
+    /// in place (every mutation goes through `Arc::make_mut`), so equal
+    /// pointers mean equal contents.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// False only when `key` is certainly absent (no hashing or probing).
+    pub fn may_contain(&self, key: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut filter = self.0.filter.load(Relaxed);
+        if filter == 0 {
+            filter = self
+                .0
+                .map
+                .keys()
+                .fold(FILTER_READY, |bits, key| bits | key_bit(key));
+            self.0.filter.store(filter, Relaxed);
+        }
+        filter & key_bit(key) != 0
+    }
+
+    fn map_mut(&mut self) -> &mut CustomPropertyMap {
+        let data = std::sync::Arc::make_mut(&mut self.0);
+        *data.filter.get_mut() = 0;
+        &mut data.map
     }
 
     /// Copy-on-write aware: a no-op removal never unshares the map (Blink's
@@ -129,45 +193,45 @@ impl CustomProperties {
         String: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        if !self.0.contains_key(key) {
+        if !self.0.map.contains_key(key) {
             return None;
         }
-        std::sync::Arc::make_mut(&mut self.0).remove(key)
+        self.map_mut().remove(key)
     }
 
     /// Like `HashMap::retain`, but only unshares when something is dropped.
     pub fn retain(&mut self, mut keep: impl FnMut(&String, &String) -> bool) {
-        if self.0.iter().all(|(key, value)| keep(key, value)) {
+        if self.0.map.iter().all(|(key, value)| keep(key, value)) {
             return;
         }
-        std::sync::Arc::make_mut(&mut self.0).retain(|key, value| keep(key, value));
+        self.map_mut().retain(|key, value| keep(key, value));
     }
 
     /// Like `HashMap::insert`, but storing an identical value keeps sharing.
     pub fn insert(&mut self, key: String, value: String) -> Option<String> {
-        if self.0.get(&key) == Some(&value) {
+        if self.0.map.get(&key) == Some(&value) {
             return Some(value);
         }
-        std::sync::Arc::make_mut(&mut self.0).insert(key, value)
+        self.map_mut().insert(key, value)
     }
 }
 
 impl std::ops::Deref for CustomProperties {
     type Target = CustomPropertyMap;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.0.map
     }
 }
 
 impl std::ops::DerefMut for CustomProperties {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        std::sync::Arc::make_mut(&mut self.0)
+        self.map_mut()
     }
 }
 
 impl PartialEq for CustomProperties {
     fn eq(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0.map == other.0.map
     }
 }
 
@@ -175,26 +239,30 @@ impl Eq for CustomProperties {}
 
 impl std::fmt::Debug for CustomProperties {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.0.map.fmt(f)
     }
 }
 
 impl From<CustomPropertyMap> for CustomProperties {
     fn from(map: CustomPropertyMap) -> Self {
-        Self(std::sync::Arc::new(map))
+        Self(std::sync::Arc::new(CustomPropertyData {
+            map,
+            filter: Default::default(),
+        }))
     }
 }
 
 impl From<std::collections::HashMap<String, String>> for CustomProperties {
     fn from(map: std::collections::HashMap<String, String>) -> Self {
-        Self(std::sync::Arc::new(map.into_iter().collect()))
+        Self::from(map.into_iter().collect::<CustomPropertyMap>())
     }
 }
 
 impl From<CustomProperties> for std::collections::HashMap<String, String> {
     fn from(props: CustomProperties) -> Self {
         std::sync::Arc::try_unwrap(props.0)
-            .unwrap_or_else(|shared| (*shared).clone())
+            .map(|data| data.map)
+            .unwrap_or_else(|shared| shared.map.clone())
             .into_iter()
             .collect()
     }
@@ -210,13 +278,13 @@ impl<'a> IntoIterator for &'a CustomProperties {
     type Item = (&'a String, &'a String);
     type IntoIter = std::collections::hash_map::Iter<'a, String, String>;
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.0.map.iter()
     }
 }
 
 impl Serialize for CustomProperties {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (*self.0).serialize(serializer)
+        self.0.map.serialize(serializer)
     }
 }
 
@@ -1547,9 +1615,26 @@ impl Edges {
         }
     }
 
+    /// Every side a plain px length: no safe-area or keyboard inset can
+    /// apply, so layout's per-item edge reads skip those lookups.
+    fn px_lengths(&self) -> Option<EdgeLengths> {
+        match (self.top, self.right, self.bottom, self.left) {
+            (Spacing::Px(top), Spacing::Px(right), Spacing::Px(bottom), Spacing::Px(left)) => {
+                Some(EdgeLengths {
+                    top: used_box_spacing(top),
+                    right: used_box_spacing(right),
+                    bottom: used_box_spacing(bottom),
+                    left: used_box_spacing(left),
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_lengths_with_style(&self, insets: &SafeAreaInsets, style: &Style) -> EdgeLengths {
         let resolve = |value: Spacing| {
             used_box_spacing(match value {
+                Spacing::Px(value) => value,
                 Spacing::Em(value) => value * style.font_size,
                 Spacing::Ch(value) => value * style.ch_advance(),
                 // A calc() with a zero percentage does not depend on the
@@ -1613,13 +1698,17 @@ impl Style {
     }
 
     pub fn padding_lengths(&self) -> EdgeLengths {
-        self.padding
-            .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        self.padding.px_lengths().unwrap_or_else(|| {
+            self.padding
+                .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        })
     }
 
     pub fn margin_lengths(&self) -> EdgeLengths {
-        self.margin
-            .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        self.margin.px_lengths().unwrap_or_else(|| {
+            self.margin
+                .resolve_lengths_with_style(&crate::safe_area::current(), self)
+        })
     }
 
     pub fn resolved_overflow_x(&self) -> Overflow {
@@ -1643,7 +1732,33 @@ impl Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{Display, Edges, Overflow, Spacing, Style};
+    use super::{CustomProperties, Display, Edges, Overflow, Spacing, Style};
+
+    #[test]
+    fn custom_property_filter_follows_every_mutation() {
+        let mut props = CustomProperties::new();
+        assert!(!props.may_contain("--a"));
+        props.insert("--w3cos-internal-stretch".into(), "1".into());
+        assert!(props.may_contain("--w3cos-internal-stretch"));
+        // A shared map keeps its filter; the unshared copy recomputes it.
+        let shared = props.clone();
+        props.remove("--w3cos-internal-stretch");
+        assert!(shared.may_contain("--w3cos-internal-stretch"));
+        assert!(props.get("--w3cos-internal-stretch").is_none());
+        props.insert("--b".into(), "2".into());
+        assert!(props.may_contain("--b"));
+        (*props).insert("--through-deref-mut".into(), "3".into());
+        assert!(props.may_contain("--through-deref-mut"));
+        props.retain(|key, _| key != "--b");
+        // Every present key always passes the filter.
+        for key in ["--through-deref-mut", "--w3cos-internal-stretch"] {
+            assert_eq!(
+                props.get(key).is_some(),
+                props.get(key).is_some() && props.may_contain(key)
+            );
+        }
+        assert!(props.may_contain("--through-deref-mut"));
+    }
 
     #[test]
     fn absolute_length_conversion_rounds_only_the_final_pixel_value() {

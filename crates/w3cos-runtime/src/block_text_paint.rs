@@ -80,7 +80,7 @@ pub(crate) fn replay<'a>(
                         ..*piece
                     },
                     kind: Cow::Owned(ComponentKind::Text {
-                        content: text.clone(),
+                        content: text.to_string(),
                     }),
                     style: Cow::Owned(piece_style.clone()),
                 });

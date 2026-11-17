@@ -853,7 +853,7 @@ pub(super) fn layout(
             text_range: None,
             ellipsis: false,
             vertical: false,
-            children,
+            children: children.into(),
         },
         last_baseline: LastBaseline::NoLines,
         first_baseline: LastBaseline::NoLines,

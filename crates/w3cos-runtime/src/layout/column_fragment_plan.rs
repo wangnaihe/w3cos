@@ -26,6 +26,14 @@ pub(crate) fn resolve(
     viewport: Option<(f32, f32)>,
 ) -> Vec<Option<ColumnFragmentPlan>> {
     use w3cos_std::style::ColumnFill;
+    // Plans exist only for column contexts, which are decided by style
+    // alone; a tree without one needs no geometry walk.
+    if !nodes
+        .iter()
+        .any(|(style, _)| establishes_column_context(style))
+    {
+        return vec![None; nodes.len()];
+    }
     let mut contexts = vec![None; nodes.len()];
     let mut owners = vec![None; nodes.len()];
     let mut children = vec![false; nodes.len()];

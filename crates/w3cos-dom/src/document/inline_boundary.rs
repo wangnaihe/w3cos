@@ -13,7 +13,7 @@ impl Document {
             if raw.is_empty() {
                 return None;
             }
-            let style = self.computed_style_for(id);
+            let style = self.computed_flow_style(id);
             return (!is_only_css_whitespace(raw)
                 || !matches!(
                     style.white_space,
@@ -24,7 +24,7 @@ impl Document {
         if node.node_type != NodeType::Element {
             return None;
         }
-        let style = self.computed_style_for(id);
+        let style = self.computed_flow_style(id);
         if style.display == Display::None
             || style.float != Float::None
             || matches!(style.position, Position::Absolute | Position::Fixed)
@@ -54,7 +54,7 @@ impl Document {
                 | Display::TableColumnGroup
         ) && node
             .parent
-            .is_some_and(|parent| self.computed_style_for(parent).display == Display::Inline)
+            .is_some_and(|parent| self.computed_flow_style(parent).display == Display::Inline)
         {
             return Some(true);
         }

@@ -1222,6 +1222,79 @@ pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
     out
 }
 
+thread_local! {
+    /// Box-tree mode: the preorder stable ids of the last patch flush's
+    /// flat tree, under its structure key (ids depend on structure only).
+    static FLAT_SKELETON: std::cell::RefCell<Option<((u64, u64), Vec<u64>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `pre_flatten` for a patch flush over structure `key` (box-tree mode):
+/// reuses the stable ids and node count kept for that structure instead of
+/// counting and rehashing every slot.
+pub(crate) fn pre_flatten_keyed(
+    root: &Component,
+    key: Option<(u64, u64)>,
+) -> Vec<FlatNodeInfo<'_>> {
+    let Some(key) = key else {
+        return pre_flatten(root);
+    };
+    let kept = FLAT_SKELETON.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .filter(|(at, _)| *at == key)
+            .map(|(_, ids)| ids)
+    });
+    let (flat, ids) = match kept {
+        Some(ids) => {
+            install_font_unit_provider();
+            let mut out = Vec::with_capacity(ids.len());
+            pre_flatten_with_ids(root, None, &ids, &mut out);
+            if out.len() == ids.len() {
+                (out, ids)
+            } else {
+                let flat = pre_flatten(root);
+                let ids = flat.iter().map(|node| node.stable_id).collect();
+                (flat, ids)
+            }
+        }
+        None => {
+            let flat = pre_flatten(root);
+            let ids = flat.iter().map(|node| node.stable_id).collect();
+            (flat, ids)
+        }
+    };
+    FLAT_SKELETON.with(|slot| *slot.borrow_mut() = Some((key, ids)));
+    flat
+}
+
+pub(crate) fn forget_flat_skeleton() {
+    FLAT_SKELETON.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn pre_flatten_with_ids<'a>(
+    comp: &'a Component,
+    parent: Option<usize>,
+    ids: &[u64],
+    out: &mut Vec<FlatNodeInfo<'a>>,
+) {
+    let my_idx = out.len();
+    out.push(FlatNodeInfo {
+        component: Some(comp),
+        stable_id: ids.get(my_idx).copied().unwrap_or(0),
+        kind: &comp.kind,
+        style: &comp.style,
+        on_click: &comp.on_click,
+        sticky_counter_signal: comp.sticky_counter_signal,
+        parent,
+        subtree_end: my_idx + 1,
+    });
+    for child in &comp.children {
+        pre_flatten_with_ids(child, Some(my_idx), ids, out);
+    }
+    out[my_idx].subtree_end = out.len();
+}
+
 pub(crate) fn count_nodes(comp: &Component) -> usize {
     if comp.children.is_empty() {
         return 1;
@@ -2952,6 +3025,7 @@ fn auto_table_track_widths(component: &Component, percentage_basis: Option<f32>)
                     WSpacing::Ch(ch) => ch * component.style.ch_advance(),
                     WSpacing::Rem(rem) => rem * ROOT_FONT_SIZE,
                     WSpacing::Auto => 0.0,
+                    WSpacing::Px(value) => value,
                     other => other.resolve(&w3cos_std::safe_area::current()),
                 };
                 let inner_edges = if component.style.border_collapse {
@@ -4009,6 +4083,7 @@ pub(crate) fn resolve_spacing_for_layout(
         WSpacing::Vw(value) => value * viewport_w / 100.0,
         WSpacing::Vh(value) => value * viewport_h / 100.0,
         WSpacing::Auto => 0.0,
+        WSpacing::Px(value) => value,
         other => other.resolve(&w3cos_std::safe_area::current()),
     })
 }
@@ -4806,6 +4881,10 @@ pub struct LayoutResults {
     /// (NGPhysicalTextFragment), in fragment order. `layout_cache` holds the
     /// union rect for such a node; paint draws the pieces instead.
     pub text_fragments: Vec<crate::layout_ng::TextFragment>,
+    /// [`layout_slots`] for `layout_cache` (flat index -> its last entry),
+    /// when the producer built one. Valid while `layout_cache` keeps its
+    /// order and length.
+    pub(crate) layout_slots: Option<Vec<u32>>,
 }
 
 impl LayoutResults {
@@ -4816,6 +4895,7 @@ impl LayoutResults {
             clip_only_nodes: Vec::new(),
             scroll_ancestor: Vec::new(),
             text_fragments: Vec::new(),
+            layout_slots: None,
         }
     }
 }
@@ -4855,6 +4935,11 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> bool {
+        if !self.tree_valid && crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            // LayoutNG reads the patched component; a legacy fallback
+            // rebuilds the (invalid) Taffy tree from it.
+            return true;
+        }
         let Some(&node) = self.node_index.get(index) else {
             return false;
         };
@@ -4896,11 +4981,16 @@ impl LayoutEngine {
                     Some((layout_cache, text_fragments)) => {
                         // The legacy Taffy tree no longer matches this output.
                         self.tree_valid = false;
+                        // The flush's own entries: its flat index table
+                        // still holds.
+                        let slots = take_layout_slots(&layout_cache, flat.len())
+                            .unwrap_or_else(|| layout_slots(&layout_cache, flat.len()));
                         let (scrollable_nodes, clip_only_nodes, scroll_ancestor) =
-                            scroll_containers_from_layout(
+                            scroll_containers_with_slots(
                                 &layout_cache,
                                 flat,
                                 Some((viewport_w, viewport_h)),
+                                &slots,
                             );
                         Ok(LayoutResults {
                             layout_cache,
@@ -4908,6 +4998,7 @@ impl LayoutEngine {
                             clip_only_nodes,
                             scroll_ancestor,
                             text_fragments,
+                            layout_slots: Some(slots),
                         })
                     }
                     None => self.compute_legacy(root, flat, viewport_w, viewport_h),
@@ -5071,6 +5162,7 @@ impl LayoutEngine {
                 clip_only_nodes: clip_only,
                 scroll_ancestor,
                 text_fragments: Vec::new(),
+                layout_slots: None,
             });
         }
 
@@ -5351,6 +5443,7 @@ impl LayoutEngine {
             clip_only_nodes: clip_only,
             scroll_ancestor,
             text_fragments: Vec::new(),
+            layout_slots: None,
         })
     }
 }
@@ -6095,6 +6188,7 @@ pub fn compute_with_scroll_details(
         clip_only_nodes: clip_only,
         scroll_ancestor,
         text_fragments: Vec::new(),
+        layout_slots: None,
     })
 }
 
@@ -11700,7 +11794,7 @@ fn project_simple_float_margin_boxes(
     visit(root, 0, layouts, &layout_position, viewport_w, viewport_h);
 }
 
-fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
+pub(crate) fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
     // Only consulted for flex/grid boxes; probing the custom property map
     // for every box in every float pass dominated this predicate.
     let anonymous = || {
@@ -11727,7 +11821,7 @@ fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
         ) && !anonymous())
 }
 
-fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
+pub(crate) fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
     matches!(
         style.display,
         WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
@@ -11741,12 +11835,16 @@ fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
 /// context, while their own contents and real flex/grid items are isolated.
 pub(crate) fn float_content_contexts(flat: &[FlatNodeInfo<'_>]) -> Vec<usize> {
     let mut contexts = vec![0; flat.len()];
+    // Per parent, read once for all its children: 0 unread, 1 no, 2 yes.
+    let mut track = vec![0u8; flat.len()];
     for (index, node) in flat.iter().enumerate() {
         contexts[index] = if establishes_float_bfc(node.style, node.parent.is_none())
-            || node
-                .parent
-                .is_some_and(|parent| genuine_float_track_container(flat[parent].style))
-        {
+            || node.parent.is_some_and(|parent| {
+                if track[parent] == 0 {
+                    track[parent] = 1 + genuine_float_track_container(flat[parent].style) as u8;
+                }
+                track[parent] == 2
+            }) {
             index
         } else {
             node.parent.map_or(index, |parent| contexts[parent])
@@ -20743,43 +20841,121 @@ fn refresh_scroll_container_rects(
 /// overflow clip) is a scrollport; its scrollable extent is the farthest
 /// descendant border-box edge past its own border box, as in the legacy
 /// collector. Scrollbars take no space (the legacy engine reserves none).
-pub(crate) fn scroll_containers_from_layout(
-    layouts: &[(LayoutRect, usize)],
-    flat: &[FlatNodeInfo<'_>],
-    viewport: Option<(f32, f32)>,
-) -> (
-    Vec<(usize, LayoutRect, ScrollExtent)>,
-    Vec<(usize, LayoutRect)>,
-    Vec<Option<usize>>,
-) {
-    let rects = layouts
-        .iter()
-        .map(|(rect, index)| (*index, *rect))
-        .collect::<HashMap<_, _>>();
+/// The style-derived half of `scroll_containers_from_layout`: per box its
+/// scroll container, the scroll-container candidates (with whether they
+/// clip as `hidden`), and the accumulated transform shifts. Box-tree mode
+/// keeps it per structure (Blink keeps these bits on the LayoutObject).
+struct ScrollPlan {
+    scroll_ancestor: Vec<Option<usize>>,
+    /// Per box: the scroll container whose extent it extends (its scroll
+    /// ancestor unless it is fixed), `u32::MAX` for none.
+    extent_ancestor: Vec<u32>,
+    containers: Vec<(usize, bool)>,
+    shifts: Vec<(usize, (f32, f32))>,
+    columns: bool,
+}
+
+struct RetainedScrollPlan {
+    key: (u64, u64),
+    len: usize,
+    seq: u64,
+    inputs: Vec<ScrollInput>,
+    plan: std::rc::Rc<ScrollPlan>,
+}
+
+/// Every style input `scroll_plan` reads from one box.
+#[derive(Clone, Copy, PartialEq)]
+struct ScrollInput {
+    flags: u16,
+    translate: (u32, u32),
+}
+
+fn scroll_input(style: &w3cos_std::style::Style) -> ScrollInput {
+    let overflow = |o: WOverflow| match o {
+        WOverflow::Visible => 0u16,
+        WOverflow::Hidden => 1,
+        WOverflow::Scroll | WOverflow::Auto => 2,
+        #[allow(unreachable_patterns)]
+        _ => 3,
+    };
+    let flags = u16::from(matches!(style.position, WPos::Absolute))
+        | u16::from(matches!(style.position, WPos::Static)) << 1
+        | u16::from(style.display.establishes_overflow_clip()) << 2
+        | u16::from(establishes_column_context(style)) << 3
+        | overflow(style.resolved_overflow_x()) << 4
+        | overflow(style.resolved_overflow_y()) << 6
+        | u16::from(matches!(style.position, WPos::Fixed)) << 8;
+    ScrollInput {
+        flags,
+        translate: (
+            style.transform.translate_x.to_bits(),
+            style.transform.translate_y.to_bits(),
+        ),
+    }
+}
+
+thread_local! {
+    static SCROLL_PLAN: std::cell::RefCell<Option<RetainedScrollPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn forget_scroll_plan() {
+    SCROLL_PLAN.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn scroll_plan(flat: &[FlatNodeInfo<'_>]) -> std::rc::Rc<ScrollPlan> {
+    let Some(key) = crate::layout_ng::box_tree_key(flat) else {
+        return std::rc::Rc::new(build_scroll_plan(flat));
+    };
+    let seq = crate::layout_ng::restyle_position();
+    let kept = SCROLL_PLAN
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|kept| kept.key == key && kept.len == flat.len());
+    let reused = kept.and_then(|mut kept| {
+        let dirty = crate::layout_ng::restyled_boxes_since(flat, key, kept.seq)?;
+        for index in dirty {
+            let now = scroll_input(flat[index].style);
+            if kept.inputs[index] != now {
+                return None;
+            }
+        }
+        kept.seq = seq;
+        Some(kept)
+    });
+    let kept = reused.unwrap_or_else(|| RetainedScrollPlan {
+        key,
+        len: flat.len(),
+        seq,
+        inputs: flat.iter().map(|node| scroll_input(node.style)).collect(),
+        plan: std::rc::Rc::new(build_scroll_plan(flat)),
+    });
+    let plan = kept.plan.clone();
+    SCROLL_PLAN.with(|slot| *slot.borrow_mut() = Some(kept));
+    plan
+}
+
+fn build_scroll_plan(flat: &[FlatNodeInfo<'_>]) -> ScrollPlan {
     // `inherited[i]`: the scroll container that clips `i`'s children.
     let mut inherited: Vec<Option<usize>> = vec![None; flat.len()];
     let mut scroll_ancestor: Vec<Option<usize>> = vec![None; flat.len()];
-    let mut scrollable = Vec::new();
-    let mut hidden_clip = vec![false; flat.len()];
+    let mut extent_ancestor = vec![u32::MAX; flat.len()];
+    let mut containers = Vec::new();
+    let mut shifts = Vec::new();
     // Translation accumulated from the transforms of the boxes between a box
     // and its scroll container (the container's own transform moves the
     // container, not its contents). Scrollable overflow is measured on the
     // transformed boxes (CSS Overflow 3), so a descendant that a transform
     // moves back into the scrollport adds no overflow.
     let mut content_shift: Vec<(f32, f32)> = vec![(0.0, 0.0); flat.len()];
-    let mut shifted_layouts = layouts.to_vec();
-    let layout_slot = layouts
-        .iter()
-        .enumerate()
-        .map(|(slot, (_, index))| (*index, slot))
-        .collect::<HashMap<_, _>>();
     let body_host = crate::dom::body_id();
     let root_overflow_visible = flat.first().is_some_and(|root| {
         root.style.resolved_overflow_x() == WOverflow::Visible
             && root.style.resolved_overflow_y() == WOverflow::Visible
     });
+    let mut columns = false;
     for index in 0..flat.len() {
         let info = &flat[index];
+        columns |= establishes_column_context(info.style);
         let current = info.parent.and_then(|parent| inherited[parent]);
         let mut effective = current;
         if matches!(info.style.position, WPos::Absolute) {
@@ -20811,6 +20987,11 @@ pub(crate) fn scroll_containers_from_layout(
             }
         }
         scroll_ancestor[index] = effective;
+        if !matches!(info.style.position, WPos::Fixed)
+            && let Some(clip) = effective
+        {
+            extent_ancestor[index] = clip as u32;
+        }
         inherited[index] = effective;
         let parent_shift = info
             .parent
@@ -20820,11 +21001,8 @@ pub(crate) fn scroll_containers_from_layout(
             parent_shift.1 + info.style.transform.translate_y,
         );
         content_shift[index] = own_shift;
-        if (own_shift.0 != 0.0 || own_shift.1 != 0.0)
-            && let Some(slot) = layout_slot.get(&index)
-        {
-            shifted_layouts[*slot].0.x += own_shift.0;
-            shifted_layouts[*slot].0.y += own_shift.1;
+        if own_shift.0 != 0.0 || own_shift.1 != 0.0 {
+            shifts.push((index, own_shift));
         }
         let overflow_x = info.style.resolved_overflow_x();
         let overflow_y = info.style.resolved_overflow_y();
@@ -20851,36 +21029,129 @@ pub(crate) fn scroll_containers_from_layout(
         {
             inherited[index] = Some(index);
             content_shift[index] = (0.0, 0.0);
-            if let Some(rect) = rects.get(&index) {
-                scrollable.push((
-                    index,
-                    *rect,
-                    ScrollExtent {
-                        max_x: 0.0,
-                        max_y: 0.0,
-                    },
-                ));
-                hidden_clip[index] = clips(overflow_x) || clips(overflow_y);
-            }
+            containers.push((index, clips(overflow_x) || clips(overflow_y)));
         }
     }
-    extend_scroll_extents_from_descendants(
-        &shifted_layouts,
-        flat,
-        &scroll_ancestor,
-        &mut scrollable,
-    );
-    extend_scroll_extents_from_overflow_columns(&shifted_layouts, flat, viewport, &mut scrollable);
+    ScrollPlan {
+        scroll_ancestor,
+        extent_ancestor,
+        containers,
+        shifts,
+        columns,
+    }
+}
+
+/// Flat index -> its (last) entry in `layouts`, as a dense table
+/// (`u32::MAX`: none).
+pub(crate) fn layout_slots(layouts: &[(LayoutRect, usize)], len: usize) -> Vec<u32> {
+    let mut table = vec![u32::MAX; len];
+    for (slot, (_, index)) in layouts.iter().enumerate() {
+        if let Some(entry) = table.get_mut(*index) {
+            *entry = slot as u32;
+        }
+    }
+    table
+}
+
+thread_local! {
+    /// The LayoutNG flush's [`layout_slots`] for the entries it returned:
+    /// (entries pointer, entries length, flat length, table).
+    static LAYOUT_SLOTS: std::cell::RefCell<Option<(usize, usize, usize, Vec<u32>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keep `slots` for the [`scroll_containers_from_layout`] call on these
+/// same entries.
+pub(crate) fn stash_layout_slots(layouts: &[(LayoutRect, usize)], len: usize, slots: Vec<u32>) {
+    LAYOUT_SLOTS.with(|slot| {
+        *slot.borrow_mut() = Some((layouts.as_ptr() as usize, layouts.len(), len, slots));
+    });
+}
+
+/// The stashed table, if it is for these entries. Only a caller holding
+/// the very entries the flush returned may use it (a copy can reuse their
+/// allocation).
+fn take_layout_slots(layouts: &[(LayoutRect, usize)], len: usize) -> Option<Vec<u32>> {
+    let (ptr, entries, flat_len, slots) = LAYOUT_SLOTS.with(|slot| slot.borrow_mut().take())?;
+    (ptr == layouts.as_ptr() as usize && entries == layouts.len() && flat_len == len)
+        .then_some(slots)
+}
+
+pub(crate) fn scroll_containers_from_layout(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    scroll_containers_with_slots(layouts, flat, viewport, &layout_slots(layouts, flat.len()))
+}
+
+fn scroll_containers_with_slots(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+    layout_slot: &[u32],
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    debug_assert_eq!(layout_slot, layout_slots(layouts, flat.len()));
+    let slot_of = |index: usize| {
+        layout_slot
+            .get(index)
+            .filter(|slot| **slot != u32::MAX)
+            .map(|slot| *slot as usize)
+    };
+    let plan = scroll_plan(flat);
+    let mut shifted = None::<Vec<(LayoutRect, usize)>>;
+    for &(index, shift) in &plan.shifts {
+        if let Some(slot) = slot_of(index) {
+            let layouts = shifted.get_or_insert_with(|| layouts.to_vec());
+            layouts[slot].0.x += shift.0;
+            layouts[slot].0.y += shift.1;
+        }
+    }
+    let shifted_layouts = shifted.as_deref().unwrap_or(layouts);
+    let mut hidden_clip = Vec::new();
+    let mut scrollable = Vec::new();
+    for &(index, hidden) in &plan.containers {
+        if let Some(slot) = slot_of(index) {
+            scrollable.push((
+                index,
+                layouts[slot].0,
+                ScrollExtent {
+                    max_x: 0.0,
+                    max_y: 0.0,
+                },
+            ));
+            hidden_clip.push(hidden);
+        }
+    }
+    extend_scroll_extents_planned(shifted_layouts, &plan.extent_ancestor, &mut scrollable);
+    if plan.columns {
+        extend_scroll_extents_from_overflow_columns(
+            shifted_layouts,
+            flat,
+            viewport,
+            &mut scrollable,
+        );
+    }
     let mut clip_only = Vec::new();
+    let mut hidden = hidden_clip.into_iter();
     scrollable.retain(|(index, rect, extent)| {
-        if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden_clip[*index] {
+        let hidden = hidden.next().unwrap_or(false);
+        if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden {
             true
         } else {
             clip_only.push((*index, *rect));
             false
         }
     });
-    (scrollable, clip_only, scroll_ancestor)
+    (scrollable, clip_only, plan.scroll_ancestor.clone())
 }
 
 /// Overflow columns are paint-projected (CSS Multicol) and therefore absent
@@ -20893,7 +21164,12 @@ fn extend_scroll_extents_from_overflow_columns(
     viewport: Option<(f32, f32)>,
     scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
 ) {
-    if scrollable.is_empty() {
+    // (Plans exist only for column contexts, decided by style alone.)
+    if scrollable.is_empty()
+        || !flat
+            .iter()
+            .any(|node| establishes_column_context(node.style))
+    {
         return;
     }
     let mut rects = vec![None; flat.len()];
@@ -20936,17 +21212,58 @@ fn extend_scroll_extents_from_overflow_columns(
     }
 }
 
+/// `extend_scroll_extents_from_descendants` over a plan's precomputed
+/// extent ancestors (no style reads per box).
+fn extend_scroll_extents_planned(
+    layouts: &[(LayoutRect, usize)],
+    extent_ancestor: &[u32],
+    scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
+) {
+    if scrollable.is_empty() {
+        return;
+    }
+    let mut scrollport_positions = vec![u32::MAX; extent_ancestor.len()];
+    for (position, (index, _, _)) in scrollable.iter().enumerate() {
+        if let Some(entry) = scrollport_positions.get_mut(*index) {
+            *entry = position as u32;
+        }
+    }
+    for (child, child_index) in layouts {
+        let Some(&scroll_index) = extent_ancestor.get(*child_index) else {
+            continue;
+        };
+        let Some(&position) = scrollport_positions.get(scroll_index as usize) else {
+            continue;
+        };
+        if position == u32::MAX {
+            continue;
+        }
+        let (_, scrollport, extent) = &mut scrollable[position as usize];
+        extent.max_x = extent
+            .max_x
+            .max(child.x + child.width - (scrollport.x + scrollport.width));
+        extent.max_y = extent
+            .max_y
+            .max(child.y + child.height - (scrollport.y + scrollport.height));
+    }
+}
+
 fn extend_scroll_extents_from_descendants(
     layouts: &[(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
     scroll_ancestor: &[Option<usize>],
     scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
 ) {
-    let scrollport_positions = scrollable
-        .iter()
-        .enumerate()
-        .map(|(position, (index, _, _))| (*index, position))
-        .collect::<HashMap<_, _>>();
+    if scrollable.is_empty() {
+        return;
+    }
+    // Flat index -> position in `scrollable`, as a dense table.
+    let mut scrollport_positions = vec![u32::MAX; flat.len()];
+    for (position, (index, _, _)) in scrollable.iter().enumerate() {
+        if let Some(entry) = scrollport_positions.get_mut(*index) {
+            *entry = position as u32;
+        }
+    }
     for (child, child_index) in layouts {
         if matches!(
             flat.get(*child_index).map(|entry| entry.style.position),
@@ -20957,10 +21274,14 @@ fn extend_scroll_extents_from_descendants(
         let Some(scroll_index) = scroll_ancestor.get(*child_index).copied().flatten() else {
             continue;
         };
-        let Some(position) = scrollport_positions.get(&scroll_index).copied() else {
+        let Some(position) = scrollport_positions
+            .get(scroll_index)
+            .copied()
+            .filter(|position| *position != u32::MAX)
+        else {
             continue;
         };
-        let (_, scrollport, extent) = &mut scrollable[position];
+        let (_, scrollport, extent) = &mut scrollable[position as usize];
         extent.max_x = extent
             .max_x
             .max(child.x + child.width - (scrollport.x + scrollport.width));
@@ -26107,6 +26428,7 @@ fn compute_absolute_rect(
         WSpacing::Vw(value) => value * viewport_w / 100.0,
         WSpacing::Vh(value) => value * viewport_h / 100.0,
         WSpacing::Auto => 0.0,
+        WSpacing::Px(value) => value,
         other => other.resolve(&w3cos_std::safe_area::current()),
     };
     let resolve_h = |d: WDim| {
@@ -26269,6 +26591,7 @@ fn positioned_percentage_border_box_size(
         WSpacing::Vw(value) => value * viewport_w / 100.0,
         WSpacing::Vh(value) => value * viewport_h / 100.0,
         WSpacing::Auto => 0.0,
+        WSpacing::Px(value) => value,
         other => other.resolve(&w3cos_std::safe_area::current()),
     };
     let content_width = style.width.resolve(

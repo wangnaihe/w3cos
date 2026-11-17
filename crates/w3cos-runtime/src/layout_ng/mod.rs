@@ -27,6 +27,8 @@
 //! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod box_scan;
+mod cache;
 mod columns;
 mod exclusion;
 mod flex;
@@ -68,6 +70,61 @@ pub(crate) fn mode_from_env(
     }
 }
 
+/// A node's style was patched in place (see `cache::note_restyled`).
+pub(crate) fn note_restyled(id: u32) {
+    cache::note_restyled(id);
+    if cache::box_tree_enabled() {
+        crate::list_marker::note_restyled(id);
+        crate::incremental_layout::note_client_restyled(id);
+        box_scan::note_restyled(id);
+    }
+}
+
+/// The tree was edited other than by an in-place restyle.
+pub(crate) fn forget_patch_memo() {
+    cache::forget_patch_memo();
+    crate::list_marker::forget_retained();
+    crate::incremental_layout::forget_client_plan();
+    crate::incremental_layout::forget_style_paths();
+    box_scan::forget();
+    forget_flat_reuse();
+    crate::layout::forget_flat_skeleton();
+    crate::layout::forget_scroll_plan();
+}
+
+/// Box-tree mode: the restyle-log position a memo kept under
+/// `box_tree_key` records.
+pub(crate) fn restyle_position() -> u64 {
+    box_scan::log_position()
+}
+
+/// Box-tree mode: the boxes a restyle since `seq` can have changed.
+pub(crate) fn restyled_boxes_since(
+    flat: &[crate::layout::FlatNodeInfo],
+    key: (u64, u64),
+    seq: u64,
+) -> Option<Vec<usize>> {
+    box_scan::changed_since(flat, key, seq)
+}
+
+pub(crate) fn box_tree_enabled() -> bool {
+    cache::box_tree_enabled()
+}
+
+/// Box-tree mode: the structure key of the patch flush laying out `flat`
+/// (per-box data kept under it stays valid but for restyled boxes).
+pub(crate) fn box_tree_key(flat: &[crate::layout::FlatNodeInfo]) -> Option<(u64, u64)> {
+    cache::box_tree_enabled()
+        .then(|| cache::patch_key(flat))
+        .flatten()
+}
+
+/// Mark (or with `None` end) the flush laying out patched `flat` under
+/// structure `key`.
+pub(crate) fn set_patch_hint(flat: Option<(&[crate::layout::FlatNodeInfo], (u64, u64))>) {
+    cache::set_patch_hint(flat);
+}
+
 pub(crate) fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
@@ -105,7 +162,7 @@ fn trace() -> bool {
 }
 
 /// NGConstraintSpace: the input of every layout algorithm.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ConstraintSpace {
     /// Available inline size (the containing block's content width).
     pub available_inline: f32,
@@ -216,7 +273,82 @@ pub(crate) struct BoxFragment {
     /// glyphs of `text-orientation: mixed`).
     pub vertical: bool,
     /// Children with their border-box offset from this border box.
-    pub children: Vec<(f32, f32, BoxFragment)>,
+    pub children: FragmentChildren,
+}
+
+/// A fragment's children, shared between copies (Blink's
+/// NGPhysicalFragment is ref-counted and immutable once built: a cached
+/// NGLayoutResult hands out the same fragment tree). Copy-on-write: a
+/// mutable borrow of a shared list copies one level.
+#[derive(Debug, Clone)]
+pub(crate) struct FragmentChildren(std::rc::Rc<Vec<(f32, f32, BoxFragment)>>);
+
+impl Default for FragmentChildren {
+    /// Leaf fragments share one empty list (no allocation per leaf; the
+    /// first push copies it like any shared list).
+    fn default() -> Self {
+        thread_local! {
+            static EMPTY: std::rc::Rc<Vec<(f32, f32, BoxFragment)>> =
+                std::rc::Rc::new(Vec::new());
+        }
+        Self(EMPTY.with(std::rc::Rc::clone))
+    }
+}
+
+impl std::ops::Deref for FragmentChildren {
+    type Target = Vec<(f32, f32, BoxFragment)>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FragmentChildren {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::rc::Rc::make_mut(&mut self.0)
+    }
+}
+
+impl From<Vec<(f32, f32, BoxFragment)>> for FragmentChildren {
+    fn from(children: Vec<(f32, f32, BoxFragment)>) -> Self {
+        Self(std::rc::Rc::new(children))
+    }
+}
+
+impl FromIterator<(f32, f32, BoxFragment)> for FragmentChildren {
+    fn from_iter<I: IntoIterator<Item = (f32, f32, BoxFragment)>>(iter: I) -> Self {
+        Self(std::rc::Rc::new(iter.into_iter().collect()))
+    }
+}
+
+impl FragmentChildren {
+    /// The list by value (moved out when unshared).
+    pub fn into_vec(self) -> Vec<(f32, f32, BoxFragment)> {
+        std::rc::Rc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl IntoIterator for FragmentChildren {
+    type Item = (f32, f32, BoxFragment);
+    type IntoIter = std::vec::IntoIter<(f32, f32, BoxFragment)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FragmentChildren {
+    type Item = &'a (f32, f32, BoxFragment);
+    type IntoIter = std::slice::Iter<'a, (f32, f32, BoxFragment)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut FragmentChildren {
+    type Item = &'a mut (f32, f32, BoxFragment);
+    type IntoIter = std::slice::IterMut<'a, (f32, f32, BoxFragment)>;
+    fn into_iter(self) -> Self::IntoIter {
+        std::rc::Rc::make_mut(&mut self.0).iter_mut()
+    }
 }
 
 /// The last line box's baseline (NGBoxFragment::LastBaseline), as an
@@ -317,6 +449,55 @@ fn note(reason: &'static str) {
     let _ = reason;
 }
 
+/// A text fragment's characters, shared by every copy of the fragment
+/// (paint's, and a retained subtree's on the next flush) instead of
+/// copied (Blink's NGPhysicalTextFragment shares its text content).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FragmentText(std::rc::Rc<str>);
+
+impl FragmentText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for FragmentText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for FragmentText {
+    fn from(text: &str) -> Self {
+        Self(text.into())
+    }
+}
+
+impl From<String> for FragmentText {
+    fn from(text: String) -> Self {
+        Self(text.into())
+    }
+}
+
+impl PartialEq<str> for FragmentText {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for FragmentText {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl std::fmt::Display for FragmentText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One line-box piece of a text node broken inside its content, like
 /// Blink's NGPhysicalTextFragment: the node, its [start, end) byte offsets
 /// into the node's text (NGInlineItem start/end offsets) and the piece's
@@ -328,7 +509,7 @@ pub struct TextFragment {
     pub start: usize,
     pub end: usize,
     pub rect: LayoutRect,
-    pub text: String,
+    pub text: FragmentText,
     /// Sideways glyphs of a vertical flow (see `BoxFragment::vertical`).
     pub vertical: bool,
 }
@@ -362,10 +543,9 @@ pub(crate) fn layout_tree_with_text(
     // An empty inline text node generates no box at all (CSS Text 3 §4.1:
     // collapsed away; it adds nothing to a line, and a flex or grid parent
     // makes no item of it).
-    let hidden: Vec<(usize, w3cos_std::style::Style)> = flat
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
+    let hidden_entry = |index: usize| -> Option<(usize, w3cos_std::style::Style)> {
+        let node = &flat[index];
+        {
             if is_empty_inline_text(node)
                 && !node
                     .parent
@@ -377,15 +557,26 @@ pub(crate) fn layout_tree_with_text(
             }
             // The DOM's fallback `px` size of an svg grid item is `auto`
             // for layout (the legacy engine keeps reading the `px`).
-            if node
-                .parent
-                .is_some_and(|parent| block::is_author_grid(flat[parent].style))
+            // (Only a box with a specified size has a fallback one; read
+            // its markers, then its parent's, only then.)
+            if node.style.width == w3cos_std::style::Dimension::Auto
+                && node.style.height == w3cos_std::style::Dimension::Auto
             {
-                return block::svg_fallback_auto_style(node.style).map(|style| (index, style));
+                return None;
             }
-            None
-        })
-        .collect();
+            let style = block::svg_fallback_auto_style(node.style)?;
+            node.parent
+                .is_some_and(|parent| block::is_author_grid(flat[parent].style))
+                .then_some((index, style))
+        }
+    };
+    let hidden: Vec<(usize, w3cos_std::style::Style)> =
+        match box_scan::retained(box_scan::Scan::Hidden, flat, |index| {
+            hidden_entry(index).is_some()
+        }) {
+            Some(hits) => hits.into_iter().filter_map(hidden_entry).collect(),
+            None => (0..flat.len()).filter_map(hidden_entry).collect(),
+        };
     if !hidden.is_empty() {
         let flat_hidden = run_in_patched(flat, &hidden);
         let patched: Vec<FlatNodeInfo> = flat_hidden
@@ -401,7 +592,14 @@ pub(crate) fn layout_tree_with_text(
             .collect();
         return layout_tree_balanced(&patched, viewport_w, viewport_h);
     }
-    if flat.iter().any(is_empty_box_leaf) {
+    let empty_leaf = box_scan::retained(box_scan::Scan::EmptyLeaf, flat, |index| {
+        is_empty_box_leaf(&flat[index])
+    })
+    .map_or_else(
+        || flat.iter().any(is_empty_box_leaf),
+        |hits| !hits.is_empty(),
+    );
+    if empty_leaf {
         let patched: Vec<FlatNodeInfo> = flat
             .iter()
             .map(|node| FlatNodeInfo {
@@ -473,10 +671,9 @@ fn layout_tree_balanced(
 /// `wrap-reverse`) with the balance marker, keyed by flat index.
 fn balanced_wrap_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, w3cos_std::style::Style)> {
     use w3cos_std::style::{Display, FlexWrap};
-    flat.iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
-            let style = node.style;
+    let entry = |index: usize| -> Option<(usize, w3cos_std::style::Style)> {
+        {
+            let style = flat[index].style;
             if !matches!(style.display, Display::Flex) {
                 return None;
             }
@@ -509,8 +706,14 @@ fn balanced_wrap_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, w3cos_std::style::
                 properties.insert(flex::BALANCE_MARKER.to_string(), "1".to_string());
             }
             Some((index, style))
-        })
-        .collect()
+        }
+    };
+    match box_scan::retained(box_scan::Scan::Balanced, flat, |index| {
+        entry(index).is_some()
+    }) {
+        Some(hits) => hits.into_iter().filter_map(entry).collect(),
+        None => (0..flat.len()).filter_map(entry).collect(),
+    }
 }
 
 fn layout_logical(
@@ -521,16 +724,20 @@ fn layout_logical(
     // Logical properties (`inline-size`, `block-size`, block-axis margins and
     // padding) resolved per writing mode apply to this engine only; the
     // declared style stays what the legacy engine reads.
-    let logical: Vec<(usize, w3cos_std::style::Style)> = flat
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
-            let overrides = node.style.logical_overrides.as_ref()?;
-            let mut style = node.style.clone();
-            overrides.apply(&mut style);
-            Some((index, style))
-        })
-        .collect();
+    let logical_entry = |index: usize| -> Option<(usize, w3cos_std::style::Style)> {
+        let node = &flat[index];
+        let overrides = node.style.logical_overrides.as_ref()?;
+        let mut style = node.style.clone();
+        overrides.apply(&mut style);
+        Some((index, style))
+    };
+    let logical: Vec<(usize, w3cos_std::style::Style)> =
+        match box_scan::retained(box_scan::Scan::Logical, flat, |index| {
+            flat[index].style.logical_overrides.is_some()
+        }) {
+            Some(hits) => hits.into_iter().filter_map(logical_entry).collect(),
+            None => (0..flat.len()).filter_map(logical_entry).collect(),
+        };
     // `text-spacing-trim` (default `normal`) halves fullwidth punctuation at
     // line ends and between adjacent marks; it is not laid out yet, so a page
     // that sets text in such punctuation keeps ignoring the logical sizes on
@@ -623,13 +830,25 @@ fn layout_with_run_in(
     };
     // Vertical-writing-mode flex and grid containers lay out with transposed
     // axes.
-    let mut vertical = grid::vertical_grid_styles(base);
-    let taken: Vec<usize> = vertical.iter().map(|(index, _)| *index).collect();
-    vertical.extend(
-        flex::vertical_flex_styles(base)
-            .into_iter()
-            .filter(|(index, _)| !taken.contains(index)),
-    );
+    // Both read only boxes in a vertical writing mode: a tree without one
+    // has nothing to transpose (box-tree mode keeps that set).
+    let no_vertical = box_scan::retained(box_scan::Scan::Vertical, base, |index| {
+        !base[index].style.writing_mode.is_horizontal()
+    })
+    .is_some_and(|hits| hits.is_empty());
+    let mut vertical = if no_vertical {
+        Vec::new()
+    } else {
+        grid::vertical_grid_styles(base)
+    };
+    if !no_vertical {
+        let taken: Vec<usize> = vertical.iter().map(|(index, _)| *index).collect();
+        vertical.extend(
+            flex::vertical_flex_styles(base)
+                .into_iter()
+                .filter(|(index, _)| !taken.contains(index)),
+        );
+    }
     if vertical.is_empty() {
         return layout_flat_with_text(base, viewport_w, viewport_h);
     }
@@ -691,7 +910,10 @@ fn layout_flat_with_text(
     }
     #[cfg(any(test, feature = "layout-ng-trace"))]
     RUNTIME_REASON.with(|r| r.set(""));
-    let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
+    let pass = cache::begin_pass(flat);
+    let laid = block::layout_root(flat, viewport_w, viewport_h);
+    drop(pass);
+    let Some((x, y, fragment)) = laid else {
         #[cfg(any(test, feature = "layout-ng-trace"))]
         if trace() {
             let reason = RUNTIME_REASON.with(|r| r.get());
@@ -705,7 +927,16 @@ fn layout_flat_with_text(
     };
     let mut out = Vec::with_capacity(flat.len());
     let mut texts = Vec::new();
-    flatten(&fragment, x, y, flat, &mut out, &mut texts);
+    match box_tree_key(flat) {
+        Some(key) if flat_shift() => {
+            flatten_retained_shift(&fragment, x, y, flat, key, &mut out, &mut texts)
+        }
+        Some(key) => flatten_retained(&fragment, x, y, flat, key, &mut out, &mut texts),
+        None if flat_shift() => {
+            flatten_f64(&fragment, x.into(), y.into(), flat, &mut out, &mut texts)
+        }
+        None => flatten(&fragment, x, y, flat, &mut out, &mut texts),
+    }
     if !texts.is_empty() {
         // Paint draws pieces as inline text runs; a block-level text leaf
         // also paints box decorations from its single node rect.
@@ -735,8 +966,14 @@ fn layout_flat_with_text(
             }
             return None;
         }
-        out = union_text_pieces(out, &texts);
+        out = union_text_pieces(out, &texts, flat.len());
     }
+    // One flat index -> entry table for the marker projection and the
+    // scroll containers `LayoutEngine::compute` derives next (projection
+    // moves rects, never entries).
+    let slots = crate::layout::layout_slots(&out, flat.len());
+    crate::list_marker::project_retained(&mut out, flat, &slots, viewport_w, viewport_h);
+    crate::layout::stash_layout_slots(&out, flat.len(), slots);
     Some((out, texts))
 }
 
@@ -745,14 +982,23 @@ fn layout_flat_with_text(
 fn union_text_pieces(
     out: Vec<(LayoutRect, usize)>,
     texts: &[TextFragment],
+    len: usize,
 ) -> Vec<(LayoutRect, usize)> {
-    let broken: std::collections::HashSet<usize> = texts.iter().map(|t| t.index).collect();
-    let mut slot: std::collections::HashMap<usize, usize> = Default::default();
+    // Flat index -> its merged entry (dense: `UNSEEN` for a broken text
+    // node not yet met, `u32::MAX` for an unbroken box).
+    const UNSEEN: u32 = u32::MAX - 1;
+    let len = len.max(texts.iter().map(|t| t.index + 1).max().unwrap_or(0));
+    let mut slot = vec![u32::MAX; len];
+    for text in texts {
+        slot[text.index] = UNSEEN;
+    }
     let mut merged: Vec<(LayoutRect, usize)> = Vec::with_capacity(out.len());
     for (rect, index) in out {
-        if broken.contains(&index) {
-            if let Some(&at) = slot.get(&index) {
-                let u = &mut merged[at].0;
+        if let Some(entry) = slot.get_mut(index)
+            && *entry != u32::MAX
+        {
+            if *entry != UNSEEN {
+                let u = &mut merged[*entry as usize].0;
                 let x0 = u.x.min(rect.x);
                 let y0 = u.y.min(rect.y);
                 let x1 = (u.x + u.width).max(rect.x + rect.width);
@@ -765,14 +1011,56 @@ fn union_text_pieces(
                 };
                 continue;
             }
-            slot.insert(index, merged.len());
+            *entry = merged.len() as u32;
         }
         merged.push((rect, index));
     }
     merged
 }
 
+/// The f32 walk (positions summed in f32 down each chain); with
+/// W3COS_FLAT_SHIFT=0 this is the only one used.
 fn flatten(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    flatten_own(fragment, x, y, flat, out, texts);
+    for (dx, dy, child) in &fragment.children {
+        flatten(child, x + dx, y + dy, flat, out, texts);
+    }
+}
+
+/// Positions add up in f64 and round to f32 once per box, so a box's
+/// position is (nearly always exactly) the real sum of the offsets above
+/// it, whatever the path: a moved child list's output can then be shifted
+/// rather than walked again (see [`shift_span`]).
+fn flatten_f64(
+    fragment: &BoxFragment,
+    x: f64,
+    y: f64,
+    flat: &[FlatNodeInfo],
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    flatten_own(fragment, x as f32, y as f32, flat, out, texts);
+    for (dx, dy, child) in &fragment.children {
+        flatten_f64(
+            child,
+            x + f64::from(*dx),
+            y + f64::from(*dy),
+            flat,
+            out,
+            texts,
+        );
+    }
+}
+
+/// A fragment's own rect entry and its text piece, if any.
+fn flatten_own(
     fragment: &BoxFragment,
     x: f32,
     y: f32,
@@ -794,11 +1082,16 @@ fn flatten(
         })
         .filter(|_| fragment.text_range.is_none());
     if let Some((start, end)) = fragment.text_range.or(whole) {
-        let mut text = match flat[fragment.index].kind {
-            w3cos_std::ComponentKind::Text { content } => content[start..end].to_string(),
-            _ => String::new(),
+        let content = match flat[fragment.index].kind {
+            w3cos_std::ComponentKind::Text { content } => &content[start..end],
+            _ => "",
         };
-        if fragment.ellipsis {
+        // One allocation for the shared text (a `String` first would be
+        // copied again into the `Rc<str>`).
+        let text: FragmentText = if !fragment.ellipsis {
+            content.into()
+        } else {
+            let mut text = content.to_string();
             // (The line's collapsible trailing space goes before the ellipsis.)
             let keep_spaces =
                 flat[fragment.index].style.white_space == w3cos_std::style::WhiteSpace::Pre;
@@ -809,7 +1102,8 @@ fn flatten(
                 .len(),
             );
             text.push('\u{2026}');
-        }
+            text.into()
+        };
         texts.push(TextFragment {
             index: fragment.index,
             start,
@@ -820,8 +1114,402 @@ fn flatten(
         });
     }
     out.push((rect, fragment.index));
-    for (dx, dy, child) in &fragment.children {
-        flatten(child, x + dx, y + dy, flat, out, texts);
+}
+
+/// Box-tree mode: the last patch flush's flattened output, and where each
+/// large retained child list's part of it sits (keyed by the list's
+/// address; the list is pinned so the address stays its own).
+struct FlatReuse {
+    key: (u64, u64),
+    len: usize,
+    out: Vec<(LayoutRect, usize)>,
+    texts: Vec<TextFragment>,
+    /// The f64 positions behind `out` and `texts` (same indices).
+    pos: Vec<(f64, f64)>,
+    text_pos: Vec<(f64, f64)>,
+    spans: w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
+}
+
+struct FlatSpan {
+    children: FragmentChildren,
+    x: f64,
+    y: f64,
+    out: (usize, usize),
+    texts: (usize, usize),
+    /// Per axis: every position sum inside the span (`x + dx` down each
+    /// chain) was exact, so its positions are the real sums of the span's
+    /// origin and the offsets below it.
+    exact: (bool, bool),
+}
+
+/// `a + b` rounded to `s` without error (round-to-nearest: the sum is
+/// exact iff both differences give the operands back).
+#[inline(always)]
+fn exact_sum(a: f64, b: f64, s: f64) -> bool {
+    s - a == b && s - b == a
+}
+
+/// Reuse a retained child list's flattened output at a moved position by
+/// shifting it, when every sum stays exact (see [`shift_span`]); on unless
+/// W3COS_FLAT_SHIFT=0, which keeps the f32 walk.
+fn flat_shift() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_FLAT_SHIFT").is_none_or(|v| v != "0"))
+}
+
+/// Output buffers of the flatten before last, kept for the next one (a
+/// fresh 1-2 MB allocation per flush faults its pages in again).
+struct FlatSpare {
+    out: Vec<(LayoutRect, usize)>,
+    pos: Vec<(f64, f64)>,
+    text_pos: Vec<(f64, f64)>,
+}
+
+/// Appends `prev`'s entries moved by `(dx, dy)`.  Each old position is the
+/// exact sum of the old origin and the offsets above it (`span.exact`); if
+/// each moved position is exact too, every partial sum of the fresh chain
+/// (each one some ancestor's position) is exact, so the fresh walk would
+/// give these same bits.  An axis that did not move is copied as is.
+/// Returns false (and appends nothing) when a sum would round, or would
+/// give a zero whose sign the fresh walk might not.
+#[allow(clippy::too_many_arguments)]
+fn shift_span(prev: &FlatReuse, span: &FlatSpan, x: f64, y: f64, w: &mut FlatWrite<'_>) -> bool {
+    let (sx, sy) = (
+        x.to_bits() != span.x.to_bits(),
+        y.to_bits() != span.y.to_bits(),
+    );
+    if (sx && !span.exact.0) || (sy && !span.exact.1) {
+        return false;
+    }
+    let (dx, dy) = (x - span.x, y - span.y);
+    if (sx && !exact_sum(span.x, dx, x)) || (sy && !exact_sum(span.y, dy, y)) {
+        return false;
+    }
+    let shift = |v: f64, d: f64, on: bool| -> Option<f64> {
+        if !on {
+            return Some(v);
+        }
+        let s = v + d;
+        (s != 0.0 && exact_sum(v, d, s)).then_some(s)
+    };
+    let (out_start, text_start) = (w.out.len(), w.texts.len());
+    let (src, src_pos) = (
+        &prev.out[span.out.0..span.out.1],
+        &prev.pos[span.out.0..span.out.1],
+    );
+    w.out.reserve(src.len());
+    w.pos.reserve(src.len());
+    for ((rect, index), &(px, py)) in src.iter().zip(src_pos) {
+        let (Some(nx), Some(ny)) = (shift(px, dx, sx), shift(py, dy, sy)) else {
+            w.out.truncate(out_start);
+            w.pos.truncate(out_start);
+            return false;
+        };
+        w.out.push((
+            LayoutRect {
+                x: nx as f32,
+                y: ny as f32,
+                ..*rect
+            },
+            *index,
+        ));
+        w.pos.push((nx, ny));
+    }
+    let (src, src_pos) = (
+        &prev.texts[span.texts.0..span.texts.1],
+        &prev.text_pos[span.texts.0..span.texts.1],
+    );
+    for (text, &(px, py)) in src.iter().zip(src_pos) {
+        let (Some(nx), Some(ny)) = (shift(px, dx, sx), shift(py, dy, sy)) else {
+            w.out.truncate(out_start);
+            w.pos.truncate(out_start);
+            w.texts.truncate(text_start);
+            w.text_pos.truncate(text_start);
+            return false;
+        };
+        let mut text = text.clone();
+        text.rect.x = nx as f32;
+        text.rect.y = ny as f32;
+        w.texts.push(text);
+        w.text_pos.push((nx, ny));
+    }
+    true
+}
+
+/// The outputs [`flatten_reusing`] appends to.
+struct FlatWrite<'a> {
+    out: &'a mut Vec<(LayoutRect, usize)>,
+    texts: &'a mut Vec<TextFragment>,
+    pos: Vec<(f64, f64)>,
+    text_pos: Vec<(f64, f64)>,
+    spans: w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
+}
+
+thread_local! {
+    static FLAT_REUSE: std::cell::RefCell<Option<FlatReuse>> = const { std::cell::RefCell::new(None) };
+    static FLAT_SPARE: std::cell::RefCell<Option<FlatSpare>> = const { std::cell::RefCell::new(None) };
+}
+
+/// See [`cache::forget_walk_fingerprints`].
+pub(crate) fn forget_walk_fingerprints() {
+    cache::forget_walk_fingerprints();
+}
+
+pub(crate) fn forget_flat_reuse() {
+    FLAT_REUSE.with(|slot| *slot.borrow_mut() = None);
+    FLAT_SPARE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// [`flatten`] reusing the output of a child list laid out in the last
+/// patch flush (the same list, so the same boxes and offsets): copied when
+/// at the same position, shifted when moved and exact (W3COS_FLAT_SHIFT).
+fn flatten_retained_shift(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    key: (u64, u64),
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    let prev = FLAT_REUSE
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|prev| prev.key == key && prev.len == flat.len());
+    let spare = FLAT_SPARE.with(|slot| slot.borrow_mut().take());
+    let (mut keep, mut pos, mut text_pos) = match spare {
+        Some(FlatSpare { out, pos, text_pos }) => (out, pos, text_pos),
+        None => Default::default(),
+    };
+    pos.clear();
+    pos.reserve(flat.len());
+    text_pos.clear();
+    let mut w = FlatWrite {
+        out,
+        texts,
+        pos,
+        text_pos,
+        spans: w3cos_std::fxhash::FxHashMap::default(),
+    };
+    flatten_reusing_shift(fragment, x.into(), y.into(), flat, prev.as_ref(), &mut w);
+    let FlatWrite {
+        out,
+        texts,
+        pos,
+        text_pos,
+        spans,
+    } = w;
+    keep.clear();
+    keep.extend_from_slice(out);
+    if let Some(prev) = prev {
+        FLAT_SPARE.with(|slot| {
+            *slot.borrow_mut() = Some(FlatSpare {
+                out: prev.out,
+                pos: prev.pos,
+                text_pos: prev.text_pos,
+            })
+        });
+    }
+    FLAT_REUSE.with(|slot| {
+        *slot.borrow_mut() = Some(FlatReuse {
+            key,
+            len: flat.len(),
+            out: keep,
+            texts: texts.clone(),
+            pos,
+            text_pos,
+            spans,
+        })
+    });
+}
+
+fn flatten_reusing_shift(
+    fragment: &BoxFragment,
+    x: f64,
+    y: f64,
+    flat: &[FlatNodeInfo],
+    prev: Option<&FlatReuse>,
+    w: &mut FlatWrite<'_>,
+) -> (bool, bool) {
+    // This box's own entries, exactly as `flatten` makes them.
+    let text_start = w.texts.len();
+    flatten_own(fragment, x as f32, y as f32, flat, w.out, w.texts);
+    w.pos.push((x, y));
+    if w.texts.len() > text_start {
+        w.text_pos.push((x, y));
+    }
+    if fragment.children.is_empty() {
+        return (true, true);
+    }
+    let address = std::rc::Rc::as_ptr(&fragment.children.0) as usize;
+    if let Some(span) = prev.and_then(|prev| prev.spans.get(&address))
+        && std::rc::Rc::ptr_eq(&span.children.0, &fragment.children.0)
+    {
+        let prev = prev.unwrap();
+        let (out_start, text_start) = (w.out.len(), w.texts.len());
+        let reused = if span.x.to_bits() == x.to_bits() && span.y.to_bits() == y.to_bits() {
+            w.out.extend_from_slice(&prev.out[span.out.0..span.out.1]);
+            w.pos.extend_from_slice(&prev.pos[span.out.0..span.out.1]);
+            w.texts
+                .extend_from_slice(&prev.texts[span.texts.0..span.texts.1]);
+            w.text_pos
+                .extend_from_slice(&prev.text_pos[span.texts.0..span.texts.1]);
+            true
+        } else {
+            shift_span(prev, span, x, y, w)
+        };
+        if reused {
+            #[cfg(debug_assertions)]
+            {
+                let (mut o, mut t) = (Vec::new(), Vec::new());
+                for (dx, dy, child) in fragment.children.iter() {
+                    flatten_f64(
+                        child,
+                        x + f64::from(*dx),
+                        y + f64::from(*dy),
+                        flat,
+                        &mut o,
+                        &mut t,
+                    );
+                }
+                let bits = |r: &LayoutRect| [r.x, r.y, r.width, r.height].map(f32::to_bits);
+                debug_assert_eq!(o.len(), w.out.len() - out_start);
+                for ((a, i), (b, j)) in o.iter().zip(&w.out[out_start..]) {
+                    debug_assert!(i == j && bits(a) == bits(b), "flat reuse {a:?} vs {b:?}");
+                }
+                debug_assert_eq!(t.len(), w.texts.len() - text_start);
+                for (a, b) in t.iter().zip(&w.texts[text_start..]) {
+                    debug_assert!(bits(&a.rect) == bits(&b.rect), "text reuse");
+                }
+            }
+            let exact = span.exact;
+            let children = fragment.children.clone();
+            let (out_end, text_end) = (w.out.len(), w.texts.len());
+            w.spans.insert(
+                address,
+                FlatSpan {
+                    children,
+                    x,
+                    y,
+                    out: (out_start, out_end),
+                    texts: (text_start, text_end),
+                    exact,
+                },
+            );
+            return exact;
+        }
+    }
+    let (out_start, text_start) = (w.out.len(), w.texts.len());
+    let (mut ex, mut ey) = (true, true);
+    for (dx, dy, child) in fragment.children.iter() {
+        let (dx, dy) = (f64::from(*dx), f64::from(*dy));
+        let (cx, cy) = (x + dx, y + dy);
+        let (cex, cey) = flatten_reusing_shift(child, cx, cy, flat, prev, w);
+        ex &= cex & exact_sum(x, dx, cx);
+        ey &= cey & exact_sum(y, dy, cy);
+    }
+    let exact = (ex, ey);
+    if w.out.len() - out_start >= 16 {
+        let (out_end, text_end) = (w.out.len(), w.texts.len());
+        w.spans.insert(
+            address,
+            FlatSpan {
+                children: fragment.children.clone(),
+                x,
+                y,
+                out: (out_start, out_end),
+                texts: (text_start, text_end),
+                exact,
+            },
+        );
+    }
+    exact
+}
+
+/// [`flatten`] reusing the output of a child list laid out at the same
+/// position in the last patch flush (the same list, so the same boxes and
+/// offsets; an exact position keeps the sums bit-identical).
+fn flatten_retained(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    key: (u64, u64),
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    let prev = FLAT_REUSE
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|prev| prev.key == key && prev.len == flat.len());
+    let mut spans = w3cos_std::fxhash::FxHashMap::default();
+    flatten_reusing(fragment, x, y, flat, prev.as_ref(), out, texts, &mut spans);
+    FLAT_REUSE.with(|slot| {
+        *slot.borrow_mut() = Some(FlatReuse {
+            key,
+            len: flat.len(),
+            out: out.clone(),
+            texts: texts.clone(),
+            pos: Vec::new(),
+            text_pos: Vec::new(),
+            spans,
+        })
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_reusing(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    prev: Option<&FlatReuse>,
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+    spans: &mut w3cos_std::fxhash::FxHashMap<usize, FlatSpan>,
+) {
+    // This box's own entries, exactly as `flatten` makes them.
+    flatten_own(fragment, x, y, flat, out, texts);
+    if fragment.children.is_empty() {
+        return;
+    }
+    let address = std::rc::Rc::as_ptr(&fragment.children.0) as usize;
+    if let Some(span) = prev.and_then(|prev| prev.spans.get(&address))
+        && std::rc::Rc::ptr_eq(&span.children.0, &fragment.children.0)
+        && span.x.to_bits() == f64::from(x).to_bits()
+        && span.y.to_bits() == f64::from(y).to_bits()
+    {
+        let prev = prev.unwrap();
+        let (out_start, text_start) = (out.len(), texts.len());
+        out.extend_from_slice(&prev.out[span.out.0..span.out.1]);
+        texts.extend_from_slice(&prev.texts[span.texts.0..span.texts.1]);
+        spans.insert(
+            address,
+            FlatSpan {
+                children: fragment.children.clone(),
+                x: x.into(),
+                y: y.into(),
+                out: (out_start, out.len()),
+                texts: (text_start, texts.len()),
+                exact: (false, false),
+            },
+        );
+        return;
+    }
+    let (out_start, text_start) = (out.len(), texts.len());
+    for (dx, dy, child) in fragment.children.iter() {
+        flatten_reusing(child, x + dx, y + dy, flat, prev, out, texts, spans);
+    }
+    if out.len() - out_start >= 16 {
+        spans.insert(
+            address,
+            FlatSpan {
+                children: fragment.children.clone(),
+                x: x.into(),
+                y: y.into(),
+                out: (out_start, out.len()),
+                texts: (text_start, texts.len()),
+                exact: (false, false),
+            },
+        );
     }
 }
 

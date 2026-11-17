@@ -318,7 +318,7 @@ pub struct PaintArtifact {
     /// order. Empty for every node when nothing was broken. Paint draws the
     /// pieces in place of the node's single rect, at the node's own position
     /// in paint order.
-    pub text_fragments: Vec<Vec<(LayoutRect, String)>>,
+    pub text_fragments: Vec<Vec<(LayoutRect, crate::layout_ng::FragmentText)>>,
     /// Per node: its text pieces are sideways glyphs of a vertical flow
     /// (`TextFragment::vertical`); paint rotates them a quarter turn.
     pub vertical_text: Vec<bool>,
@@ -2217,7 +2217,10 @@ impl PaintArtifact {
         self.vertical_text.get(index).copied().unwrap_or(false)
     }
 
-    pub(crate) fn text_fragments_of(&self, index: usize) -> &[(LayoutRect, String)] {
+    pub(crate) fn text_fragments_of(
+        &self,
+        index: usize,
+    ) -> &[(LayoutRect, crate::layout_ng::FragmentText)] {
         self.text_fragments
             .get(index)
             .map(Vec::as_slice)

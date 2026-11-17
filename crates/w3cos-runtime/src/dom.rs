@@ -35,6 +35,11 @@ pub fn with_document<R>(f: impl FnOnce(&Document) -> R) -> R {
     DOCUMENT.with(|d| f(&d.borrow()))
 }
 
+/// `with_document` when no mutable borrow is active.
+pub(crate) fn try_with_document<R>(f: impl FnOnce(&Document) -> R) -> Option<R> {
+    DOCUMENT.with(|d| d.try_borrow().ok().map(|d| f(&d)))
+}
+
 pub fn with_document_mut<R>(f: impl FnOnce(&mut Document) -> R) -> R {
     DOCUMENT.with(|d| f(&mut d.borrow_mut()))
 }

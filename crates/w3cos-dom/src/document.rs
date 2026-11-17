@@ -383,7 +383,18 @@ impl MatchedPropertiesCache {
 #[derive(Default)]
 struct StyleForMemo {
     key: Option<(u64, u64, u64)>,
-    styles: HashMap<u32, w3cos_std::style::Style>,
+    /// FxHash for the integer node ids.
+    styles: w3cos_std::fxhash::FxHashMap<u32, w3cos_std::style::Style>,
+}
+
+/// The fields of a computed style that inline whitespace and boundary
+/// checks read.
+#[derive(Clone, Copy)]
+pub(crate) struct FlowStyle {
+    pub display: w3cos_std::style::Display,
+    pub float: w3cos_std::style::Float,
+    pub position: w3cos_std::style::Position,
+    pub white_space: w3cos_std::style::WhiteSpace,
 }
 
 /// Immutable, reference-counted computed style (Blink's scoped_refptr<const
@@ -800,6 +811,30 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
     }
 }
 
+/// A layout pass's rects, stored on demand ([`Document::defer_layout_rects`]).
+/// `for_each` yields each node's final rect from the pass.
+pub trait PendingLayoutRects {
+    fn for_each(&self, f: &mut dyn FnMut(NodeId, DOMRect));
+}
+
+/// Mark `id` and its ancestors' cached extents dirty, stopping at one
+/// already dirty (no cached extent: nothing to invalidate).
+fn mark_extent_chain(nodes: &[Option<DomNode>], extent: &mut ExtentCache, id: NodeId) {
+    if extent.clean == 0 {
+        return;
+    }
+    let mut current = Some(id);
+    while let Some(node) = current {
+        if !extent.mark(node.0 as usize) {
+            break;
+        }
+        current = nodes
+            .get(node.0 as usize)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|node| node.parent);
+    }
+}
+
 /// Per-node subtree extent cache (see `Document::extent`).
 #[derive(Default)]
 struct ExtentCache {
@@ -810,6 +845,8 @@ struct ExtentCache {
     /// slot was written by `descendant_extent` (scrollWidth/Height of a
     /// container with thousands of clean children answers in O(1)).
     descendants: Vec<Option<Option<(f32, f32)>>>,
+    /// Slots with `dirty[idx] == false`: with none, marking changes nothing.
+    clean: usize,
 }
 
 impl ExtentCache {
@@ -818,6 +855,7 @@ impl ExtentCache {
         match self.dirty.get_mut(idx) {
             Some(slot) if !*slot => {
                 *slot = true;
+                self.clean -= 1;
                 true
             }
             Some(_) => false,
@@ -829,6 +867,9 @@ impl ExtentCache {
 
     fn forget(&mut self, idx: usize) {
         if let Some(slot) = self.dirty.get_mut(idx) {
+            if !*slot {
+                self.clean -= 1;
+            }
             *slot = true;
         }
     }
@@ -842,6 +883,9 @@ impl ExtentCache {
             self.dirty.resize(idx + 1, true);
             self.value.resize(idx + 1, (0.0, 0.0));
             self.descendants.resize(idx + 1, None);
+        }
+        if self.dirty[idx] {
+            self.clean += 1;
         }
         self.dirty[idx] = false;
         self.value[idx] = value;
@@ -881,7 +925,11 @@ pub struct Document {
     extent: std::cell::RefCell<ExtentCache>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
-    layout_rects: Vec<DOMRect>,
+    layout_rects: RefCell<Vec<DOMRect>>,
+    /// Rects a layout pass produced but has not stored yet: stored on the
+    /// first read or before any other rect write (Blink reads geometry from
+    /// the current fragments on demand).
+    pending_rects: RefCell<Option<Box<dyn PendingLayoutRects>>>,
     /// Scroll offsets (scroll_left, scroll_top) per node.
     scroll_offsets: Vec<(f32, f32)>,
     free_list: Vec<u32>,
@@ -1087,6 +1135,15 @@ impl Document {
     }
 
     /// Identity in [`ChildListChange`] records.
+    /// The node's style revision: changes whenever its computed style may
+    /// have changed (local edit, selector or inherited invalidation).
+    pub fn style_revision(&self, id: NodeId) -> u64 {
+        self.style_revisions
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
     pub fn serial(&self) -> u64 {
         self.serial
     }
@@ -1148,7 +1205,8 @@ impl Document {
             nodes: Vec::new(),
             page_strings: Vec::new(),
             styles: Vec::new(),
-            layout_rects: Vec::new(),
+            layout_rects: RefCell::new(Vec::new()),
+            pending_rects: RefCell::new(None),
             scroll_offsets: Vec::new(),
             free_list: Vec::new(),
             dirty: Vec::new(),
@@ -1599,7 +1657,7 @@ impl Document {
             let extra = PAGE_SLOTS - self.nodes.len();
             self.nodes.reserve(extra);
             self.styles.reserve(extra);
-            self.layout_rects.reserve(extra);
+            self.layout_rects.get_mut().reserve(extra);
             self.scroll_offsets.reserve(extra);
             self.style_revisions.reserve(extra);
             self.dirty.reserve(PAGE_SLOTS);
@@ -1965,7 +2023,7 @@ impl Document {
         let extra = (self.nodes.capacity() / 2).max(count.max(512));
         self.nodes.reserve(extra);
         self.styles.reserve(extra);
-        self.layout_rects.reserve(extra);
+        self.layout_rects.get_mut().reserve(extra);
         self.scroll_offsets.reserve(extra);
         self.style_revisions.reserve(extra);
         self.precise_stamp.reserve(extra);
@@ -1978,7 +2036,7 @@ impl Document {
             let extra = (self.nodes.capacity() / 2).max(512);
             self.nodes.reserve(extra);
             self.styles.reserve(extra);
-            self.layout_rects.reserve(extra);
+            self.layout_rects.get_mut().reserve(extra);
             self.scroll_offsets.reserve(extra);
             self.style_revisions.reserve(extra);
             self.precise_stamp.reserve(extra);
@@ -1988,6 +2046,9 @@ impl Document {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
         self.last_match_change = self.style_revision_clock;
         let style_revision = self.style_revision_clock;
+        // A deferred rect for a recycled slot lands before the slot resets,
+        // as an eager write would have.
+        self.settle_layout_rects();
         let id = if let Some(slot) = self.free_list.pop() {
             node.id = NodeId(slot);
             let idx = slot as usize;
@@ -1997,7 +2058,7 @@ impl Document {
                 node: slot,
             });
             self.styles[idx] = initial_style;
-            self.layout_rects[idx] = DOMRect::zero();
+            self.layout_rects.get_mut()[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
             self.style_revisions[idx] = style_revision;
             self.extent.get_mut().forget(idx);
@@ -2008,7 +2069,7 @@ impl Document {
             let tag = node.tag;
             self.nodes.push(Some(node));
             self.styles.push(initial_style);
-            self.layout_rects.push(DOMRect::zero());
+            self.layout_rects.get_mut().push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
             self.style_revisions.push(style_revision);
             // Update tag index. One reserve covers a page of the same tag.
@@ -2029,22 +2090,62 @@ impl Document {
     /// Get the last computed bounding rect for a node.
     /// Returns `DOMRect::zero()` if no layout has been run yet.
     pub fn get_layout_rect(&self, id: NodeId) -> DOMRect {
+        self.settle_layout_rects();
         self.layout_rects
+            .borrow()
             .get(id.0 as usize)
             .copied()
             .unwrap_or_default()
     }
 
+    /// Defer a layout pass's rects to the first read (or the next rect
+    /// write). `supersedes`: the pass writes exactly the nodes a still
+    /// pending pass would, so that pass's rects are never observable and
+    /// are dropped unstored.
+    pub fn defer_layout_rects(&mut self, pending: Box<dyn PendingLayoutRects>, supersedes: bool) {
+        if !supersedes {
+            self.settle_layout_rects();
+        }
+        *self.pending_rects.get_mut() = Some(pending);
+        self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+    }
+
+    /// Whether a deferred pass's rects are still unstored.
+    pub fn layout_rects_pending(&self) -> bool {
+        self.pending_rects.borrow().is_some()
+    }
+
+    /// Store deferred rects, as [`Self::set_layout_rect`] would have.
+    fn settle_layout_rects(&self) {
+        let Some(pending) = self.pending_rects.borrow_mut().take() else {
+            return;
+        };
+        let mut rects = self.layout_rects.borrow_mut();
+        let mut extent = self.extent.borrow_mut();
+        pending.for_each(&mut |id, rect| {
+            let idx = id.0 as usize;
+            if idx < rects.len() {
+                let moved = rects[idx] != rect;
+                rects[idx] = rect;
+                if moved {
+                    mark_extent_chain(&self.nodes, &mut extent, id);
+                }
+            }
+        });
+    }
+
     /// Store the computed bounding rect for a node.
     /// Called by the layout engine after each layout pass.
     pub fn set_layout_rect(&mut self, id: NodeId, rect: DOMRect) {
+        self.settle_layout_rects();
         let idx = id.0 as usize;
-        if idx < self.layout_rects.len() {
+        let rects = self.layout_rects.get_mut();
+        if idx < rects.len() {
             // Relayout rewrites every rect it visits; an unchanged rect keeps
             // the cached overflow extent of its ancestors valid (Blink only
             // recomputes overflow for boxes whose geometry changed).
-            let moved = self.layout_rects[idx] != rect;
-            self.layout_rects[idx] = rect;
+            let moved = rects[idx] != rect;
+            rects[idx] = rect;
             self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
             if moved {
                 self.mark_extent_dirty(id);
@@ -2053,22 +2154,14 @@ impl Document {
     }
 
     fn mark_extent_dirty(&mut self, id: NodeId) {
-        let mut current = Some(id);
-        while let Some(node) = current {
-            if !self.extent.get_mut().mark(node.0 as usize) {
-                break;
-            }
-            current = self
-                .nodes
-                .get(node.0 as usize)
-                .and_then(|slot| slot.as_ref())
-                .and_then(|node| node.parent);
-        }
+        mark_extent_chain(&self.nodes, self.extent.get_mut(), id);
     }
 
     /// Max (right, bottom) layout edge over the descendants of `id`, or None
     /// without descendants. Clean subtrees answer from the cache.
     pub fn descendant_extent(&self, id: NodeId) -> Option<(f32, f32)> {
+        // (Before the borrow: settling marks the extent cache.)
+        self.settle_layout_rects();
         let mut cache = self.extent.borrow_mut();
         let idx = id.0 as usize;
         if let Some(hit) = cache.clean_descendants(idx) {
@@ -5714,6 +5807,27 @@ impl Document {
     }
 
     pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+        self.with_computed_style_for(id, Clone::clone)
+    }
+
+    /// The flow-relevant fields of [`Self::computed_style_for`], read in
+    /// place from the per-epoch memo (no `Style` copy).
+    pub(crate) fn computed_flow_style(&self, id: NodeId) -> FlowStyle {
+        self.with_computed_style_for(id, |style| FlowStyle {
+            display: style.display,
+            float: style.float,
+            position: style.position,
+            white_space: style.white_space,
+        })
+    }
+
+    /// Run `read` on [`Self::computed_style_for`]'s style in the memo.
+    /// `read` must not reenter style resolution.
+    fn with_computed_style_for<R>(
+        &self,
+        id: NodeId,
+        read: impl FnOnce(&w3cos_std::style::Style) -> R,
+    ) -> R {
         let key = (
             self.style_revision_clock,
             stylesheet::generation(),
@@ -5725,11 +5839,16 @@ impl Document {
                 memo.key = Some(key);
                 memo.styles.clear();
             }
+            // A layout walk reads most elements: size the table once
+            // (`clear` keeps the capacity) instead of rehashing as it grows.
+            if memo.styles.capacity() == 0 {
+                memo.styles.reserve(self.nodes.len().min(65_536));
+            }
             if let Some(style) = memo.styles.get(&id.0) {
                 #[cfg(test)]
                 self.computed_style_cache_hits
                     .set(self.computed_style_cache_hits.get() + 1);
-                return style.clone();
+                return read(style);
             }
         }
         let mut ancestor_ids = Vec::new();
@@ -5765,11 +5884,8 @@ impl Document {
             inherited = Some(style);
         }
         let style = self.computed_style(id, &[], inherited.as_ref());
-        self.style_for_memo
-            .borrow_mut()
-            .styles
-            .insert(id.0, style.clone());
-        style
+        let mut memo = self.style_for_memo.borrow_mut();
+        read(memo.styles.entry(id.0).insert_entry(style).get())
     }
 
     /// Cascade one element from an already-computed parent style.
@@ -7629,7 +7745,7 @@ impl Document {
         let node = self.get_node(id);
         if node.node_type == NodeType::Text {
             if !matches!(
-                self.computed_style_for(id).white_space,
+                self.computed_flow_style(id).white_space,
                 w3cos_std::style::WhiteSpace::Normal
                     | w3cos_std::style::WhiteSpace::NoWrap
                     | w3cos_std::style::WhiteSpace::PreLine
@@ -7658,7 +7774,7 @@ impl Document {
                             return true;
                         }
                     } else if sibling.node_type == NodeType::Element {
-                        let style = self.computed_style_for(previous_id);
+                        let style = self.computed_flow_style(previous_id);
                         if style.display == w3cos_std::style::Display::None
                             || style.float != w3cos_std::style::Float::None
                             || matches!(
@@ -7681,7 +7797,7 @@ impl Document {
                 let Some(parent) = self.get_node(cursor).parent else {
                     break;
                 };
-                if self.computed_style_for(parent).display != w3cos_std::style::Display::Inline {
+                if self.computed_flow_style(parent).display != w3cos_std::style::Display::Inline {
                     break;
                 }
                 cursor = parent;
@@ -7689,7 +7805,7 @@ impl Document {
             return false;
         }
         if node.node_type != NodeType::Element
-            || self.computed_style_for(id).display != w3cos_std::style::Display::Inline
+            || self.computed_flow_style(id).display != w3cos_std::style::Display::Inline
         {
             return false;
         }
@@ -7698,7 +7814,7 @@ impl Document {
             let node = self.get_node(id);
             child = crate::node::sib(node.prev_sibling);
             if node.node_type == NodeType::Element {
-                let style = self.computed_style_for(id);
+                let style = self.computed_flow_style(id);
                 if style.display == w3cos_std::style::Display::None
                     || style.float != w3cos_std::style::Float::None
                     || matches!(
@@ -7743,7 +7859,7 @@ impl Document {
                 let sibling = self.get_node(previous_id);
                 previous = crate::node::sib(sibling.prev_sibling);
                 if sibling.node_type == NodeType::Element {
-                    let style = self.computed_style_for(previous_id);
+                    let style = self.computed_flow_style(previous_id);
                     if style.display == w3cos_std::style::Display::None
                         || style.float != w3cos_std::style::Float::None
                         || matches!(
@@ -7764,7 +7880,7 @@ impl Document {
             let Some(parent) = self.get_node(cursor).parent else {
                 break;
             };
-            if self.computed_style_for(parent).display != w3cos_std::style::Display::Inline {
+            if self.computed_flow_style(parent).display != w3cos_std::style::Display::Inline {
                 break;
             }
             cursor = parent;
@@ -7776,7 +7892,7 @@ impl Document {
         let node = self.get_node(id);
         if node.node_type == NodeType::Text {
             if !matches!(
-                self.computed_style_for(id).white_space,
+                self.computed_flow_style(id).white_space,
                 w3cos_std::style::WhiteSpace::Pre
                     | w3cos_std::style::WhiteSpace::PreWrap
                     | w3cos_std::style::WhiteSpace::PreLine
@@ -7791,7 +7907,7 @@ impl Document {
                 .ends_with(['\n', '\r']);
         }
         if node.node_type != NodeType::Element
-            || self.computed_style_for(id).display != w3cos_std::style::Display::Inline
+            || self.computed_flow_style(id).display != w3cos_std::style::Display::Inline
         {
             return false;
         }
@@ -7800,7 +7916,7 @@ impl Document {
             let child_node = self.get_node(child_id);
             child = crate::node::sib(child_node.prev_sibling);
             if child_node.node_type == NodeType::Element {
-                let style = self.computed_style_for(child_id);
+                let style = self.computed_flow_style(child_id);
                 if style.display == w3cos_std::style::Display::None
                     || style.float != w3cos_std::style::Float::None
                     || matches!(
@@ -7822,7 +7938,7 @@ impl Document {
         use w3cos_std::style::{Display, Float, Position};
         let mut preceding_space = false;
         loop {
-            if self.computed_style_for(inline_id).display != Display::Inline {
+            if self.computed_flow_style(inline_id).display != Display::Inline {
                 return false;
             }
             let mut sibling = crate::node::sib(self.get_node(inline_id).prev_sibling);
@@ -7836,7 +7952,7 @@ impl Document {
                         // collapsed separator. A following nowrap space owns
                         // its advance until line layout discards a line edge.
                         if !raw.is_empty()
-                            && self.computed_style_for(id).white_space
+                            && self.computed_flow_style(id).white_space
                                 == w3cos_std::style::WhiteSpace::Pre
                             && !raw.ends_with(['\n', '\r'])
                         {
@@ -7849,7 +7965,7 @@ impl Document {
                         && !self.inline_ends_with_collapsible_space(id)
                         && !self.inline_ends_with_forced_break(id);
                 } else if node.node_type == NodeType::Element {
-                    let style = self.computed_style_for(id);
+                    let style = self.computed_flow_style(id);
                     if style.display == Display::None
                         || style.float != Float::None
                         || matches!(style.position, Position::Absolute | Position::Fixed)
@@ -7877,7 +7993,7 @@ impl Document {
     fn inline_flow_continues_after(&self, mut inline_id: NodeId) -> bool {
         use w3cos_std::style::{Display, Float, Position};
         loop {
-            if self.computed_style_for(inline_id).display != Display::Inline {
+            if self.computed_flow_style(inline_id).display != Display::Inline {
                 return false;
             }
             let mut sibling = crate::node::sib(self.get_node(inline_id).next_sibling);
@@ -7893,7 +8009,7 @@ impl Document {
                         return true;
                     }
                 } else if node.node_type == NodeType::Element {
-                    let style = self.computed_style_for(id);
+                    let style = self.computed_flow_style(id);
                     if style.display == Display::None
                         || style.float != Float::None
                         || matches!(style.position, Position::Absolute | Position::Fixed)
@@ -8170,28 +8286,34 @@ impl Document {
                 _ => None,
             }
         };
-        let inline_before = child_ids[..index]
-            .iter()
-            .rev()
-            .find_map(|sibling| {
-                sibling_inline_state(*sibling, true).map(|inline| {
-                    let already_has_space = self.inline_ends_with_collapsible_space(*sibling);
-                    inline && !already_has_space && !self.inline_ends_with_forced_break(*sibling)
+        // The neighbours only decide whether edge whitespace survives; text
+        // without leading (trailing) collapsible whitespace needs no look.
+        let inline_before = raw.chars().next().is_some_and(is_css_whitespace)
+            && child_ids[..index]
+                .iter()
+                .rev()
+                .find_map(|sibling| {
+                    sibling_inline_state(*sibling, true).map(|inline| {
+                        let already_has_space = self.inline_ends_with_collapsible_space(*sibling);
+                        inline
+                            && !already_has_space
+                            && !self.inline_ends_with_forced_break(*sibling)
+                    })
                 })
-            })
-            .unwrap_or_else(|| {
-                child
-                    .parent
-                    .is_some_and(|parent| self.inline_flow_needs_leading_space(parent))
-            });
-        let inline_after = child_ids[index + 1..]
-            .iter()
-            .find_map(|sibling| sibling_inline_state(*sibling, false))
-            .unwrap_or_else(|| {
-                child
-                    .parent
-                    .is_some_and(|parent| self.inline_flow_continues_after(parent))
-            });
+                .unwrap_or_else(|| {
+                    child
+                        .parent
+                        .is_some_and(|parent| self.inline_flow_needs_leading_space(parent))
+                });
+        let inline_after = raw.chars().next_back().is_some_and(is_css_whitespace)
+            && child_ids[index + 1..]
+                .iter()
+                .find_map(|sibling| sibling_inline_state(*sibling, false))
+                .unwrap_or_else(|| {
+                    child
+                        .parent
+                        .is_some_and(|parent| self.inline_flow_continues_after(parent))
+                });
         if parent_style.white_space == WhiteSpace::PreLine {
             // Pre-line collapses spaces, but a text node is not necessarily a
             // whole line. Keep its edge space when an adjoining inline box
@@ -15473,36 +15595,38 @@ fn group_unbroken_ascii_inline_words(
     if parent.unicode_bidi != UnicodeBidi::Normal {
         return children;
     }
+    // A length vertical-align is lowered to a synthetic vertical margin.
+    // That margin changes the line box, not the word-break opportunities.
+    // Borders decorate an inline fragment; they do not add a word break.
+    let style_ok = |style: &Style| {
+        style.display == Display::Inline
+            && style.position == Position::Static
+            && style.float == Float::None
+            && style.word_break == WordBreak::Normal
+            && style.unicode_bidi == UnicodeBidi::Normal
+            && style.direction == parent.direction
+            && ((style.margin.top == Spacing::Px(0.0) && style.margin.bottom == Spacing::Px(0.0))
+                || (style.margin.left == Spacing::Px(0.0)
+                    && style.margin.right == Spacing::Px(0.0)
+                    && style.custom_properties.as_ref().is_some_and(|properties| {
+                        properties.contains_key("--w3cos-internal-vertical-align-length")
+                    })))
+            && style.width == Dimension::Auto
+    };
     let eligible = |child: &Component| {
-        // A length vertical-align is lowered to a synthetic vertical margin.
-        // That margin changes the line box, not the word-break opportunities.
-        let synthetic_vertical_margin =
-            child
-                .style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|properties| {
-                    properties.contains_key("--w3cos-internal-vertical-align-length")
-                });
         matches!(&child.kind, ComponentKind::Text { content }
             if !content.is_empty() && (content.chars().all(|ch| ch.is_ascii_alphanumeric())
                 || child.style.custom_properties.as_ref().is_some_and(|p|
                     p.contains_key("--w3cos-internal-generated-quote"))
                     && content.chars().all(|ch| matches!(ch,
                         '"' | '\'' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '\u{00ab}' | '\u{00bb}'))))
-            && child.style.display == Display::Inline
-            && child.style.position == Position::Static
-            && child.style.float == Float::None
-            && child.style.word_break == WordBreak::Normal
-            && child.style.unicode_bidi == UnicodeBidi::Normal
-            && child.style.direction == parent.direction
-            && ((child.style.margin.top == Spacing::Px(0.0)
-                && child.style.margin.bottom == Spacing::Px(0.0))
-                || (synthetic_vertical_margin
-                    && child.style.margin.left == Spacing::Px(0.0)
-                    && child.style.margin.right == Spacing::Px(0.0)))
-            && child.style.width == Dimension::Auto
-        // Borders decorate an inline fragment; they do not add a word break.
+            && style_ok(&child.style)
+    };
+    // A text leaf with only ASCII alphanumerics and `child`'s style: what
+    // `eligible` says of it is `style_ok` of that style.
+    let split_text = |child: &Component, content: String| Component {
+        kind: ComponentKind::Text { content },
+        ..child.clone()
     };
     let mut output = Vec::with_capacity(children.len());
     let mut word = Vec::new();
@@ -15532,33 +15656,34 @@ fn group_unbroken_ascii_inline_words(
         }
     };
     let mut source = children.into_iter().peekable();
-    let mut fragments = Vec::new();
+    // Each fragment with whether it is `eligible`.
+    let mut fragments: Vec<(Component, bool)> = Vec::with_capacity(source.len() + 4);
+    let mut next_ok: Option<bool> = None;
     while let Some(mut child) = source.next() {
+        let child_ok = next_ok.take();
         if child.style.padding == Edges::ZERO
-            && fragments.last().is_some_and(|previous| eligible(previous))
+            && fragments.last().is_some_and(|previous| previous.1)
             && let ComponentKind::Text { content } = &child.kind
             && content.starts_with(' ')
+            && content.len() > 1
             && content[1..]
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric())
+            && style_ok(&child.style)
         {
             // Keep the soft separator outside the preceding unbroken word,
             // so line-edge whitespace can disappear without moving its glyphs.
-            let mut suffix = child.clone();
-            suffix.kind = ComponentKind::Text {
-                content: content[1..].to_string(),
+            let suffix = split_text(&child, content[1..].to_string());
+            child.kind = ComponentKind::Text {
+                content: " ".to_string(),
             };
-            if eligible(&suffix) {
-                child.kind = ComponentKind::Text {
-                    content: " ".to_string(),
-                };
-                fragments.push(child);
-                fragments.push(suffix);
-                continue;
-            }
+            fragments.push((child, false));
+            fragments.push((suffix, true));
+            continue;
         }
         if child.style.padding == Edges::ZERO
-            && source.peek().is_some_and(|next| eligible(next))
+            && let Some(next) = source.peek()
+            && *next_ok.insert(eligible(next))
             && let ComponentKind::Text { content } = &child.kind
             && let Some(space) = content.rfind(|character: char| character.is_ascii_whitespace())
             && !content[space + 1..].is_empty()
@@ -15566,23 +15691,22 @@ fn group_unbroken_ascii_inline_words(
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric())
         {
-            let mut suffix = child.clone();
-            suffix.kind = ComponentKind::Text {
-                content: content[space + 1..].to_string(),
-            };
+            let suffix = style_ok(&child.style)
+                .then(|| split_text(&child, content[space + 1..].to_string()));
             child.kind = ComponentKind::Text {
                 content: content[..space + 1].to_string(),
             };
-            if eligible(&suffix) {
-                fragments.push(child);
-                fragments.push(suffix);
+            if let Some(suffix) = suffix {
+                fragments.push((child, false));
+                fragments.push((suffix, true));
                 continue;
             }
         }
-        fragments.push(child);
+        let ok = child_ok.unwrap_or_else(|| eligible(&child));
+        fragments.push((child, ok));
     }
-    for child in fragments {
-        if eligible(&child) {
+    for (child, ok) in fragments {
+        if ok {
             word.push(child);
         } else {
             flush(&mut word, &mut output);
@@ -16057,8 +16181,10 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
     };
     let can_flatten_painted = |child: &w3cos_std::Component| {
         let bordered = has_border(&child.style);
-        let mut principal = child.style.clone();
-        if bordered {
+        // (Only a bordered child is checked through a stripped principal
+        // copy; the copy is the cost of this walk otherwise.)
+        let principal = || {
+            let mut principal = child.style.clone();
             principal.background = w3cos_std::Color::TRANSPARENT;
             principal.padding = w3cos_std::style::Edges::ZERO;
             principal.margin = w3cos_std::style::Edges::ZERO;
@@ -16067,7 +16193,8 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             principal.border_right_width = Some(0.0);
             principal.border_bottom_width = Some(0.0);
             principal.border_left_width = Some(0.0);
-        }
+            principal
+        };
         child.style.display == Display::Inline
             && child.style.position == Position::Static
             && child.style.float == w3cos_std::style::Float::None
@@ -16077,7 +16204,7 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 | w3cos_std::style::AlignSelf::Baseline)
             && matches!(child.style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
             && if bordered {
-                principal_box_can_merge_generated_inline_text(&principal)
+                principal_box_can_merge_generated_inline_text(&principal())
             } else {
                 painted_inline_text_box_can_merge(&child.style)
             }
@@ -16391,77 +16518,89 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 segments
             })
             .collect::<Vec<_>>();
+        // Edits shared by every piece go on a few template styles first, so
+        // the word fragments share one style allocation per variant instead
+        // of copy-on-write cloning the full style for every word.
+        let clear_line_width = style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key("--w3cos-internal-text-line-width"));
+        let clear_vertical_margin = !style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-vertical-align-length")
+        });
+        let background_group = !decorated_border && style.background.a > 0;
+        let parent_indent_moves = percent_line_indent.is_some()
+            && source_index == 0
+            && component.style.text_indent == style.text_indent;
+        let mut base = child.style.clone();
+        if clear_line_width {
+            base.width = w3cos_std::style::Dimension::Auto;
+            if let Some(properties) = &mut base.custom_properties {
+                properties.remove("--w3cos-internal-text-line-width");
+            }
+        }
+        if percent_line_indent.is_some() {
+            base.text_indent = w3cos_std::style::Dimension::Px(0.0);
+        }
+        if clear_vertical_margin {
+            base.margin.top = Spacing::Px(0.0);
+            base.margin.bottom = Spacing::Px(0.0);
+        }
+        if background_group {
+            base.custom_properties
+                .get_or_insert_with(Default::default)
+                .entry("--w3cos-internal-inline-background-group".into())
+                .or_insert_with(|| format!("leaf:{source_index}"));
+        }
+        let variant = |left: bool, right: bool| {
+            let mut style = base.clone();
+            if left {
+                style.padding.left = Spacing::Px(0.0);
+            }
+            if right {
+                style.padding.right = Spacing::Px(0.0);
+            }
+            style
+        };
+        let styles = [
+            base.clone(),
+            variant(true, false),
+            variant(false, true),
+            variant(true, true),
+        ];
+        // `child` has no children here (checked above).
+        let piece = |text: &str, left: bool, right: bool| w3cos_std::Component {
+            kind: ComponentKind::Text {
+                content: text.to_string(),
+            },
+            style: styles[usize::from(left) + 2 * usize::from(right)].clone(),
+            children: Vec::new(),
+            on_click: child.on_click.clone(),
+            sticky_counter_signal: child.sticky_counter_signal,
+        };
         let mut pieces = Vec::with_capacity(words.len() * 2 + 1);
         if content.starts_with(' ') {
-            let mut space = child.clone();
-            space.kind = ComponentKind::Text {
-                content: " ".to_string(),
-            };
-            pieces.push(space);
+            pieces.push(piece(" ", false, false));
         }
         for (index, (word, space_after)) in words.iter().enumerate() {
-            let mut fragment = child.clone();
-            fragment.kind = ComponentKind::Text {
-                content: (*word).to_string(),
-            };
-            if index > 0 && !decorated_border {
-                fragment.style.padding.left = Spacing::Px(0.0);
-            }
-            if index + 1 < words.len() && !decorated_border {
-                fragment.style.padding.right = Spacing::Px(0.0);
-            }
-            pieces.push(fragment);
+            pieces.push(piece(
+                word,
+                index > 0 && !decorated_border,
+                index + 1 < words.len() && !decorated_border,
+            ));
             if *space_after && index + 1 < words.len() {
-                let mut space = child.clone();
-                space.kind = ComponentKind::Text {
-                    content: " ".to_string(),
-                };
-                if !decorated_border {
-                    space.style.padding.left = Spacing::Px(0.0);
-                    space.style.padding.right = Spacing::Px(0.0);
-                }
-                pieces.push(space);
+                pieces.push(piece(" ", !decorated_border, !decorated_border));
             }
         }
         if content.ends_with(' ') {
-            let mut space = child.clone();
-            space.kind = ComponentKind::Text {
-                content: " ".to_string(),
-            };
-            pieces.push(space);
-        }
-        if style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| properties.contains_key("--w3cos-internal-text-line-width"))
-        {
-            for piece in &mut pieces {
-                piece.style.width = w3cos_std::style::Dimension::Auto;
-                if let Some(properties) = &mut piece.style.custom_properties {
-                    properties.remove("--w3cos-internal-text-line-width");
-                }
-            }
+            pieces.push(piece(" ", false, false));
         }
         if let Some(indent) = percent_line_indent {
-            for piece in &mut pieces {
-                piece.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
-            }
             pieces[0].style.padding.left = Spacing::Percent(indent);
-            if source_index == 0 && component.style.text_indent == style.text_indent {
+            if parent_indent_moves {
                 // The first fragment now owns the used indent. The parent
                 // must not retain a second line-breaking constraint.
                 component.style.text_indent = w3cos_std::style::Dimension::Px(0.0);
-            }
-        }
-        // Authored vertical margins do not apply to non-replaced inline
-        // boxes. Keep synthetic vertical-align offsets distinct: those
-        // participate in the line metrics rather than CSS margin layout.
-        if !style.custom_properties.as_ref().is_some_and(|properties| {
-            properties.contains_key("--w3cos-internal-vertical-align-length")
-        }) {
-            for piece in &mut pieces {
-                piece.style.margin.top = Spacing::Px(0.0);
-                piece.style.margin.bottom = Spacing::Px(0.0);
             }
         }
         if decorated_border {
@@ -16496,16 +16635,6 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 if index != last {
                     piece.style.margin.right = Spacing::Px(0.0);
                 }
-            }
-        }
-        if !decorated_border && style.background.a > 0 {
-            for piece in &mut pieces {
-                piece
-                    .style
-                    .custom_properties
-                    .get_or_insert_with(Default::default)
-                    .entry("--w3cos-internal-inline-background-group".into())
-                    .or_insert_with(|| format!("leaf:{source_index}"));
             }
         }
         fragments.extend(pieces);
@@ -16543,7 +16672,8 @@ fn split_collapsible_space_after_nonbreaking_run(component: &mut w3cos_std::Comp
     for mut child in std::mem::take(&mut component.children) {
         let prefix = match &child.kind {
             ComponentKind::Text { content }
-                if child.children.is_empty()
+                if content.ends_with("\u{a0} ")
+                    && child.children.is_empty()
                     && child.style.display == Display::Inline
                     && matches!(
                         child.style.white_space,
@@ -16770,19 +16900,27 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         };
         (!content.is_empty() && content.chars().all(is_regional_indicator)).then(|| text.clone())
     });
-    let leading_has_rtl = component.children[..component.children.len().saturating_sub(1)]
-        .iter()
-        .any(|child| match &child.kind {
-            ComponentKind::Text { content } => content.chars().any(|character| {
-                matches!(
-                    unicode_bidi::bidi_class(character),
-                    unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
-                )
-            }),
-            _ => false,
-        });
+    // Only consulted when the run ends in regional indicators; ASCII text
+    // has no strong RTL characters.
+    let leading_has_rtl = || {
+        component.children[..component.children.len().saturating_sub(1)]
+            .iter()
+            .any(|child| match &child.kind {
+                ComponentKind::Text { content } => {
+                    !content.is_ascii()
+                        && content.chars().any(|character| {
+                            matches!(
+                                unicode_bidi::bidi_class(character),
+                                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+                            )
+                        })
+                }
+                _ => false,
+            })
+    };
     if style_bidi_control.is_none()
-        && leading_has_rtl
+        && trailing_isolated_indicators.is_some()
+        && leading_has_rtl()
         && let Some(mut indicators) = trailing_isolated_indicators
     {
         indicators.style.unicode_bidi = UnicodeBidi::Isolate;
