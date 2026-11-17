@@ -833,6 +833,18 @@ fn fallback_grows_line(content: &str, style: &Style) -> bool {
     false
 }
 
+/// Whether `fallback_grows_line` can hold for any range of `content`: it
+/// is false for Latin-1 text and for a set line height, so a text item
+/// with neither needs no per-line fallback check.
+fn may_fallback_grow(content: &str, style: &Style) -> bool {
+    #[cfg(feature = "skia")]
+    if style.line_height_is_normal {
+        return !latin1(&content.replace('\t', ""));
+    }
+    let _ = (content, style);
+    false
+}
+
 /// The content a text leaf cannot carry yet: an empty leaf, a carriage
 /// return, a preserved tab (unless `tabs_ok`), or a preserved newline
 /// (unless `newline_ok`).
@@ -1989,6 +2001,11 @@ struct InlineItem {
     descent: f32,
     content_ascent: f32,
     font_height: f32,
+    /// `fallback_grows_line` can hold for some range of the item's text
+    /// (a non-Latin-1 character under `line-height: normal`), so placing
+    /// a piece of it reads its fallback metrics; fixed when the item is
+    /// built and kept with the reused items.
+    may_fallback: bool,
 }
 
 /// A soft-wrap opportunity inside the item's non-space core: the engine's
@@ -3541,6 +3558,7 @@ fn layout_lines_uncached(
                     descent: height - ascent,
                     content_ascent: 0.0,
                     font_height: 0.0,
+                    may_fallback: false,
                 });
                 run += 1;
                 start += 1;
@@ -3658,6 +3676,7 @@ fn layout_lines_uncached(
                     descent: height - baseline,
                     content_ascent: inline_font_content_ascent(style),
                     font_height: inline_font_height(style),
+                    may_fallback: may_fallback_grow(content, style),
                 });
                 if content != FORCED_BREAK && content.contains('\u{2028}') {
                     let whole = items.pop().expect("just pushed");
@@ -4318,7 +4337,17 @@ fn layout_lines_uncached(
             // box (NGLineHeightMetrics of the item) rather than the primary
             // font box, so the glyphs sit on the line's baseline.
             // (The item's own metrics are checked before its node is read.)
-            let (content_ascent, font_height) = if item.ascent > item.content_ascent + EPSILON
+            #[cfg(debug_assertions)]
+            if !item.may_fallback
+                && let ComponentKind::Text { content } = flat[item.index].kind
+            {
+                debug_assert!(!fallback_grows_line(
+                    item.range.map_or(content, |(a, b)| &content[a..b]),
+                    flat[item.index].style,
+                ));
+            }
+            let (content_ascent, font_height) = if item.may_fallback
+                && item.ascent > item.content_ascent + EPSILON
                 && let ComponentKind::Text { content } = flat[item.index].kind
                 && fallback_grows_line(
                     item.range.map_or(content, |(a, b)| &content[a..b]),
