@@ -233,12 +233,14 @@ impl Fragment {
     }
 }
 
-pub(crate) fn build(
-    artifact: &PaintArtifact,
-    clients: impl Iterator<Item = usize>,
-    face: &Typeface,
-) -> HashMap<usize, Fragment> {
-    let clients = clients.collect::<HashSet<_>>();
+/// The artifact-wide inputs of [`build`]: they read every node, so a frame
+/// that records several layers computes them once, not once per layer.
+pub(crate) struct ShapingIndex {
+    quote_words: HashSet<usize>,
+    owner_children: HashMap<usize, Vec<usize>>,
+}
+
+pub(crate) fn index(artifact: &PaintArtifact) -> ShapingIndex {
     // No-break quote words constrain line fitting, not the shaping extent
     // of the adjacent authored text. Recover the transparent word's inline
     // owner so its text can share glyph slices with later spaces/words.
@@ -264,6 +266,43 @@ pub(crate) fn build(
                 .then_some(parent)
         })
         .collect::<HashSet<_>>();
+    let inline_owner = |mut parent: usize| -> Option<usize> {
+        while quote_words.contains(&parent) {
+            parent = artifact.nodes[parent].parent?;
+        }
+        Some(parent)
+    };
+    let mut owner_children: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, node) in artifact.nodes.iter().enumerate() {
+        if quote_words.contains(&index) {
+            continue;
+        }
+        if let Some(parent) = node.parent.and_then(inline_owner) {
+            owner_children.entry(parent).or_default().push(index);
+        }
+    }
+    ShapingIndex {
+        quote_words,
+        owner_children,
+    }
+}
+
+pub(crate) fn build(
+    artifact: &PaintArtifact,
+    clients: impl Iterator<Item = usize>,
+    face: &Typeface,
+) -> HashMap<usize, Fragment> {
+    build_with_index(artifact, clients, face, &index(artifact))
+}
+
+pub(crate) fn build_with_index(
+    artifact: &PaintArtifact,
+    clients: impl Iterator<Item = usize>,
+    face: &Typeface,
+    shaping_index: &ShapingIndex,
+) -> HashMap<usize, Fragment> {
+    let clients = clients.collect::<HashSet<_>>();
+    let quote_words = &shaping_index.quote_words;
     let inline_owner = |mut parent: usize| -> Option<usize> {
         while quote_words.contains(&parent) {
             parent = artifact.nodes[parent].parent?;
@@ -302,19 +341,12 @@ pub(crate) fn build(
         .iter()
         .filter_map(|index| inline_owner(artifact.nodes.get(*index)?.parent?))
         .collect::<HashSet<_>>();
-    let mut siblings: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (index, node) in artifact.nodes.iter().enumerate() {
-        if quote_words.contains(&index) {
-            continue;
-        }
-        if let Some(parent) = node
-            .parent
-            .and_then(inline_owner)
-            .filter(|parent| parents.contains(parent))
-        {
-            siblings.entry(parent).or_default().push(index);
-        }
-    }
+    let siblings = parents.iter().filter_map(|parent| {
+        shaping_index
+            .owner_children
+            .get(parent)
+            .map(|children| (*parent, children))
+    });
     let mut result = HashMap::new();
     for (parent, children) in siblings {
         let style = &artifact.nodes[parent].style;

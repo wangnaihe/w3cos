@@ -829,6 +829,78 @@ impl SkiaRasterizer {
     }
 }
 
+struct InlineBackgrounds {
+    groups: HashMap<usize, Vec<usize>>,
+    grouped: std::collections::HashSet<usize>,
+}
+
+impl InlineBackgrounds {
+    fn new(artifact: Option<&PaintArtifact>) -> Self {
+        let groups = artifact.map(inline_background_groups).unwrap_or_default();
+        let grouped = groups.values().flatten().copied().collect();
+        Self { groups, grouped }
+    }
+}
+
+/// Paint inputs that read the whole artifact, not one recording's nodes.
+/// `replay_frame` records each compositor layer separately; these are the
+/// same for every layer of the frame, so they are computed once per frame.
+struct ArtifactFrameShared {
+    multisampled_effects: std::rc::Rc<std::collections::HashSet<usize>>,
+    backgrounds: std::rc::Rc<InlineBackgrounds>,
+    shaping_index: std::rc::Rc<crate::inline_shaping::ShapingIndex>,
+}
+
+/// The frame scope of [`ArtifactFrameShared`]: active only while
+/// `replay_frame` records the layers of one artifact.
+struct ArtifactFrameMemo {
+    previous: Option<(usize, Option<std::rc::Rc<ArtifactFrameShared>>)>,
+}
+
+thread_local! {
+    static ARTIFACT_FRAME_MEMO: RefCell<Option<(usize, Option<std::rc::Rc<ArtifactFrameShared>>)>> =
+        const { RefCell::new(None) };
+}
+
+impl ArtifactFrameMemo {
+    fn enter(artifact: &PaintArtifact) -> Self {
+        let key = artifact as *const PaintArtifact as usize;
+        let previous = ARTIFACT_FRAME_MEMO.with(|memo| memo.borrow_mut().replace((key, None)));
+        Self { previous }
+    }
+
+    fn get(artifact: &PaintArtifact) -> Option<std::rc::Rc<ArtifactFrameShared>> {
+        let key = artifact as *const PaintArtifact as usize;
+        let cached = ARTIFACT_FRAME_MEMO.with(|memo| match &*memo.borrow() {
+            Some((active, shared)) if *active == key => Some(shared.clone()),
+            _ => None,
+        })?;
+        if let Some(shared) = cached {
+            return Some(shared);
+        }
+        let shared = std::rc::Rc::new(ArtifactFrameShared {
+            multisampled_effects: std::rc::Rc::new(artifact_resize_multisampled_effects(artifact)),
+            backgrounds: std::rc::Rc::new(InlineBackgrounds::new(Some(artifact))),
+            shaping_index: std::rc::Rc::new(crate::inline_shaping::index(artifact)),
+        });
+        ARTIFACT_FRAME_MEMO.with(|memo| {
+            if let Some((active, slot)) = &mut *memo.borrow_mut()
+                && *active == key
+            {
+                *slot = Some(shared.clone());
+            }
+        });
+        Some(shared)
+    }
+}
+
+impl Drop for ArtifactFrameMemo {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        ARTIFACT_FRAME_MEMO.with(|memo| *memo.borrow_mut() = previous);
+    }
+}
+
 fn paint_display_list(
     canvas: &Canvas,
     typeface: &Typeface,
@@ -845,26 +917,33 @@ fn paint_display_list(
     );
 }
 
+fn visible_resize(rect: LayoutRect, style: &Style) -> bool {
+    style.display != Display::None
+        && rect.width > 1.0
+        && rect.height > 1.0
+        && has_css_resize_indicator(style)
+}
+
+fn artifact_resize_multisampled_effects(
+    artifact: &PaintArtifact,
+) -> std::collections::HashSet<usize> {
+    // Picture recordings can split one raster effect into several chunks
+    // (e.g. at a scroll clip). Its sample context must still see sibling
+    // draws from that effect, not just this recording's client indices.
+    artifact
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let rect = artifact.rect_by_index.get(index).copied().flatten()?;
+            visible_resize(rect, &node.style).then(|| artifact.node_properties[index].effect)
+        })
+        .collect()
+}
+
 fn resize_multisampled_effects(frame: &ReplayFrame<'_>) -> std::collections::HashSet<usize> {
-    let visible_resize = |rect: LayoutRect, style: &Style| {
-        style.display != Display::None
-            && rect.width > 1.0
-            && rect.height > 1.0
-            && has_css_resize_indicator(style)
-    };
     if let Some(artifact) = frame.artifact {
-        // Picture recordings can split one raster effect into several chunks
-        // (e.g. at a scroll clip). Its sample context must still see sibling
-        // draws from that effect, not just this recording's client indices.
-        artifact
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                let rect = artifact.rect_by_index.get(index).copied().flatten()?;
-                visible_resize(rect, &node.style).then(|| artifact.node_properties[index].effect)
-            })
-            .collect()
+        artifact_resize_multisampled_effects(artifact)
     } else if frame
         .nodes
         .iter()
@@ -884,19 +963,32 @@ fn paint_display_list_with_suppressed_effects(
     suppressed: &[usize],
     paint_background: bool,
 ) {
-    let multisampled_effects = resize_multisampled_effects(&frame);
+    let shared = frame.artifact.and_then(ArtifactFrameMemo::get);
+    let multisampled_effects = match &shared {
+        Some(shared) => shared.multisampled_effects.clone(),
+        None => std::rc::Rc::new(resize_multisampled_effects(&frame)),
+    };
     let shaped_fragments = frame
         .artifact
         .map(|artifact| {
-            crate::inline_shaping::build(artifact, frame.nodes.iter().map(|node| node.0), typeface)
+            let clients = frame.nodes.iter().map(|node| node.0);
+            match &shared {
+                Some(shared) => crate::inline_shaping::build_with_index(
+                    artifact,
+                    clients,
+                    typeface,
+                    &shared.shaping_index,
+                ),
+                None => crate::inline_shaping::build(artifact, clients, typeface),
+            }
         })
         .unwrap_or_default();
-    let background_groups = frame
-        .artifact
-        .map(inline_background_groups)
-        .unwrap_or_default();
-    let grouped_backgrounds: std::collections::HashSet<usize> =
-        background_groups.values().flatten().copied().collect();
+    let backgrounds = match &shared {
+        Some(shared) => shared.backgrounds.clone(),
+        None => std::rc::Rc::new(InlineBackgrounds::new(frame.artifact)),
+    };
+    let background_groups = &backgrounds.groups;
+    let grouped_backgrounds = &backgrounds.grouped;
     let blur_bounds = small_blur_input_bounds(&frame, bake_compositor_props);
     // Layer recordings must not bake a background clear; composite applies
     // the canvas background, then opacity / transform / scroll.
@@ -1513,6 +1605,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             );
             return;
         }
+        let _memo = ArtifactFrameMemo::enter(artifact);
         let mut pictures = Vec::with_capacity(cache.tree.layers.len());
         let mut glyph_clip_decisions = Vec::with_capacity(cache.tree.layers.len());
         let keep: Vec<bool> = (0..cache.tree.layers.len())
