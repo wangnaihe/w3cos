@@ -3025,6 +3025,7 @@ fn auto_table_track_widths(component: &Component, percentage_basis: Option<f32>)
                     WSpacing::Ch(ch) => ch * component.style.ch_advance(),
                     WSpacing::Rem(rem) => rem * ROOT_FONT_SIZE,
                     WSpacing::Auto => 0.0,
+                    WSpacing::Px(value) => value,
                     other => other.resolve(&w3cos_std::safe_area::current()),
                 };
                 let inner_edges = if component.style.border_collapse {
@@ -4082,6 +4083,7 @@ pub(crate) fn resolve_spacing_for_layout(
         WSpacing::Vw(value) => value * viewport_w / 100.0,
         WSpacing::Vh(value) => value * viewport_h / 100.0,
         WSpacing::Auto => 0.0,
+        WSpacing::Px(value) => value,
         other => other.resolve(&w3cos_std::safe_area::current()),
     })
 }
@@ -26426,6 +26428,7 @@ fn compute_absolute_rect(
         WSpacing::Vw(value) => value * viewport_w / 100.0,
         WSpacing::Vh(value) => value * viewport_h / 100.0,
         WSpacing::Auto => 0.0,
+        WSpacing::Px(value) => value,
         other => other.resolve(&w3cos_std::safe_area::current()),
     };
     let resolve_h = |d: WDim| {
@@ -26588,6 +26591,7 @@ fn positioned_percentage_border_box_size(
         WSpacing::Vw(value) => value * viewport_w / 100.0,
         WSpacing::Vh(value) => value * viewport_h / 100.0,
         WSpacing::Auto => 0.0,
+        WSpacing::Px(value) => value,
         other => other.resolve(&w3cos_std::safe_area::current()),
     };
     let content_width = style.width.resolve(
