@@ -62,8 +62,6 @@ pub(crate) fn authored_line_styles(
             .map(|offset| offset - start)
             .chain(std::iter::once(line.len()))
             .collect::<Vec<_>>();
-        let mut line_style = style.clone();
-        w3cos_std::inline_text::set_fragment_ends(&mut line_style, line, &local_ends);
         let local_owner_ranges = owner_ranges
             .iter()
             .filter_map(|(owner, owner_start, owner_end)| {
@@ -76,6 +74,20 @@ pub(crate) fn authored_line_styles(
                 ))
             })
             .collect::<Vec<_>>();
+        if lines.len() == 1
+            && w3cos_std::inline_text::line_metadata_reads_unchanged(
+                style,
+                line,
+                &local_ends,
+                &local_owner_ranges,
+            )
+        {
+            // The one line's style would read the same as `style`, which
+            // callers fall back to; skip the clone.
+            return None;
+        }
+        let mut line_style = style.clone();
+        w3cos_std::inline_text::set_fragment_ends(&mut line_style, line, &local_ends);
         w3cos_std::inline_text::set_cssom_owner_ranges(&mut line_style, line, &local_owner_ranges);
         result.push(line_style);
         cursor = end;

@@ -47,6 +47,13 @@ pub fn cssom_owner_ranges(text: &str, style: &Style) -> Vec<(u32, usize, usize)>
 pub fn set_cssom_owner_ranges(style: &mut Style, text: &str, ranges: &[(u32, usize, usize)]) {
     let properties = style.custom_properties.get_or_insert_with(Default::default);
     properties.remove(CSSOM_OWNER_RANGES);
+    if let Some(value) = cssom_owner_ranges_value(text, ranges) {
+        properties.insert(CSSOM_OWNER_RANGES.into(), value);
+    }
+}
+
+/// The `CSSOM_OWNER_RANGES` value `set_cssom_owner_ranges` stores, if any.
+fn cssom_owner_ranges_value(text: &str, ranges: &[(u32, usize, usize)]) -> Option<String> {
     let records = ranges
         .iter()
         .filter(|(_, start, end)| {
@@ -57,12 +64,7 @@ pub fn set_cssom_owner_ranges(style: &mut Style, text: &str, ranges: &[(u32, usi
         })
         .map(|(owner, start, end)| format!("{owner},{start},{end}"))
         .collect::<Vec<_>>();
-    if !records.is_empty() {
-        properties.insert(
-            CSSOM_OWNER_RANGES.into(),
-            format!("{:x}:{}", fingerprint(text), records.join(";")),
-        );
-    }
+    (!records.is_empty()).then(|| format!("{:x}:{}", fingerprint(text), records.join(";")))
 }
 
 pub fn cssom_box_owners(style: &Style) -> Vec<u32> {
@@ -345,6 +347,26 @@ pub fn append_source_fragment_ends(
 pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
     let properties = style.custom_properties.get_or_insert_with(Default::default);
     properties.remove(FRAGMENT_ENDS);
+    if let Some(value) = fragment_ends_value(text, ends) {
+        properties.remove(SOURCE_RUN);
+        properties.insert(FRAGMENT_ENDS.into(), value);
+    }
+}
+
+/// The `FRAGMENT_ENDS` value `set_fragment_ends` stores, if any.
+fn fragment_ends_value(text: &str, ends: &[usize]) -> Option<String> {
+    let ends = canonical_fragment_ends(text, ends)?;
+    let offsets = ends
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{:x}:{offsets}", fingerprint(text)))
+}
+
+/// The ends `set_fragment_ends` records for `text`: what `fragment_ends`
+/// then returns. `None` when there is at most one end (nothing is stored).
+fn canonical_fragment_ends(text: &str, ends: &[usize]) -> Option<Vec<usize>> {
     let mut ends = ends
         .iter()
         .copied()
@@ -355,23 +377,81 @@ pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
     if ends.last().copied() != Some(text.len()) && !text.is_empty() {
         ends.push(text.len());
     }
-    if ends.len() > 1 {
-        properties.remove(SOURCE_RUN);
-        let offsets = ends
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        properties.insert(
-            FRAGMENT_ENDS.into(),
-            format!("{:x}:{offsets}", fingerprint(text)),
-        );
-    }
+    (ends.len() > 1).then_some(ends)
+}
+
+/// True when restamping `style` for `text` with `set_fragment_ends(.., ends)`
+/// and `set_cssom_owner_ranges(.., ranges)` changes nothing a reader of that
+/// text sees: `fragment_ends(text, ..)` returns the same ends (a value stamped
+/// for another text already reads as absent), and the owner ranges and
+/// source-run marker are stored unchanged.
+pub fn line_metadata_reads_unchanged(
+    style: &Style,
+    text: &str,
+    ends: &[usize],
+    ranges: &[(u32, usize, usize)],
+) -> bool {
+    let get = |key: &str| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+    };
+    let ends = canonical_fragment_ends(text, ends);
+    (ends.is_none() || get(SOURCE_RUN).is_none())
+        && fragment_ends(text, style) == ends
+        && get(CSSOM_OWNER_RANGES) == cssom_owner_ranges_value(text, ranges).as_ref()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_metadata_reads_unchanged_matches_restamped_style() {
+        let text = "one two";
+        let mut stale = Style::default();
+        set_fragment_ends(&mut stale, "other text", &[5, 10]);
+        assert!(line_metadata_reads_unchanged(
+            &stale,
+            text,
+            &[text.len()],
+            &[]
+        ));
+        let mut restamped = stale.clone();
+        set_fragment_ends(&mut restamped, text, &[text.len()]);
+        assert_eq!(fragment_ends(text, &stale), fragment_ends(text, &restamped));
+
+        let mut own = Style::default();
+        set_fragment_ends(&mut own, text, &[3, 7]);
+        assert!(line_metadata_reads_unchanged(&own, text, &[3, 7], &[]));
+        assert!(!line_metadata_reads_unchanged(&own, text, &[7], &[]));
+        assert!(!line_metadata_reads_unchanged(
+            &Style::default(),
+            text,
+            &[3, 7],
+            &[]
+        ));
+        own.custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(SOURCE_RUN.into(), "1".into());
+        assert!(!line_metadata_reads_unchanged(&own, text, &[3, 7], &[]));
+
+        let mut owned = Style::default();
+        set_cssom_owner_ranges(&mut owned, text, &[(4, 0, 3)]);
+        assert!(line_metadata_reads_unchanged(
+            &owned,
+            text,
+            &[text.len()],
+            &[(4, 0, 3)]
+        ));
+        assert!(!line_metadata_reads_unchanged(
+            &owned,
+            text,
+            &[text.len()],
+            &[]
+        ));
+    }
 
     #[test]
     fn explicit_decoration_color_survives_used_text_and_owner_snapshots() {

@@ -6240,11 +6240,20 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
             .map(|(_, typeface)| typeface)
             .or(generic.as_ref())
             .unwrap_or(intrinsic);
+        // The unbounded wrap usually measures the whole text as its one
+        // line; keep that advance for the per-line pass below.
+        let mut whole_advance = None;
         let lines = text_layout::wrap_text_with_run_width(
             text,
             f32::MAX / 4.0,
             style.white_space,
-            |line| measure_skia_text_advance(line, primary, style),
+            |line| {
+                let advance = measure_skia_text_advance(line, primary, style);
+                if line == text {
+                    whole_advance = Some(advance);
+                }
+                advance
+            },
         );
         let authored_styles = text_layout::authored_line_styles(text, style, &lines);
         let width = lines
@@ -6254,7 +6263,12 @@ pub(crate) fn measure_skia_text_intrinsic_size(text: &str, style: &Style) -> (f3
                 let style = authored_styles
                     .as_ref()
                     .map_or(style, |styles| &styles[index]);
-                measure_skia_text_advance(line, primary, style)
+                // Same line, face and style as a wrap measurement: reuse it.
+                let advance = match whole_advance {
+                    Some(advance) if authored_styles.is_none() && line == text => advance,
+                    _ => measure_skia_text_advance(line, primary, style),
+                };
+                advance
                     + authored_fragment_adjustments(line, style).map_or(0.0, |(_, _, extra)| extra)
             })
             .fold(0.0_f32, f32::max);
