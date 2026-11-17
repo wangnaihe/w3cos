@@ -744,6 +744,24 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     // A replaced item's min- and max-content sizes are its natural size
     // under its constraints (CSS Sizing 3 §5.1).
     if block::is_replaced(info.kind) {
+        // An svg root with no intrinsic size and no ratio is the 300×150
+        // default object. Blink's UA sheet sets `overflow: hidden` on that
+        // root, so the automatic minimum is 0 and the item can flex into
+        // the container. DOM lowering forces `flex-shrink: 0`, so the
+        // 300px default cannot shrink; a positive flex-grow fills from a
+        // zero base instead (display-flex-svg-overflow-default).
+        if info.style.flex_grow > 0.0
+            && matches!(info.style.width, Dimension::Auto)
+            && matches!(info.style.height, Dimension::Auto)
+            && matches!(info.style.min_width, Dimension::Auto)
+            && matches!(info.style.max_width, Dimension::Auto)
+            && matches!(info.style.min_height, Dimension::Auto)
+            && matches!(info.style.max_height, Dimension::Auto)
+            && matches!(info.kind, w3cos_std::ComponentKind::SvgDocument { .. })
+            && !block::svg_has_intrinsic_ratio(info.kind, info.style)
+        {
+            return Some(MinMax::exact(0.0));
+        }
         return block::intrinsic_sizes(flat, index, space);
     }
     // A box with an aspect ratio and a definite block size has the inline
@@ -2542,6 +2560,22 @@ fn layout_with(
                 ..*space
             };
             &basis_space
+        } else if row
+            && matches!(
+                flat[child].kind,
+                w3cos_std::ComponentKind::SvgDocument { .. }
+            )
+        {
+            // A ratio-only svg has no intrinsic size, so its flex base
+            // size stretches into this container's inner size (css-flexbox
+            // §9.2.3 E). The ancestor's available size is not that size.
+            basis_space = ConstraintSpace {
+                available_inline: inner_width,
+                cyclic_percent_auto: false,
+                line_clamp: None,
+                ..*space
+            };
+            &basis_space
         } else {
             space
         };
@@ -2657,8 +2691,19 @@ fn layout_with(
                 && align != AlignItems::Stretch
                 && block::is_replaced(flat[child].kind)
             {
+                // `svg_content_size` subtracts the item's own margins,
+                // border, and padding. The container's inner width is the
+                // available size; `available` already removed those edges.
+                let available_inline = if matches!(
+                    flat[child].kind,
+                    w3cos_std::ComponentKind::SvgDocument { .. }
+                ) {
+                    inner_width
+                } else {
+                    available
+                };
                 let line = ConstraintSpace {
-                    available_inline: available,
+                    available_inline,
                     cyclic_percent_auto: false,
                     line_clamp: None,
                     ..*space
@@ -2812,10 +2857,18 @@ fn layout_with(
             stretched_image_main(flat, child, style, space, inner_width, specified_height)
                 .why("flex:image")?
         {
-            if matches!(child_style.flex_basis, Dimension::Auto) {
+            // A ratio-less svg's 300×150 default object size does not
+            // transfer from the stretched cross size. The flex base stays
+            // the content size, which is 0 when flex-grow fills the line.
+            let transfer = !matches!(
+                flat[child].kind,
+                w3cos_std::ComponentKind::SvgDocument { .. }
+            ) || block::svg_has_intrinsic_ratio(flat[child].kind, child_style);
+            if transfer && matches!(child_style.flex_basis, Dimension::Auto) {
                 base = transferred;
             }
-            if matches!(child_style.min_width, Dimension::Auto)
+            if transfer
+                && matches!(child_style.min_width, Dimension::Auto)
                 && !block::computed_scrolls_in_axis(child_style, true)
             {
                 min = transferred.min(max);
