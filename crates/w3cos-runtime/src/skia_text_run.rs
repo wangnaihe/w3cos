@@ -61,6 +61,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+#[derive(Clone, PartialEq)]
 pub(crate) struct GlyphRun {
     pub glyphs: Vec<GlyphId>,
     pub positions: Vec<Point>,
@@ -334,7 +335,107 @@ fn skia_nominal_advances(face: &Typeface, style: &Style, glyphs: &[GlyphId]) -> 
     )
 }
 
+/// Shaped runs kept by their text, face and the style inputs shaping reads
+/// (the design of Blink's ShapeCache, platform/fonts/shaping/shape_cache.h:
+/// a text run is shaped once per font and its ShapeResult reused, and the
+/// cache is cleared when it reaches its bound). Layout measures a run for
+/// its max-content size, again per wrapped line, and paint shapes it once
+/// more; all of them read the same result. Justified and synthesized
+/// small-caps runs read more of the style and are shaped each time.
+/// `W3COS_SHAPE_CACHE=1` turns it on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    text_hash: u64,
+    face: u32,
+    font_size: u32,
+    letter_spacing: u32,
+    word_spacing: u32,
+    kern: bool,
+    clusters: bool,
+}
+
+/// Blink's ShapeCache bound (kMaxSize).
+const SHAPE_CACHE_MAX: usize = 10000;
+
+#[derive(Default)]
+struct ShapeCache {
+    runs: w3cos_std::fxhash::FxHashMap<ShapeKey, Vec<(Box<str>, Option<GlyphRun>)>>,
+    entries: usize,
+}
+
+thread_local! {
+    static SHAPE_CACHE: RefCell<ShapeCache> = RefCell::new(ShapeCache::default());
+}
+
+fn shape_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_SHAPE_CACHE").is_some_and(|v| v == "1"))
+}
+
+fn shape_key(text: &str, face: &Typeface, style: &Style, collect_clusters: bool) -> ShapeKey {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
+    text.hash(&mut hasher);
+    ShapeKey {
+        text_hash: hasher.finish(),
+        face: face.unique_id(),
+        font_size: style.font_size.to_bits(),
+        letter_spacing: style.letter_spacing.to_bits(),
+        word_spacing: style.word_spacing.to_bits(),
+        kern: style.font_feature_kern.unwrap_or(style.font_kerning),
+        clusters: collect_clusters,
+    }
+}
+
 fn shape_visual_run_impl(
+    text: &str,
+    face: &Typeface,
+    style: &Style,
+    collect_clusters: bool,
+    expansion: Option<(crate::text_layout::JustificationExpansion, usize)>,
+) -> Option<GlyphRun> {
+    if expansion.is_some()
+        || style.font_variant == w3cos_std::style::FontVariant::SmallCaps
+        || !shape_cache_enabled()
+    {
+        return shape_visual_run_uncached(text, face, style, collect_clusters, expansion);
+    }
+    let key = shape_key(text, face, style, collect_clusters);
+    let hit = SHAPE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .runs
+            .get(&key)?
+            .iter()
+            .find(|(cached, _)| &**cached == text)
+            .map(|(_, run)| run.clone())
+    });
+    if let Some(run) = hit {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            run == shape_visual_run_uncached(text, face, style, collect_clusters, None),
+            "shape cache: stale run for {text:?}"
+        );
+        return run;
+    }
+    let run = shape_visual_run_uncached(text, face, style, collect_clusters, None);
+    SHAPE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.entries >= SHAPE_CACHE_MAX {
+            cache.runs.clear();
+            cache.entries = 0;
+        }
+        cache
+            .runs
+            .entry(key)
+            .or_default()
+            .push((text.into(), run.clone()));
+        cache.entries += 1;
+    });
+    run
+}
+
+fn shape_visual_run_uncached(
     text: &str,
     face: &Typeface,
     style: &Style,
