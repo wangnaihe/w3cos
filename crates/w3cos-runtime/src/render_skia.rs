@@ -88,6 +88,7 @@ thread_local! {
             .or_else(|| manager.match_family_style("Times New Roman", FontStyle::normal()))
     };
     static HTML_STANDARD_TYPEFACE: Option<Typeface> = host_typeface();
+    static HOST_TYPEFACE: Option<Typeface> = host_typeface();
     #[cfg(target_os = "macos")]
     static LANGUAGE_GENERIC_TYPEFACES: RefCell<HashMap<&'static str, Option<Typeface>>> =
         RefCell::new(HashMap::new());
@@ -744,7 +745,9 @@ impl SkiaRasterizer {
     }
 
     pub fn new_host() -> Option<Self> {
-        let typeface = host_typeface()?;
+        // One host face per thread: a face's unique id keys the shape
+        // cache, so a fresh instance per headless frame reshaped every run.
+        let typeface = HOST_TYPEFACE.with(Clone::clone)?;
         Some(Self {
             surface: None,
             size: (0, 0),

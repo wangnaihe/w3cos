@@ -358,9 +358,18 @@ struct ShapeKey {
 const SHAPE_CACHE_MAX: usize = 10000;
 
 #[derive(Default)]
-struct ShapeCache {
+struct FaceShapeCache {
     runs: w3cos_std::fxhash::FxHashMap<ShapeKey, Vec<(Box<str>, Option<GlyphRun>)>>,
     entries: usize,
+}
+
+/// One bounded cache per face, as Blink keeps one ShapeCache per font
+/// (FontCache::GetShapeCache) rather than one shared by every font: a page
+/// whose text spans several faces must not evict one face's words for
+/// another's.
+#[derive(Default)]
+struct ShapeCache {
+    faces: w3cos_std::fxhash::FxHashMap<u32, FaceShapeCache>,
 }
 
 thread_local! {
@@ -404,6 +413,8 @@ fn shape_visual_run_impl(
     let hit = SHAPE_CACHE.with(|cache| {
         cache
             .borrow()
+            .faces
+            .get(&key.face)?
             .runs
             .get(&key)?
             .iter()
@@ -421,6 +432,7 @@ fn shape_visual_run_impl(
     let run = shape_visual_run_uncached(text, face, style, collect_clusters, None);
     SHAPE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
+        let cache = cache.faces.entry(key.face).or_default();
         if cache.entries >= SHAPE_CACHE_MAX {
             cache.runs.clear();
             cache.entries = 0;
