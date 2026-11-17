@@ -596,6 +596,9 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
             if let Some(plan) = try_container(cache, document, &chain, node) {
                 return Ok(Some(plan));
             }
+            if let Some(plan) = try_container_children(cache, document, &chain, &chains) {
+                return Ok(Some(plan));
+            }
             // A column flex too large for `try_container` keeps its items and
             // lays out only the appended ones.
             if let Some(plan) = try_tail_in(cache, document, &chain, &chains, true) {
@@ -996,6 +999,140 @@ fn try_container(
         path,
         node,
         kind: PlanKind::Subtree(fresh),
+    })
+}
+
+/// A child-list edit under a flex or grid container that [`try_children`]
+/// cannot shift (growing items, wrapping, alignment): keep the lowered
+/// components of the untouched items, lower only the inserted ones, and lay
+/// out every item again in a wrapper at the container's content box. Blink re-attaches
+/// only the inserted children and relayouts up to the container, which is a
+/// relayout boundary when its width does not depend on its content.
+fn try_container_children(
+    cache: &Cache,
+    document: &w3cos_dom::document::Document,
+    chain: &[u32],
+    chains: &[Vec<u32>],
+) -> Option<Plan> {
+    if !retain_lowering_enabled()
+        || !subtree_relayout_enabled()
+        || crate::layout_ng::mode() == crate::layout_ng::Mode::Off
+        || chain.len() <= 1
+        || chain.last() == Some(&crate::dom::body_id())
+        || w3cos_dom::stylesheet::tree_order_affects_matching()
+        || w3cos_dom::stylesheet::has_counter_rules()
+    {
+        return None;
+    }
+    let node = *chain.last()?;
+    let path = component_path(&cache.component, chain)?;
+    let old = at_path(&cache.component, &path);
+    let parent = at_path(&cache.component, &path[..path.len() - 1]);
+    let style = &old.style;
+    // The used width must come from the containing block: a definite width,
+    // or a block-level box filling its block parent (checked below).
+    let width_from_parent = width_is_definite(style)
+        || (matches!(style.width, Dimension::Auto)
+            && px_spacing(style.margin.left).is_some()
+            && px_spacing(style.margin.right).is_some());
+    if !matches!(style.display, Display::Flex | Display::Grid)
+        || !in_flow_static(style)
+        || !width_from_parent
+        || style.writing_mode != Default::default()
+        // The wrapper has an auto height: so must the container, and a block
+        // parent keeps it content-sized (a flex or grid parent may stretch it).
+        || !matches!(style.height, Dimension::Auto)
+        || !matches!(style.min_height, Dimension::Auto)
+        || !matches!(style.max_height, Dimension::Auto)
+        || !matches!(
+            parent.style.display,
+            Display::Block | Display::FlowRoot | Display::ListItem
+        )
+        // Items are laid out from the content box.
+        || px_spacing(style.padding.top).is_none()
+        || px_spacing(style.padding.left).is_none()
+        || px_spacing(style.padding.right).is_none()
+        || is_table_like(old)
+        || *style != document.computed_style_for(NodeId::from_u32(node))
+        || !(document.get_layout_rect(NodeId::from_u32(node)).height > 0.0)
+    {
+        return None;
+    }
+    splice_ancestor_levels(&cache.component, &path)?;
+    let depth = chain.len();
+    let touched: Vec<u32> = chains
+        .iter()
+        .filter(|other| other.len() > depth)
+        .map(|other| other[depth])
+        .collect();
+    let mut dom_children = Vec::new();
+    let mut child = document.get_node(NodeId::from_u32(node)).first_child;
+    while let Some(id) = child {
+        let dom = document.get_node(id);
+        if dom.node_type != NodeType::Element {
+            return None;
+        }
+        dom_children.push(id.as_u32());
+        child = w3cos_dom::node::sib(dom.next_sibling);
+    }
+    let cached = old
+        .children
+        .iter()
+        .map(host_id)
+        .collect::<Option<Vec<_>>>()?;
+    let same = |cached: &u32, live: &u32| cached == live && !touched.contains(cached);
+    let keep = cached
+        .iter()
+        .zip(&dom_children)
+        .take_while(|(cached, live)| same(cached, live))
+        .count();
+    let room = cached.len().min(dom_children.len()) - keep;
+    let suffix = cached
+        .iter()
+        .rev()
+        .zip(dom_children.iter().rev())
+        .take(room)
+        .take_while(|(cached, live)| same(cached, live))
+        .count();
+    let removed = cached.len() - keep - suffix;
+    let inserted_ids = &dom_children[keep..dom_children.len() - suffix];
+    if removed == 0 && inserted_ids.is_empty() {
+        return None;
+    }
+    let neutral = |id: u32| document.subtree_is_counter_neutral(NodeId::from_u32(id));
+    if !cached[keep..keep + removed].iter().all(|&id| neutral(id))
+        || !inserted_ids.iter().all(|&id| neutral(id))
+    {
+        return None;
+    }
+    let mut inserted = Vec::with_capacity(inserted_ids.len());
+    for &id in inserted_ids {
+        let component = document.to_component_subtree(NodeId::from_u32(id));
+        if host_id(&component) != Some(id) || !tree_is_spliceable_with_owners(&component) {
+            return None;
+        }
+        inserted.push(component);
+    }
+    // Every item is solved again in a wrapper at the content box; only the
+    // untouched items' lowered components are reused.
+    let mut items = Vec::with_capacity(keep + inserted.len() + suffix);
+    items.extend(old.children[..keep].iter().cloned());
+    items.extend(inserted);
+    items.extend(old.children[keep + removed..].iter().cloned());
+    if debug_enabled() {
+        eprintln!(
+            "[splice] container children plan node {node}: keep {keep}, removed {removed}, inserted {}, following {suffix}",
+            inserted_ids.len()
+        );
+    }
+    Some(Plan {
+        path,
+        node,
+        kind: PlanKind::Children {
+            keep: 0,
+            removed: cached.len(),
+            inserted: items,
+        },
     })
 }
 
@@ -1699,8 +1836,11 @@ pub(super) fn try_splice(
             children.extend(inserted);
             children.extend(next);
             let mut wrapper = wrapper_for(target, width, children);
+            // Pending rects are rebased from the raw results below; only a
+            // published map needs the inserted items' rects now.
+            let publish = !(retain_lowering_enabled() && super::client_rects_pending());
             let Some((rects, own, client, raw)) =
-                solve_raw(&wrapper, skip, measure, viewport_w, viewport_h, true)
+                solve_raw(&wrapper, skip, measure, viewport_w, viewport_h, publish)
             else {
                 return bail("children solve");
             };
@@ -3669,6 +3809,85 @@ mod tests {
                 child_splices() - before,
                 5,
                 "child-list edits keep the items"
+            );
+        }
+    }
+
+    #[test]
+    fn container_child_list_edits_relayout_only_the_container() {
+        let _retain = RetainGuard::on();
+        let (chat, msgs) = chat_items();
+        check("initial");
+        let before = child_splices();
+        // A growing item: the column cannot shift its followers by one
+        // offset, so the container is laid out again with its kept items.
+        let grow = crate::dom::create_element("div");
+        style(grow, &[("flex-grow", "1"), ("padding", "3px")]);
+        crate::dom::append_child(grow, crate::dom::create_text_node("grows"));
+        crate::dom::insert_before(chat, grow, msgs[1]);
+        assert!(crate::incremental_layout::flush());
+        check("insert growing item");
+        crate::dom::remove_child(chat, grow);
+        assert!(crate::incremental_layout::flush());
+        check("remove growing item");
+        // A wrapping row and a grid after the chat.
+        let row = crate::dom::create_element("div");
+        style(
+            row,
+            &[
+                ("display", "flex"),
+                ("flex-wrap", "wrap"),
+                ("gap", "6px"),
+                ("padding", "4px"),
+            ],
+        );
+        let grid = crate::dom::create_element("div");
+        style(
+            grid,
+            &[
+                ("display", "grid"),
+                ("grid-template-columns", "repeat(3, 1fr)"),
+                ("gap", "5px"),
+                ("padding", "2px"),
+            ],
+        );
+        let mut cells = Vec::new();
+        for index in 0..7 {
+            for parent in [row, grid] {
+                let cell = crate::dom::create_element("div");
+                style(cell, &[("padding", "3px"), ("width", "180px")]);
+                crate::dom::append_child(
+                    cell,
+                    crate::dom::create_text_node(&"cell words ".repeat(index + 1)),
+                );
+                crate::dom::append_child(parent, cell);
+                cells.push(cell);
+            }
+        }
+        let body = crate::dom::body_id();
+        crate::dom::append_child(body, row);
+        crate::dom::append_child(body, grid);
+        assert!(crate::incremental_layout::flush());
+        check("row and grid");
+        let splices = child_splices();
+        crate::dom::remove_child(row, cells[2]);
+        assert!(crate::incremental_layout::flush());
+        check("remove from wrapping row");
+        crate::dom::insert_before(row, cells[2], cells[0]);
+        assert!(crate::incremental_layout::flush());
+        check("insert first in wrapping row");
+        crate::dom::remove_child(grid, cells[5]);
+        assert!(crate::incremental_layout::flush());
+        check("remove from grid");
+        crate::dom::append_child(grid, cells[5]);
+        assert!(crate::incremental_layout::flush());
+        check("append to grid");
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            assert_eq!(splices - before, 2, "growing item edits keep the items");
+            assert_eq!(
+                child_splices() - splices,
+                4,
+                "row and grid edits keep the items"
             );
         }
     }
