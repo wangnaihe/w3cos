@@ -2286,9 +2286,10 @@ const SVG_MARKERS: [&str; 4] = [
     SVG_FALLBACK_HEIGHT_MARKER,
 ];
 
-/// The style of an svg grid item with the DOM's fallback sizes read as
-/// `auto` (Blink: an svg root without `width`/`height` attributes has `auto`
-/// computed sizes); `None` when the style already is that. The DOM keeps the
+/// The style of an svg grid or flex item with the DOM's fallback sizes
+/// read as `auto` (Blink: an svg root without `width`/`height` attributes
+/// has `auto` computed sizes); `None` when the style already is that. Only
+/// axes that came from the fallback are rewritten. The DOM keeps the
 /// fallback `px` for the legacy engine, which has no replaced-ratio sizing.
 pub(super) fn svg_fallback_auto_style(style: &Style) -> Option<Style> {
     let width = svg_specified(style, true).is_some() && style.width != Dimension::Auto;
@@ -2498,7 +2499,26 @@ fn svg_box_reason(flat: &[FlatNodeInfo], index: usize, source: &str) -> Option<&
         .parent
         .is_some_and(|parent| is_author_flex(flat[parent].style))
     {
-        if svg_specified(style, true).is_some() || svg_specified(style, false).is_some() {
+        // Fallback px are already `auto` (see `svg_fallback_auto_style`).
+        // An author width/height attribute on one axis, with the other
+        // axis automatic, stays on legacy: flex would stretch that auto
+        // axis instead of keeping the presentation size.
+        let author = |width: bool| {
+            let marker = if width {
+                SVG_WIDTH_MARKER
+            } else {
+                SVG_HEIGHT_MARKER
+            };
+            style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|props| props.contains_key(marker))
+        };
+        let auto_w = matches!(style.width, Dimension::Auto);
+        let auto_h = matches!(style.height, Dimension::Auto);
+        let author_w = author(true);
+        let author_h = author(false);
+        if (author_w && auto_h && !author_h) || (author_h && auto_w && !author_w) {
             return Some("svg:flex-fallback-size");
         }
         return unsupported_box_style(
@@ -2556,6 +2576,18 @@ fn svg_box_reason(flat: &[FlatNodeInfo], index: usize, source: &str) -> Option<&
         Display::Inline | Display::InlineBlock => Some("svg:inline"),
         _ => Some("svg:display"),
     }
+}
+
+/// Whether the outer svg has an intrinsic ratio (absolute width and height
+/// attributes, or a viewBox). A root with neither is the 300×150 default
+/// object size.
+pub(super) fn svg_has_intrinsic_ratio(kind: &ComponentKind, style: &Style) -> bool {
+    let ComponentKind::SvgDocument { source, .. } = kind else {
+        return false;
+    };
+    svg_root_sizing(source, style)
+        .and_then(|sizing| sizing.ratio)
+        .is_some()
 }
 
 /// Content-box size of an outer `<svg>`: the sizing behavior of Blink
