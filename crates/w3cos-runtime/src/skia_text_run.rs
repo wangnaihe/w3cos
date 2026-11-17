@@ -342,7 +342,7 @@ fn skia_nominal_advances(face: &Typeface, style: &Style, glyphs: &[GlyphId]) -> 
 /// its max-content size, again per wrapped line, and paint shapes it once
 /// more; all of them read the same result. Justified and synthesized
 /// small-caps runs read more of the style and are shaped each time.
-/// `W3COS_SHAPE_CACHE=1` turns it on.
+/// On by default; `W3COS_SHAPE_CACHE=0` shapes every run.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ShapeKey {
     text_hash: u64,
@@ -369,7 +369,7 @@ thread_local! {
 
 fn shape_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("W3COS_SHAPE_CACHE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("W3COS_SHAPE_CACHE").is_none_or(|v| v != "0"))
 }
 
 fn shape_key(text: &str, face: &Typeface, style: &Style, collect_clusters: bool) -> ShapeKey {
