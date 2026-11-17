@@ -860,6 +860,19 @@ fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
     }
 }
 
+/// Each table row's cell children, in paint-tree order.
+fn table_cells_by_row(nodes: &[PaintNode]) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut cells: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if node.style.display == Display::TableCell
+            && let Some(row) = node.parent
+        {
+            cells.entry(row).or_default().push(index);
+        }
+    }
+    cells
+}
+
 fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
     use w3cos_std::style::TextDirection;
 
@@ -960,16 +973,10 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         .filter(|(_, node)| node.style.display == Display::TableRow && node.style.border_collapse)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    fn row_cells(nodes: &[PaintNode], row: usize) -> Vec<usize> {
-        nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| {
-                node.parent == Some(row) && node.style.display == Display::TableCell
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-    }
+    // Cell membership reads only parent and display, which neither pass
+    // changes; index it once rather than scanning every node per row.
+    let cells_by_row = table_cells_by_row(nodes);
+    let row_cells = |row: usize| cells_by_row.get(&row).cloned().unwrap_or_default();
 
     fn nearest_table(nodes: &[PaintNode], index: usize) -> Option<usize> {
         let mut parent = nodes[index].parent;
@@ -1042,20 +1049,15 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         let populated_rows = part_rows
             .iter()
             .copied()
-            .filter(|row| !row_cells(nodes, *row).is_empty())
+            .filter(|row| !row_cells(*row).is_empty())
             .collect::<Vec<_>>();
         let Some(first) = populated_rows.first().copied() else {
             continue;
         };
         let last = populated_rows.last().copied().unwrap_or(first);
-        let mut boundary_cells = [
-            row_cells(nodes, first),
-            Vec::new(),
-            row_cells(nodes, last),
-            Vec::new(),
-        ];
+        let mut boundary_cells = [row_cells(first), Vec::new(), row_cells(last), Vec::new()];
         for row in populated_rows {
-            let cells = row_cells(nodes, row);
+            let cells = row_cells(row);
             if let Some(first) = cells.first() {
                 boundary_cells[3].push(*first);
             }
@@ -1109,7 +1111,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             boundary_cells = std::array::from_fn(|_| Vec::new());
             for row in &part_rows {
                 let mut column = 0usize;
-                for cell in row_cells(nodes, *row) {
+                for cell in row_cells(*row) {
                     let next = column + span(&nodes[cell].style);
                     if column < end && next > start {
                         if *row == first {
@@ -1198,7 +1200,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
                 })
                 .collect::<Vec<_>>()
         } else {
-            row_cells(nodes, *row)
+            row_cells(*row)
                 .windows(2)
                 .map(|pair| (pair[0], pair[1], 1, 1))
                 .collect()
@@ -1280,16 +1282,16 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         };
         let last_row = boundary_rows.last().copied().unwrap_or(first_row);
         let mut boundary_cells = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        boundary_cells[0] = row_cells(nodes, first_row)
+        boundary_cells[0] = row_cells(first_row)
             .into_iter()
             .filter(|cell| nodes[*cell].style.visibility != Visibility::Collapse)
             .collect();
-        boundary_cells[2] = row_cells(nodes, last_row)
+        boundary_cells[2] = row_cells(last_row)
             .into_iter()
             .filter(|cell| nodes[*cell].style.visibility != Visibility::Collapse)
             .collect();
         for row in boundary_rows {
-            let cells = row_cells(nodes, *row)
+            let cells = row_cells(*row)
                 .into_iter()
                 .filter(|cell| nodes[*cell].style.visibility != Visibility::Collapse)
                 .collect::<Vec<_>>();
@@ -1344,7 +1346,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
         }
         let ranges = |row| {
             let mut column = 0usize;
-            row_cells(nodes, row)
+            row_cells(row)
                 .into_iter()
                 .map(|cell| {
                     let span = nodes[cell]
@@ -1628,26 +1630,18 @@ fn extend_collapsed_borders_across_empty_rows(
     nodes: &mut [PaintNode],
     rect_by_index: &[Option<LayoutRect>],
 ) {
-    fn row_cells(nodes: &[PaintNode], row: usize) -> Vec<usize> {
-        nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| {
-                node.parent == Some(row) && node.style.display == Display::TableCell
-            })
-            .map(|(index, _)| index)
-            .collect()
-    }
     let rows = nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| node.style.display == Display::TableRow && node.style.border_collapse)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    let cells_by_row = table_cells_by_row(nodes);
+    let row_cells = |row: usize| cells_by_row.get(&row).cloned().unwrap_or_default();
     for rows in rows.windows(3) {
-        let top_cells = row_cells(nodes, rows[0]);
-        let empty_cells = row_cells(nodes, rows[1]);
-        let bottom_cells = row_cells(nodes, rows[2]);
+        let top_cells = row_cells(rows[0]);
+        let empty_cells = row_cells(rows[1]);
+        let bottom_cells = row_cells(rows[2]);
         if top_cells.is_empty() || !empty_cells.is_empty() || bottom_cells.is_empty() {
             continue;
         }
