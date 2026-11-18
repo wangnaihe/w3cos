@@ -67,6 +67,10 @@ thread_local! {
     static CHECKSUM_ONLY: Cell<bool> = const { Cell::new(false) };
     static LAST_FRAME_CHECKSUM: Cell<u64> = const { Cell::new(0) };
     static RETAINED_PAINT: RefCell<Option<RetainedPaint>> = const { RefCell::new(None) };
+    /// The node kinds of the artifact the last frame replaced, by node index.
+    /// The next build copies into them (`refill_kind`), so an unchanged text
+    /// keeps its buffer instead of being allocated and freed every frame.
+    static RECYCLED_KINDS: RefCell<Vec<w3cos_std::ComponentKind>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(feature = "cpu-render")]
@@ -263,9 +267,10 @@ fn finish_headless_frame(
                 if *id == u64::from(crate::dom::body_id())
         )
     });
+    let mut recycled = RECYCLED_KINDS.with(|kinds| std::mem::take(&mut *kinds.borrow_mut()));
     let mut artifact = PaintArtifact::build_with_body_background_and_viewport(
-        flat.iter().map(|node| PaintNode {
-            kind: node.kind.clone(),
+        flat.iter().enumerate().map(|(index, node)| PaintNode {
+            kind: crate::paint_artifact::refill_kind(recycled.get_mut(index), node.kind),
             style: crate::paint_artifact::shared_paint_style(node.component, node.style),
             parent: node.parent,
             sticky_counter_signal: node.sticky_counter_signal,
@@ -381,13 +386,18 @@ fn finish_headless_frame(
     }
     let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact, force_cpu)?;
     let rect_independent = component_rect_independent(root);
-    RETAINED_PAINT.with(|slot| {
-        *slot.borrow_mut() = Some(RetainedPaint {
+    let replaced = RETAINED_PAINT.with(|slot| {
+        slot.borrow_mut().replace(RetainedPaint {
             structure,
             rect_independent,
             artifact,
-        });
+        })
     });
+    if let Some(replaced) = replaced {
+        recycled.clear();
+        recycled.extend(replaced.artifact.nodes.into_iter().map(|node| node.kind));
+        RECYCLED_KINDS.with(|kinds| *kinds.borrow_mut() = recycled);
+    }
 
     Ok(HeadlessFrame {
         width,

@@ -207,6 +207,25 @@ pub fn shared_paint_style(
     }
 }
 
+/// `source` as an owned kind, built in `slot`'s storage when there is one:
+/// a text kind copies into the old buffer instead of allocating a new one.
+pub(crate) fn refill_kind(
+    slot: Option<&mut ComponentKind>,
+    source: &ComponentKind,
+) -> ComponentKind {
+    let Some(slot) = slot else {
+        return source.clone();
+    };
+    let mut kind = std::mem::replace(slot, ComponentKind::Root);
+    match (&mut kind, source) {
+        (ComponentKind::Text { content }, ComponentKind::Text { content: source }) => {
+            content.clone_from(source);
+        }
+        (kind, source) => *kind = source.clone(),
+    }
+    kind
+}
+
 /// Rebuild paint nodes, cloning `Style` only for slots that actually changed.
 ///
 /// Returns the node list and the number of Style clones performed. A clean
@@ -3980,6 +3999,46 @@ fn rank_paint_order(paint_order: &PaintOrderKeys) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refilled_kinds_equal_their_source_and_reuse_text_buffers() {
+        let long = "x".repeat(64);
+        let mut slots = vec![
+            ComponentKind::Text {
+                content: long.clone(),
+            },
+            ComponentKind::Text {
+                content: "old".into(),
+            },
+            ComponentKind::Box,
+        ];
+        let buffer = match &slots[0] {
+            ComponentKind::Text { content } => content.as_ptr(),
+            _ => unreachable!(),
+        };
+        let sources = [
+            ComponentKind::Text {
+                content: "short".into(),
+            },
+            ComponentKind::Column,
+            ComponentKind::Text {
+                content: "from a box".into(),
+            },
+            ComponentKind::Text {
+                content: "no slot".into(),
+            },
+        ];
+        let refilled = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| refill_kind(slots.get_mut(index), source))
+            .collect::<Vec<_>>();
+        assert!(refilled.iter().zip(&sources).all(|(a, b)| a == b));
+        match &refilled[0] {
+            ComponentKind::Text { content } => assert_eq!(content.as_ptr(), buffer),
+            _ => unreachable!(),
+        }
+    }
 
     #[test]
     fn paint_order_keys_extend_an_owner_prefix() {
