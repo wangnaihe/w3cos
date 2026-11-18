@@ -981,17 +981,15 @@ fn content_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> 
         }
     }
     for (index, node) in artifact.nodes.iter().enumerate() {
-        index.hash(&mut hasher);
-        node.parent.hash(&mut hasher);
+        hasher.write_usize(index);
+        hasher.write_usize(node.parent.map_or(usize::MAX, |parent| parent));
         hash_kind(&node.kind, &mut hasher);
         hash_paint_style(&node.style, &mut hasher);
-        artifact
-            .z_order
-            .get(index)
-            .copied()
-            .unwrap_or(0)
-            .hash(&mut hasher);
-        artifact.sticky_owner.get(index).copied().hash(&mut hasher);
+        let z_order = artifact.z_order.get(index).copied().unwrap_or(0);
+        let sticky = artifact.sticky_owner.get(index).copied().flatten();
+        hasher.write_u64(
+            u64::from(z_order as u32) | (sticky.map_or(u64::MAX, |owner| owner as u64) << 32),
+        );
     }
     for clip in &artifact.properties.clips {
         clip.parent.hash(&mut hasher);
@@ -1061,10 +1059,8 @@ fn compositor_fingerprint(
 }
 
 fn hash_rect(rect: LayoutRect, hasher: &mut impl Hasher) {
-    rect.x.to_bits().hash(hasher);
-    rect.y.to_bits().hash(hasher);
-    rect.width.to_bits().hash(hasher);
-    rect.height.to_bits().hash(hasher);
+    hasher.write_u64(u64::from(rect.x.to_bits()) | (u64::from(rect.y.to_bits()) << 32));
+    hasher.write_u64(u64::from(rect.width.to_bits()) | (u64::from(rect.height.to_bits()) << 32));
 }
 
 fn hash_transform(transform: Transform2D, hasher: &mut impl Hasher) {
@@ -1109,61 +1105,39 @@ fn hash_kind(kind: &ComponentKind, hasher: &mut impl Hasher) {
 }
 
 fn hash_paint_style(style: &Style, hasher: &mut impl Hasher) {
-    style.background.r.hash(hasher);
-    style.background.g.hash(hasher);
-    style.background.b.hash(hasher);
-    style.background.a.hash(hasher);
-    style.color.r.hash(hasher);
-    style.color.g.hash(hasher);
-    style.color.b.hash(hasher);
-    style.color.a.hash(hasher);
-    style.font_size.to_bits().hash(hasher);
-    style.font_weight.hash(hasher);
+    // Runs for every node each frame: pack the scalar inputs into a few
+    // words instead of one hasher write per field. The value is only ever
+    // compared with this function's value for another frame.
+    let color = |c: w3cos_std::Color| u64::from(u32::from_le_bytes([c.r, c.g, c.b, c.a]));
+    let pair = |a: f32, b: f32| u64::from(a.to_bits()) | (u64::from(b.to_bits()) << 32);
+    let overflow = |value: Option<w3cos_std::style::Overflow>| value.map_or(0, |v| v as u64 + 1);
+    hasher.write_u64(color(style.background) | (color(style.color) << 32));
+    hasher.write_u64(color(style.border_color) | (color(style.outline_color) << 32));
+    hasher.write_u64(pair(style.font_size, style.border_radius));
+    hasher.write_u64(pair(style.border_width, style.line_height));
+    hasher.write_u64(pair(style.letter_spacing, style.word_spacing));
+    hasher
+        .write_u64(u64::from(style.outline_width.to_bits()) | (u64::from(style.font_weight) << 32));
+    let flags = style.visibility as u64
+        | (style.overflow as u64) << 4
+        | overflow(style.overflow_x) << 8
+        | overflow(style.overflow_y) << 12
+        | (style.contain as u64) << 16
+        | (style.text_align as u64) << 20
+        | (style.white_space as u64) << 24
+        | (style.text_decoration as u64) << 28
+        | (style.outline_style as u64) << 32
+        | u64::from(style.has_box_shadow()) << 40
+        | u64::from(style.backdrop_blur.is_some()) << 41
+        | u64::from(style.will_change.transform) << 42
+        | u64::from(style.will_change.opacity) << 43
+        | u64::from(style.will_change.filter) << 44
+        | u64::from(style.will_change.scroll_position) << 45;
+    hasher.write_u64(flags);
+    hasher.write_usize(style.text_shadows.len());
     style.font_family.hash(hasher);
-    style.border_radius.to_bits().hash(hasher);
-    style.border_width.to_bits().hash(hasher);
-    style.border_color.r.hash(hasher);
-    style.border_color.g.hash(hasher);
-    style.border_color.b.hash(hasher);
-    style.border_color.a.hash(hasher);
     style.filter.hash(hasher);
     style.background_image.hash(hasher);
-    std::mem::discriminant(&style.visibility).hash(hasher);
-    std::mem::discriminant(&style.overflow).hash(hasher);
-    match style.overflow_x {
-        Some(value) => {
-            1u8.hash(hasher);
-            std::mem::discriminant(&value).hash(hasher);
-        }
-        None => 0u8.hash(hasher),
-    }
-    match style.overflow_y {
-        Some(value) => {
-            1u8.hash(hasher);
-            std::mem::discriminant(&value).hash(hasher);
-        }
-        None => 0u8.hash(hasher),
-    }
-    style.has_box_shadow().hash(hasher);
-    style.backdrop_blur.is_some().hash(hasher);
-    style.text_shadows.len().hash(hasher);
-    style.will_change.transform.hash(hasher);
-    style.will_change.opacity.hash(hasher);
-    style.will_change.filter.hash(hasher);
-    style.will_change.scroll_position.hash(hasher);
-    std::mem::discriminant(&style.contain).hash(hasher);
-    std::mem::discriminant(&style.text_align).hash(hasher);
-    std::mem::discriminant(&style.white_space).hash(hasher);
-    style.line_height.to_bits().hash(hasher);
-    style.letter_spacing.to_bits().hash(hasher);
-    style.word_spacing.to_bits().hash(hasher);
-    std::mem::discriminant(&style.text_decoration).hash(hasher);
-    style.outline_width.to_bits().hash(hasher);
-    style.outline_color.r.hash(hasher);
-    style.outline_color.g.hash(hasher);
-    style.outline_color.b.hash(hasher);
-    style.outline_color.a.hash(hasher);
-    std::mem::discriminant(&style.outline_style).hash(hasher);
 }
 
 pub fn layer_scroll_translation(
