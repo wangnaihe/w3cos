@@ -2758,6 +2758,11 @@ impl Document {
         std::mem::take(&mut self.precise_dirty)
     }
 
+    /// Mutations recorded since the last `take_precise_dirty`.
+    pub fn has_precise_dirty(&self) -> bool {
+        !self.precise_dirty.is_empty()
+    }
+
     /// Changes on every `take_precise_dirty`. A retained layout that saw the
     /// previous value knows no other consumer drained mutations it missed.
     pub fn precise_drain_epoch(&self) -> u32 {

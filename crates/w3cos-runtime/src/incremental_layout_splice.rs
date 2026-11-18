@@ -1226,6 +1226,7 @@ fn solve_with_client_rects(
 
 /// The wrapper's own layout results: per flat index rects and text line
 /// fragments, in wrapper coordinates.
+#[derive(Clone)]
 struct RawSolve {
     layouts: Vec<(crate::layout::LayoutRect, usize)>,
     texts: Vec<crate::layout_ng::TextFragment>,
@@ -1598,6 +1599,9 @@ pub(super) fn try_splice(
     // A child-list splice's raw wrapper results, the inserted items' first
     // wrapper flat index, and their node count.
     let mut children_raw: Option<(RawSolve, usize, usize)> = None;
+    // The inserted boxes' raw fragments for the paint journal: (results,
+    // first wrapper flat index, node count).
+    let mut paint_raw: Option<(RawSolve, usize, usize)> = None;
     let (rects, dx, dy, dh, skip_projections, measure_text, commit, client): (
         Vec<(u32, crate::layout::LayoutRect)>,
         f32,
@@ -1649,12 +1653,16 @@ pub(super) fn try_splice(
                 let fresh =
                     std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
                 let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
+                let fresh_len = crate::layout::count_nodes(&fresh);
                 let mut wrapper = wrapper_for(parent, width, vec![fresh]);
-                let Some((rects, _, client)) =
-                    solve_with_client_rects(&wrapper, skip, measure, viewport_w, viewport_h, true)
+                let Some((rects, _, client, raw)) =
+                    solve_raw(&wrapper, skip, measure, viewport_w, viewport_h, true)
                 else {
                     return bail("solve 568");
                 };
+                if paint_splice_enabled() {
+                    paint_raw = Some((raw, 1, fresh_len));
+                }
                 let Some(new_rect) = rect_of(&rects, plan.node) else {
                     return bail("solve 571");
                 };
@@ -1705,15 +1713,20 @@ pub(super) fn try_splice(
             }
             let padding_bottom = target.style.padding_lengths().bottom;
             let border_bottom = border_side(&target.style, 2);
+            let tail_first = 1 + crate::layout::count_nodes(&anchor);
+            let tail_len = tail.iter().map(crate::layout::count_nodes).sum::<usize>();
             let mut children = Vec::with_capacity(tail.len() + 1);
             children.push(anchor);
             children.extend(tail);
             let mut wrapper = wrapper_for(target, width, children);
-            let Some((rects, own, client)) =
-                solve_with_client_rects(&wrapper, skip, measure, viewport_w, viewport_h, true)
+            let Some((rects, own, client, raw)) =
+                solve_raw(&wrapper, skip, measure, viewport_w, viewport_h, true)
             else {
                 return bail("solve 616");
             };
+            if paint_splice_enabled() {
+                paint_raw = Some((raw, tail_first, tail_len));
+            }
             let Some(anchor_new) = rect_of(&rects, anchor_id) else {
                 return bail("solve 619");
             };
@@ -1881,6 +1894,9 @@ pub(super) fn try_splice(
             };
             if !dh.is_finite() || node_rect.height + dh <= 0.0 {
                 return bail("children height");
+            }
+            if paint_splice_enabled() {
+                paint_raw = Some((raw.clone(), inserted_first, inserted_len));
             }
             children_raw = Some((raw, inserted_first, inserted_len));
             if next_id.is_some() {
@@ -2131,6 +2147,39 @@ pub(super) fn try_splice(
         ),
         _ => None,
     };
+    if paint_splice_enabled() {
+        match paint_raw.take() {
+            Some((raw, first, len)) => {
+                let target = at_path(&cache.component, &plan.path);
+                let (children, inserted) = match &commit {
+                    PlanKind::Subtree(fresh) => (None, vec![fresh.clone()]),
+                    PlanKind::Tail { keep, tail } => (
+                        Some((*keep, target.children.len().saturating_sub(*keep))),
+                        tail.clone(),
+                    ),
+                    PlanKind::Children {
+                        keep,
+                        removed,
+                        inserted,
+                    } => (Some((*keep, *removed)), inserted.clone()),
+                };
+                record_paint_splice(PaintSplice {
+                    path: plan.path.clone(),
+                    node: plan.node,
+                    children,
+                    inserted,
+                    raw,
+                    first,
+                    len,
+                    dx,
+                    dy,
+                    dh,
+                    levels,
+                });
+            }
+            None => clear_paint_journal(),
+        }
+    }
     let target = at_path_mut(&mut cache.component, &plan.path);
     SPLICES.with(|count| {
         let (subtree, tail) = count.get();
@@ -2306,6 +2355,318 @@ fn rebase_pending_client_rects(
     // The box-tree plan is keyed by the old tree: publish without it.
     super::forget_client_plan();
     super::defer_client_rects(None, layouts, texts);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test override of [`paint_splice_enabled`] (also turns verify on).
+    pub(super) static FORCE_PAINT_SPLICE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `W3COS_PAINT_SPLICE=1`: a headless paint after a structural splice
+/// applies the splice to its own tree and layout instead of lowering and
+/// laying out the whole document again (Blink paints from the layout tree
+/// the lifecycle just updated). LayoutNG only.
+pub(super) fn paint_splice_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(forced) = FORCE_PAINT_SPLICE.with(std::cell::Cell::get) {
+        return forced && crate::layout_ng::mode() == crate::layout_ng::Mode::On;
+    }
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_SPLICE").is_ok_and(|value| value == "1"))
+        && crate::layout_ng::mode() == crate::layout_ng::Mode::On
+}
+
+/// `W3COS_PAINT_SPLICE_VERIFY=1`: compare each spliced paint layout with a
+/// full lowering and layout.
+pub(super) fn paint_splice_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if FORCE_PAINT_SPLICE.with(std::cell::Cell::get).is_some() {
+        return true;
+    }
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_SPLICE_VERIFY").is_ok_and(|value| value == "1"))
+}
+
+/// One committed splice, as the paint cache replays it: the same subtree
+/// or child-list replacement, the wrapper's raw fragments for the inserted
+/// boxes, and the shift and growth the splice wrote to the DOM rects.
+pub(super) struct PaintSplice {
+    /// Subtree: the replaced box. Child list: the box whose children change.
+    path: Vec<usize>,
+    node: u32,
+    /// `Some((keep, removed))`: children `keep..keep + removed` are replaced.
+    children: Option<(usize, usize)>,
+    inserted: Vec<Component>,
+    raw: RawSolve,
+    first: usize,
+    len: usize,
+    dx: f32,
+    dy: f32,
+    dh: f32,
+    levels: usize,
+}
+
+/// Splices committed to the flush cache since `epoch` began. The paint
+/// cache remembers the (epoch, count) it matches; any other flush cache
+/// change starts a new epoch.
+struct PaintJournal {
+    epoch: u64,
+    entries: Vec<PaintSplice>,
+    nodes: usize,
+}
+
+/// Past this many replayed boxes a full paint layout is as cheap.
+const PAINT_JOURNAL_MAX_NODES: usize = 32_768;
+const PAINT_JOURNAL_MAX_ENTRIES: usize = 256;
+
+thread_local! {
+    static PAINT_JOURNAL: std::cell::RefCell<PaintJournal> = const {
+        std::cell::RefCell::new(PaintJournal {
+            epoch: 0,
+            entries: Vec::new(),
+            nodes: 0,
+        })
+    };
+}
+
+/// The flush cache changed other than by a recorded splice.
+pub(super) fn clear_paint_journal() {
+    PAINT_JOURNAL.with(|journal| {
+        let mut journal = journal.borrow_mut();
+        journal.epoch += 1;
+        journal.entries.clear();
+        journal.nodes = 0;
+    });
+}
+
+/// The journal position matching the flush cache now.
+pub(super) fn paint_journal_point() -> (u64, usize) {
+    PAINT_JOURNAL.with(|journal| {
+        let journal = journal.borrow();
+        (journal.epoch, journal.entries.len())
+    })
+}
+
+fn record_paint_splice(entry: PaintSplice) {
+    PAINT_JOURNAL.with(|journal| {
+        let mut journal = journal.borrow_mut();
+        journal.nodes += entry.len.max(1);
+        journal.entries.push(entry);
+        if journal.nodes > PAINT_JOURNAL_MAX_NODES
+            || journal.entries.len() > PAINT_JOURNAL_MAX_ENTRIES
+        {
+            journal.epoch += 1;
+            journal.entries.clear();
+            journal.nodes = 0;
+        }
+    });
+}
+
+/// Replay the splices after `point` onto a paint tree and layout that
+/// match the flush cache at `point`. `None`: the journal no longer reaches
+/// back to `point`. `Some(false)`: a splice did not fit and the inputs may
+/// be partly edited.
+pub(super) fn replay_paint_splices(
+    point: (u64, usize),
+    root: &mut Component,
+    layouts: &mut Vec<(crate::layout::LayoutRect, usize)>,
+    texts: &mut Vec<crate::layout_ng::TextFragment>,
+) -> Option<(bool, usize)> {
+    PAINT_JOURNAL.with(|journal| {
+        let journal = journal.borrow();
+        if journal.epoch != point.0 || journal.entries.len() < point.1 {
+            return None;
+        }
+        let entries = &journal.entries[point.1..];
+        for entry in entries {
+            if !apply_paint_splice(root, layouts, texts, entry) {
+                return Some((false, 0));
+            }
+        }
+        Some((true, entries.len()))
+    })
+}
+
+fn apply_paint_splice(
+    root: &mut Component,
+    layouts: &mut Vec<(crate::layout::LayoutRect, usize)>,
+    texts: &mut Vec<crate::layout_ng::TextFragment>,
+    entry: &PaintSplice,
+) -> bool {
+    let count = crate::layout::count_nodes;
+    let path = &entry.path;
+    if entry.levels > path.len() {
+        return false;
+    }
+    let mut starts = Vec::with_capacity(path.len() + 1);
+    let mut node: &Component = root;
+    let mut index = 0;
+    starts.push(0);
+    for &child in path {
+        if child >= node.children.len() {
+            return false;
+        }
+        index += 1 + node.children[..child].iter().map(count).sum::<usize>();
+        starts.push(index);
+        node = &node.children[child];
+    }
+    if host_id(node) != Some(entry.node) {
+        return false;
+    }
+    let target = node;
+    let target_index = index;
+    let target_size = count(target);
+    let (region_start, region_end) = match entry.children {
+        None => (target_index, target_index + target_size),
+        Some((keep, removed)) => {
+            if keep + removed > target.children.len() {
+                return false;
+            }
+            let start = target_index + 1 + target.children[..keep].iter().map(count).sum::<usize>();
+            (
+                start,
+                start
+                    + target.children[keep..keep + removed]
+                        .iter()
+                        .map(count)
+                        .sum::<usize>(),
+            )
+        }
+    };
+    let mut sizes = vec![0; path.len() + 1];
+    sizes[path.len()] = target_size;
+    for depth in (0..path.len()).rev() {
+        let parent = at_path(root, &path[..depth]);
+        sizes[depth] = 1
+            + sizes[depth + 1]
+            + parent
+                .children
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| *position != path[depth])
+                .map(|(_, child)| count(child))
+                .sum::<usize>();
+    }
+    // The same boxes `try_splice` moves and grows in the DOM, as preorder
+    // ranges (every box of a shifted subtree moves, not only its hosts).
+    let mut shifted: Vec<(usize, usize)> = Vec::new();
+    let mut grown: Vec<usize> = Vec::new();
+    if entry.dh != 0.0 {
+        if entry.children.is_some() {
+            shifted.push((region_end, target_index + target_size));
+            grown.push(target_index);
+        }
+        for level in 0..entry.levels {
+            let depth = path.len() - 1 - level;
+            let parent = at_path(root, &path[..depth]);
+            let child_end = starts[depth + 1] + sizes[depth + 1];
+            if !is_row_flex(parent) {
+                shifted.push((child_end, starts[depth] + sizes[depth]));
+            }
+            if host_id(parent).is_some() && !matches!(parent.style.height, Dimension::Px(_)) {
+                grown.push(starts[depth]);
+            }
+        }
+    }
+    let removed_len = region_end - region_start;
+    let delta = entry.len as isize - removed_len as isize;
+    let renumber = |index: usize| {
+        if index >= region_end {
+            (index as isize + delta) as usize
+        } else {
+            index
+        }
+    };
+    let in_shift = |index: usize| shifted.iter().any(|&(a, b)| index >= a && index < b);
+    let in_region = |index: usize| index >= region_start && index < region_end;
+    let inserted = |index: usize| index >= entry.first && index < entry.first + entry.len;
+    // The inserted fragments take the removed ones' place in the output
+    // order (before the first fragment after the region when none was
+    // removed), as a full layout would emit them.
+    let old_layouts = std::mem::take(layouts);
+    let mut out = Vec::with_capacity(old_layouts.len() + entry.len);
+    let mut placed = false;
+    let place = |out: &mut Vec<(crate::layout::LayoutRect, usize)>| {
+        for &(mut rect, index) in &entry.raw.layouts {
+            if inserted(index) {
+                rect.x += entry.dx;
+                rect.y += entry.dy;
+                out.push((rect, region_start + index - entry.first));
+            }
+        }
+    };
+    for (mut rect, index) in old_layouts {
+        if in_region(index) {
+            if !placed {
+                place(&mut out);
+                placed = true;
+            }
+            continue;
+        }
+        if !placed && index >= region_end {
+            place(&mut out);
+            placed = true;
+        }
+        if in_shift(index) {
+            rect.y += entry.dh;
+        }
+        if grown.contains(&index) {
+            rect.height += entry.dh;
+        }
+        out.push((rect, renumber(index)));
+    }
+    if !placed {
+        place(&mut out);
+    }
+    *layouts = out;
+    let old_texts = std::mem::take(texts);
+    let mut out = Vec::with_capacity(old_texts.len() + entry.raw.texts.len());
+    let mut placed = false;
+    let place = |out: &mut Vec<crate::layout_ng::TextFragment>| {
+        for fragment in &entry.raw.texts {
+            if inserted(fragment.index) {
+                let mut fragment = fragment.clone();
+                fragment.rect.x += entry.dx;
+                fragment.rect.y += entry.dy;
+                fragment.index = region_start + fragment.index - entry.first;
+                out.push(fragment);
+            }
+        }
+    };
+    for mut fragment in old_texts {
+        if in_region(fragment.index) {
+            if !placed {
+                place(&mut out);
+                placed = true;
+            }
+            continue;
+        }
+        if !placed && fragment.index >= region_end {
+            place(&mut out);
+            placed = true;
+        }
+        if in_shift(fragment.index) {
+            fragment.rect.y += entry.dh;
+        }
+        fragment.index = renumber(fragment.index);
+        out.push(fragment);
+    }
+    if !placed {
+        place(&mut out);
+    }
+    *texts = out;
+    let target = at_path_mut(root, path);
+    match entry.children {
+        None => *target = entry.inserted[0].clone(),
+        Some((keep, removed)) => {
+            target
+                .children
+                .splice(keep..keep + removed, entry.inserted.iter().cloned());
+        }
+    }
+    true
 }
 
 /// [`retain_lowering_verify`]: the retained component tree must equal the

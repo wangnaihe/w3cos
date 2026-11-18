@@ -525,6 +525,7 @@ fn phase_log_enabled() -> bool {
 
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
+    splice::clear_paint_journal();
     PAINT.with(|cache| *cache.borrow_mut() = None);
     drop_pending_client_rects();
     CLIENT_RECTS.with(|rects| rects.borrow_mut().clear());
@@ -599,6 +600,8 @@ pub fn flush() -> bool {
         crate::dom::clear_document_dirty();
         return true;
     }
+    // Any other outcome changes the retained tree without a journal entry.
+    splice::clear_paint_journal();
     if crate::definite_layout::try_apply() {
         let _ = crate::dom::with_document_mut(|document| document.take_precise_dirty());
         crate::dom::clear_document_dirty();
@@ -2302,6 +2305,9 @@ struct PaintCache {
     children: Vec<Vec<usize>>,
     /// Absolute or fixed leaves whose used position is a px inset delta.
     shift_ok: Vec<bool>,
+    /// The paint journal position this tree and layout equal the flush
+    /// cache at (`W3COS_PAINT_SPLICE`).
+    journal: Option<(u64, usize)>,
 }
 
 /// Why the next headless paint can keep its artifact and only move rects.
@@ -2438,6 +2444,10 @@ pub fn with_paint_layout<R>(
     viewport_h: f32,
     use_layout: impl FnOnce(&Component, &crate::layout::LayoutResults) -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
+    // Paint after layout (the document lifecycle): a structural change is
+    // laid out by the retained flush first, and its splices are replayed on
+    // the paint tree below.
+    let flushed = splice::paint_splice_enabled() && flush_before_paint(viewport_w, viewport_h);
     let (structure, cascade) = crate::dom::with_document(|document| {
         (
             document.structure_generation(),
@@ -2450,27 +2460,218 @@ pub fn with_paint_layout<R>(
         stash_paint_drained(before, &dirty, document.precise_drain_epoch());
         dirty
     });
+    // The flush cache equals the document now, so a paint tree built or
+    // spliced now can follow its later splices.
+    let synced = flushed && dirty.is_empty();
     // A geometry read can set this and never paint. The paint that follows
     // records its own reason.
     note_paint_reuse(PaintReuse::None);
     PAINT.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let reusable = slot.as_ref().is_some_and(|cache| {
-            cache.structure == structure
-                && cache.viewport_w_bits == viewport_w.to_bits()
+        let same_viewport = |cache: &PaintCache| {
+            cache.viewport_w_bits == viewport_w.to_bits()
                 && cache.viewport_h_bits == viewport_h.to_bits()
-        });
+        };
+        let reusable = slot
+            .as_ref()
+            .is_some_and(|cache| cache.structure == structure && same_viewport(cache));
         if reusable {
             let cache = slot.as_mut().unwrap();
             if sync_paint_cache(cache, &dirty, cascade, viewport_w, viewport_h) {
                 return use_layout(&cache.component, &cache.results);
             }
+        } else if synced
+            && let Some(cache) = slot.as_mut()
+            && same_viewport(cache)
+            && let Some(point) = cache.journal
+        {
+            match splice_paint_cache(cache, point, structure, cascade, viewport_w, viewport_h) {
+                Some(true) => return use_layout(&cache.component, &cache.results),
+                Some(false) | None => {}
+            }
         }
         *slot = None;
         rebuild_paint_cache(&mut slot, structure, cascade, viewport_w, viewport_h)?;
-        let cache = slot.as_ref().expect("paint layout rebuild stores a cache");
+        let cache = slot.as_mut().expect("paint layout rebuild stores a cache");
+        if synced {
+            cache.journal = Some(splice::paint_journal_point());
+        }
         use_layout(&cache.component, &cache.results)
     })
+}
+
+/// Run the retained flush when the paint tree is behind the document and
+/// the flush lays out the viewport this paint uses. True when the flush
+/// cache now matches the document.
+fn flush_before_paint(viewport_w: f32, viewport_h: f32) -> bool {
+    let (vw, vh, _) = crate::jsdom::viewport();
+    if (vw as f32).to_bits() != viewport_w.to_bits()
+        || (vh as f32).to_bits() != viewport_h.to_bits()
+    {
+        return false;
+    }
+    if flush_cache_current(viewport_w, viewport_h) {
+        return true;
+    }
+    let structure = crate::dom::with_document(|document| document.structure_generation());
+    let behind = PAINT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.structure != structure)
+    });
+    let retained = CACHE.with(|slot| slot.borrow().is_some());
+    behind && retained && flush()
+}
+
+/// The flush cache has seen every mutation: nothing is recorded or drained
+/// since its last flush, and no generation moved.
+fn flush_cache_current(viewport_w: f32, viewport_h: f32) -> bool {
+    let (layout_gen, text_gen, cascade, epoch, pending) = crate::dom::with_document(|document| {
+        (
+            document.layout_generation(),
+            document.repaint_text_generation(),
+            document.cascade_generation(),
+            document.precise_drain_epoch(),
+            document.has_precise_dirty(),
+        )
+    });
+    if pending || PAINT_DRAINED.with(|stash| stash.borrow().is_some()) {
+        return false;
+    }
+    CACHE.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|cache| {
+            cache.structure == layout_gen
+                && cache.source_structure == text_gen
+                && cache.cascade == cascade
+                && cache.drain_epoch == epoch
+                && cache.sheet_generation == w3cos_dom::stylesheet::generation()
+                && cache.viewport_w_bits == viewport_w.to_bits()
+                && cache.viewport_h_bits == viewport_h.to_bits()
+        })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAINT_SPLICES: Cell<u32> = const { Cell::new(0) };
+    static PAINT_SPLICE_MISMATCHES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// (paint layouts spliced, spliced layouts that differed from a full one).
+#[cfg(test)]
+pub(crate) fn paint_splice_stats() -> (u32, u32) {
+    (
+        PAINT_SPLICES.with(Cell::get),
+        PAINT_SPLICE_MISMATCHES.with(Cell::get),
+    )
+}
+
+/// Replay the flush cache's splices since `point` on the paint tree and
+/// layout. `Some(true)`: the cache is current. `Some(false)`: it may be
+/// partly edited and must be rebuilt. `None`: untouched.
+fn splice_paint_cache(
+    cache: &mut PaintCache,
+    point: (u64, usize),
+    structure: u64,
+    cascade: u64,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<bool> {
+    let (applied, count) = splice::replay_paint_splices(
+        point,
+        &mut cache.component,
+        &mut cache.results.layout_cache,
+        &mut cache.results.text_fragments,
+    )?;
+    if !applied {
+        return Some(false);
+    }
+    if count == 0 {
+        // The structure moved without a splice (an off-document edit, or
+        // a change the flush did not lay out): rebuild.
+        return Some(false);
+    }
+    let flat = pre_flatten(&cache.component);
+    let slots = crate::layout::layout_slots(&cache.results.layout_cache, flat.len());
+    let (scrollable, clip_only, scroll_ancestor) = crate::layout::scroll_containers_from_layout(
+        &cache.results.layout_cache,
+        &flat,
+        Some((viewport_w, viewport_h)),
+    );
+    cache.results.scrollable_nodes = scrollable;
+    cache.results.clip_only_nodes = clip_only;
+    cache.results.scroll_ancestor = scroll_ancestor;
+    cache.results.layout_slots = Some(slots);
+    cache.node_ids = flat.iter().map(flat_host_id).collect();
+    cache.children = child_lists(&flat);
+    cache.shift_ok = absolute_shift_ok(&flat);
+    drop(flat);
+    // The retained Taffy tree no longer matches the spliced component.
+    let mut engine = LayoutEngine::new();
+    engine.set_skip_projections(can_skip_projections(&cache.component));
+    engine.set_measure_text(true);
+    cache.engine = engine;
+    cache.structure = structure;
+    cache.cascade = cascade;
+    cache.journal = Some(splice::paint_journal_point());
+    note_paint_patch();
+    #[cfg(test)]
+    PAINT_SPLICES.with(|count| count.set(count.get() + 1));
+    if splice::paint_splice_verify() {
+        verify_paint_splice(cache, count, viewport_w, viewport_h);
+    }
+    Some(true)
+}
+
+/// [`splice::paint_splice_verify`]: compare the spliced paint tree and
+/// layout with a full lowering and layout of the document.
+fn verify_paint_splice(cache: &PaintCache, count: usize, viewport_w: f32, viewport_h: f32) {
+    let component = crate::dom::to_component_tree();
+    let flat = pre_flatten(&component);
+    let mut engine = LayoutEngine::new();
+    engine.set_skip_projections(can_skip_projections(&component));
+    engine.set_measure_text(true);
+    let Ok(fresh) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
+        eprintln!("[paint-splice-verify] full layout failed");
+        return;
+    };
+    let tree_same = format!("{component:?}") == format!("{:?}", cache.component);
+    let kept = &cache.results;
+    let mut max_diff = 0f32;
+    let layouts_same = kept.layout_cache.len() == fresh.layout_cache.len()
+        && kept
+            .layout_cache
+            .iter()
+            .zip(&fresh.layout_cache)
+            .all(|((a, i), (b, j))| {
+                for (x, y) in [
+                    (a.x, b.x),
+                    (a.y, b.y),
+                    (a.width, b.width),
+                    (a.height, b.height),
+                ] {
+                    max_diff = max_diff.max((x - y).abs());
+                }
+                i == j && a == b
+            });
+    let texts_same = kept.text_fragments == fresh.text_fragments;
+    let scroll_same = format!("{:?}", kept.scrollable_nodes)
+        == format!("{:?}", fresh.scrollable_nodes)
+        && format!("{:?}", kept.clip_only_nodes) == format!("{:?}", fresh.clip_only_nodes)
+        && kept.scroll_ancestor == fresh.scroll_ancestor;
+    let same = tree_same && layouts_same && texts_same && scroll_same;
+    eprintln!(
+        "[paint-splice-verify] {count} splices: {} (tree {tree_same} layouts {layouts_same} {}/{} max {max_diff} texts {texts_same} {}/{} scroll {scroll_same})",
+        if same { "same" } else { "DIFFERS" },
+        kept.layout_cache.len(),
+        fresh.layout_cache.len(),
+        kept.text_fragments.len(),
+        fresh.text_fragments.len(),
+    );
+    #[cfg(test)]
+    if !same {
+        PAINT_SPLICE_MISMATCHES.with(|count| count.set(count.get() + 1));
+    }
 }
 
 /// After a multicol layout, record how many ::column boxes each
@@ -2552,6 +2753,7 @@ fn rebuild_paint_cache(
         results,
         children,
         shift_ok,
+        journal: None,
     });
     note_paint_rebuild();
     Ok(())
@@ -3217,6 +3419,84 @@ mod paint_layout_tests {
             .children
             .iter()
             .find_map(|child| component_color(child, id))
+    }
+
+    #[test]
+    fn paint_splice_replays_flush_splices_and_matches_full_layout() {
+        struct Force;
+        impl Drop for Force {
+            fn drop(&mut self) {
+                splice::FORCE_PAINT_SPLICE.with(|force| force.set(None));
+            }
+        }
+        crate::dom::reset_document();
+        invalidate();
+        splice::FORCE_PAINT_SPLICE.with(|force| force.set(Some(true)));
+        let _force = Force;
+        let log = crate::dom::create_element("div");
+        crate::dom::set_style_property(log, "width", "300px");
+        // A closed bottom edge lets an appended message splice as a tail.
+        crate::dom::set_style_property(log, "padding-bottom", "2px");
+        let mut messages = Vec::new();
+        for index in 0..6 {
+            let message = crate::dom::create_element("div");
+            crate::dom::set_style_property(message, "padding", "4px");
+            let paragraph = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node(&format!("message {index} with some words"));
+            crate::dom::append_child(paragraph, text);
+            crate::dom::append_child(message, paragraph);
+            crate::dom::append_child(log, message);
+            messages.push(message);
+        }
+        let footer = crate::dom::create_element("div");
+        crate::dom::set_style_property(footer, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), log);
+        crate::dom::append_child(crate::dom::body_id(), footer);
+        let streamed = crate::dom::create_element("p");
+        let text = crate::dom::create_text_node("streamed");
+        crate::dom::append_child(streamed, text);
+        crate::dom::append_child(messages[2], streamed);
+        assert!(flush());
+        let (spliced_before, mismatches_before) = paint_splice_stats();
+        let _ = paint_rect(footer);
+        let mut content = String::from("streamed");
+        for step in 0..8 {
+            if step != 5 {
+                content.push_str(" more streamed words that wrap onto new lines");
+                crate::dom::set_text_content(text, &content);
+            }
+            if step % 2 == 0 {
+                assert!(flush());
+            }
+            if step == 5 {
+                // A child-list splice: a new message after the streamed one.
+                let message = crate::dom::create_element("div");
+                let paragraph = crate::dom::create_element("p");
+                let words = crate::dom::create_text_node("a new message");
+                crate::dom::append_child(paragraph, words);
+                crate::dom::append_child(message, paragraph);
+                crate::dom::append_child(log, message);
+            }
+            let painted = paint_rect(footer);
+            let fresh = fresh_rect(footer);
+            assert!(
+                (painted.y - fresh.y).abs() < 0.05 && (painted.height - fresh.height).abs() < 0.05,
+                "step {step}: spliced paint rect {painted:?} diverges from full layout {fresh:?}"
+            );
+        }
+        let (spliced, mismatches) = paint_splice_stats();
+        assert_eq!(
+            mismatches - mismatches_before,
+            0,
+            "a spliced paint layout differs from a full one"
+        );
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(
+                spliced - spliced_before >= 8,
+                "streamed text must splice the paint layout, got {}",
+                spliced - spliced_before
+            );
+        }
     }
 
     #[test]
