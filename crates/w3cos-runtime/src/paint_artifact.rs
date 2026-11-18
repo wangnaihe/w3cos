@@ -413,6 +413,9 @@ pub struct PaintArtifact {
     /// use; see [`PaintArtifact::paint_order_class`]).
     pub paint_classes: std::sync::OnceLock<Vec<u32>>,
     logical_paint_ordinals: Vec<usize>,
+    /// Per appended node: it or an ancestor is a fixed box (see
+    /// [`PaintArtifact::viewport_attached`]).
+    viewport_attached_by_index: Vec<bool>,
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
     pub column_fragments: Vec<Vec<ColumnFragment>>,
@@ -447,6 +450,7 @@ impl Default for PaintArtifact {
             paint_order: PaintOrderKeys::default(),
             paint_classes: std::sync::OnceLock::new(),
             logical_paint_ordinals: Vec::new(),
+            viewport_attached_by_index: Vec::new(),
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
             column_fragments: Vec::new(),
@@ -510,7 +514,16 @@ struct AppendMemo {
     /// Per appended node: it owns a paint context (its key ends with its
     /// own background level).
     owns_context: Vec<bool>,
+    /// Per appended node: it establishes a stacking context.
+    stacking: Vec<bool>,
+    /// Per appended node: the local paint phase its descendants inherit
+    /// from the ancestor walk in `local_paint_order_level` when that walk
+    /// reaches it (`ANCESTOR_PHASE_NONE` when the walk stops there or runs
+    /// out of ancestors without deciding).
+    ancestor_phase: Vec<u8>,
 }
+
+const ANCESTOR_PHASE_NONE: u8 = 0;
 
 impl AppendMemo {
     fn new(nodes: &[PaintNode]) -> Self {
@@ -523,6 +536,8 @@ impl AppendMemo {
                 .map(|node| split_positioned_inline_owner(node).is_some())
                 .collect(),
             owns_context: vec![false; len],
+            stacking: vec![false; len],
+            ancestor_phase: vec![ANCESTOR_PHASE_NONE; len],
         }
     }
 }
@@ -2845,6 +2860,13 @@ impl PaintArtifact {
     /// Fixed boxes and their descendants are attached to the viewport rather
     /// than the scrolling document. This mirrors layout's fixed-box owner.
     pub(crate) fn viewport_attached(&self, index: usize) -> bool {
+        if self.viewport_attached_by_index.len() == self.nodes.len() {
+            return self
+                .viewport_attached_by_index
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+        }
         let mut current = Some(index);
         while let Some(index) = current {
             let Some(node) = self.nodes.get(index) else {
@@ -3153,6 +3175,7 @@ impl PaintArtifact {
             z_order: vec![0; nodes.len()],
             paint_order: PaintOrderKeys::with_len(nodes.len()),
             sticky_owner: vec![None; nodes.len()],
+            viewport_attached_by_index: vec![false; nodes.len()],
             nodes,
             canvas_background,
             canvas_background_style,
@@ -3402,8 +3425,27 @@ impl PaintArtifact {
             } else {
                 node.parent.and_then(|parent| memo.fixed_owner[parent])
             };
+        let stacking = establishes_stacking_context(node);
+        memo.stacking[index] = stacking;
+        // What the local paint phase walk decides when it reaches this node
+        // as an ancestor; descendants read it instead of walking up.
+        memo.ancestor_phase[index] = if is_positioned(&node.style) && !stacking {
+            ANCESTOR_PHASE_NONE
+        } else if node.style.float != w3cos_std::style::Float::None {
+            2
+        } else if matches!(
+            node.style.display,
+            Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+        ) {
+            3
+        } else if stacking {
+            ANCESTOR_PHASE_NONE
+        } else {
+            node.parent
+                .map_or(ANCESTOR_PHASE_NONE, |parent| memo.ancestor_phase[parent])
+        };
         let owns_context = node.parent.is_none()
-            || establishes_stacking_context(node)
+            || stacking
             || is_positioned(&node.style)
             || memo.split_owner[index];
         memo.owns_context[index] = owns_context;
@@ -3415,6 +3457,10 @@ impl PaintArtifact {
         let (prefix, tail, tail_len) = self.hierarchical_paint_order(index, memo);
         self.paint_order.set(index, prefix, &tail[..tail_len]);
         self.paint_classes = std::sync::OnceLock::new();
+        self.viewport_attached_by_index[index] = node.style.position == Position::Fixed
+            || node
+                .parent
+                .is_some_and(|parent| self.viewport_attached_by_index[parent]);
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
         } else {
@@ -3645,16 +3691,14 @@ impl PaintArtifact {
         let mut parent = node.parent;
         if is_positioned(&node.style) {
             while let Some(current) = parent {
-                if self.nodes[current].parent.is_none()
-                    || establishes_stacking_context(&self.nodes[current])
-                {
+                if self.nodes[current].parent.is_none() || memo.stacking[current] {
                     break;
                 }
                 parent = self.nodes[current].parent;
             }
         }
         let prefix = parent.and_then(|parent| self.paint_context_prefix(parent, memo));
-        let local = self.local_paint_order_level(index, memo.split_owner[index]);
+        let local = self.local_paint_order_level(index, memo);
         if memo.owns_context[index] {
             // A context's own background is the first item inside that
             // context. Descendant keys extend the prefix before adding their
@@ -3675,8 +3719,9 @@ impl PaintArtifact {
         Some((owner, len))
     }
 
-    fn local_paint_order_level(&self, index: usize, split_owner: bool) -> PaintOrderLevel {
+    fn local_paint_order_level(&self, index: usize, memo: &AppendMemo) -> PaintOrderLevel {
         let node = &self.nodes[index];
+        let split_owner = memo.split_owner[index];
         let ordinal = self
             .logical_paint_ordinals
             .get(index)
@@ -3694,7 +3739,7 @@ impl PaintArtifact {
                 std::cmp::Ordering::Greater => (5, node.style.z_index, ordinal),
             };
         }
-        if node.parent.is_some() && establishes_stacking_context(node) {
+        if node.parent.is_some() && memo.stacking[index] {
             // Transform/opacity contexts participate at stack level zero,
             // after normal inline ink, even when their box is a static float.
             // A non-positioned box does not gain authored z-index semantics.
@@ -3733,32 +3778,18 @@ impl PaintArtifact {
             return (4, 0, ordinal);
         }
 
-        let mut cursor = Some(index);
-        while let Some(current) = cursor {
-            let current_node = &self.nodes[current];
-            if current != index
-                && is_positioned(&current_node.style)
-                && !establishes_stacking_context(current_node)
-            {
-                // The hierarchical prefix keeps this normal subtree in the
-                // positioned participant; retain its local CSS paint phases.
-                break;
-            }
-            if current_node.style.float != w3cos_std::style::Float::None {
-                return (2, 0, ordinal);
-            }
-            if current != index
-                && matches!(
-                    current_node.style.display,
-                    Display::InlineBlock | Display::InlineFlex | Display::InlineTable
-                )
-            {
-                return (3, 0, ordinal);
-            }
-            if current != index && establishes_stacking_context(current_node) {
-                break;
-            }
-            cursor = current_node.parent;
+        // The walk from this node up to its nearest positioned, floated,
+        // atomic inline or stacking-context ancestor; every ancestor's
+        // outcome is remembered when it is appended (preorder).
+        if node.style.float != w3cos_std::style::Float::None {
+            return (2, 0, ordinal);
+        }
+        match node
+            .parent
+            .map_or(ANCESTOR_PHASE_NONE, |parent| memo.ancestor_phase[parent])
+        {
+            ANCESTOR_PHASE_NONE => {}
+            phase => return (phase, 0, ordinal),
         }
 
         let split_inline_edge = node
@@ -6726,6 +6757,209 @@ mod tests {
             100.0,
             "balancing shortens fragmentainers, not an explicit principal height"
         );
+    }
+
+    /// The paint phase walk as it was before ancestors' outcomes were
+    /// remembered: every node walks up its ancestor chain.
+    fn reference_local_level(
+        this: &PaintArtifact,
+        index: usize,
+        split_owner: bool,
+    ) -> PaintOrderLevel {
+        let node = &this.nodes[index];
+        let ordinal = this
+            .logical_paint_ordinals
+            .get(index)
+            .copied()
+            .unwrap_or(index);
+        if split_owner {
+            // A lowered static float can have a zero visual offset. It still
+            // belongs to its positioned inline owner, without changing flow.
+            return (4, 0, ordinal);
+        }
+        if is_positioned(&node.style) {
+            return match node.style.z_index.cmp(&0) {
+                std::cmp::Ordering::Less => (0, node.style.z_index, ordinal),
+                std::cmp::Ordering::Equal => (4, 0, ordinal),
+                std::cmp::Ordering::Greater => (5, node.style.z_index, ordinal),
+            };
+        }
+        if node.parent.is_some() && establishes_stacking_context(node) {
+            // Transform/opacity contexts participate at stack level zero,
+            // after normal inline ink, even when their box is a static float.
+            // A non-positioned box does not gain authored z-index semantics.
+            return (4, 0, ordinal);
+        }
+
+        let collapsed_table_part_border = node.style.border_collapse
+            && node.style.background.a == 0
+            && matches!(
+                node.style.display,
+                Display::TableRowGroup
+                    | Display::TableHeaderGroup
+                    | Display::TableFooterGroup
+                    | Display::TableRow
+                    | Display::TableColumnGroup
+                    | Display::TableColumn
+            )
+            && (node.style.border_width > 0.0
+                || node.style.border_top_width.is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_right_width
+                    .is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_bottom_width
+                    .is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_left_width
+                    .is_some_and(|width| width > 0.0));
+        if collapsed_table_part_border {
+            // Collapsed table borders paint over cell contents. Transparent
+            // table-part backgrounds can therefore use a late display item
+            // without disturbing the table background-layer ordering.
+            return (4, 0, ordinal);
+        }
+
+        let mut cursor = Some(index);
+        while let Some(current) = cursor {
+            let current_node = &this.nodes[current];
+            if current != index
+                && is_positioned(&current_node.style)
+                && !establishes_stacking_context(current_node)
+            {
+                // The hierarchical prefix keeps this normal subtree in the
+                // positioned participant; retain its local CSS paint phases.
+                break;
+            }
+            if current_node.style.float != w3cos_std::style::Float::None {
+                return (2, 0, ordinal);
+            }
+            if current != index
+                && matches!(
+                    current_node.style.display,
+                    Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+                )
+            {
+                return (3, 0, ordinal);
+            }
+            if current != index && establishes_stacking_context(current_node) {
+                break;
+            }
+            cursor = current_node.parent;
+        }
+
+        let split_inline_edge = node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-split-inline-edge")
+            });
+        let normal_inline_border = node.style.display == Display::Inline
+            && node.style.line_height_is_normal
+            && matches!(node.kind, ComponentKind::Row | ComponentKind::Box)
+            && (node.style.border_width > 0.0
+                || node.style.border_top_width.is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_right_width
+                    .is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_bottom_width
+                    .is_some_and(|width| width > 0.0)
+                || node
+                    .style
+                    .border_left_width
+                    .is_some_and(|width| width > 0.0));
+        let phase = if split_inline_edge || normal_inline_border {
+            // Inline decoration and in-flow foreground share tree order:
+            // a later fragment covers preceding block glyph overflow, while
+            // remaining behind its own/following text. Moving every border
+            // before all foreground loses that ordering across split lines.
+            3
+        } else if unadorned_block_text(node)
+            || matches!(
+                node.style.display,
+                Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+            )
+        {
+            3
+        } else {
+            1
+        };
+        (phase, 0, ordinal)
+    }
+
+    #[test]
+    fn remembered_ancestor_walks_match_a_fresh_walk() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        let mut nodes = Vec::new();
+        let mut layout = Vec::new();
+        for index in 0..400 {
+            let mut style = Style::default();
+            style.position = [
+                Position::Static,
+                Position::Static,
+                Position::Relative,
+                Position::Absolute,
+                Position::Fixed,
+                Position::Sticky,
+            ][next(6)];
+            style.z_index = [0, 0, 1, -1][next(4)];
+            style.float = [
+                w3cos_std::style::Float::None,
+                w3cos_std::style::Float::None,
+                w3cos_std::style::Float::Left,
+            ][next(3)];
+            style.display = [
+                Display::Block,
+                Display::Inline,
+                Display::InlineBlock,
+                Display::InlineFlex,
+                Display::Flex,
+            ][next(5)];
+            if next(5) == 0 {
+                style.opacity = 0.5;
+            }
+            let parent = (index > 0).then(|| next(index as u64));
+            nodes.push(PaintNode {
+                kind: ComponentKind::Column,
+                style: style.into(),
+                parent,
+                sticky_counter_signal: None,
+            });
+            layout.push((rect(index as f32), index));
+        }
+        let artifact = PaintArtifact::build(nodes, &layout, 1);
+        let mut replay = artifact.clone();
+        let mut memo = AppendMemo::new(&replay.nodes);
+        for index in 0..replay.nodes.len() {
+            replay.append_node(index, &mut memo);
+        }
+        let mut walked = artifact.clone();
+        walked.viewport_attached_by_index.clear();
+        for index in 0..artifact.nodes.len() {
+            assert_eq!(
+                replay.local_paint_order_level(index, &memo),
+                reference_local_level(&replay, index, memo.split_owner[index]),
+                "node {index}"
+            );
+            assert_eq!(
+                artifact.viewport_attached(index),
+                walked.viewport_attached(index),
+                "node {index}"
+            );
+        }
     }
 
     #[test]
