@@ -547,8 +547,9 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
 /// backgrounds), with a per-table memo: like Blink's `NGTableBorders`,
 /// cached on the table and recomputed only when the table changes, a table
 /// whose subtree inputs equal the last build's reuses that build's results
-/// (`W3COS_PAINT_TABLE_MEMO=1`; `W3COS_PAINT_TABLE_MEMO_VERIFY=1` also runs
-/// the passes and reports differing styles).
+/// (on by default, `W3COS_PAINT_TABLE_MEMO=0` turns it off;
+/// `W3COS_PAINT_TABLE_MEMO_VERIFY=1` also runs the passes and reports
+/// differing styles).
 mod table_passes {
     use super::*;
     use std::cell::RefCell;
@@ -569,7 +570,9 @@ mod table_passes {
 
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| flag("W3COS_PAINT_TABLE_MEMO"))
+        *ON.get_or_init(|| {
+            std::env::var("W3COS_PAINT_TABLE_MEMO").map_or(true, |value| value != "0")
+        })
     }
 
     fn verify() -> bool {
