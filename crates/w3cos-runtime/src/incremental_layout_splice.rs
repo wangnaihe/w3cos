@@ -2588,79 +2588,110 @@ fn apply_paint_splice(
     let inserted = |index: usize| index >= entry.first && index < entry.first + entry.len;
     // The inserted fragments take the removed ones' place in the output
     // order (before the first fragment after the region when none was
-    // removed), as a full layout would emit them.
-    let old_layouts = std::mem::take(layouts);
-    let mut out = Vec::with_capacity(old_layouts.len() + entry.len);
-    let mut placed = false;
-    let place = |out: &mut Vec<(crate::layout::LayoutRect, usize)>| {
-        for &(mut rect, index) in &entry.raw.layouts {
-            if inserted(index) {
+    // removed), as a full layout would emit them. The other fragments are
+    // updated in place; only a region scattered through the list (not one
+    // run) goes through a rebuilt list.
+    let layout_inserted = || {
+        entry
+            .raw
+            .layouts
+            .iter()
+            .filter(|(_, index)| inserted(*index))
+            .map(|&(mut rect, index)| {
                 rect.x += entry.dx;
                 rect.y += entry.dy;
-                out.push((rect, region_start + index - entry.first));
-            }
-        }
+                (rect, region_start + index - entry.first)
+            })
     };
-    for (mut rect, index) in old_layouts {
-        if in_region(index) {
-            if !placed {
-                place(&mut out);
-                placed = true;
-            }
-            continue;
-        }
-        if !placed && index >= region_end {
-            place(&mut out);
-            placed = true;
-        }
-        if in_shift(index) {
+    let update_layout = |(rect, index): &mut (crate::layout::LayoutRect, usize)| {
+        if in_shift(*index) {
             rect.y += entry.dh;
         }
-        if grown.contains(&index) {
+        if grown.contains(index) {
             rect.height += entry.dh;
         }
-        out.push((rect, renumber(index)));
+        *index = renumber(*index);
+    };
+    if !splice_region_in_place(
+        layouts,
+        (region_start, region_end),
+        |(_, index)| *index,
+        update_layout,
+        layout_inserted(),
+    ) {
+        let old_layouts = std::mem::take(layouts);
+        let mut out = Vec::with_capacity(old_layouts.len() + entry.len);
+        let mut placed = false;
+        for mut item in old_layouts {
+            if in_region(item.1) {
+                if !placed {
+                    out.extend(layout_inserted());
+                    placed = true;
+                }
+                continue;
+            }
+            if !placed && item.1 >= region_end {
+                out.extend(layout_inserted());
+                placed = true;
+            }
+            update_layout(&mut item);
+            out.push(item);
+        }
+        if !placed {
+            out.extend(layout_inserted());
+        }
+        *layouts = out;
     }
-    if !placed {
-        place(&mut out);
-    }
-    *layouts = out;
-    let old_texts = std::mem::take(texts);
-    let mut out = Vec::with_capacity(old_texts.len() + entry.raw.texts.len());
-    let mut placed = false;
-    let place = |out: &mut Vec<crate::layout_ng::TextFragment>| {
-        for fragment in &entry.raw.texts {
-            if inserted(fragment.index) {
+    let text_inserted = || {
+        entry
+            .raw
+            .texts
+            .iter()
+            .filter(|fragment| inserted(fragment.index))
+            .map(|fragment| {
                 let mut fragment = fragment.clone();
                 fragment.rect.x += entry.dx;
                 fragment.rect.y += entry.dy;
                 fragment.index = region_start + fragment.index - entry.first;
-                out.push(fragment);
-            }
-        }
+                fragment
+            })
     };
-    for mut fragment in old_texts {
-        if in_region(fragment.index) {
-            if !placed {
-                place(&mut out);
-                placed = true;
-            }
-            continue;
-        }
-        if !placed && fragment.index >= region_end {
-            place(&mut out);
-            placed = true;
-        }
+    let update_text = |fragment: &mut crate::layout_ng::TextFragment| {
         if in_shift(fragment.index) {
             fragment.rect.y += entry.dh;
         }
         fragment.index = renumber(fragment.index);
-        out.push(fragment);
+    };
+    if !splice_region_in_place(
+        texts,
+        (region_start, region_end),
+        |fragment| fragment.index,
+        update_text,
+        text_inserted(),
+    ) {
+        let old_texts = std::mem::take(texts);
+        let mut out = Vec::with_capacity(old_texts.len() + entry.raw.texts.len());
+        let mut placed = false;
+        for mut fragment in old_texts {
+            if in_region(fragment.index) {
+                if !placed {
+                    out.extend(text_inserted());
+                    placed = true;
+                }
+                continue;
+            }
+            if !placed && fragment.index >= region_end {
+                out.extend(text_inserted());
+                placed = true;
+            }
+            update_text(&mut fragment);
+            out.push(fragment);
+        }
+        if !placed {
+            out.extend(text_inserted());
+        }
+        *texts = out;
     }
-    if !placed {
-        place(&mut out);
-    }
-    *texts = out;
     let target = at_path_mut(root, path);
     match entry.children {
         None => *target = entry.inserted[0].clone(),
@@ -2670,6 +2701,48 @@ fn apply_paint_splice(
                 .splice(keep..keep + removed, entry.inserted.iter().cloned());
         }
     }
+    true
+}
+
+/// Replace the items whose index is in `region` with `inserted` and run
+/// `update` on every other item, in place. The inserted items go where the
+/// region's first item was, or before the first item past the region when
+/// the region has none, which is where a rebuilt list would put them.
+/// Returns false, touching nothing, when the region's items are not one run
+/// at that place; the caller then rebuilds the list.
+fn splice_region_in_place<T>(
+    items: &mut Vec<T>,
+    (start, end): (usize, usize),
+    index_of: impl Fn(&T) -> usize,
+    mut update: impl FnMut(&mut T),
+    inserted: impl Iterator<Item = T>,
+) -> bool {
+    let mut at = None;
+    let mut first_region = None;
+    let mut last_region = 0;
+    let mut region_items = 0;
+    for (position, item) in items.iter().enumerate() {
+        let index = index_of(item);
+        let in_region = index >= start && index < end;
+        if at.is_none() && (in_region || index >= end) {
+            at = Some(position);
+        }
+        if in_region {
+            first_region.get_or_insert(position);
+            last_region = position;
+            region_items += 1;
+        }
+    }
+    let at = at.unwrap_or(items.len());
+    if region_items > 0 && (first_region != Some(at) || last_region + 1 - at != region_items) {
+        return false;
+    }
+    for (position, item) in items.iter_mut().enumerate() {
+        if position < at || position >= at + region_items {
+            update(item);
+        }
+    }
+    items.splice(at..at + region_items, inserted);
     true
 }
 
@@ -3061,6 +3134,55 @@ pub(super) fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_splice_in_place_matches_a_rebuilt_list() {
+        // (index) items; region 3..5 becomes two items 3, 4, 5; the rest
+        // shift by +1.
+        let update = |item: &mut usize| {
+            if *item >= 5 {
+                *item += 1;
+            }
+        };
+        let mut items = vec![0, 1, 2, 3, 4, 5, 6];
+        assert!(splice_region_in_place(
+            &mut items,
+            (3, 5),
+            |i| *i,
+            update,
+            [3, 4, 5].into_iter()
+        ));
+        assert_eq!(items, [0, 1, 2, 3, 4, 5, 6, 7]);
+        // No item in the region: insert before the first item past it.
+        let mut items = vec![0, 1, 6, 2, 7];
+        assert!(splice_region_in_place(
+            &mut items,
+            (3, 5),
+            |i| *i,
+            update,
+            [3].into_iter()
+        ));
+        assert_eq!(items, [0, 1, 3, 7, 2, 8]);
+        // A region split by another item is left for the caller.
+        let mut items = vec![0, 3, 1, 4, 5];
+        assert!(!splice_region_in_place(
+            &mut items,
+            (3, 5),
+            |i| *i,
+            update,
+            [3].into_iter()
+        ));
+        assert_eq!(items, [0, 3, 1, 4, 5]);
+        // An item past the region before it: also left for the caller.
+        let mut items = vec![0, 6, 3, 4];
+        assert!(!splice_region_in_place(
+            &mut items,
+            (3, 5),
+            |i| *i,
+            update,
+            [3].into_iter()
+        ));
+    }
 
     /// Column flex uses the same subtree kind in every mode. Geometry stays
     /// exact; a full-document rebuild is not the supported path.
