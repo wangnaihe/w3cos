@@ -542,6 +542,258 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
     })
 }
 
+/// The table paint fix-ups (collapsed border resolution, track projection,
+/// joints, empty-row extension, hidden empty cells, separated column
+/// backgrounds), with a per-table memo: like Blink's `NGTableBorders`,
+/// cached on the table and recomputed only when the table changes, a table
+/// whose subtree inputs equal the last build's reuses that build's results
+/// (`W3COS_PAINT_TABLE_MEMO=1`; `W3COS_PAINT_TABLE_MEMO_VERIFY=1` also runs
+/// the passes and reports differing styles).
+mod table_passes {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn passes(nodes: &mut [PaintNode], rect_by_index: &[Option<LayoutRect>]) {
+        suppress_improper_nested_table_part_backgrounds(nodes);
+        suppress_hidden_empty_cell_paint(nodes);
+        project_collapsed_table_tracks_to_cells(nodes);
+        resolve_collapsed_cell_border_conflicts(nodes);
+        annotate_collapsed_border_joints(nodes, rect_by_index);
+        extend_collapsed_borders_across_empty_rows(nodes, rect_by_index);
+        annotate_separated_table_background_fragments(nodes, rect_by_index);
+    }
+
+    fn flag(name: &str) -> bool {
+        std::env::var(name).is_ok_and(|value| value == "1")
+    }
+
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| flag("W3COS_PAINT_TABLE_MEMO"))
+    }
+
+    fn verify() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| flag("W3COS_PAINT_TABLE_MEMO_VERIFY"))
+    }
+
+    fn table_part(display: Display) -> bool {
+        matches!(
+            display,
+            Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableRow
+                | Display::TableColumnGroup
+                | Display::TableColumn
+                | Display::TableCell
+                | Display::TableCaption
+        )
+    }
+
+    /// Outermost tables as preorder ranges, or `None` when a table part
+    /// sits outside every table (the passes then read across the tree).
+    fn tables(nodes: &[PaintNode]) -> Option<Vec<std::ops::Range<usize>>> {
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < nodes.len() {
+            let display = nodes[index].style.display;
+            if matches!(display, Display::Table | Display::InlineTable) {
+                let mut end = index + 1;
+                while end < nodes.len() && nodes[end].parent.is_some_and(|parent| parent >= index) {
+                    end += 1;
+                }
+                ranges.push(index..end);
+                index = end;
+                continue;
+            }
+            if table_part(display) {
+                return None;
+            }
+            index += 1;
+        }
+        Some(ranges)
+    }
+
+    struct Input {
+        kind: ComponentKind,
+        style: w3cos_std::component::ComponentStyle,
+        parent: Option<usize>,
+        rect: Option<[u32; 4]>,
+    }
+
+    struct Entry {
+        root_rect: Option<LayoutRect>,
+        inputs: Vec<Input>,
+        outputs: Vec<w3cos_std::component::ComponentStyle>,
+        /// No result holds absolute coordinates (separated column background
+        /// fragments do), so a moved table keeps its results.
+        translation_safe: bool,
+    }
+
+    thread_local! {
+        static MEMO: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn relative(rect: Option<LayoutRect>, root: Option<LayoutRect>) -> Option<[u32; 4]> {
+        let rect = rect?;
+        let (x, y) = root.map_or((0.0, 0.0), |root| (root.x, root.y));
+        Some([
+            (rect.x - x).to_bits(),
+            (rect.y - y).to_bits(),
+            rect.width.to_bits(),
+            rect.height.to_bits(),
+        ])
+    }
+
+    fn rect_bits(rect: Option<LayoutRect>) -> Option<[u32; 4]> {
+        rect.map(|rect| {
+            [
+                rect.x.to_bits(),
+                rect.y.to_bits(),
+                rect.width.to_bits(),
+                rect.height.to_bits(),
+            ]
+        })
+    }
+
+    fn input(
+        nodes: &[PaintNode],
+        rects: &[Option<LayoutRect>],
+        range: &std::ops::Range<usize>,
+        index: usize,
+    ) -> Input {
+        let root = rects.get(range.start).copied().flatten();
+        let node = &nodes[index];
+        Input {
+            kind: node.kind.clone(),
+            style: node.style.clone(),
+            parent: node
+                .parent
+                .filter(|parent| *parent >= range.start)
+                .map(|parent| parent - range.start),
+            rect: relative(rects.get(index).copied().flatten(), root),
+        }
+    }
+
+    fn hit(
+        entry: &Entry,
+        nodes: &[PaintNode],
+        rects: &[Option<LayoutRect>],
+        range: &std::ops::Range<usize>,
+    ) -> bool {
+        let root = rects.get(range.start).copied().flatten();
+        entry.inputs.len() == range.len()
+            && (entry.translation_safe || rect_bits(entry.root_rect) == rect_bits(root))
+            && range.clone().zip(&entry.inputs).all(|(index, input)| {
+                let node = &nodes[index];
+                node.parent
+                    .filter(|parent| *parent >= range.start)
+                    .map(|parent| parent - range.start)
+                    == input.parent
+                    && relative(rects.get(index).copied().flatten(), root) == input.rect
+                    && node.style == input.style
+                    && node.kind == input.kind
+            })
+    }
+
+    pub(super) fn run(nodes: &mut [PaintNode], rects: &[Option<LayoutRect>]) {
+        if !enabled() {
+            passes(nodes, rects);
+            return;
+        }
+        let Some(ranges) = tables(nodes) else {
+            MEMO.with(|memo| memo.borrow_mut().clear());
+            passes(nodes, rects);
+            return;
+        };
+        let hits: Vec<bool> = MEMO.with(|memo| {
+            let memo = memo.borrow();
+            if memo.len() != ranges.len() {
+                return vec![false; ranges.len()];
+            }
+            ranges
+                .iter()
+                .zip(memo.iter())
+                .map(|(range, entry)| hit(entry, nodes, rects, range))
+                .collect()
+        });
+        if hits.iter().all(|hit| *hit) && !verify() {
+            MEMO.with(|memo| {
+                for (range, entry) in ranges.iter().zip(memo.borrow().iter()) {
+                    for (index, output) in range.clone().zip(&entry.outputs) {
+                        nodes[index].style = output.clone();
+                    }
+                }
+            });
+            return;
+        }
+        let inputs: Vec<Option<Vec<Input>>> = ranges
+            .iter()
+            .zip(&hits)
+            .map(|(range, hit)| {
+                (!hit).then(|| {
+                    range
+                        .clone()
+                        .map(|index| input(nodes, rects, range, index))
+                        .collect()
+                })
+            })
+            .collect();
+        passes(nodes, rects);
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if verify() {
+                let mut differing = 0usize;
+                let mut reused = 0usize;
+                for ((range, hit), entry) in ranges.iter().zip(&hits).zip(memo.iter()) {
+                    if !hit {
+                        continue;
+                    }
+                    reused += 1;
+                    differing += range
+                        .clone()
+                        .zip(&entry.outputs)
+                        .filter(|(index, output)| nodes[*index].style != **output)
+                        .count();
+                }
+                eprintln!(
+                    "[table-memo-verify] tables {} reused {reused} differing styles {differing}",
+                    ranges.len()
+                );
+            }
+            if memo.len() != ranges.len() {
+                memo.clear();
+            }
+            for (k, (range, inputs)) in ranges.iter().zip(inputs).enumerate() {
+                let Some(inputs) = inputs else {
+                    continue;
+                };
+                let outputs: Vec<_> = range
+                    .clone()
+                    .map(|index| nodes[index].style.clone())
+                    .collect();
+                let translation_safe = outputs.iter().all(|style| {
+                    style.custom_properties.as_ref().is_none_or(|properties| {
+                        !properties.contains_key(TABLE_BACKGROUND_FRAGMENTS)
+                    })
+                });
+                let entry = Entry {
+                    root_rect: rects.get(range.start).copied().flatten(),
+                    inputs,
+                    outputs,
+                    translation_safe,
+                };
+                if k < memo.len() {
+                    memo[k] = entry;
+                } else {
+                    memo.push(entry);
+                }
+            }
+        });
+    }
+}
+
 fn suppress_improper_nested_table_part_backgrounds(nodes: &mut [PaintNode]) {
     for index in 0..nodes.len() {
         if !matches!(
@@ -2802,13 +3054,7 @@ impl PaintArtifact {
             }
         }
         trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rect_by_index);
-        suppress_improper_nested_table_part_backgrounds(&mut nodes);
-        suppress_hidden_empty_cell_paint(&mut nodes);
-        project_collapsed_table_tracks_to_cells(&mut nodes);
-        resolve_collapsed_cell_border_conflicts(&mut nodes);
-        annotate_collapsed_border_joints(&mut nodes, &rect_by_index);
-        extend_collapsed_borders_across_empty_rows(&mut nodes, &rect_by_index);
-        annotate_separated_table_background_fragments(&mut nodes, &rect_by_index);
+        table_passes::run(&mut nodes, &rect_by_index);
         media_controls::append(&mut nodes, &mut rect_by_index);
         let mut artifact = Self {
             logical_paint_ordinals: positioned_inline_fragment_ordinals(&nodes),
