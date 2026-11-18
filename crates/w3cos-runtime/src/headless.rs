@@ -287,11 +287,7 @@ fn finish_headless_frame(
             Some((index, rect, &node.kind, &node.style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
-    nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
-        artifact
-            .paint_order_key(*left)
-            .cmp(artifact.paint_order_key(*right))
-    });
+    nodes.sort_by_cached_key(|(index, _, _, _)| artifact.paint_order_class(*index));
 
     let table_replay = crate::table_paint::replay(&nodes, &artifact);
     let nodes = table_replay
@@ -518,11 +514,7 @@ fn paint_retained_artifact(
             Some((index, rect, &node.kind, &node.style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
-    nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
-        artifact
-            .paint_order_key(*left)
-            .cmp(artifact.paint_order_key(*right))
-    });
+    nodes.sort_by_cached_key(|(index, _, _, _)| artifact.paint_order_class(*index));
     let table_replay = crate::table_paint::replay(&nodes, artifact);
     let nodes = table_replay
         .iter()

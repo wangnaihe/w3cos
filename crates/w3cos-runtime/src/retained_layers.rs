@@ -476,18 +476,15 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
 pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
     let mut layers = Vec::new();
     let mut chunk_ids = (0..artifact.chunks.len()).collect::<Vec<_>>();
-    chunk_ids.sort_by(|left, right| {
-        let client_index = |chunk_id: &usize| {
-            artifact
-                .chunks
-                .get(*chunk_id)
-                .and_then(|chunk| artifact.display_items.get(chunk.begin))
-                .map(|item| item.client_index)
-                .unwrap_or(usize::MAX)
-        };
-        artifact
-            .paint_order_key(client_index(left))
-            .cmp(artifact.paint_order_key(client_index(right)))
+    // Stable: chunks of equal paint order keep their order.
+    chunk_ids.sort_by_cached_key(|chunk_id| {
+        let client_index = artifact
+            .chunks
+            .get(*chunk_id)
+            .and_then(|chunk| artifact.display_items.get(chunk.begin))
+            .map(|item| item.client_index)
+            .unwrap_or(usize::MAX);
+        artifact.paint_order_class(client_index)
     });
     for chunk_id in chunk_ids {
         let chunk = &artifact.chunks[chunk_id];
@@ -588,7 +585,8 @@ fn union_rect(a: LayoutRect, b: LayoutRect) -> LayoutRect {
 }
 
 fn content_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Every node and display item feeds this each frame: FxHash, not SipHash.
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
     layers.len().hash(&mut hasher);
     for layer in layers {
         layer.properties.transform.hash(&mut hasher);

@@ -309,6 +309,10 @@ pub struct PaintArtifact {
     pub self_clip: Vec<PropertyNodeId>,
     pub z_order: Vec<i32>,
     pub paint_order: Vec<Vec<PaintOrderLevel>>,
+    /// Per node, a rank that orders nodes as `paint_order_key` does and is
+    /// equal exactly for equal keys; 0 is the empty key's (built on first
+    /// use; see [`PaintArtifact::paint_order_class`]).
+    pub paint_classes: std::sync::OnceLock<Vec<u32>>,
     logical_paint_ordinals: Vec<usize>,
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
@@ -342,6 +346,7 @@ impl Default for PaintArtifact {
             self_clip: Vec::new(),
             z_order: Vec::new(),
             paint_order: Vec::new(),
+            paint_classes: std::sync::OnceLock::new(),
             logical_paint_ordinals: Vec::new(),
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
@@ -2362,6 +2367,36 @@ impl PaintArtifact {
         self.paint_order.get(index).map_or(&[], Vec::as_slice)
     }
 
+    /// `paint_order_key` as one integer: comparing two classes compares the
+    /// two keys, so a stable sort by class equals a stable sort by key. The
+    /// keys are sorted once per artifact instead of on every sort.
+    pub fn paint_order_class(&self, index: usize) -> u32 {
+        let classes = self.paint_classes.get_or_init(|| {
+            let mut order: Vec<u32> = (0..self.paint_order.len() as u32).collect();
+            order.sort_by(|left, right| {
+                self.paint_order_key(*left as usize)
+                    .cmp(self.paint_order_key(*right as usize))
+            });
+            let mut classes = vec![0u32; order.len()];
+            // Class 0 is kept for the empty key (indices without a key).
+            let mut class = 0u32;
+            let mut previous: Option<&[PaintOrderLevel]> = None;
+            for &index in &order {
+                let key = self.paint_order_key(index as usize);
+                if previous != Some(key) {
+                    if !(previous.is_none() && key.is_empty()) {
+                        class += 1;
+                    }
+                    previous = Some(key);
+                }
+                classes[index as usize] = class;
+            }
+            classes
+        });
+        // Indices without a node have the empty key.
+        classes.get(index).copied().unwrap_or(0)
+    }
+
     /// CSS2 paint phase within one effective stack level. In-flow block
     /// backgrounds paint before floats, and inline content paints after
     /// floats. A float's descendants stay in the float phase as one atomic
@@ -2961,6 +2996,7 @@ impl PaintArtifact {
             self.z_order[index] = self.z_order[index].max(floor);
         }
         self.paint_order[index] = self.hierarchical_paint_order(index);
+        self.paint_classes = std::sync::OnceLock::new();
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
         } else {
@@ -6082,6 +6118,24 @@ mod tests {
         assert_eq!(artifact.z_order, vec![i32::MIN, 3, 3]);
     }
 
+    /// `paint_order_class` orders and ties exactly as `paint_order_key`.
+    fn assert_paint_classes_follow_keys(artifact: &PaintArtifact) {
+        let n = artifact.nodes.len() + 1;
+        for left in 0..n {
+            for right in 0..n {
+                assert_eq!(
+                    artifact
+                        .paint_order_class(left)
+                        .cmp(&artifact.paint_order_class(right)),
+                    artifact
+                        .paint_order_key(left)
+                        .cmp(artifact.paint_order_key(right)),
+                    "paint order class of {left} vs {right}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bidi_visual_fragments_paint_in_logical_order_without_changing_layout() {
         let mut nodes = vec![PaintNode {
@@ -6120,6 +6174,7 @@ mod tests {
         assert!(artifact.paint_order_key(2) < artifact.paint_order_key(1));
         assert_eq!(artifact.rect_by_index[1], Some(rect(0.0)));
         assert_eq!(artifact.nodes[1].style.z_index, 0);
+        assert_paint_classes_follow_keys(&artifact);
     }
 
     #[test]
@@ -6238,6 +6293,7 @@ mod tests {
 
         assert!(artifact.paint_order_key(1) < artifact.paint_order_key(3));
         assert!(artifact.paint_order_key(3) < artifact.paint_order_key(2));
+        assert_paint_classes_follow_keys(&artifact);
     }
 
     #[test]
