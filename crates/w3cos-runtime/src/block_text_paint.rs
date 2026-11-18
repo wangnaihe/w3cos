@@ -1,7 +1,11 @@
 //! Replay folded block text as block decoration followed by inline foreground.
 //! DOM lowering may combine a paragraph box and its text into one client; this
 //! must not combine their distinct CSS2 Appendix E paint phases.
-use crate::{layout::LayoutRect, paint_artifact::PaintArtifact, table_paint::ReplayNode};
+use crate::{
+    layout::LayoutRect,
+    paint_artifact::PaintArtifact,
+    table_paint::{ReplayNode, ReplayStyle},
+};
 use std::borrow::Cow;
 use w3cos_std::style::Display;
 use w3cos_std::{ComponentKind, Style};
@@ -82,7 +86,7 @@ pub(crate) fn replay<'a>(
                     kind: Cow::Owned(ComponentKind::Text {
                         content: text.to_string(),
                     }),
-                    style: Cow::Owned(piece_style.clone()),
+                    style: ReplayStyle::Owned(Box::new(piece_style.clone())),
                 });
             }
             continue;
@@ -100,7 +104,7 @@ pub(crate) fn replay<'a>(
                 index,
                 rect,
                 kind: Cow::Owned(ComponentKind::Box),
-                style: Cow::Owned(decoration),
+                style: ReplayStyle::Owned(Box::new(decoration)),
             });
             let mut text = style.clone();
             text.background = w3cos_std::Color::TRANSPARENT;
@@ -121,7 +125,7 @@ pub(crate) fn replay<'a>(
                     index,
                     rect,
                     kind: Cow::Borrowed(kind),
-                    style: Cow::Owned(text),
+                    style: ReplayStyle::Owned(Box::new(text)),
                 },
             ));
         } else {
@@ -129,7 +133,7 @@ pub(crate) fn replay<'a>(
                 index,
                 rect,
                 kind: Cow::Borrowed(kind),
-                style: Cow::Borrowed(style),
+                style: ReplayStyle::Borrowed(style),
             });
         }
     }

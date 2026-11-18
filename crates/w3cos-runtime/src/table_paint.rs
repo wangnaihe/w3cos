@@ -15,7 +15,32 @@ pub(crate) struct ReplayNode<'a> {
     pub index: usize,
     pub rect: LayoutRect,
     pub kind: Cow<'a, ComponentKind>,
-    pub style: Cow<'a, Style>,
+    pub style: ReplayStyle<'a>,
+}
+
+/// A replayed node's style: borrowed from the artifact, or rewritten for the
+/// replay. Owned styles are boxed so that the common borrowed node stays
+/// small (`Style` is over a kilobyte, and every frame node is replayed).
+pub(crate) enum ReplayStyle<'a> {
+    Borrowed(&'a Style),
+    Owned(Box<Style>),
+}
+
+impl AsRef<Style> for ReplayStyle<'_> {
+    fn as_ref(&self) -> &Style {
+        match self {
+            Self::Borrowed(style) => style,
+            Self::Owned(style) => style,
+        }
+    }
+}
+
+impl std::ops::Deref for ReplayStyle<'_> {
+    type Target = Style;
+
+    fn deref(&self) -> &Style {
+        self.as_ref()
+    }
 }
 
 fn layer(display: Display) -> Option<u8> {
@@ -111,7 +136,7 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                         index,
                         rect,
                         kind: Cow::Owned(ComponentKind::Box),
-                        style: Cow::Owned(style),
+                        style: ReplayStyle::Owned(Box::new(style)),
                     });
                 }
                 for member in group {
@@ -123,7 +148,7 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                         index,
                         rect,
                         kind: Cow::Owned(ComponentKind::Box),
-                        style: Cow::Owned(style),
+                        style: ReplayStyle::Owned(Box::new(style)),
                     });
                 }
             }
@@ -134,14 +159,14 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                 index,
                 rect,
                 kind: Cow::Borrowed(kind),
-                style: Cow::Owned(style),
+                style: ReplayStyle::Owned(Box::new(style)),
             });
         } else {
             output.push(ReplayNode {
                 index,
                 rect,
                 kind: Cow::Borrowed(kind),
-                style: Cow::Borrowed(style),
+                style: ReplayStyle::Borrowed(style),
             });
         }
     }
@@ -260,6 +285,6 @@ mod tests {
             .filter(|node| node.index == 3)
             .collect::<Vec<_>>();
         assert_eq!(cell.len(), 1);
-        assert!(matches!(cell[0].style, Cow::Borrowed(_)));
+        assert!(matches!(cell[0].style, ReplayStyle::Borrowed(_)));
     }
 }

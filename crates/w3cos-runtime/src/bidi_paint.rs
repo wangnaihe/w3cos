@@ -1,7 +1,11 @@
 //! Preserve inline backgrounds while shaping compatible bidi fragments as one run.
 use std::borrow::Cow;
 
-use crate::{layout::LayoutRect, paint_artifact::PaintArtifact, table_paint::ReplayNode};
+use crate::{
+    layout::LayoutRect,
+    paint_artifact::PaintArtifact,
+    table_paint::{ReplayNode, ReplayStyle},
+};
 use w3cos_std::{
     Color,
     component::ComponentKind,
@@ -65,7 +69,7 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                 index,
                 rect,
                 kind: Cow::Borrowed(kind),
-                style: Cow::Borrowed(style),
+                style: ReplayStyle::Borrowed(style),
             });
             cursor += 1;
             continue;
@@ -104,7 +108,7 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                     index,
                     rect,
                     kind: Cow::Owned(ComponentKind::Box),
-                    style: Cow::Owned(background),
+                    style: ReplayStyle::Owned(Box::new(background)),
                 });
             }
             let mut content = String::new();
@@ -120,7 +124,7 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                 index: first,
                 rect: union,
                 kind: Cow::Owned(ComponentKind::Text { content }),
-                style: Cow::Owned(normalized),
+                style: ReplayStyle::Owned(Box::new(normalized)),
             });
         } else {
             for &(index, rect, kind, style) in &nodes[cursor..end] {
@@ -128,7 +132,7 @@ pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> V
                     index,
                     rect,
                     kind: Cow::Borrowed(kind),
-                    style: Cow::Borrowed(style),
+                    style: ReplayStyle::Borrowed(style),
                 });
             }
         }
