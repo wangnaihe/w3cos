@@ -154,6 +154,12 @@ fn key_bit(key: &str) -> u64 {
 pub type CustomPropertyMap = crate::fxhash::FxHashMap<String, String>;
 
 impl CustomProperties {
+    /// The shared map's address: equal while both are alive means the same
+    /// map (see `ptr_eq`), for per-pass memos keyed by map.
+    pub fn identity(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
+    }
+
     /// Same shared map. While a caller holds a clone, the map cannot change
     /// in place (every mutation goes through `Arc::make_mut`), so equal
     /// pointers mean equal contents.

@@ -75,6 +75,12 @@ pub struct RetainedLayerTree {
     /// inputs are unchanged since the recordings were made, so a backend may
     /// keep that layer's recording when none of its clients was invalidated.
     partial: Option<Vec<bool>>,
+    /// After a `Rebuild` sync: per layer, the offset (CSS px) its bounds,
+    /// chunks and clips all moved by since the recordings were made, when
+    /// that move is the layer's only change besides its clients' paint.
+    translated: Option<Vec<Option<(f32, f32)>>>,
+    /// The clip tree's rects when the recordings were made.
+    clip_rects: Vec<Option<LayoutRect>>,
 }
 
 impl RetainedLayerTree {
@@ -95,27 +101,67 @@ impl RetainedLayerTree {
         } else {
             (0, Vec::new())
         };
+        let clip_rects: Vec<Option<LayoutRect>> = if self.track_partial {
+            artifact
+                .properties
+                .clips
+                .iter()
+                .map(|clip| clip.rect)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let structure_changed = self.layers.len() != layers.len()
             || self
                 .layers
                 .iter()
                 .zip(&layers)
                 .any(|(old, new)| old.client_indices != new.client_indices);
-        self.partial = (self.track_partial
+        let comparable = self.track_partial
             && self.recordings_valid
             && !self.layers.is_empty()
             && !structure_changed
-            && global == self.global_fingerprint)
-            .then(|| {
-                self.layers
-                    .iter()
-                    .zip(&layers)
-                    .zip(self.layer_chunk_hashes.iter().zip(&chunk_hashes))
-                    .map(|((old, new), (old_chunks, new_chunks))| {
-                        rects_equal(old.bounds, new.bounds) && old_chunks == new_chunks
-                    })
-                    .collect()
-            });
+            && global == self.global_fingerprint
+            && self.clip_rects.len() == clip_rects.len();
+        let moves: Option<Vec<LayerMove>> = comparable.then(|| {
+            let mut chain = ClipChainMoves::new(artifact, &self.clip_rects, &clip_rects);
+            self.layers
+                .iter()
+                .zip(&layers)
+                .zip(self.layer_chunk_hashes.iter().zip(&chunk_hashes))
+                .map(|((old, new), (old_chunks, new_chunks))| {
+                    if old_chunks != new_chunks
+                        || old.bounds.width.to_bits() != new.bounds.width.to_bits()
+                        || old.bounds.height.to_bits() != new.bounds.height.to_bits()
+                    {
+                        return LayerMove::Changed;
+                    }
+                    let delta = (new.bounds.x - old.bounds.x, new.bounds.y - old.bounds.y);
+                    let clips_moved = new
+                        .client_indices
+                        .iter()
+                        .all(|&client| chain.client_moved_by(client, delta));
+                    match (clips_moved, delta == (0.0, 0.0)) {
+                        (false, _) => LayerMove::Changed,
+                        (true, true) => LayerMove::Same,
+                        (true, false) => LayerMove::Moved(delta),
+                    }
+                })
+                .collect()
+        });
+        self.partial = moves
+            .as_ref()
+            .map(|moves| moves.iter().map(|m| matches!(m, LayerMove::Same)).collect());
+        self.translated = moves.map(|moves| {
+            moves
+                .iter()
+                .map(|m| match m {
+                    LayerMove::Moved(delta) => Some(*delta),
+                    _ => None,
+                })
+                .collect()
+        });
+        self.clip_rects = clip_rects;
         self.global_fingerprint = global;
         self.layer_chunk_hashes = chunk_hashes;
         self.layers = layers;
@@ -159,6 +205,122 @@ impl RetainedLayerTree {
     pub fn partial_layers(&self) -> Option<&[bool]> {
         self.partial.as_deref()
     }
+
+    /// Per layer, the offset it moved by as a whole (see `translated`).
+    pub fn translated_layers(&self) -> Option<&[Option<(f32, f32)>]> {
+        self.translated.as_deref()
+    }
+}
+
+enum LayerMove {
+    Same,
+    Moved((f32, f32)),
+    Changed,
+}
+
+/// Per clip node, the offset its rect and every recorded ancestor clip
+/// moved by (`None`: they moved apart or changed). Scrollport clips are
+/// applied when compositing, not recorded, so they do not count.
+struct ClipChainMoves<'a> {
+    artifact: &'a PaintArtifact,
+    old: &'a [Option<LayoutRect>],
+    new: &'a [Option<LayoutRect>],
+    scrollport: Vec<bool>,
+    memo: Vec<Option<Option<ClipMove>>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ClipMove {
+    /// No recorded clip, or only clips without a rect.
+    Any,
+    By(u32, u32),
+}
+
+impl<'a> ClipChainMoves<'a> {
+    fn new(
+        artifact: &'a PaintArtifact,
+        old: &'a [Option<LayoutRect>],
+        new: &'a [Option<LayoutRect>],
+    ) -> Self {
+        let mut scrollport = vec![false; new.len()];
+        for scroll in &artifact.properties.scrolls {
+            if let Some(clip) = scroll.clip
+                && let Some(slot) = scrollport.get_mut(clip)
+            {
+                *slot = true;
+            }
+        }
+        Self {
+            artifact,
+            old,
+            new,
+            scrollport,
+            memo: vec![None; new.len()],
+        }
+    }
+
+    fn chain(&mut self, clip: usize) -> Option<ClipMove> {
+        if clip == 0 || clip >= self.new.len() {
+            return Some(ClipMove::Any);
+        }
+        if let Some(known) = self.memo[clip] {
+            return known;
+        }
+        let own = if self.scrollport[clip] {
+            Some(ClipMove::Any)
+        } else {
+            match (self.old[clip], self.new[clip]) {
+                (None, None) => Some(ClipMove::Any),
+                (Some(o), Some(n))
+                    if o.width.to_bits() == n.width.to_bits()
+                        && o.height.to_bits() == n.height.to_bits() =>
+                {
+                    Some(ClipMove::By((n.x - o.x).to_bits(), (n.y - o.y).to_bits()))
+                }
+                _ => None,
+            }
+        };
+        let parent = self.artifact.properties.clips[clip].parent;
+        let up = if parent == clip {
+            Some(ClipMove::Any)
+        } else {
+            self.chain(parent)
+        };
+        let result = match (own, up) {
+            (Some(ClipMove::Any), up) => up,
+            (own, Some(ClipMove::Any)) => own,
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        };
+        self.memo[clip] = Some(result);
+        result
+    }
+
+    fn client_moved_by(&mut self, client: usize, delta: (f32, f32)) -> bool {
+        let want = ClipMove::By(delta.0.to_bits(), delta.1.to_bits());
+        let zero = delta == (0.0, 0.0);
+        let self_clip = self
+            .artifact
+            .self_clip
+            .get(client)
+            .copied()
+            .unwrap_or_default();
+        let contents_clip = self
+            .artifact
+            .node_properties
+            .get(client)
+            .map_or(0, |properties| properties.clip);
+        [self_clip, contents_clip]
+            .into_iter()
+            .all(|clip| match self.chain(clip) {
+                Some(ClipMove::Any) => true,
+                Some(ClipMove::By(x, y)) => {
+                    ClipMove::By(x, y) == want
+                        || (zero && f32::from_bits(x) == 0.0 && f32::from_bits(y) == 0.0)
+                }
+                None => false,
+            })
+    }
 }
 
 /// What a layer's recording reads from its own paint chunks.
@@ -174,7 +336,16 @@ fn layer_chunk_hashes(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> V
                     u64::MAX.hash(&mut hasher);
                     continue;
                 };
-                hash_rect(chunk.bounds, &mut hasher);
+                // Relative to the layer, so a layer that moved as a whole
+                // keeps its hashes.
+                hash_rect(
+                    LayoutRect {
+                        x: chunk.bounds.x - layer.bounds.x,
+                        y: chunk.bounds.y - layer.bounds.y,
+                        ..chunk.bounds
+                    },
+                    &mut hasher,
+                );
                 chunk.properties.transform.hash(&mut hasher);
                 chunk.properties.clip.hash(&mut hasher);
                 chunk.properties.effect.hash(&mut hasher);
@@ -221,13 +392,26 @@ fn global_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> u
     // Property nodes carry floats without `Hash`; their `Debug` form is
     // exact (shortest round-trip) and these trees are small.
     let mut text = String::new();
+    // Clip rects are compared per layer (`ClipChainMoves`); only the clip
+    // tree's shape is global.
+    let clip_parents: Vec<usize> = artifact
+        .properties
+        .clips
+        .iter()
+        .map(|clip| clip.parent)
+        .collect();
+    // Scrollport rects are read when compositing (from the current
+    // artifact), never by a recording.
+    let scroll_shape: Vec<_> = artifact
+        .properties
+        .scrolls
+        .iter()
+        .map(|scroll| (scroll.parent, scroll.host_index, scroll.clip))
+        .collect();
     let _ = write!(
         text,
         "{:?}{:?}{:?}{:?}",
-        artifact.properties.transforms,
-        artifact.properties.clips,
-        artifact.properties.effects,
-        artifact.properties.scrolls
+        artifact.properties.transforms, clip_parents, artifact.properties.effects, scroll_shape
     );
     text.hash(&mut hasher);
     artifact.viewport_scroll.0.to_bits().hash(&mut hasher);
@@ -246,6 +430,29 @@ fn global_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> u
 /// a changed client under a filter or with a resize indicator (effects that
 /// read across clients).
 pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<Vec<bool>> {
+    paint_diff_clients(prev, cur).map(|diff| {
+        diff.dirty
+            .iter()
+            .zip(&diff.moved)
+            .map(|(dirty, moved)| *dirty || moved.is_some())
+            .collect()
+    })
+}
+
+/// `paint_dirty_clients`, with clients that only moved kept apart: a moved
+/// client paints exactly what it painted before, offset by its move (its
+/// display items, text fragments and every other paint input are equal
+/// relative to its box), so a layer whose clients all moved by one offset
+/// can keep its recording under that offset, as cc keeps a layer's raster
+/// when only its position changes.
+pub struct PaintDiff {
+    /// Clients whose paint changed (not counting moves).
+    pub dirty: Vec<bool>,
+    /// Clients that only moved, with the move in CSS px.
+    pub moved: Vec<Option<(f32, f32)>>,
+}
+
+pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<PaintDiff> {
     use w3cos_std::component::ComponentKind;
     use w3cos_std::style::Display;
     let n = cur.nodes.len();
@@ -259,13 +466,28 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
     {
         return None;
     }
+    // Display item rects relative to their client's box: with equal boxes
+    // this is the absolute comparison, and a moved client compares equal.
     let item_hashes = |artifact: &PaintArtifact| {
         let mut hashes = vec![0u64; n];
         for item in &artifact.display_items {
             if let Some(slot) = hashes.get_mut(item.client_index) {
+                let (ox, oy) = artifact
+                    .rect_by_index
+                    .get(item.client_index)
+                    .copied()
+                    .flatten()
+                    .map_or((0.0, 0.0), |rect| (rect.x, rect.y));
                 let mut hasher = w3cos_std::fxhash::FxHasher::default();
                 slot.hash(&mut hasher);
-                hash_rect(item.visual_rect, &mut hasher);
+                hash_rect(
+                    LayoutRect {
+                        x: item.visual_rect.x - ox,
+                        y: item.visual_rect.y - oy,
+                        ..item.visual_rect
+                    },
+                    &mut hasher,
+                );
                 item.chunk_id.hash(&mut hasher);
                 *slot = hasher.finish() | 1;
             }
@@ -302,6 +524,18 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
             Display::Inline | Display::InlineBlock | Display::InlineFlex
         ) || display == Display::Contents
     };
+    // Inherited custom properties share one map across many boxes: scan
+    // each map once per diff.
+    let url_maps = std::cell::RefCell::new(w3cos_std::fxhash::FxHashMap::<usize, bool>::default());
+    let has_url = |properties: &w3cos_std::style::CustomProperties| {
+        let key = properties.identity();
+        if let Some(&known) = url_maps.borrow().get(&key) {
+            return known;
+        }
+        let found = properties.values().any(|value| value.contains("url("));
+        url_maps.borrow_mut().insert(key, found);
+        found
+    };
     let volatile = |b: &crate::paint_artifact::PaintNode| {
         matches!(
             b.kind,
@@ -314,13 +548,26 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
             .background_image
             .as_deref()
             .is_some_and(|value| value.contains("url("))
-            || b.style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|properties| properties.values().any(|value| value.contains("url(")))
+            || b.style.custom_properties.as_ref().is_some_and(has_url)
     };
     let get = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+    // `viewport_attached` per box in one preorder pass (parents come first),
+    // built on the first move instead of walking ancestors per moved box.
+    let attached = std::cell::OnceCell::<Vec<bool>>::new();
+    let viewport_attached = |index: usize| {
+        attached.get_or_init(|| {
+            let mut attached = vec![false; n];
+            for (i, node) in cur.nodes.iter().enumerate() {
+                attached[i] = node.style.position == w3cos_std::style::Position::Fixed
+                    || node
+                        .parent
+                        .is_some_and(|parent| parent < i && attached[parent]);
+            }
+            attached
+        })[index]
+    };
     let mut changed = Vec::new();
+    let mut moved: Vec<Option<(f32, f32)>> = vec![None; n];
     for index in 0..n {
         let (a, b) = (&prev.nodes[index], &cur.nodes[index]);
         // Geometry first: it is the cheap check and the common change.
@@ -360,6 +607,15 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
             if volatile(b) {
                 changed.push((index, true));
             }
+        } else if let Some(delta) = moved_by(
+            prev,
+            cur,
+            index,
+            prev_items[index] == cur_items[index],
+            &volatile,
+            &viewport_attached,
+        ) {
+            moved[index] = Some(delta);
         } else {
             // A block-level box whose own paint inputs are unchanged and only
             // moved does not change what its siblings paint; each moved
@@ -394,9 +650,25 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
     {
         return None;
     }
+    let (prev_filters, cur_filters) = (effects_under_filter(prev), effects_under_filter(cur));
+    let under_filter = |artifact: &PaintArtifact, filters: &[bool], index: usize| {
+        artifact
+            .node_properties
+            .get(index)
+            .is_some_and(|properties| filters.get(properties.effect).copied().unwrap_or(false))
+    };
+    for index in 0..n {
+        // A moved box paints the same pixels offset, resize indicator
+        // included; only a filter above it reads across clients.
+        if moved[index].is_some()
+            && (under_filter(prev, &prev_filters, index) || under_filter(cur, &cur_filters, index))
+        {
+            return None;
+        }
+    }
     let mut dirty = vec![false; n];
     if changed.is_empty() {
-        return Some(dirty);
+        return Some(PaintDiff { dirty, moved });
     }
     let reads_across_clients = |artifact: &PaintArtifact, index: usize| {
         let node = &artifact.nodes[index];
@@ -470,7 +742,103 @@ pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<
             dirty[index] = true;
         }
     }
-    Some(dirty)
+    for (moved, dirty) in moved.iter_mut().zip(&dirty) {
+        if *dirty {
+            *moved = None;
+        }
+    }
+    Some(PaintDiff { dirty, moved })
+}
+
+/// Per effect node, whether it or an ancestor effect has a filter.
+fn effects_under_filter(artifact: &PaintArtifact) -> Vec<bool> {
+    fn visit(
+        effects: &[crate::paint_artifact::EffectNode],
+        memo: &mut [Option<bool>],
+        id: usize,
+    ) -> bool {
+        if let Some(known) = memo[id] {
+            return known;
+        }
+        // Provisional entry guards a malformed cycle while recursing.
+        memo[id] = Some(effects[id].filter.is_some());
+        let parent = effects[id].parent;
+        let result = effects[id].filter.is_some()
+            || (id != 0 && parent != id && parent < effects.len() && visit(effects, memo, parent));
+        memo[id] = Some(result);
+        result
+    }
+    let effects = &artifact.properties.effects;
+    let mut memo: Vec<Option<bool>> = vec![None; effects.len()];
+    (0..effects.len())
+        .map(|id| visit(effects, &mut memo, id))
+        .collect()
+}
+
+/// The offset a client moved by when that is its only paint change: same
+/// box size, same paint inputs, and its display items and text fragments
+/// equal relative to its box. Clients whose paint reads the viewport (fixed
+/// backgrounds, sticky or viewport-attached boxes), columns, or resources
+/// the artifact does not describe never count as moved.
+fn moved_by(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    index: usize,
+    items_equal: bool,
+    volatile: &dyn Fn(&crate::paint_artifact::PaintNode) -> bool,
+    viewport_attached: &dyn Fn(usize) -> bool,
+) -> Option<(f32, f32)> {
+    if !items_equal {
+        return None;
+    }
+    let (a, b) = (&prev.nodes[index], &cur.nodes[index]);
+    let old = prev.rect_by_index.get(index).copied().flatten()?;
+    let new = cur.rect_by_index.get(index).copied().flatten()?;
+    if old.width.to_bits() != new.width.to_bits() || old.height.to_bits() != new.height.to_bits() {
+        return None;
+    }
+    let delta = (new.x - old.x, new.y - old.y);
+    if !delta.0.is_finite() || !delta.1.is_finite() || delta == (0.0, 0.0) {
+        return None;
+    }
+    let get = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+    let same_inputs = a.parent == b.parent
+        && a.sticky_counter_signal == b.sticky_counter_signal
+        && a.kind == b.kind
+        && a.style == b.style
+        && prev.node_properties.get(index) == cur.node_properties.get(index)
+        && prev.self_clip.get(index) == cur.self_clip.get(index)
+        && prev.z_order.get(index) == cur.z_order.get(index)
+        && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
+        && prev.paint_order.get(index) == cur.paint_order.get(index)
+        && get(&prev.vertical_text, index) == get(&cur.vertical_text, index);
+    if !same_inputs
+        || cur.sticky_owner.get(index).copied().flatten().is_some()
+        || prev.column_fragments.get(index).is_some_and(|f| !f.is_empty())
+        || cur.column_fragments.get(index).is_some_and(|f| !f.is_empty())
+        || volatile(b)
+        // Gradients sit in the box's own positioning area and move with it;
+        // fixed backgrounds read the viewport.
+        || b.style
+            .background_attachment
+            .as_deref()
+            .is_some_and(|value| value.contains("fixed"))
+        || viewport_attached(index)
+    {
+        return None;
+    }
+    let empty: &[(LayoutRect, crate::layout_ng::FragmentText)] = &[];
+    let old_text = prev.text_fragments.get(index).map_or(empty, Vec::as_slice);
+    let new_text = cur.text_fragments.get(index).map_or(empty, Vec::as_slice);
+    let text_moved = old_text.len() == new_text.len()
+        && old_text.iter().zip(new_text).all(|(o, n)| {
+            o.1 == n.1
+                && (o.0.x - old.x).to_bits() == (n.0.x - new.x).to_bits()
+                && (o.0.y - old.y).to_bits() == (n.0.y - new.y).to_bits()
+                && o.0.width.to_bits() == n.0.width.to_bits()
+                && o.0.height.to_bits() == n.0.height.to_bits()
+        });
+    text_moved.then_some(delta)
 }
 
 pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {

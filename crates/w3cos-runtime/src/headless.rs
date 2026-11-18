@@ -369,12 +369,15 @@ fn finish_headless_frame(
             .then(|| {
                 RETAINED_PAINT.with(|slot| {
                     slot.borrow().as_ref().and_then(|retained| {
-                        crate::retained_layers::paint_dirty_clients(&retained.artifact, &artifact)
+                        crate::retained_layers::paint_diff_clients(&retained.artifact, &artifact)
                     })
                 })
             })
             .flatten();
+        let (dirty, moved) =
+            dirty.map_or((None, None), |diff| (Some(diff.dirty), Some(diff.moved)));
         crate::render_skia::set_pending_paint_invalidation(dirty);
+        crate::render_skia::set_pending_paint_moved(moved);
     }
     let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact, force_cpu)?;
     let rect_independent = component_rect_independent(root);
@@ -1008,11 +1011,18 @@ mod tests {
             "kept layer recordings must match a frame painted from scratch"
         );
         // Wrapping the first card moves every card below it.
-        let wrapped = with_layer_reuse(true, || {
+        let (wrapped, moved_reuse) = with_layer_reuse(true, || {
             render_document_rgba(160, 360).expect("warm frame");
             crate::dom::set_text_content(texts[0], "card 0 now says a much longer hello");
-            render_document_rgba(160, 360).expect("wrapped frame")
+            let wrapped = render_document_rgba(160, 360).expect("wrapped frame");
+            (wrapped, HEADLESS_SKIA_REUSED.with(Cell::get))
         });
+        // The cards below only moved: their layers keep their recordings
+        // under the offset (the first card's layers re-record).
+        assert!(
+            moved_reuse.0 > 0 && moved_reuse.0 < moved_reuse.1,
+            "moved cards keep their recordings, got {moved_reuse:?}"
+        );
         let fresh = with_layer_reuse(false, || {
             crate::incremental_layout::invalidate();
             invalidate_retained_frame();

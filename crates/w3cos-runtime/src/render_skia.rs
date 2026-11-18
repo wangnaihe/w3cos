@@ -645,6 +645,13 @@ pub struct RetainedSkiaCache {
     cull_rects: Vec<Option<Rect>>,
     /// Layers whose recording the last frame kept, and the layer count.
     last_reused: (usize, usize),
+    /// Per picture, the device offset from its recording to the layer's
+    /// current position (non-zero once a moved layer kept its recording).
+    offsets: Vec<(f32, f32)>,
+}
+
+fn shift_rect(rect: Option<Rect>, by: (f32, f32)) -> Option<Rect> {
+    rect.map(|rect| rect.with_offset(by))
 }
 
 /// Blink's `CullRect` expansion (`kPixelDistanceToRecord`): a culled layer
@@ -683,6 +690,13 @@ thread_local! {
     /// recording across a content change (set by the kept headless
     /// rasterizer).
     static TRACK_PARTIAL_LAYERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// With the pending invalidation: per client, the offset (CSS px) it
+    /// only moved by (`retained_layers::PaintDiff::moved`).
+    static PENDING_PAINT_MOVED: RefCell<Option<Vec<Option<(f32, f32)>>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_pending_paint_moved(moved: Option<Vec<Option<(f32, f32)>>>) {
+    PENDING_PAINT_MOVED.with(|slot| *slot.borrow_mut() = moved);
 }
 
 pub(crate) fn has_pending_paint_invalidation() -> bool {
@@ -696,6 +710,7 @@ pub(crate) fn set_track_partial_layers(track: bool) {
 /// Hand the next `replay_frame` the clients whose paint changed since the
 /// cache's recordings; `None` re-records every layer whose content changed.
 pub(crate) fn set_pending_paint_invalidation(dirty: Option<Vec<bool>>) {
+    PENDING_PAINT_MOVED.with(|slot| slot.borrow_mut().take());
     PENDING_PAINT_INVALIDATION.with(|slot| *slot.borrow_mut() = dirty);
 }
 
@@ -1764,6 +1779,15 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             .set_track_partial(TRACK_PARTIAL_LAYERS.with(std::cell::Cell::get));
         let action = cache.tree.sync(artifact, &scrolls, overrides);
         let invalidation = PENDING_PAINT_INVALIDATION.with(|slot| slot.borrow_mut().take());
+        let moved = PENDING_PAINT_MOVED.with(|slot| slot.borrow_mut().take());
+        let moved_client = |client: usize| {
+            moved
+                .as_ref()
+                .and_then(|moved| moved.get(client).copied().flatten())
+        };
+        if cache.offsets.len() != cache.pictures.len() {
+            cache.offsets = vec![(0.0, 0.0); cache.pictures.len()];
+        }
         let glyph_clips = cache
             .tree
             .layers
@@ -1787,22 +1811,36 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         // reuses across content changes; it re-records when the visible
         // rect leaves the culled area.
         let cull_layers = TRACK_PARTIAL_LAYERS.with(std::cell::Cell::get);
-        let covered = |layer_index: usize| {
-            cache
-                .cull_rects
-                .get(layer_index)
-                .is_some_and(|recorded| cull_covers(*recorded, glyph_clips[layer_index]))
+        // Visible rects and glyph clips in recording space: a kept moved
+        // recording sits at an offset from its layer.
+        let covered_at = |layer_index: usize, offset: (f32, f32)| {
+            cache.cull_rects.get(layer_index).is_some_and(|recorded| {
+                cull_covers(
+                    *recorded,
+                    shift_rect(glyph_clips[layer_index], (-offset.0, -offset.1)),
+                )
+            })
         };
+        let decisions_match_at = |layer_index: usize, offset: (f32, f32)| {
+            glyph_clip_decisions_match(
+                &cache.glyph_clip_decisions[layer_index],
+                shift_rect(glyph_clips[layer_index], (-offset.0, -offset.1)),
+            )
+        };
+        let offset_of = |layer_index: usize| {
+            cache
+                .offsets
+                .get(layer_index)
+                .copied()
+                .unwrap_or((0.0, 0.0))
+        };
+        let covered = |layer_index: usize| covered_at(layer_index, offset_of(layer_index));
         let can_replay = reusable
             && (0..cache.tree.layers.len()).all(covered)
             && invalidation
                 .as_ref()
                 .is_none_or(|dirty| !dirty.iter().any(|client| *client))
-            && cache
-                .glyph_clip_decisions
-                .iter()
-                .zip(&glyph_clips)
-                .all(|(decisions, clip)| glyph_clip_decisions_match(decisions, *clip));
+            && (0..cache.tree.layers.len()).all(|i| decisions_match_at(i, offset_of(i)));
         if can_replay {
             cache.last_reused = (cache.tree.layers.len(), cache.tree.layers.len());
             cache.tree.note_replay();
@@ -1816,6 +1854,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 overrides,
                 frame.background,
                 scale_factor,
+                &cache.offsets,
             );
             return;
         }
@@ -1838,24 +1877,58 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                         .iter()
                         .zip(same_bounds)
                         .map(|(layer, &same)| {
-                            same && !layer
-                                .client_indices
-                                .iter()
-                                .any(|&client| dirty.get(client).copied().unwrap_or(true))
+                            same && !layer.client_indices.iter().any(|&client| {
+                                dirty.get(client).copied().unwrap_or(true)
+                                    || moved_client(client).is_some()
+                            })
                         })
                         .collect(),
                 )
             }
             _ => None,
         };
+        // A layer whose clients all only moved by the offset the layer and
+        // its clips moved by keeps its recording under that offset.
+        let moved_by: Vec<Option<(f32, f32)>> =
+            match (&invalidation, cache.tree.translated_layers()) {
+                (Some(dirty), Some(translated)) if partial.is_some() => cache
+                    .tree
+                    .layers
+                    .iter()
+                    .zip(translated)
+                    .map(|(layer, delta)| {
+                        let delta = (*delta)?;
+                        layer
+                            .client_indices
+                            .iter()
+                            .all(|&client| {
+                                !dirty.get(client).copied().unwrap_or(true)
+                                    && moved_client(client).is_some_and(|m| {
+                                        m.0.to_bits() == delta.0.to_bits()
+                                            && m.1.to_bits() == delta.1.to_bits()
+                                    })
+                            })
+                            .then_some((delta.0 * scale_factor, delta.1 * scale_factor))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+        let new_offsets: Vec<(f32, f32)> = (0..cache.tree.layers.len())
+            .map(|layer_index| {
+                let offset = offset_of(layer_index);
+                match moved_by.get(layer_index).copied().flatten() {
+                    Some(delta) => (offset.0 + delta.0, offset.1 + delta.1),
+                    None => offset,
+                }
+            })
+            .collect();
         let keep: Vec<bool> = (0..cache.tree.layers.len())
             .map(|layer_index| {
-                (reusable || partial.as_ref().is_some_and(|clean| clean[layer_index]))
-                    && covered(layer_index)
-                    && glyph_clip_decisions_match(
-                        &cache.glyph_clip_decisions[layer_index],
-                        glyph_clips[layer_index],
-                    )
+                (reusable
+                    || partial.as_ref().is_some_and(|clean| clean[layer_index])
+                    || moved_by.get(layer_index).copied().flatten().is_some())
+                    && covered_at(layer_index, new_offsets[layer_index])
+                    && decisions_match_at(layer_index, new_offsets[layer_index])
             })
             .collect();
         cache.last_reused = (
@@ -1864,30 +1937,58 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         );
         // Bucket the frame's nodes by layer in one pass (frame order kept),
         // instead of scanning every layer's client list per node.
-        let mut layer_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        // Indexed by client: most clients sit in one re-recorded layer, and a
+        // hash per frame node was a measurable share of the frame.
+        const NO_LAYER: u32 = u32::MAX;
+        const MANY_LAYERS: u32 = u32::MAX - 1;
+        let mut layer_of = vec![NO_LAYER; artifact.nodes.len()];
+        let mut layers_of: HashMap<usize, Vec<usize>> = HashMap::new();
         for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
             if keep[layer_index] {
                 continue;
             }
             for &client in &layer.client_indices {
-                let layers = layer_of.entry(client).or_default();
-                if layers.last() != Some(&layer_index) {
-                    layers.push(layer_index);
+                if client >= layer_of.len() {
+                    layer_of.resize(client + 1, NO_LAYER);
+                }
+                match layer_of[client] {
+                    NO_LAYER => layer_of[client] = layer_index as u32,
+                    MANY_LAYERS => {
+                        let layers = layers_of.entry(client).or_default();
+                        if layers.last() != Some(&layer_index) {
+                            layers.push(layer_index);
+                        }
+                    }
+                    first if first as usize != layer_index => {
+                        layer_of[client] = MANY_LAYERS;
+                        layers_of.insert(client, vec![first as usize, layer_index]);
+                    }
+                    _ => {}
                 }
             }
         }
         let mut nodes_by_layer: Vec<Vec<(usize, LayoutRect, &ComponentKind, &Style)>> =
             vec![Vec::new(); cache.tree.layers.len()];
         for node in frame.nodes.iter().copied() {
-            if let Some(layers) = layer_of.get(&node.0) {
-                for &layer_index in layers {
-                    nodes_by_layer[layer_index].push(node);
+            match layer_of.get(node.0).copied().unwrap_or(NO_LAYER) {
+                NO_LAYER => {}
+                MANY_LAYERS => {
+                    for &layer_index in &layers_of[&node.0] {
+                        nodes_by_layer[layer_index].push(node);
+                    }
                 }
+                layer_index => nodes_by_layer[layer_index as usize].push(node),
             }
         }
         let mut cull_rects = Vec::with_capacity(cache.tree.layers.len());
         let mut culling = cull_layers.then(|| CullIndex::new(artifact));
+        let mut offsets = Vec::with_capacity(cache.tree.layers.len());
         for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
+            offsets.push(if keep[layer_index] {
+                new_offsets[layer_index]
+            } else {
+                (0.0, 0.0)
+            });
             if keep[layer_index] {
                 pictures.push(cache.pictures[layer_index].clone());
                 glyph_clip_decisions.push(cache.glyph_clip_decisions[layer_index].clone());
@@ -1934,6 +2035,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         cache.pictures = pictures;
         cache.glyph_clip_decisions = glyph_clip_decisions;
         cache.cull_rects = cull_rects;
+        cache.offsets = offsets;
         cache.tree.note_rebuild();
         crate::perf::record_paint_path(if partial.is_some() {
             "partial-layer-rebuild"
@@ -1949,6 +2051,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             overrides,
             frame.background,
             scale_factor,
+            &cache.offsets,
         );
         return;
     }
@@ -2086,11 +2189,19 @@ fn composite_skia_layers(
     overrides: &CompositorOverrides,
     background: w3cos_std::color::Color,
     scale_factor: f32,
+    offsets: &[(f32, f32)],
 ) {
     canvas.clear(to_skia_color(background, 1.0));
     paint_canvas_background_image(canvas, Some(artifact), scale_factor);
-    for (layer, picture) in layers.iter().zip(pictures) {
-        let matrix = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+    for (layer_index, (layer, picture)) in layers.iter().zip(pictures).enumerate() {
+        let mut matrix =
+            compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+        // A moved layer that kept its recording draws it at its offset.
+        if let Some(&offset) = offsets.get(layer_index)
+            && offset != (0.0, 0.0)
+        {
+            matrix = Matrix::concat(&matrix, &Matrix::translate(offset));
+        }
         let opacity = compositor_layer_opacity(layer, artifact, overrides);
         let save = canvas.save();
         if let Some(&index) = layer.client_indices.first() {
