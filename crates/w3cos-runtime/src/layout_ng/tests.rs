@@ -7836,6 +7836,205 @@ fn inline_min_max_ignores_text_and_inline_box_widths() {
     assert_eq!(rects(&percent), rects(&auto));
 }
 
+/// The WPT pre-wrap-align pages: `dir=rtl`, `font: 20px Ahem`, `width: 15ch`,
+/// the preserved newlines, and (for -003) `unicode-bidi: bidi-override`.
+/// Painted through the headless path and compared to the reference's `<br>` lines.
+#[cfg(feature = "cpu-render")]
+#[test]
+fn wpt_prewrap_align_pages_match_their_references() {
+    use crate::html_parser_host::InertParserScriptHost;
+    use crate::html_parser_state::StreamingDocumentParser;
+    use std::rc::Rc;
+
+    let _ahem = super::inline_tests::AhemGuard::new();
+    // The runner installs the font-unit provider before the first document.
+    // Ahem's ch is 1em there, matching Skia; install it before parsing.
+    crate::layout::install_font_unit_provider();
+    let source = "one two three four five\nsix seven eight nine ten.\nun deux trois quatre cinq\nsix sept huit neuf dix";
+    let lines_002 = [
+        "one two three",
+        "four five",
+        "six seven eight",
+        ".nine ten",
+        "un deux trois",
+        "quatre cinq",
+        "six sept huit",
+        "neuf dix",
+    ];
+    let lines_003 = [
+        "eerht owt eno",
+        "evif ruof",
+        "thgie neves xis",
+        ".net enin",
+        "siort xued nu",
+        "qnic ertauq",
+        "tiuh tpes xis",
+        "xid fuen",
+    ];
+    let paint =
+        |html: &str, align: &str, white_space: &str, bidi: Option<&str>| -> (Vec<u8>, String) {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(800.0, 600.0);
+            w3cos_dom::stylesheet::clear_rules();
+            let mut decls = vec![
+                ("font", "20px Ahem, monospace"),
+                ("width", "15ch"),
+                ("border", "1px solid gray"),
+                ("padding", "5px"),
+                ("white-space", white_space),
+                ("text-align", align),
+            ];
+            if let Some(value) = bidi {
+                decls.push(("unicode-bidi", value));
+            }
+            w3cos_dom::stylesheet::register_rule(".test", &decls);
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost),
+                "https://example.test/pre-wrap-align.html",
+            )
+            .expect("parser");
+            parser.write(html).expect("html");
+            parser.finish().expect("finish");
+            let texts = crate::dom::with_document(|document| {
+                let tree = document.to_component_tree();
+                let flat = crate::layout::pre_flatten(&tree);
+                let reasons = block::unsupported_reasons(&flat);
+                let laid = layout_tree(&tree, &flat, 800.0, 600.0);
+                let runtime = super::RUNTIME_REASON.with(|r| r.get());
+                let mut texts = Vec::new();
+                for (i, node) in flat.iter().enumerate() {
+                    let w3cos_std::ComponentKind::Text { content } = node.kind else {
+                        continue;
+                    };
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let placed = laid.as_ref().map(|out| rect(out, i));
+                    texts.push(format!("{content:?} {placed:?}"));
+                }
+                let ch = flat
+                    .iter()
+                    .find(|node| node.style.width == w3cos_std::style::Dimension::Ch(15.0))
+                    .map(|node| {
+                        format!(
+                            "ch={} fs={} ff={:?} ws={:?}",
+                            node.style.ch_advance(),
+                            node.style.font_size,
+                            node.style.font_family,
+                            node.style.white_space
+                        )
+                    })
+                    .unwrap_or_else(|| "no 15ch box".into());
+                format!(
+                    "reasons={reasons:?} runtime={runtime} {ch} {}",
+                    texts.join(" / ")
+                )
+            });
+            let frame = crate::headless::render_document_rgba_cpu(800, 600).expect("frame");
+            w3cos_dom::stylesheet::clear_rules();
+            (frame.rgba, texts)
+        };
+    let page = |align: &str, white_space: &str, bidi: Option<&str>, body: &str| {
+        format!(
+            "<!DOCTYPE html><html><head><style>.test {{ font: 20px Ahem, monospace; width: 15ch; border: 1px solid gray; padding: 5px; white-space: {white_space}; text-align: {align}; {bidi} }}</style></head><body><p>The text on each line should be neatly aligned:</p>{body}</body></html>",
+            bidi = bidi
+                .map(|value| format!("unicode-bidi: {value};"))
+                .unwrap_or_default()
+        )
+    };
+    let mut failures = Vec::new();
+    for (name, bidi, lines) in [
+        ("002", None, &lines_002[..]),
+        ("003", Some("bidi-override"), &lines_003[..]),
+    ] {
+        let reference_body = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if i + 1 == lines.len() {
+                    (*line).to_string()
+                } else {
+                    format!("{line}<br>")
+                }
+            })
+            .collect::<String>();
+        for align in ["left", "right", "center", "start", "end"] {
+            // RTL start is the physical right; RTL end is the physical left.
+            // The references are LTR, so they spell that physical edge.
+            let ref_align = match align {
+                "start" => "right",
+                "end" => "left",
+                other => other,
+            };
+            let test_html = page(
+                align,
+                "pre-wrap",
+                bidi,
+                &format!("<div class=test dir=rtl>{source}</div>"),
+            );
+            let ref_html = page(
+                ref_align,
+                "normal",
+                None,
+                &format!("<div class=test>{reference_body}</div>"),
+            );
+            let (test_px, test_text) = paint(&test_html, align, "pre-wrap", bidi);
+            let (ref_px, ref_text) = paint(&ref_html, ref_align, "normal", None);
+            let mut n = 0usize;
+            let mut min_x = 800i32;
+            let mut min_y = 600i32;
+            let mut max_x = 0i32;
+            let mut max_y = 0i32;
+            let mut sample = String::new();
+            for y in 0..600i32 {
+                for x in 0..800i32 {
+                    let i = ((y * 800 + x) * 4) as usize;
+                    if test_px[i..i + 4] != ref_px[i..i + 4] {
+                        if n < 6 {
+                            sample.push_str(&format!(
+                                " ({x},{y}) test={:?} ref={:?}",
+                                &test_px[i..i + 4],
+                                &ref_px[i..i + 4]
+                            ));
+                        }
+                        n += 1;
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+            if n != 0 {
+                let black_rows = |px: &[u8]| {
+                    let mut rows = Vec::new();
+                    for y in 50..250 {
+                        let mut count = 0;
+                        for x in 14..314 {
+                            let i = ((y * 800 + x) * 4) as usize;
+                            if px[i] < 20 && px[i + 1] < 20 && px[i + 2] < 20 && px[i + 3] > 200 {
+                                count += 1;
+                            }
+                        }
+                        if count > 10 {
+                            rows.push((y, count));
+                        }
+                    }
+                    rows
+                };
+                failures.push(format!(
+                    "{align}-{name} diff={n} bbox={min_x},{min_y}-{max_x},{max_y}{sample}\n  test rows {:?}\n  ref rows {:?}\n  test {test_text}\n  ref  {ref_text}",
+                    black_rows(&test_px),
+                    black_rows(&ref_px)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// RTL `white-space: pre-wrap` hangs trailing spaces (CSS Text 3 4.1.3):
 /// they do not change the line break or the alignment. Ahem 20px, content
 /// width 300 (the WPT's 15ch when `ch` is 1em). pre-wrap-align-*-002.
