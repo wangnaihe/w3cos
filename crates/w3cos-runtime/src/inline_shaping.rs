@@ -236,8 +236,19 @@ impl Fragment {
 /// The artifact-wide inputs of [`build`]: they read every node, so a frame
 /// that records several layers computes them once, not once per layer.
 pub(crate) struct ShapingIndex {
-    quote_words: HashSet<usize>,
-    owner_children: HashMap<usize, Vec<usize>>,
+    quote_words: HashSet<usize, w3cos_std::fxhash::FxBuildHasher>,
+    /// Per inline owner, its children in tree order: one list of children
+    /// grouped by owner, and each owner's range in it (built per frame from
+    /// every node, so no per-node hashing or per-owner allocation).
+    owner_children: Vec<usize>,
+    owner_ranges: Vec<(u32, u32)>,
+}
+
+impl ShapingIndex {
+    fn children_of(&self, owner: usize) -> Option<&[usize]> {
+        let &(start, len) = self.owner_ranges.get(owner)?;
+        (len > 0).then(|| &self.owner_children[start as usize..(start + len) as usize])
+    }
 }
 
 pub(crate) fn index(artifact: &PaintArtifact) -> ShapingIndex {
@@ -265,25 +276,51 @@ pub(crate) fn index(artifact: &PaintArtifact) -> ShapingIndex {
                 .is_some_and(|p| p.contains_key("--w3cos-internal-unbroken-inline-word"))
                 .then_some(parent)
         })
-        .collect::<HashSet<_>>();
+        .collect::<HashSet<_, w3cos_std::fxhash::FxBuildHasher>>();
     let inline_owner = |mut parent: usize| -> Option<usize> {
         while quote_words.contains(&parent) {
             parent = artifact.nodes[parent].parent?;
         }
         Some(parent)
     };
-    let mut owner_children: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (index, node) in artifact.nodes.iter().enumerate() {
-        if quote_words.contains(&index) {
-            continue;
+    let owners = artifact
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            if quote_words.contains(&index) {
+                None
+            } else {
+                node.parent.and_then(inline_owner)
+            }
+        })
+        .collect::<Vec<_>>();
+    // Counting sort by owner; children keep tree order within an owner.
+    let mut owner_ranges = vec![(0u32, 0u32); artifact.nodes.len()];
+    for owner in owners.iter().flatten() {
+        if let Some(range) = owner_ranges.get_mut(*owner) {
+            range.1 += 1;
         }
-        if let Some(parent) = node.parent.and_then(inline_owner) {
-            owner_children.entry(parent).or_default().push(index);
+    }
+    let mut next = 0u32;
+    for range in &mut owner_ranges {
+        range.0 = next;
+        next += range.1;
+    }
+    let mut owner_children = vec![0usize; next as usize];
+    let mut fill = owner_ranges.iter().map(|range| range.0).collect::<Vec<_>>();
+    for (index, owner) in owners.iter().enumerate() {
+        if let Some(owner) = *owner
+            && let Some(slot) = fill.get_mut(owner)
+        {
+            owner_children[*slot as usize] = index;
+            *slot += 1;
         }
     }
     ShapingIndex {
         quote_words,
         owner_children,
+        owner_ranges,
     }
 }
 
@@ -343,8 +380,7 @@ pub(crate) fn build_with_index(
         .collect::<HashSet<_>>();
     let siblings = parents.iter().filter_map(|parent| {
         shaping_index
-            .owner_children
-            .get(parent)
+            .children_of(*parent)
             .map(|children| (*parent, children))
     });
     let mut result = HashMap::new();

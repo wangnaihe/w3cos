@@ -205,6 +205,23 @@ impl CustomProperties {
         &mut data.map
     }
 
+    /// `HashMap::contains_key` behind the key filter: an absent key, the
+    /// common case for internal markers, answers without hashing.
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.may_contain(key) && self.0.map.contains_key(key)
+    }
+
+    /// `HashMap::get` behind the key filter.
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&String> {
+        if self.may_contain(key) {
+            self.0.map.get(key)
+        } else {
+            None
+        }
+    }
+
     /// Copy-on-write aware: a no-op removal never unshares the map (Blink's
     /// DataRef::Access() is likewise only taken when a field really changes).
     pub fn remove<Q>(&mut self, key: &Q) -> Option<String>
@@ -1802,6 +1819,27 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn filtered_lookups_match_the_map() {
+        let mut props = CustomProperties::new();
+        let keys: Vec<String> = (0..64).map(|i| format!("--k{i}")).collect();
+        for (i, key) in keys.iter().enumerate() {
+            if i % 3 == 0 {
+                props.insert(key.clone(), i.to_string());
+            }
+        }
+        props.remove("--k3");
+        for key in keys
+            .iter()
+            .map(String::as_str)
+            .chain(["--w3cos-internal-x", ""])
+        {
+            let map: &super::CustomPropertyMap = &props;
+            assert_eq!(props.contains_key(key), map.contains_key(key), "{key}");
+            assert_eq!(props.get(key), map.get(key), "{key}");
         }
     }
 
