@@ -1033,6 +1033,91 @@ mod tests {
     }
 
     #[test]
+    fn layer_reuse_keeps_text_overflowing_a_zero_width_block() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        invalidate_retained_frame();
+        let body = crate::dom::body_id();
+        let note = crate::dom::create_element("p");
+        let note_text = crate::dom::create_text_node("edit me");
+        crate::dom::append_child(note, note_text);
+        crate::dom::append_child(body, note);
+        for content in ["12345", "a b"] {
+            let block = crate::dom::create_element("div");
+            crate::dom::set_style_property(block, "width", "0");
+            crate::dom::set_style_property(block, "font-size", "32px");
+            crate::dom::append_child(block, crate::dom::create_text_node(content));
+            crate::dom::append_child(body, block);
+        }
+        let kept = with_layer_reuse(true, || {
+            render_document_rgba(200, 200).expect("first frame");
+            crate::dom::set_text_content(note_text, "edited");
+            render_document_rgba(200, 200).expect("second frame")
+        });
+        let fresh = with_layer_reuse(false, || {
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            render_document_rgba(200, 200).expect("fresh frame")
+        });
+        assert_eq!(
+            kept.rgba, fresh.rgba,
+            "text overflowing a zero-width block must not be culled"
+        );
+    }
+
+    #[test]
+    fn layer_reuse_culls_far_content_and_recovers_it_on_scroll() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        invalidate_retained_frame();
+        let body = crate::dom::body_id();
+        crate::dom::set_style_property(body, "margin", "0");
+        let scroller = crate::dom::create_element("div");
+        for (name, value) in [
+            ("overflow", "auto"),
+            ("width", "120px"),
+            ("height", "100px"),
+            ("will-change", "transform"),
+        ] {
+            crate::dom::set_style_property(scroller, name, value);
+        }
+        for index in 0..120 {
+            let row = crate::dom::create_element("div");
+            for (name, value) in [
+                ("height", "100px"),
+                (
+                    "background",
+                    if index % 2 == 0 { "#cc3333" } else { "#3333cc" },
+                ),
+            ] {
+                crate::dom::set_style_property(row, name, value);
+            }
+            crate::dom::append_child(row, crate::dom::create_text_node(&format!("row {index}")));
+            crate::dom::append_child(scroller, row);
+        }
+        crate::dom::append_child(body, scroller);
+        let note = crate::dom::create_element("p");
+        let note_text = crate::dom::create_text_node("edit me");
+        crate::dom::append_child(note, note_text);
+        crate::dom::append_child(body, note);
+        let scrolled = with_layer_reuse(true, || {
+            render_document_rgba(160, 200).expect("first frame");
+            crate::dom::set_scroll_offset(scroller, None, Some(9000.0));
+            crate::dom::set_text_content(note_text, "edited");
+            render_document_rgba(160, 200).expect("scrolled frame")
+        });
+        let fresh = with_layer_reuse(false, || {
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            render_document_rgba(160, 200).expect("fresh frame")
+        });
+        assert_eq!(
+            scrolled.rgba, fresh.rgba,
+            "content culled at the first frame must be recorded once scrolled into view"
+        );
+    }
+
+    #[test]
     fn absolute_top_reuses_the_paint_artifact_and_matches_a_fresh_frame() {
         crate::dom::reset_document();
         let layer = crate::dom::create_element("div");

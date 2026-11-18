@@ -640,8 +640,32 @@ pub struct RetainedSkiaCache {
     tree: RetainedLayerTree,
     pictures: Vec<Picture>,
     glyph_clip_decisions: Vec<Vec<GlyphClipDecision>>,
+    /// Per picture, the layer-space rect its recording was culled to
+    /// (`None`: every client recorded).
+    cull_rects: Vec<Option<Rect>>,
     /// Layers whose recording the last frame kept, and the layer count.
     last_reused: (usize, usize),
+}
+
+/// Blink's `CullRect` expansion (`kPixelDistanceToRecord`): a culled layer
+/// records what lies within this distance of the visible rect, so small
+/// scrolls keep the recording.
+const CULL_RECORD_DISTANCE: f32 = 4000.0;
+
+/// Whether a recording culled to `recorded` still holds everything visible
+/// through `visible` (both in layer space).
+fn cull_covers(recorded: Option<Rect>, visible: Option<Rect>) -> bool {
+    match (recorded, visible) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(recorded), Some(visible)) => {
+            visible.is_empty()
+                || (recorded.left <= visible.left
+                    && recorded.top <= visible.top
+                    && recorded.right >= visible.right
+                    && recorded.bottom >= visible.bottom)
+        }
+    }
 }
 
 impl RetainedSkiaCache {
@@ -733,6 +757,138 @@ fn glyph_ink_visible(ink: Rect, clip: Option<Rect>) -> bool {
             && ink.top < clip.bottom
             && ink.bottom > clip.top
     })
+}
+
+fn union_cull_rect(a: LayoutRect, b: LayoutRect) -> LayoutRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    LayoutRect {
+        x,
+        y,
+        width: (a.x + a.width).max(b.x + b.width) - x,
+        height: (a.y + a.height).max(b.y + b.height) - y,
+    }
+}
+
+/// Per frame: each client's cull extent, the paint extent of its nearest
+/// non-inline ancestor-or-self together with every inline descendant that
+/// maps to it (their rects and display item visual rects), so a block's
+/// inline content is kept or culled together, including text that
+/// overflows the block. Inline painting reads across a block's fragments
+/// (shaping, bidi runs, inline backgrounds), and Blink culls display items
+/// by visual rect the same way.
+struct CullIndex<'a> {
+    artifact: &'a PaintArtifact,
+    /// Per node: its cull key's extent (built on first use).
+    extents: Option<Vec<Option<LayoutRect>>>,
+}
+
+impl<'a> CullIndex<'a> {
+    fn new(artifact: &'a PaintArtifact) -> Self {
+        Self {
+            artifact,
+            extents: None,
+        }
+    }
+
+    fn build(artifact: &PaintArtifact) -> Vec<Option<LayoutRect>> {
+        let nodes = &artifact.nodes;
+        let is_inline = |index: usize| {
+            let node = &nodes[index];
+            matches!(
+                node.style.display,
+                Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::Contents
+            ) || matches!(node.kind, ComponentKind::Text { .. })
+        };
+        // Cull key per node: the nearest non-inline ancestor-or-self.
+        let mut key_of: Vec<usize> = (0..nodes.len()).collect();
+        for index in 0..nodes.len() {
+            let mut key = index;
+            while is_inline(key) {
+                match nodes[key].parent {
+                    Some(parent) if parent < index => {
+                        key = key_of[parent];
+                        break;
+                    }
+                    Some(parent) if parent < nodes.len() => key = parent,
+                    _ => break,
+                }
+            }
+            key_of[index] = key;
+        }
+        let mut extents: Vec<Option<LayoutRect>> = vec![None; nodes.len()];
+        let mut add = |index: usize, rect: LayoutRect| {
+            if let Some(&key) = key_of.get(index) {
+                let slot = &mut extents[key];
+                *slot = Some(slot.map_or(rect, |extent| union_cull_rect(extent, rect)));
+            }
+        };
+        for (index, rect) in artifact.rect_by_index.iter().enumerate() {
+            if let Some(rect) = rect {
+                add(index, *rect);
+            }
+        }
+        for item in &artifact.display_items {
+            add(item.client_index, item.visual_rect);
+        }
+        // Every node reads its key's extent.
+        (0..nodes.len())
+            .map(|index| extents[key_of[index]])
+            .collect()
+    }
+
+    fn extent(&mut self, index: usize) -> Option<LayoutRect> {
+        let artifact = self.artifact;
+        self.extents
+            .get_or_insert_with(|| Self::build(artifact))
+            .get(index)
+            .copied()
+            .flatten()
+    }
+
+    /// Drop the layer's nodes outside the visible rect expanded by
+    /// `CULL_RECORD_DISTANCE`, and return that layer-space rect (`None`
+    /// when the layer cannot be culled and records every node).
+    fn cull_layer<'n>(
+        &mut self,
+        nodes: &mut Vec<(usize, LayoutRect, &'n ComponentKind, &'n Style)>,
+        visible: Option<Rect>,
+        scale: f32,
+    ) -> Option<Rect> {
+        let visible = visible?;
+        let distance = CULL_RECORD_DISTANCE * scale;
+        let cull = if visible.is_empty() {
+            // Nothing of the layer is visible: record nothing until it is.
+            Rect::default()
+        } else {
+            Rect::new(
+                visible.left - distance,
+                visible.top - distance,
+                visible.right + distance,
+                visible.bottom + distance,
+            )
+        };
+        nodes.retain(|&(index, rect, _, _)| {
+            let extent = self
+                .extent(index)
+                .map_or(rect, |extent| union_cull_rect(extent, rect));
+            let extent = Rect::new(
+                extent.x * scale,
+                extent.y * scale,
+                (extent.x + extent.width) * scale,
+                (extent.y + extent.height) * scale,
+            );
+            // Keep anything that is not a plain finite box. Edges count, so a
+            // zero-width box still intersects.
+            !extent.is_finite()
+                || (!cull.is_empty()
+                    && extent.left <= cull.right
+                    && extent.right >= cull.left
+                    && extent.top <= cull.bottom
+                    && extent.bottom >= cull.top)
+        });
+        Some(cull)
+    }
 }
 
 fn glyph_clip_decisions_match(decisions: &[GlyphClipDecision], clip: Option<Rect>) -> bool {
@@ -1627,7 +1783,18 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             && cache.tree.recordings_valid()
             && cache.pictures.len() == cache.tree.layers.len()
             && cache.glyph_clip_decisions.len() == cache.tree.layers.len();
+        // Culling only applies to recordings a kept headless rasterizer
+        // reuses across content changes; it re-records when the visible
+        // rect leaves the culled area.
+        let cull_layers = TRACK_PARTIAL_LAYERS.with(std::cell::Cell::get);
+        let covered = |layer_index: usize| {
+            cache
+                .cull_rects
+                .get(layer_index)
+                .is_some_and(|recorded| cull_covers(*recorded, glyph_clips[layer_index]))
+        };
         let can_replay = reusable
+            && (0..cache.tree.layers.len()).all(covered)
             && invalidation
                 .as_ref()
                 .is_none_or(|dirty| !dirty.iter().any(|client| *client))
@@ -1684,6 +1851,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         let keep: Vec<bool> = (0..cache.tree.layers.len())
             .map(|layer_index| {
                 (reusable || partial.as_ref().is_some_and(|clean| clean[layer_index]))
+                    && covered(layer_index)
                     && glyph_clip_decisions_match(
                         &cache.glyph_clip_decisions[layer_index],
                         glyph_clips[layer_index],
@@ -1717,13 +1885,20 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 }
             }
         }
+        let mut cull_rects = Vec::with_capacity(cache.tree.layers.len());
+        let mut culling = cull_layers.then(|| CullIndex::new(artifact));
         for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
             if keep[layer_index] {
                 pictures.push(cache.pictures[layer_index].clone());
                 glyph_clip_decisions.push(cache.glyph_clip_decisions[layer_index].clone());
+                cull_rects.push(cache.cull_rects[layer_index]);
                 continue;
             }
-            let layer_nodes = std::mem::take(&mut nodes_by_layer[layer_index]);
+            let mut layer_nodes = std::mem::take(&mut nodes_by_layer[layer_index]);
+            let cull = culling.as_mut().and_then(|index| {
+                index.cull_layer(&mut layer_nodes, glyph_clips[layer_index], scale_factor)
+            });
+            cull_rects.push(cull);
             let mut recorder = PictureRecorder::new();
             let bounds = Rect::new(
                 layer.bounds.x * scale_factor - 64.0,
@@ -1758,6 +1933,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         }
         cache.pictures = pictures;
         cache.glyph_clip_decisions = glyph_clip_decisions;
+        cache.cull_rects = cull_rects;
         cache.tree.note_rebuild();
         crate::perf::record_paint_path(if partial.is_some() {
             "partial-layer-rebuild"
