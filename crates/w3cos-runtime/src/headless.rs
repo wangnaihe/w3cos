@@ -277,7 +277,7 @@ fn finish_headless_frame(
     );
     artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
-    let mut nodes = artifact
+    let nodes = artifact
         .rect_by_index
         .iter()
         .enumerate()
@@ -287,7 +287,7 @@ fn finish_headless_frame(
             Some((index, rect, &node.kind, node.style.as_style()))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
-    nodes.sort_by_cached_key(|(index, _, _, _)| artifact.paint_order_class(*index));
+    let nodes = crate::paint_artifact::sort_by_paint_order(&artifact, nodes, |node| node.0);
 
     let table_replay = crate::table_paint::replay(&nodes, &artifact);
     let nodes = table_replay
@@ -507,7 +507,7 @@ fn paint_retained_artifact(
     layout_results: &layout::LayoutResults,
     artifact: &PaintArtifact,
 ) -> Result<HeadlessFrame> {
-    let mut nodes = artifact
+    let nodes = artifact
         .rect_by_index
         .iter()
         .enumerate()
@@ -517,7 +517,7 @@ fn paint_retained_artifact(
             Some((index, rect, &node.kind, node.style.as_style()))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
-    nodes.sort_by_cached_key(|(index, _, _, _)| artifact.paint_order_class(*index));
+    let nodes = crate::paint_artifact::sort_by_paint_order(&artifact, nodes, |node| node.0);
     let table_replay = crate::table_paint::replay(&nodes, artifact);
     let nodes = table_replay
         .iter()

@@ -2674,28 +2674,9 @@ impl PaintArtifact {
     /// two keys, so a stable sort by class equals a stable sort by key. The
     /// keys are sorted once per artifact instead of on every sort.
     pub fn paint_order_class(&self, index: usize) -> u32 {
-        let classes = self.paint_classes.get_or_init(|| {
-            let mut order: Vec<u32> = (0..self.paint_order.len() as u32).collect();
-            order.sort_by(|left, right| {
-                self.paint_order_key(*left as usize)
-                    .cmp(self.paint_order_key(*right as usize))
-            });
-            let mut classes = vec![0u32; order.len()];
-            // Class 0 is kept for the empty key (indices without a key).
-            let mut class = 0u32;
-            let mut previous: Option<&[PaintOrderLevel]> = None;
-            for &index in &order {
-                let key = self.paint_order_key(index as usize);
-                if previous != Some(key) {
-                    if !(previous.is_none() && key.is_empty()) {
-                        class += 1;
-                    }
-                    previous = Some(key);
-                }
-                classes[index as usize] = class;
-            }
-            classes
-        });
+        let classes = self
+            .paint_classes
+            .get_or_init(|| paint_classes_for(&self.paint_order));
         // Indices without a node have the empty key.
         classes.get(index).copied().unwrap_or(0)
     }
@@ -3780,9 +3761,116 @@ fn establishes_stacking_context(node: &PaintNode) -> bool {
                 || specifies_z_index()))
 }
 
+/// Indices of `classes` ordered by class, equal classes in index order.
+pub(crate) fn stable_order_by_class(classes: &[usize]) -> Vec<usize> {
+    let buckets = classes.iter().copied().max().map_or(0, |max| max + 1);
+    let mut starts = vec![0usize; buckets + 1];
+    for &class in classes {
+        starts[class + 1] += 1;
+    }
+    for bucket in 0..buckets {
+        starts[bucket + 1] += starts[bucket];
+    }
+    let mut order = vec![0usize; classes.len()];
+    for (index, &class) in classes.iter().enumerate() {
+        order[starts[class]] = index;
+        starts[class] += 1;
+    }
+    order
+}
+
+/// `items` in paint order (stable), by the paint-order class of each item's
+/// node; a counting sort, since classes are dense ranks.
+pub(crate) fn sort_by_paint_order<T>(
+    artifact: &PaintArtifact,
+    items: Vec<T>,
+    node_index: impl Fn(&T) -> usize,
+) -> Vec<T> {
+    let classes = items
+        .iter()
+        .map(|item| artifact.paint_order_class(node_index(item)) as usize)
+        .collect::<Vec<_>>();
+    let order = stable_order_by_class(&classes);
+    let mut slots = items.into_iter().map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .map(|index| slots[index].take().expect("each index once"))
+        .collect()
+}
+
+thread_local! {
+    /// The last paint-order keys this thread ranked and their classes. A
+    /// frame whose stacking structure did not change has the same keys as
+    /// the frame before it, and comparing the keys is far cheaper than
+    /// sorting them again (like Blink keeping paint order until a paint
+    /// layer's z-order lists are dirtied).
+    static PAINT_CLASS_MEMO: std::cell::RefCell<(Vec<Vec<PaintOrderLevel>>, Vec<u32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+fn paint_class_memo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("W3COS_PAINT_CLASS_MEMO").map_or(true, |v| v != "0"))
+}
+
+/// Per node, a rank that orders nodes as their paint-order keys do and is
+/// equal exactly for equal keys; 0 is the empty key's.
+fn paint_classes_for(paint_order: &Vec<Vec<PaintOrderLevel>>) -> Vec<u32> {
+    if !paint_class_memo_enabled() {
+        return rank_paint_order(paint_order);
+    }
+    PAINT_CLASS_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.0 != *paint_order || memo.1.len() != paint_order.len() {
+            memo.1 = rank_paint_order(paint_order);
+            // Reuses the per-node key allocations of the previous frame.
+            memo.0.clone_from(paint_order);
+        }
+        memo.1.clone()
+    })
+}
+
+fn rank_paint_order(paint_order: &[Vec<PaintOrderLevel>]) -> Vec<u32> {
+    let key = |index: u32| paint_order[index as usize].as_slice();
+    let mut order: Vec<u32> = (0..paint_order.len() as u32).collect();
+    order.sort_by(|left, right| key(*left).cmp(key(*right)));
+    let mut classes = vec![0u32; order.len()];
+    // Class 0 is kept for the empty key (indices without a key).
+    let mut class = 0u32;
+    let mut previous: Option<&[PaintOrderLevel]> = None;
+    for &index in &order {
+        let key = key(index);
+        if previous != Some(key) {
+            if !(previous.is_none() && key.is_empty()) {
+                class += 1;
+            }
+            previous = Some(key);
+        }
+        classes[index as usize] = class;
+    }
+    classes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_paint_classes_match_a_fresh_ranking() {
+        let first: Vec<Vec<PaintOrderLevel>> = vec![
+            vec![(0, 0, 0)],
+            vec![],
+            vec![(0, 0, 0), (1, 2, 3)],
+            vec![(0, -1, 4)],
+            vec![(0, 0, 0)],
+        ];
+        let mut second = first.clone();
+        second[3] = vec![(0, 5, 4)];
+        for keys in [&first, &first, &second, &second, &first] {
+            assert_eq!(paint_classes_for(keys), rank_paint_order(keys));
+        }
+        assert_eq!(rank_paint_order(&first), vec![2, 0, 3, 1, 2]);
+    }
 
     #[test]
     fn plain_paint_nodes_share_component_styles() {

@@ -843,17 +843,22 @@ fn moved_by(
 
 pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
     let mut layers = Vec::new();
-    let mut chunk_ids = (0..artifact.chunks.len()).collect::<Vec<_>>();
-    // Stable: chunks of equal paint order keep their order.
-    chunk_ids.sort_by_cached_key(|chunk_id| {
-        let client_index = artifact
-            .chunks
-            .get(*chunk_id)
-            .and_then(|chunk| artifact.display_items.get(chunk.begin))
-            .map(|item| item.client_index)
-            .unwrap_or(usize::MAX);
-        artifact.paint_order_class(client_index)
-    });
+    // Stable: chunks of equal paint order keep their order. Paint-order
+    // classes are dense ranks below the node count, so a counting sort
+    // orders the chunks in linear time.
+    let classes = artifact
+        .chunks
+        .iter()
+        .map(|chunk| {
+            let client_index = artifact
+                .display_items
+                .get(chunk.begin)
+                .map(|item| item.client_index)
+                .unwrap_or(usize::MAX);
+            artifact.paint_order_class(client_index) as usize
+        })
+        .collect::<Vec<_>>();
+    let chunk_ids = crate::paint_artifact::stable_order_by_class(&classes);
     for chunk_id in chunk_ids {
         let chunk = &artifact.chunks[chunk_id];
         let sticky = artifact
@@ -1230,6 +1235,18 @@ mod tests {
     use w3cos_std::style::{Float, Overflow, Position, Style, Transform2D};
 
     use crate::paint_artifact::PaintNode;
+
+    #[test]
+    fn counting_order_matches_a_stable_sort_by_class() {
+        let classes = [3usize, 0, 2, 3, 1, 0, 2, 2, 5, 0];
+        let mut expected = (0..classes.len()).collect::<Vec<_>>();
+        expected.sort_by_key(|&index| classes[index]);
+        assert_eq!(
+            crate::paint_artifact::stable_order_by_class(&classes),
+            expected
+        );
+        assert!(crate::paint_artifact::stable_order_by_class(&[]).is_empty());
+    }
 
     #[test]
     fn outline_color_and_line_style_invalidate_paint_fingerprint() {
