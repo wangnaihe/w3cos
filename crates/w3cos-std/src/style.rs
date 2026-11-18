@@ -136,8 +136,10 @@ impl Clone for CustomPropertyData {
     }
 }
 
-/// One of 63 bits from a key's length and two of its bytes.
-fn key_bit(key: &str) -> u64 {
+/// One of 63 bits from a key's length and two of its bytes. `const` and
+/// inlined so a literal key's bit folds to a constant at the call site.
+#[inline]
+const fn key_bit(key: &str) -> u64 {
     let bytes = key.as_bytes();
     let n = bytes.len();
     let (last, mid) = if n == 0 {
@@ -172,7 +174,18 @@ impl CustomProperties {
     }
 
     /// False only when `key` is certainly absent (no hashing or probing).
+    #[inline]
     pub fn may_contain(&self, key: &str) -> bool {
+        let bit = key_bit(key);
+        let filter = self.0.filter.load(std::sync::atomic::Ordering::Relaxed);
+        if filter != 0 {
+            return filter & bit != 0;
+        }
+        self.may_contain_slow(bit)
+    }
+
+    #[cold]
+    fn may_contain_slow(&self, bit: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let mut filter = self.0.filter.load(Relaxed);
         if filter == 0 {
@@ -183,7 +196,7 @@ impl CustomProperties {
                 .fold(FILTER_READY, |bits, key| bits | key_bit(key));
             self.0.filter.store(filter, Relaxed);
         }
-        filter & key_bit(key) != 0
+        filter & bit != 0
     }
 
     fn map_mut(&mut self) -> &mut CustomPropertyMap {

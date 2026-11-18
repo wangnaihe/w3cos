@@ -11,8 +11,10 @@ const FIXED_BACKGROUND_POSITION: &str = "--w3cos-internal-fixed-background-posit
 /// Whether `annotate_fixed_background_viewport` may write to `style`.
 pub(crate) fn fixed_background_viewport_touches(style: &Style) -> bool {
     style.custom_properties.as_ref().is_some_and(|properties| {
-        properties.contains_key(FIXED_BACKGROUND_VIEWPORT)
-            || properties.contains_key(FIXED_BACKGROUND_POSITION)
+        (properties.may_contain(FIXED_BACKGROUND_VIEWPORT)
+            && properties.contains_key(FIXED_BACKGROUND_VIEWPORT))
+            || (properties.may_contain(FIXED_BACKGROUND_POSITION)
+                && properties.contains_key(FIXED_BACKGROUND_POSITION))
     }) || style
         .background_attachment
         .as_deref()

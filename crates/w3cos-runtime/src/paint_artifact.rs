@@ -19,6 +19,86 @@ pub type PropertyNodeId = usize;
 pub type PaintChunkId = usize;
 pub type PaintOrderLevel = (u8, i32, usize);
 
+/// Every node's paint-order key, stored back to back: a key is its paint
+/// context owner's key prefix plus one or two levels, so one buffer per
+/// artifact replaces one allocation per node.
+#[derive(Debug, Default, PartialEq)]
+pub struct PaintOrderKeys {
+    levels: Vec<PaintOrderLevel>,
+    /// Per node: start and length in `levels`.
+    spans: Vec<(u32, u32)>,
+}
+
+impl Clone for PaintOrderKeys {
+    fn clone(&self) -> Self {
+        Self {
+            levels: self.levels.clone(),
+            spans: self.spans.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.levels.clone_from(&source.levels);
+        self.spans.clone_from(&source.spans);
+    }
+}
+
+impl PaintOrderKeys {
+    pub const fn new() -> Self {
+        Self {
+            levels: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    pub fn with_len(len: usize) -> Self {
+        Self {
+            levels: Vec::with_capacity(len * 4),
+            spans: vec![(0, 0); len],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&[PaintOrderLevel]> {
+        let &(start, len) = self.spans.get(index)?;
+        Some(&self.levels[start as usize..(start + len) as usize])
+    }
+
+    /// The key of `index`; empty when it has none.
+    pub fn key(&self, index: usize) -> &[PaintOrderLevel] {
+        self.get(index).unwrap_or(&[])
+    }
+
+    /// Sets the key of `index` to the first `prefix.1` levels of node
+    /// `prefix.0`'s key followed by `tail`.
+    pub fn set(&mut self, index: usize, prefix: Option<(usize, usize)>, tail: &[PaintOrderLevel]) {
+        let start = self.levels.len();
+        if let Some((owner, len)) = prefix {
+            let owner_start = self.spans[owner].0 as usize;
+            self.levels
+                .extend_from_within(owner_start..owner_start + len);
+        }
+        self.levels.extend_from_slice(tail);
+        self.spans[index] = (start as u32, (self.levels.len() - start) as u32);
+    }
+
+    #[cfg(test)]
+    pub fn from_keys(keys: &[Vec<PaintOrderLevel>]) -> Self {
+        let mut out = Self::with_len(keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            out.set(index, None, key);
+        }
+        out
+    }
+}
+
 #[derive(Clone)]
 pub struct PaintNode {
     pub kind: ComponentKind,
@@ -33,10 +113,10 @@ pub struct PaintNode {
 impl PaintNode {
     /// UA paint children are appended after all DOM/layout source nodes.
     pub(crate) fn is_paint_only(&self) -> bool {
-        self.style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|p| p.contains_key("--w3cos-internal-media-controls-layer"))
+        self.style.custom_properties.as_ref().is_some_and(|p| {
+            const KEY: &str = "--w3cos-internal-media-controls-layer";
+            p.may_contain(KEY) && p.contains_key(KEY)
+        })
     }
 }
 
@@ -327,7 +407,7 @@ pub struct PaintArtifact {
     /// stationary while its contents can scroll in a separate layer.
     pub self_clip: Vec<PropertyNodeId>,
     pub z_order: Vec<i32>,
-    pub paint_order: Vec<Vec<PaintOrderLevel>>,
+    pub paint_order: PaintOrderKeys,
     /// Per node, a rank that orders nodes as `paint_order_key` does and is
     /// equal exactly for equal keys; 0 is the empty key's (built on first
     /// use; see [`PaintArtifact::paint_order_class`]).
@@ -364,7 +444,7 @@ impl Default for PaintArtifact {
             node_properties: Vec::new(),
             self_clip: Vec::new(),
             z_order: Vec::new(),
-            paint_order: Vec::new(),
+            paint_order: PaintOrderKeys::default(),
             paint_classes: std::sync::OnceLock::new(),
             logical_paint_ordinals: Vec::new(),
             sticky_owner: Vec::new(),
@@ -377,13 +457,16 @@ impl Default for PaintArtifact {
     }
 }
 
+const BIDI_LOGICAL_ORDER: &str = "--w3cos-internal-bidi-logical-order";
+
 fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
     let rank = |index: usize| {
         nodes[index]
             .style
             .custom_properties
             .as_ref()
-            .and_then(|properties| properties.get("--w3cos-internal-bidi-logical-order"))
+            .filter(|properties| properties.may_contain(BIDI_LOGICAL_ORDER))
+            .and_then(|properties| properties.get(BIDI_LOGICAL_ORDER))
             .and_then(|value| value.parse::<usize>().ok())
     };
     let mut ordinals: Vec<_> = (0..nodes.len()).collect();
@@ -421,22 +504,36 @@ struct AppendMemo {
     fixed_owner: Vec<Option<usize>>,
     /// Nearest ancestor-or-self whose paint order key children extend.
     context_owner: Vec<Option<usize>>,
+    /// Per node: a split positioned inline fragment (looked up once; the
+    /// paint order key reads it several times per node).
+    split_owner: Vec<bool>,
+    /// Per appended node: it owns a paint context (its key ends with its
+    /// own background level).
+    owns_context: Vec<bool>,
 }
 
 impl AppendMemo {
-    fn with_len(len: usize) -> Self {
+    fn new(nodes: &[PaintNode]) -> Self {
+        let len = nodes.len();
         Self {
             fixed_owner: vec![None; len],
             context_owner: vec![None; len],
+            split_owner: nodes
+                .iter()
+                .map(|node| split_positioned_inline_owner(node).is_some())
+                .collect(),
+            owns_context: vec![false; len],
         }
     }
 }
 
 fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
+    const KEY: &str = "--w3cos-internal-positioned-inline-owner";
     node.style
         .custom_properties
-        .as_ref()?
-        .get("--w3cos-internal-positioned-inline-owner")
+        .as_ref()
+        .filter(|properties| properties.may_contain(KEY))?
+        .get(KEY)
         .map(String::as_str)
         .filter(|owner| !owner.is_empty())
 }
@@ -870,6 +967,13 @@ fn trim_collapsible_inline_whitespace_at_line_start(
         {
             continue;
         }
+        // Only text that starts with collapsible white space changes: test
+        // that before the line-start geometry.
+        const COLLAPSIBLE: [char; 5] = [' ', '\t', '\n', '\r', '\u{000c}'];
+        if !matches!(&node.kind, ComponentKind::Text { content } if content.starts_with(COLLAPSIBLE))
+        {
+            continue;
+        }
         let (Some(mut parent), Some(rect)) =
             (node.parent, rect_by_index.get(index).copied().flatten())
         else {
@@ -899,7 +1003,7 @@ fn trim_collapsible_inline_whitespace_at_line_start(
         let ComponentKind::Text { content } = &mut node.kind else {
             continue;
         };
-        let trimmed = content.trim_start_matches([' ', '\t', '\n', '\r', '\u{000c}']);
+        let trimmed = content.trim_start_matches(COLLAPSIBLE);
         if trimmed.len() != content.len() {
             let removed = content.len() - trimmed.len();
             let ends = w3cos_std::inline_text::fragment_ends(content, &node.style);
@@ -2667,7 +2771,7 @@ impl PaintArtifact {
     }
 
     pub fn paint_order_key(&self, index: usize) -> &[PaintOrderLevel] {
-        self.paint_order.get(index).map_or(&[], Vec::as_slice)
+        self.paint_order.get(index).unwrap_or(&[])
     }
 
     /// `paint_order_key` as one integer: comparing two classes compares the
@@ -3047,7 +3151,7 @@ impl PaintArtifact {
             node_properties: vec![PaintProperties::default(); nodes.len()],
             self_clip: vec![0; nodes.len()],
             z_order: vec![0; nodes.len()],
-            paint_order: vec![Vec::new(); nodes.len()],
+            paint_order: PaintOrderKeys::with_len(nodes.len()),
             sticky_owner: vec![None; nodes.len()],
             nodes,
             canvas_background,
@@ -3085,7 +3189,7 @@ impl PaintArtifact {
                 .collect();
         }
 
-        let mut memo = AppendMemo::with_len(artifact.nodes.len());
+        let mut memo = AppendMemo::new(&artifact.nodes);
         for index in 0..artifact.nodes.len() {
             artifact.append_node(index, &mut memo);
         }
@@ -3301,13 +3405,15 @@ impl PaintArtifact {
         let owns_context = node.parent.is_none()
             || establishes_stacking_context(node)
             || is_positioned(&node.style)
-            || split_positioned_inline_owner(node).is_some();
+            || memo.split_owner[index];
+        memo.owns_context[index] = owns_context;
         memo.context_owner[index] = if owns_context {
             Some(index)
         } else {
             node.parent.and_then(|parent| memo.context_owner[parent])
         };
-        self.paint_order[index] = self.hierarchical_paint_order(index, &memo.context_owner);
+        let (prefix, tail, tail_len) = self.hierarchical_paint_order(index, memo);
+        self.paint_order.set(index, prefix, &tail[..tail_len]);
         self.paint_classes = std::sync::OnceLock::new();
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
@@ -3521,14 +3627,17 @@ impl PaintArtifact {
         }
     }
 
+    /// A node's paint-order key: a prefix of its paint context owner's key
+    /// (owner, length) followed by `tail[..len]`.
     fn hierarchical_paint_order(
         &self,
         index: usize,
-        context_owner: &[Option<usize>],
-    ) -> Vec<PaintOrderLevel> {
+        memo: &AppendMemo,
+    ) -> (Option<(usize, usize)>, [PaintOrderLevel; 2], usize) {
         let node = &self.nodes[index];
+        let background = (0, i32::MIN, index);
         if node.parent.is_none() {
-            return vec![(0, i32::MIN, index)];
+            return (None, [background, background], 1);
         }
 
         // Auto positioned boxes group their normal contents, but positioned
@@ -3544,50 +3653,36 @@ impl PaintArtifact {
                 parent = self.nodes[current].parent;
             }
         }
-        let mut key = parent
-            .and_then(|parent| self.paint_context_prefix(parent, context_owner))
-            .unwrap_or_default();
-        key.push(self.local_paint_order_level(index));
-        if establishes_stacking_context(node)
-            || is_positioned(&node.style)
-            || split_positioned_inline_owner(node).is_some()
-        {
+        let prefix = parent.and_then(|parent| self.paint_context_prefix(parent, memo));
+        let local = self.local_paint_order_level(index, memo.split_owner[index]);
+        if memo.owns_context[index] {
             // A context's own background is the first item inside that
             // context. Descendant keys extend the prefix before adding their
             // local CSS2 paint phase.
-            key.push((0, i32::MIN, index));
+            (prefix, [local, background], 2)
+        } else {
+            (prefix, [local, background], 1)
         }
-        key
     }
 
     /// The key prefix a child of `index` extends: the key of the nearest
     /// ancestor-or-self that owns a paint context, without that owner's own
-    /// background level. `context_owner` caches that owner per appended node.
-    fn paint_context_prefix(
-        &self,
-        index: usize,
-        context_owner: &[Option<usize>],
-    ) -> Option<Vec<PaintOrderLevel>> {
-        let owner = (*context_owner.get(index)?)?;
-        let node = self.nodes.get(owner)?;
-        let mut key = self.paint_order.get(owner)?.clone();
-        if establishes_stacking_context(node)
-            || is_positioned(&node.style)
-            || split_positioned_inline_owner(node).is_some()
-        {
-            key.pop();
-        }
-        Some(key)
+    /// background level, as the owner and the prefix length.
+    fn paint_context_prefix(&self, index: usize, memo: &AppendMemo) -> Option<(usize, usize)> {
+        let owner = (*memo.context_owner.get(index)?)?;
+        let owner_key = self.paint_order.get(owner)?;
+        let len = owner_key.len() - usize::from(memo.owns_context[owner] && !owner_key.is_empty());
+        Some((owner, len))
     }
 
-    fn local_paint_order_level(&self, index: usize) -> PaintOrderLevel {
+    fn local_paint_order_level(&self, index: usize, split_owner: bool) -> PaintOrderLevel {
         let node = &self.nodes[index];
         let ordinal = self
             .logical_paint_ordinals
             .get(index)
             .copied()
             .unwrap_or(index);
-        if split_positioned_inline_owner(node).is_some() {
+        if split_owner {
             // A lowered static float can have a zero visual offset. It still
             // belongs to its positioned inline owner, without changing flow.
             return (4, 0, ordinal);
@@ -3804,8 +3899,8 @@ thread_local! {
     /// the frame before it, and comparing the keys is far cheaper than
     /// sorting them again (like Blink keeping paint order until a paint
     /// layer's z-order lists are dirtied).
-    static PAINT_CLASS_MEMO: std::cell::RefCell<(Vec<Vec<PaintOrderLevel>>, Vec<u32>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static PAINT_CLASS_MEMO: std::cell::RefCell<(PaintOrderKeys, Vec<u32>)> =
+        const { std::cell::RefCell::new((PaintOrderKeys::new(), Vec::new())) };
 }
 
 fn paint_class_memo_enabled() -> bool {
@@ -3815,7 +3910,7 @@ fn paint_class_memo_enabled() -> bool {
 
 /// Per node, a rank that orders nodes as their paint-order keys do and is
 /// equal exactly for equal keys; 0 is the empty key's.
-fn paint_classes_for(paint_order: &Vec<Vec<PaintOrderLevel>>) -> Vec<u32> {
+fn paint_classes_for(paint_order: &PaintOrderKeys) -> Vec<u32> {
     if !paint_class_memo_enabled() {
         return rank_paint_order(paint_order);
     }
@@ -3830,8 +3925,8 @@ fn paint_classes_for(paint_order: &Vec<Vec<PaintOrderLevel>>) -> Vec<u32> {
     })
 }
 
-fn rank_paint_order(paint_order: &[Vec<PaintOrderLevel>]) -> Vec<u32> {
-    let key = |index: u32| paint_order[index as usize].as_slice();
+fn rank_paint_order(paint_order: &PaintOrderKeys) -> Vec<u32> {
+    let key = |index: u32| paint_order.key(index as usize);
     let mut order: Vec<u32> = (0..paint_order.len() as u32).collect();
     order.sort_by(|left, right| key(*left).cmp(key(*right)));
     let mut classes = vec![0u32; order.len()];
@@ -3856,6 +3951,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paint_order_keys_extend_an_owner_prefix() {
+        let mut keys = PaintOrderKeys::with_len(4);
+        keys.set(0, None, &[(0, i32::MIN, 0)]);
+        keys.set(1, Some((0, 1)), &[(4, 0, 1), (0, i32::MIN, 1)]);
+        keys.set(3, Some((1, 2)), &[(2, 0, 3)]);
+        assert_eq!(keys.key(0), &[(0, i32::MIN, 0)]);
+        assert_eq!(
+            keys.key(1),
+            &[(0, i32::MIN, 0), (4, 0, 1), (0, i32::MIN, 1)]
+        );
+        assert_eq!(keys.key(2), &[] as &[PaintOrderLevel]);
+        assert_eq!(keys.key(3), &[(0, i32::MIN, 0), (4, 0, 1), (2, 0, 3)]);
+        assert_eq!(keys.get(4), None);
+        let mut copy = PaintOrderKeys::new();
+        copy.clone_from(&keys);
+        assert_eq!(copy, keys);
+    }
+
+    #[test]
     fn remembered_paint_classes_match_a_fresh_ranking() {
         let first: Vec<Vec<PaintOrderLevel>> = vec![
             vec![(0, 0, 0)],
@@ -3866,10 +3980,13 @@ mod tests {
         ];
         let mut second = first.clone();
         second[3] = vec![(0, 5, 4)];
+        let first = PaintOrderKeys::from_keys(&first);
+        let second = PaintOrderKeys::from_keys(&second);
         for keys in [&first, &first, &second, &second, &first] {
             assert_eq!(paint_classes_for(keys), rank_paint_order(keys));
         }
         assert_eq!(rank_paint_order(&first), vec![2, 0, 3, 1, 2]);
+        assert_eq!(rank_paint_order(&second), vec![1, 0, 2, 3, 1]);
     }
 
     #[test]

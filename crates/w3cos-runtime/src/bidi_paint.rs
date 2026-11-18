@@ -26,7 +26,13 @@ fn foreground(style: &Style) -> Style {
 }
 
 fn eligible(kind: &ComponentKind, style: &Style) -> bool {
+    // Only text carrying a logical order marker (a normalized bidi run)
+    // qualifies: test that first, through the map's key filter, so other
+    // text skips the style checks below without hashing the key.
     matches!(kind, ComponentKind::Text { .. })
+        && style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.may_contain(LOGICAL_ORDER) && properties.contains_key(LOGICAL_ORDER)
+        })
         && style.position == Position::Static
         && style.float == w3cos_std::style::Float::None
         && style.opacity == 1.0
@@ -53,10 +59,6 @@ fn eligible(kind: &ComponentKind, style: &Style) -> bool {
         ]
         .into_iter()
         .all(|width| width.unwrap_or(0.0) == 0.0)
-        && style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| properties.contains_key(LOGICAL_ORDER))
 }
 
 pub(crate) fn replay<'a>(nodes: &[InputNode<'a>], artifact: &PaintArtifact) -> Vec<ReplayNode<'a>> {

@@ -527,13 +527,24 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
     // Inherited custom properties share one map across many boxes: scan
     // each map once per diff.
     let url_maps = std::cell::RefCell::new(w3cos_std::fxhash::FxHashMap::<usize, bool>::default());
+    // Siblings usually share their parent's map: check the last one first.
+    let last_url_map = std::cell::Cell::new((usize::MAX, false));
     let has_url = |properties: &w3cos_std::style::CustomProperties| {
         let key = properties.identity();
-        if let Some(&known) = url_maps.borrow().get(&key) {
-            return known;
+        let (last_key, last_found) = last_url_map.get();
+        if last_key == key {
+            return last_found;
         }
-        let found = properties.values().any(|value| value.contains("url("));
-        url_maps.borrow_mut().insert(key, found);
+        let found = match url_maps.borrow().get(&key) {
+            Some(&known) => Some(known),
+            None => None,
+        };
+        let found = found.unwrap_or_else(|| {
+            let found = properties.values().any(|value| value.contains("url("));
+            url_maps.borrow_mut().insert(key, found);
+            found
+        });
+        last_url_map.set((key, found));
         found
     };
     let volatile = |b: &crate::paint_artifact::PaintNode| {
