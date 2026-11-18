@@ -415,6 +415,23 @@ fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
     ordinals
 }
 
+/// Per-build ancestor lookups for `append_node`, filled in preorder.
+struct AppendMemo {
+    /// Nearest ancestor-or-self that is a fixed box with `z-index: auto`.
+    fixed_owner: Vec<Option<usize>>,
+    /// Nearest ancestor-or-self whose paint order key children extend.
+    context_owner: Vec<Option<usize>>,
+}
+
+impl AppendMemo {
+    fn with_len(len: usize) -> Self {
+        Self {
+            fixed_owner: vec![None; len],
+            context_owner: vec![None; len],
+        }
+    }
+}
+
 fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
     node.style
         .custom_properties
@@ -812,10 +829,18 @@ fn project_collapsed_table_tracks_to_cells(nodes: &mut [PaintNode]) {
         }
         None
     }
+    // A table projects its columns only when one of them is collapsed; with
+    // no collapsed column anywhere every table below would be skipped.
+    let any_collapsed_column = nodes.iter().any(|node| {
+        node.style.display == Display::TableColumn && node.style.visibility == Visibility::Collapse
+    });
     let tables = nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| matches!(node.style.display, Display::Table | Display::InlineTable))
+        .filter(|(_, node)| {
+            any_collapsed_column
+                && matches!(node.style.display, Display::Table | Display::InlineTable)
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     for table in tables {
@@ -991,6 +1016,10 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
             .or_insert_with(|| NAMES[side].to_string());
     }
 
+    // Every pass below starts from a box in the collapsing border model.
+    if !nodes.iter().any(|node| node.style.border_collapse) {
+        return;
+    }
     let rows = nodes
         .iter()
         .enumerate()
@@ -2826,8 +2855,9 @@ impl PaintArtifact {
                 .collect();
         }
 
+        let mut memo = AppendMemo::with_len(artifact.nodes.len());
         for index in 0..artifact.nodes.len() {
-            artifact.append_node(index);
+            artifact.append_node(index, &mut memo);
         }
         artifact
     }
@@ -2947,8 +2977,9 @@ impl PaintArtifact {
         if fragmented { fragments } else { Vec::new() }
     }
 
-    fn append_node(&mut self, index: usize) {
+    fn append_node(&mut self, index: usize, memo: &mut AppendMemo) {
         let node = &self.nodes[index];
+        debug_assert!(node.parent.is_none_or(|parent| parent < index));
         let mut inherited = node
             .parent
             .and_then(|parent| self.node_properties.get(parent).copied())
@@ -3021,28 +3052,32 @@ impl PaintArtifact {
         // A fixed-positioned box establishes a stacking context even when
         // z-index is auto. Negative descendants therefore paint above the
         // fixed box's own background instead of escaping behind it.
-        let fixed_context_floor = node.parent.and_then(|mut ancestor| {
-            loop {
-                let ancestor_node = &self.nodes[ancestor];
-                if matches!(ancestor_node.style.position, Position::Fixed)
-                    && ancestor_node.style.z_index == 0
-                {
-                    break self
-                        .z_order
-                        .get(ancestor)
-                        .copied()
-                        .map(|z| z.saturating_add(1));
-                }
-                match ancestor_node.parent {
-                    Some(parent) => ancestor = parent,
-                    None => break None,
-                }
-            }
-        });
+        // Nodes append in preorder, so the nearest fixed auto ancestor is the
+        // parent's (or the parent itself); no per-node ancestor walk.
+        let fixed_context_floor = node
+            .parent
+            .and_then(|parent| memo.fixed_owner[parent])
+            .and_then(|ancestor| self.z_order.get(ancestor).copied())
+            .map(|z| z.saturating_add(1));
         if let Some(floor) = fixed_context_floor {
             self.z_order[index] = self.z_order[index].max(floor);
         }
-        self.paint_order[index] = self.hierarchical_paint_order(index);
+        memo.fixed_owner[index] =
+            if matches!(node.style.position, Position::Fixed) && node.style.z_index == 0 {
+                Some(index)
+            } else {
+                node.parent.and_then(|parent| memo.fixed_owner[parent])
+            };
+        let owns_context = node.parent.is_none()
+            || establishes_stacking_context(node)
+            || is_positioned(&node.style)
+            || split_positioned_inline_owner(node).is_some();
+        memo.context_owner[index] = if owns_context {
+            Some(index)
+        } else {
+            node.parent.and_then(|parent| memo.context_owner[parent])
+        };
+        self.paint_order[index] = self.hierarchical_paint_order(index, &memo.context_owner);
         self.paint_classes = std::sync::OnceLock::new();
         self.sticky_owner[index] = if matches!(node.style.position, Position::Sticky) {
             Some(index)
@@ -3256,7 +3291,11 @@ impl PaintArtifact {
         }
     }
 
-    fn hierarchical_paint_order(&self, index: usize) -> Vec<PaintOrderLevel> {
+    fn hierarchical_paint_order(
+        &self,
+        index: usize,
+        context_owner: &[Option<usize>],
+    ) -> Vec<PaintOrderLevel> {
         let node = &self.nodes[index];
         if node.parent.is_none() {
             return vec![(0, i32::MIN, index)];
@@ -3276,7 +3315,7 @@ impl PaintArtifact {
             }
         }
         let mut key = parent
-            .and_then(|parent| self.paint_context_prefix(parent))
+            .and_then(|parent| self.paint_context_prefix(parent, context_owner))
             .unwrap_or_default();
         key.push(self.local_paint_order_level(index));
         if establishes_stacking_context(node)
@@ -3291,24 +3330,24 @@ impl PaintArtifact {
         key
     }
 
-    fn paint_context_prefix(&self, index: usize) -> Option<Vec<PaintOrderLevel>> {
-        let node = self.nodes.get(index)?;
-        if node.parent.is_none()
-            || establishes_stacking_context(node)
+    /// The key prefix a child of `index` extends: the key of the nearest
+    /// ancestor-or-self that owns a paint context, without that owner's own
+    /// background level. `context_owner` caches that owner per appended node.
+    fn paint_context_prefix(
+        &self,
+        index: usize,
+        context_owner: &[Option<usize>],
+    ) -> Option<Vec<PaintOrderLevel>> {
+        let owner = (*context_owner.get(index)?)?;
+        let node = self.nodes.get(owner)?;
+        let mut key = self.paint_order.get(owner)?.clone();
+        if establishes_stacking_context(node)
             || is_positioned(&node.style)
             || split_positioned_inline_owner(node).is_some()
         {
-            let mut key = self.paint_order.get(index)?.clone();
-            if establishes_stacking_context(node)
-                || is_positioned(&node.style)
-                || split_positioned_inline_owner(node).is_some()
-            {
-                key.pop();
-            }
-            return Some(key);
+            key.pop();
         }
-        node.parent
-            .and_then(|parent| self.paint_context_prefix(parent))
+        Some(key)
     }
 
     fn local_paint_order_level(&self, index: usize) -> PaintOrderLevel {
