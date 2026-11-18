@@ -189,7 +189,7 @@ mod tests {
         .enumerate()
         .map(|(index, display)| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 background: if index == 2 {
@@ -205,7 +205,8 @@ mod tests {
                     Position::Static
                 },
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: match index {
                 0 => None,
                 1 => Some(0),
@@ -239,7 +240,7 @@ mod tests {
                     index,
                     artifact.rect_by_index[index].unwrap(),
                     &node.kind,
-                    &node.style,
+                    node.style.as_style(),
                 )
             })
             .collect::<Vec<_>>();
@@ -275,7 +276,7 @@ mod tests {
                     index,
                     artifact.rect_by_index[index].unwrap(),
                     &node.kind,
-                    &node.style,
+                    node.style.as_style(),
                 )
             })
             .collect::<Vec<_>>();

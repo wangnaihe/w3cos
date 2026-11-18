@@ -35256,7 +35256,7 @@ mod tests {
             crate::paint_artifact::PaintArtifact::build_with_body_background_and_viewport(
                 flat.iter().map(|node| crate::paint_artifact::PaintNode {
                     kind: node.kind.clone(),
-                    style: node.style.clone(),
+                    style: node.style.clone().into(),
                     parent: node.parent,
                     sticky_counter_signal: node.sticky_counter_signal,
                 }),

@@ -618,7 +618,7 @@ mod tests {
             };
             let mut nodes = vec![PaintNode {
                 kind: ComponentKind::Row,
-                style: parent,
+                style: parent.into(),
                 parent: None,
                 sticky_counter_signal: None,
             }];
@@ -640,7 +640,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: (*text).into(),
                     },
-                    style: child.clone(),
+                    style: child.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 });

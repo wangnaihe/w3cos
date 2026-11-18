@@ -266,7 +266,7 @@ fn finish_headless_frame(
     let mut artifact = PaintArtifact::build_with_body_background_and_viewport(
         flat.iter().map(|node| PaintNode {
             kind: node.kind.clone(),
-            style: node.style.clone(),
+            style: crate::paint_artifact::shared_paint_style(node.component, node.style),
             parent: node.parent,
             sticky_counter_signal: node.sticky_counter_signal,
         }),
@@ -284,7 +284,7 @@ fn finish_headless_frame(
         .filter_map(|(index, rect)| {
             let rect = (*rect)?;
             let node = artifact.nodes.get(index)?;
-            Some((index, rect, &node.kind, &node.style))
+            Some((index, rect, &node.kind, node.style.as_style()))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
     nodes.sort_by_cached_key(|(index, _, _, _)| artifact.paint_order_class(*index));
@@ -511,7 +511,7 @@ fn paint_retained_artifact(
         .filter_map(|(index, rect)| {
             let rect = (*rect)?;
             let node = artifact.nodes.get(index)?;
-            Some((index, rect, &node.kind, &node.style))
+            Some((index, rect, &node.kind, node.style.as_style()))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
     nodes.sort_by_cached_key(|(index, _, _, _)| artifact.paint_order_class(*index));

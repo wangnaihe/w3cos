@@ -149,7 +149,7 @@ mod tests {
     fn fixture() -> (PaintArtifact, Vec<LayoutRect>) {
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Row,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -167,7 +167,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: content.to_string(),
                 },
-                style,
+                style: style.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
@@ -199,7 +199,7 @@ mod tests {
                     index,
                     rects[index],
                     &artifact.nodes[index].kind,
-                    &artifact.nodes[index].style,
+                    artifact.nodes[index].style.as_style(),
                 )
             })
             .collect();
@@ -231,7 +231,7 @@ mod tests {
                     index,
                     rects[index],
                     &artifact.nodes[index].kind,
-                    &artifact.nodes[index].style,
+                    artifact.nodes[index].style.as_style(),
                 )
             })
             .collect();

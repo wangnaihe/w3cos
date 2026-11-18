@@ -168,19 +168,19 @@ mod tests {
         let nodes = [
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: text("XXX-XXX"),
-                style: inline.clone(),
+                style: inline.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: text("after"),
-                style: inline.clone(),
+                style: inline.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -221,7 +221,7 @@ mod tests {
                     i,
                     artifact.rect_by_index[i].unwrap(),
                     &artifact.nodes[i].kind,
-                    &artifact.nodes[i].style,
+                    artifact.nodes[i].style.as_style(),
                 )
             })
             .collect();

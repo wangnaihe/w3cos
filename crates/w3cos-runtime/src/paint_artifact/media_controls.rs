@@ -37,7 +37,7 @@ pub(super) fn append(nodes: &mut Vec<PaintNode>, rects: &mut Vec<Option<LayoutRe
         };
         nodes.push(PaintNode {
             kind: ComponentKind::Box,
-            style,
+            style: style.into(),
             parent: Some(host),
             sticky_counter_signal: None,
         });
@@ -60,13 +60,13 @@ mod tests {
         let nodes = vec![
             PaintNode {
                 kind: ComponentKind::Root,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::InlineBlock,
                     opacity: 0.5,
                     overflow: Overflow::Hidden,
@@ -75,18 +75,20 @@ mod tests {
                         "no-source".into(),
                     )])),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::InlineBlock,
                     position: Position::Relative,
                     z_index: 1,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },

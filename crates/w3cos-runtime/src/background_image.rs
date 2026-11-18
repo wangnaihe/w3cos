@@ -8,6 +8,21 @@ const FIXED_BACKGROUND_POSITION: &str = "--w3cos-internal-fixed-background-posit
 
 /// Snapshot frame geometry before canvas propagation rewrites default origins.
 /// These private paint values are refreshed, not inherited from a prior frame.
+/// Whether `annotate_fixed_background_viewport` may write to `style`.
+pub(crate) fn fixed_background_viewport_touches(style: &Style) -> bool {
+    style.custom_properties.as_ref().is_some_and(|properties| {
+        properties.contains_key(FIXED_BACKGROUND_VIEWPORT)
+            || properties.contains_key(FIXED_BACKGROUND_POSITION)
+    }) || style
+        .background_attachment
+        .as_deref()
+        .is_some_and(|attachments| {
+            attachments
+                .split(',')
+                .any(|attachment| attachment.trim().eq_ignore_ascii_case("fixed"))
+        })
+}
+
 pub(crate) fn annotate_fixed_background_viewport(style: &mut Style, viewport: Option<(f32, f32)>) {
     if let Some(properties) = style.custom_properties.as_mut() {
         properties.remove(FIXED_BACKGROUND_VIEWPORT);
@@ -1850,16 +1865,17 @@ mod tests {
         let nodes = [
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     background: w3cos_std::color::Color::rgb(0, 0, 128),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     border_width: 3.0,
                     background_image: Some("linear-gradient(red, blue)".into()),
                     background_size: Some("17px 17px".into()),
@@ -1867,7 +1883,8 @@ mod tests {
                     background_position: Some("50% 50%".into()),
                     background_attachment: Some("fixed".into()),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },

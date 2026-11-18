@@ -8568,7 +8568,7 @@ mod tests {
                 [
                     PaintNode {
                         kind: ComponentKind::Root,
-                        style: Style::default(),
+                        style: Style::default().into(),
                         parent: None,
                         sticky_counter_signal: None,
                     },
@@ -8578,13 +8578,13 @@ mod tests {
                             placeholder: String::new(),
                             secure: false,
                         },
-                        style: textarea,
+                        style: textarea.into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
                     PaintNode {
                         kind: ComponentKind::Box,
-                        style: declaration.to_style(),
+                        style: declaration.to_style().into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
@@ -8629,7 +8629,7 @@ mod tests {
                         i,
                         artifact.rect_by_index[i].unwrap(),
                         &node.kind,
-                        &node.style,
+                        node.style.as_style(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -9013,19 +9013,19 @@ mod tests {
                 [
                     PaintNode {
                         kind: ComponentKind::Root,
-                        style: Style::default(),
+                        style: Style::default().into(),
                         parent: None,
                         sticky_counter_signal: None,
                     },
                     PaintNode {
                         kind: ComponentKind::Column,
-                        style: host_style,
+                        style: host_style.into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
                     PaintNode {
                         kind: ComponentKind::Box,
-                        style: oval_style,
+                        style: oval_style.into(),
                         parent: Some(1),
                         sticky_counter_signal: None,
                     },
@@ -9037,7 +9037,14 @@ mod tests {
                 .nodes
                 .iter()
                 .enumerate()
-                .map(|(i, n)| (i, artifact.rect_by_index[i].unwrap(), &n.kind, &n.style))
+                .map(|(i, n)| {
+                    (
+                        i,
+                        artifact.rect_by_index[i].unwrap(),
+                        &n.kind,
+                        n.style.as_style(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let metrics =
                 fontdue::Font::from_bytes(TEST_FONT, fontdue::FontSettings::default()).unwrap();
@@ -9125,16 +9132,17 @@ mod tests {
             [
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style {
+                    style: (Style {
                         filter: Some("blur(4px)".into()),
                         ..Style::default()
-                    },
+                    })
+                    .into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -9142,7 +9150,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "H".into(),
                     },
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: Some(1),
                     sticky_counter_signal: None,
                 },
@@ -9247,16 +9255,17 @@ mod tests {
             [
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style {
+                    style: (Style {
                         overflow: w3cos_std::style::Overflow::Hidden,
                         ..Style::default()
-                    },
+                    })
+                    .into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -9264,13 +9273,14 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "H".into(),
                     },
-                    style: Style {
+                    style: (Style {
                         display: Display::Block,
                         font_size: 4.0,
                         line_height: 1.0,
                         color: w3cos_std::Color::rgb(255, 0, 0),
                         ..Style::default()
-                    },
+                    })
+                    .into(),
                     parent: Some(1),
                     sticky_counter_signal: None,
                 },
@@ -9287,7 +9297,7 @@ mod tests {
                     index,
                     artifact.rect_by_index[index]?,
                     &node.kind,
-                    &node.style,
+                    node.style.as_style(),
                 ))
             })
             .collect::<Vec<_>>();
@@ -9478,19 +9488,21 @@ mod tests {
                 [
                     PaintNode {
                         kind: ComponentKind::Box,
-                        style: Style {
+                        style: (Style {
                             opacity,
                             ..Style::default()
-                        },
+                        })
+                        .into(),
                         parent: None,
                         sticky_counter_signal: None,
                     },
                     PaintNode {
                         kind: ComponentKind::Box,
-                        style: Style {
+                        style: (Style {
                             background: color,
                             ..Style::default()
-                        },
+                        })
+                        .into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
@@ -9502,7 +9514,7 @@ mod tests {
                 .nodes
                 .iter()
                 .enumerate()
-                .map(|(i, n)| (i, rect, &n.kind, &n.style))
+                .map(|(i, n)| (i, rect, &n.kind, n.style.as_style()))
                 .collect::<Vec<_>>();
             let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
             for _ in 0..2 {
@@ -9618,19 +9630,21 @@ mod tests {
                         [
                             PaintNode {
                                 kind: ComponentKind::Box,
-                                style: Style {
+                                style: (Style {
                                     opacity,
                                     ..Style::default()
-                                },
+                                })
+                                .into(),
                                 parent: None,
                                 sticky_counter_signal: None,
                             },
                             PaintNode {
                                 kind: ComponentKind::Box,
-                                style: Style {
+                                style: (Style {
                                     background: w3cos_std::Color::rgb(color[0], color[1], color[2]),
                                     ..Style::default()
-                                },
+                                })
+                                .into(),
                                 parent: Some(0),
                                 sticky_counter_signal: None,
                             },
@@ -9642,7 +9656,7 @@ mod tests {
                         .nodes
                         .iter()
                         .enumerate()
-                        .map(|(i, n)| (i, rect, &n.kind, &n.style))
+                        .map(|(i, n)| (i, rect, &n.kind, n.style.as_style()))
                         .collect::<Vec<_>>();
                     let mut rasterizer = SkiaRasterizer::new(TEST_FONT).unwrap();
                     let pixels = rasterizer
@@ -10378,13 +10392,13 @@ mod tests {
         };
         let mut artifact_nodes = vec![crate::paint_artifact::PaintNode {
             kind: root_kind.clone(),
-            style: root_style.clone(),
+            style: root_style.clone().into(),
             parent: None,
             sticky_counter_signal: None,
         }];
         artifact_nodes.extend((0..2).map(|i| crate::paint_artifact::PaintNode {
             kind: kinds[i].clone(),
-            style: styles[i].clone(),
+            style: (styles[i].clone()).into(),
             parent: Some(0),
             sticky_counter_signal: None,
         }));
@@ -10458,7 +10472,7 @@ mod tests {
         let artifact = PaintArtifact::build_with_body_background_and_viewport(
             flat.iter().map(|node| crate::paint_artifact::PaintNode {
                 kind: node.kind.clone(),
-                style: node.style.clone(),
+                style: node.style.clone().into(),
                 parent: node.parent,
                 sticky_counter_signal: node.sticky_counter_signal,
             }),
@@ -10777,7 +10791,7 @@ mod tests {
             let artifact = PaintArtifact::build(
                 (0..2).map(|i| crate::paint_artifact::PaintNode {
                     kind: kinds[i].clone(),
-                    style: styles[i].clone(),
+                    style: (styles[i].clone()).into(),
                     parent: if i == 0 { None } else { Some(0) },
                     sticky_counter_signal: None,
                 }),
@@ -10910,13 +10924,13 @@ mod tests {
             [
                 PaintNode {
                     kind: kind.clone(),
-                    style: root_style.clone(),
+                    style: root_style.clone().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: kind.clone(),
-                    style: child_style.clone(),
+                    style: child_style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -11049,7 +11063,7 @@ mod tests {
             let artifact = PaintArtifact::build(
                 (0..4).map(|i| PaintNode {
                     kind: kinds[i].clone(),
-                    style: styles[i].clone(),
+                    style: (styles[i].clone()).into(),
                     parent: (i != 0).then_some(0),
                     sticky_counter_signal: None,
                 }),
@@ -11126,13 +11140,13 @@ mod tests {
             vec![
                 PaintNode {
                     kind: kind.clone(),
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: kind.clone(),
-                    style: style.clone(),
+                    style: style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -11140,10 +11154,11 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "XXXXXX".into(),
                     },
-                    style: Style {
+                    style: (Style {
                         border_width: 0.0,
                         ..style.clone()
-                    },
+                    })
+                    .into(),
                     parent: Some(1),
                     sticky_counter_signal: None,
                 },
@@ -11191,7 +11206,7 @@ mod tests {
             vec![
                 PaintNode {
                     kind: kind.clone(),
-                    style: style.clone(),
+                    style: style.clone().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
@@ -11199,7 +11214,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "p".into(),
                     },
-                    style: child_style,
+                    style: child_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -11241,13 +11256,13 @@ mod tests {
             let mut paint_nodes = vec![
                 PaintNode {
                     kind: parent.clone(),
-                    style: parent_style.clone(),
+                    style: parent_style.clone().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: earlier.clone(),
-                    style: style.clone(),
+                    style: style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -11260,7 +11275,7 @@ mod tests {
             if let Some(later) = later {
                 paint_nodes.push(PaintNode {
                     kind: later.clone(),
-                    style: style.clone(),
+                    style: style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 });
@@ -11479,13 +11494,13 @@ mod tests {
             [
                 crate::paint_artifact::PaintNode {
                     kind: line_kind.clone(),
-                    style: line_style.clone(),
+                    style: line_style.clone().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 crate::paint_artifact::PaintNode {
                     kind: text_kind.clone(),
-                    style: text_style.clone(),
+                    style: text_style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -12255,7 +12270,7 @@ mod tests {
         let artifact = PaintArtifact::build(
             (0..2).map(|index| PaintNode {
                 kind: kinds[index].clone(),
-                style: styles[index].clone(),
+                style: (styles[index].clone()).into(),
                 parent: (index == 1).then_some(0),
                 sticky_counter_signal: None,
             }),
@@ -12352,7 +12367,7 @@ mod tests {
         let artifact = PaintArtifact::build(
             (0..5).map(|i| PaintNode {
                 kind: kinds[i].clone(),
-                style: styles[i].clone(),
+                style: (styles[i].clone()).into(),
                 parent: parents[i],
                 sticky_counter_signal: None,
             }),
@@ -14989,19 +15004,19 @@ mod tests {
             [
                 PaintNode {
                     kind: parent_kind.clone(),
-                    style: parent_style.clone(),
+                    style: parent_style.clone().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: red_kind.clone(),
-                    style: red_style.clone(),
+                    style: red_style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: blue_kind.clone(),
-                    style: blue_style.clone(),
+                    style: blue_style.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },

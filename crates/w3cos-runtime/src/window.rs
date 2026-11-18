@@ -2225,7 +2225,7 @@ impl App {
             }
             requests.push(render_gpu::DisplayChunkPrepaintRequest {
                 kind: node.kind.clone(),
-                style: node.style.clone(),
+                style: node.style.as_style().clone(),
                 width: rect.width,
                 height: rect.height,
             });
@@ -3812,7 +3812,7 @@ impl App {
             if hover_idx < flat.len() {
                 let entry = style_overrides
                     .entry(hover_idx)
-                    .or_insert_with(|| flat[hover_idx].style.clone());
+                    .or_insert_with(|| flat[hover_idx].style.as_style().clone());
                 if self.pressed_index == Some(hover_idx) {
                     entry.opacity = 0.6;
                 } else if entry.background.a > 0 {
@@ -4238,7 +4238,7 @@ impl App {
             if hover_idx < flat.len() {
                 let entry = style_overrides
                     .entry(hover_idx)
-                    .or_insert_with(|| flat[hover_idx].style.clone());
+                    .or_insert_with(|| flat[hover_idx].style.as_style().clone());
                 if self.pressed_index == Some(hover_idx) {
                     entry.opacity = 0.6;
                 } else if entry.background.a > 0 {
@@ -7114,25 +7114,26 @@ fn retained_layout_excludes_video_controls_paint_children() {
     let nodes = vec![
         PaintNode {
             kind: ComponentKind::Root,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         },
         PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-video-controls".into(),
                     "no-source".into(),
                 )])),
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         },
         PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(0),
             sticky_counter_signal: None,
         },
@@ -7154,7 +7155,7 @@ fn retained_layout_excludes_video_controls_paint_children() {
     );
     assert_eq!(flat[2].parent, Some(0));
     assert!(
-        std::ptr::eq(flat[2].style, &artifact.nodes[2].style),
+        std::ptr::eq(flat[2].style, artifact.nodes[2].style.as_style()),
         "source indices must remain stable"
     );
 }

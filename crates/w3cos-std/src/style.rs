@@ -781,6 +781,26 @@ impl Style {
 
     /// Resolve only an owned layout/paint snapshot. The source computed style
     /// must retain its lengths so explicit inheritance can copy them.
+    /// Whether `resolve_used_border_widths` would change anything, so a
+    /// shared style is copied only when a used width actually differs.
+    pub fn needs_used_border_widths(&self) -> bool {
+        let hidden =
+            |style: &Option<_>| style.is_some_and(|style: BorderLineStyle| !style.is_visible());
+        self.border_styles
+            .iter()
+            .zip([
+                self.border_top_width,
+                self.border_right_width,
+                self.border_bottom_width,
+                self.border_left_width,
+            ])
+            .any(|(line_style, width)| {
+                hidden(line_style) && width.map(f32::to_bits) != Some(0f32.to_bits())
+            })
+            || (self.border_width.to_bits() != 0f32.to_bits()
+                && self.border_styles.iter().all(hidden))
+    }
+
     pub fn resolve_used_border_widths(&mut self) {
         for (line_style, width) in self.border_styles.iter().zip([
             &mut self.border_top_width,
@@ -1733,6 +1753,38 @@ impl Style {
 #[cfg(test)]
 mod tests {
     use super::{CustomProperties, Display, Edges, Overflow, Spacing, Style};
+
+    #[test]
+    fn needs_used_border_widths_matches_resolve() {
+        use super::BorderLineStyle as L;
+        let lines = [None, Some(L::None), Some(L::Hidden), Some(L::Solid)];
+        let widths = [None, Some(0.0), Some(-0.0), Some(3.0)];
+        for (case, &line) in lines.iter().enumerate() {
+            for &width in &widths {
+                for all in [false, true] {
+                    for border_width in [0.0, -0.0, 2.0] {
+                        let mut style = Style::default();
+                        style.border_width = border_width;
+                        style.border_styles = if all {
+                            [line; 4]
+                        } else {
+                            [line, None, None, None]
+                        };
+                        style.border_top_width = width;
+                        let needs = style.needs_used_border_widths();
+                        let mut resolved = style.clone();
+                        resolved.resolve_used_border_widths();
+                        let changed = resolved.border_width.to_bits()
+                            != style.border_width.to_bits()
+                            || resolved.border_top_width.map(f32::to_bits)
+                                != style.border_top_width.map(f32::to_bits)
+                            || resolved != style;
+                        assert_eq!(needs, changed, "case {case} {width:?} {all} {border_width}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn custom_property_filter_follows_every_mutation() {

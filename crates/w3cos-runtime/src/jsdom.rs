@@ -8775,7 +8775,7 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
     let artifact = crate::paint_artifact::PaintArtifact::build_with_body_background(
         flat.iter().map(|entry| crate::paint_artifact::PaintNode {
             kind: entry.kind.clone(),
-            style: entry.style.clone(),
+            style: crate::paint_artifact::shared_paint_style(entry.component, entry.style),
             parent: entry.parent,
             sticky_counter_signal: entry.sticky_counter_signal,
         }),

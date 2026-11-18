@@ -625,7 +625,7 @@ mod tests {
         let advances = render_skia::measure_skia_inline_fragment_advances(&words, &style).unwrap();
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Row,
-            style: parent,
+            style: parent.into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -647,7 +647,7 @@ mod tests {
             };
             nodes.push(PaintNode {
                 kind: ComponentKind::Text { content },
-                style: style.clone(),
+                style: style.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
@@ -701,7 +701,7 @@ mod tests {
         };
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Row,
-            style: parent,
+            style: parent.into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -728,7 +728,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: (*word).into(),
                 },
-                style: piece,
+                style: piece.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
@@ -843,13 +843,13 @@ mod tests {
         let nodes = vec![
             PaintNode {
                 kind: ComponentKind::Row,
-                style: parent,
+                style: parent.into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Row,
-                style: word,
+                style: word.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -857,7 +857,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "\"".into(),
                 },
-                style: quote_style,
+                style: quote_style.into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -865,10 +865,11 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "Before".into(),
                 },
-                style: Style {
+                style: (Style {
                     flex_shrink: 0.0,
                     ..text_style.clone()
-                },
+                })
+                .into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -876,7 +877,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: " ".into(),
                 },
-                style: text_style.clone(),
+                style: text_style.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -884,7 +885,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "block".into(),
                 },
-                style: text_style.clone(),
+                style: text_style.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -970,7 +971,7 @@ mod tests {
         };
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Row,
-            style: parent,
+            style: parent.into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -993,7 +994,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: text.into(),
                 },
-                style: style.clone(),
+                style: style.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
@@ -1119,7 +1120,7 @@ mod tests {
         };
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Row,
-            style: parent,
+            style: parent.into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -1138,7 +1139,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: (*text).into(),
                 },
-                style: style.clone(),
+                style: style.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
@@ -1189,7 +1190,7 @@ mod tests {
             .iter()
             .map(|node| PaintNode {
                 kind: node.kind.clone(),
-                style: node.style.clone(),
+                style: node.style.clone().into(),
                 parent: node.parent,
                 sticky_counter_signal: None,
             })
@@ -1250,7 +1251,7 @@ mod tests {
             .iter()
             .map(|node| PaintNode {
                 kind: node.kind.clone(),
-                style: node.style.clone(),
+                style: node.style.clone().into(),
                 parent: node.parent,
                 sticky_counter_signal: None,
             })
@@ -1341,7 +1342,7 @@ mod tests {
                         let lines = [["⇦", " ", "There"], ["There", " ", "should"]];
                         let mut nodes = vec![PaintNode {
                             kind: ComponentKind::Row,
-                            style: parent,
+                            style: parent.into(),
                             parent: None,
                             sticky_counter_signal: None,
                         }];
@@ -1364,7 +1365,7 @@ mod tests {
                                     kind: ComponentKind::Text {
                                         content: (*text).into(),
                                     },
-                                    style: style.clone(),
+                                    style: style.clone().into(),
                                     parent: Some(0),
                                     sticky_counter_signal: None,
                                 });

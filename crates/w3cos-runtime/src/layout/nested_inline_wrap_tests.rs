@@ -1293,7 +1293,7 @@ fn nested_columns_fragment_float_child_margin_into_outer_continuation() {
             } else {
                 ComponentKind::Column
             },
-            style: (*style).clone(),
+            style: ((*style).clone()).into(),
             parent: *parent,
             sticky_counter_signal: None,
         })
@@ -1526,7 +1526,7 @@ fn auto_column_artifact_uses_real_breaks_not_uniform_height_division() {
         let extent = lines as f32 * 22.0 + (lines - 1) as f32 * gap;
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Column,
-            style: owner.clone(),
+            style: owner.clone().into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -1544,7 +1544,7 @@ fn auto_column_artifact_uses_real_breaks_not_uniform_height_division() {
                 kind: ComponentKind::Text {
                     content: "X".into(),
                 },
-                style: text.clone(),
+                style: text.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });

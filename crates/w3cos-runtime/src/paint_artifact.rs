@@ -22,7 +22,10 @@ pub type PaintOrderLevel = (u8, i32, usize);
 #[derive(Clone)]
 pub struct PaintNode {
     pub kind: ComponentKind,
-    pub style: Style,
+    /// Shared with the component tree's style until build adjusts it
+    /// (copy-on-write), so an unchanged node's style is not copied per frame
+    /// and compares by pointer.
+    pub style: w3cos_std::component::ComponentStyle,
     pub parent: Option<usize>,
     pub sticky_counter_signal: Option<usize>,
 }
@@ -108,6 +111,22 @@ pub fn effective_z_order(style: &Style, inherited: i32) -> i32 {
     }
 }
 
+/// Paint style for a flattened node. When the node paints its component's
+/// own style, share that `Arc` instead of deep-copying the `Style`, so an
+/// unchanged node keeps the same allocation across frames and the dirty
+/// comparison short-circuits on pointer equality.
+pub fn shared_paint_style(
+    component: Option<&w3cos_std::Component>,
+    style: &Style,
+) -> w3cos_std::component::ComponentStyle {
+    match component {
+        Some(component) if std::ptr::eq(component.style.as_style(), style) => {
+            component.style.clone()
+        }
+        _ => style.clone().into(),
+    }
+}
+
 /// Rebuild paint nodes, cloning `Style` only for slots that actually changed.
 ///
 /// Returns the node list and the number of Style clones performed. A clean
@@ -124,7 +143,7 @@ pub fn reuse_or_clone_paint_nodes<'a>(
             .into_iter()
             .map(|(kind, style, parent, sticky)| PaintNode {
                 kind: kind.clone(),
-                style: style.clone(),
+                style: style.clone().into(),
                 parent,
                 sticky_counter_signal: sticky,
             })
@@ -139,7 +158,7 @@ pub fn reuse_or_clone_paint_nodes<'a>(
             old.parent == parent
                 && old.sticky_counter_signal == sticky
                 && old.kind == *kind
-                && (std::ptr::eq(&old.style, style) || old.style == *style)
+                && (std::ptr::eq(old.style.as_style(), style) || *old.style == *style)
         });
         if reusable {
             out.push(existing[i].take().expect("paint node slot"));
@@ -147,7 +166,7 @@ pub fn reuse_or_clone_paint_nodes<'a>(
             clones += 1;
             out.push(PaintNode {
                 kind: kind.clone(),
-                style: style.clone(),
+                style: style.clone().into(),
                 parent,
                 sticky_counter_signal: sticky,
             });
@@ -1159,7 +1178,7 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
 
     let grid_nodes = nodes
         .iter()
-        .map(|node| (&node.style, node.parent))
+        .map(|node| (node.style.as_style(), node.parent))
         .collect::<Vec<_>>();
     let spanning_grids = crate::table_grid::calculate(&grid_nodes)
         .into_iter()
@@ -2528,8 +2547,16 @@ impl PaintArtifact {
         }
         let mut has_percentage_padding = false;
         for node in &mut nodes {
-            crate::background_image::annotate_fixed_background_viewport(&mut node.style, viewport);
-            node.style.resolve_used_border_widths();
+            // Write through the shared style only when a value changes.
+            if crate::background_image::fixed_background_viewport_touches(&node.style) {
+                crate::background_image::annotate_fixed_background_viewport(
+                    node.style.make_mut(),
+                    viewport,
+                );
+            }
+            if node.style.needs_used_border_widths() {
+                node.style.make_mut().resolve_used_border_widths();
+            }
             has_percentage_padding |= [
                 node.style.padding.top,
                 node.style.padding.right,
@@ -2583,23 +2610,35 @@ impl PaintArtifact {
                 let basis = nodes[index]
                     .parent
                     .map_or(root_basis, |parent| child_bases[parent]);
-                let style = &mut nodes[index].style;
-                for edge in [
-                    &mut style.padding.top,
-                    &mut style.padding.right,
-                    &mut style.padding.bottom,
-                    &mut style.padding.left,
-                ] {
-                    match *edge {
-                        Spacing::Percent(percent) => {
-                            *edge = Spacing::Px(basis * percent / 100.0);
+                let percent_padding = {
+                    let padding = &nodes[index].style.padding;
+                    [padding.top, padding.right, padding.bottom, padding.left]
+                        .iter()
+                        .any(|edge| {
+                            matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. })
+                        })
+                };
+                // Copy a shared style only when an edge resolves.
+                if percent_padding {
+                    let style = nodes[index].style.make_mut();
+                    for edge in [
+                        &mut style.padding.top,
+                        &mut style.padding.right,
+                        &mut style.padding.bottom,
+                        &mut style.padding.left,
+                    ] {
+                        match *edge {
+                            Spacing::Percent(percent) => {
+                                *edge = Spacing::Px(basis * percent / 100.0);
+                            }
+                            Spacing::PaddingCalc { percent, px } => {
+                                *edge = Spacing::Px((basis * percent / 100.0 + px).max(0.0));
+                            }
+                            _ => {}
                         }
-                        Spacing::PaddingCalc { percent, px } => {
-                            *edge = Spacing::Px((basis * percent / 100.0 + px).max(0.0));
-                        }
-                        _ => {}
                     }
                 }
+                let style = nodes[index].style.as_style();
                 child_bases[index] = if matches!(style.display, Display::Inline | Display::Contents)
                 {
                     basis
@@ -2637,7 +2676,7 @@ impl PaintArtifact {
             height: (rect.height - root_borders.1 - root_borders.3).max(0.0),
         });
         let canvas_background_style = canvas_background_source.map(|index| {
-            let mut style = nodes[index].style.clone();
+            let mut style = nodes[index].style.as_style().clone();
             style.border_width = 0.0;
             style.border_top_width = None;
             style.border_right_width = None;
@@ -2693,14 +2732,22 @@ impl PaintArtifact {
             }
         }
         for node in &mut nodes {
-            if let Some(properties) = node.style.custom_properties.as_mut() {
+            if node
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-float-line-bands")
+                })
+                && let Some(properties) = node.style.make_mut().custom_properties.as_mut()
+            {
                 properties.remove("--w3cos-internal-float-line-bands");
             }
         }
         if let Some((width, height)) = viewport {
             let refs: Vec<_> = nodes
                 .iter()
-                .map(|node| (&node.kind, &node.style, node.parent))
+                .map(|node| (&node.kind, node.style.as_style(), node.parent))
                 .collect();
             let flows =
                 crate::layout::resolve_float_text_layouts(&refs, &rect_by_index, width, height);
@@ -2760,7 +2807,7 @@ impl PaintArtifact {
             let column_nodes: Vec<_> = artifact
                 .nodes
                 .iter()
-                .map(|node| (&node.style, node.parent))
+                .map(|node| (node.style.as_style(), node.parent))
                 .collect();
             let fragment_plans = crate::layout::resolve_column_fragment_plans(
                 &column_nodes,
@@ -3450,6 +3497,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_paint_nodes_share_component_styles() {
+        let mut child_style = Style::default();
+        child_style.border_width = 2.0;
+        child_style.border_styles = [Some(w3cos_std::style::BorderLineStyle::Solid); 4];
+        let mut hidden = Style::default();
+        hidden.border_width = 2.0;
+        hidden.border_styles = [Some(w3cos_std::style::BorderLineStyle::None); 4];
+        let mut root = w3cos_std::Component::column(Style::default(), vec![]);
+        root.children
+            .push(w3cos_std::Component::column(child_style, vec![]));
+        root.children
+            .push(w3cos_std::Component::column(hidden, vec![]));
+        let flat = crate::layout::pre_flatten(&root);
+        let layouts = (0..flat.len())
+            .map(|index| {
+                (
+                    LayoutRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        let build = || {
+            PaintArtifact::build_with_body_background_and_viewport(
+                flat.iter().map(|node| PaintNode {
+                    kind: node.kind.clone(),
+                    style: shared_paint_style(node.component, node.style),
+                    parent: node.parent,
+                    sticky_counter_signal: node.sticky_counter_signal,
+                }),
+                &layouts,
+                1,
+                None,
+                Some((100.0, 100.0)),
+            )
+        };
+        let (first, second) = (build(), build());
+        for index in 0..2 {
+            assert!(std::ptr::eq(
+                first.nodes[index].style.as_style(),
+                flat[index].style
+            ));
+            assert!(std::ptr::eq(
+                first.nodes[index].style.as_style(),
+                second.nodes[index].style.as_style()
+            ));
+        }
+        // A used-value adjustment copies only the adjusted node.
+        assert!(!std::ptr::eq(
+            first.nodes[2].style.as_style(),
+            flat[2].style
+        ));
+        assert_eq!(first.nodes[2].style.border_width, 0.0);
+        assert_eq!(flat[2].style.border_width, 2.0);
+    }
+
+    #[test]
     fn float_line_bands_export_shared_advance_without_preserved_breaks() {
         let parent = Style {
             display: Display::Block,
@@ -3471,7 +3579,7 @@ mod tests {
         let nodes = [
             PaintNode {
                 kind: ComponentKind::Row,
-                style: parent,
+                style: parent.into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
@@ -3479,7 +3587,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "wrapped text without BR".into(),
                 },
-                style: text,
+                style: text.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -3537,7 +3645,7 @@ mod tests {
             let nodes = [
                 PaintNode {
                     kind: ComponentKind::Row,
-                    style: parent,
+                    style: parent.into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
@@ -3545,7 +3653,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "\u{200b}".into(),
                     },
-                    style: text.clone(),
+                    style: text.clone().into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -3553,7 +3661,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "XX\nXX".into(),
                     },
-                    style: text,
+                    style: text.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -3609,16 +3717,17 @@ mod tests {
         let nodes = vec![
             PaintNode {
                 kind: ComponentKind::Row,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Row,
-                style: Style {
+                style: (Style {
                     display: Display::Block,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -3626,7 +3735,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "x".into(),
                 },
-                style: text_style,
+                style: text_style.into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -3677,19 +3786,19 @@ mod tests {
         let nodes = vec![
             PaintNode {
                 kind: ComponentKind::Row,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Row,
-                style: parent_style,
+                style: parent_style.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Row,
-                style: inline_style,
+                style: inline_style.into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -3697,7 +3806,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "x".into(),
                 },
-                style: text_style,
+                style: text_style.into(),
                 parent: Some(2),
                 sticky_counter_signal: None,
             },
@@ -3861,23 +3970,24 @@ mod tests {
         // area of their own border when the box was clipped with its contents.
         let outer = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
         let clipping = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 overflow: Overflow::Hidden,
                 border_width: 10.0,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let child = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -3914,7 +4024,7 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Row,
-                style: parent_style,
+                style: parent_style.into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
@@ -3922,7 +4032,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "  next line".to_string(),
                 },
-                style: inline_style,
+                style: inline_style.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -3971,13 +4081,13 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Row,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Row,
-                style: inline_style.clone(),
+                style: inline_style.clone().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -3985,7 +4095,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: " X".into(),
                 },
-                style: inline_style,
+                style: inline_style.into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -4125,29 +4235,32 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::Table,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRowGroup,
                     background: Color::rgb(255, 0, 0),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -4160,13 +4273,14 @@ mod tests {
     fn empty_cells_hide_suppresses_separate_cell_background_and_border() {
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display: Display::TableCell,
                 empty_cells_hide: true,
                 background: Color::rgb(255, 0, 0),
                 border_width: 5.0,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -4181,13 +4295,14 @@ mod tests {
         let red = Color::rgb(255, 0, 0);
         let node = |display, width, color, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width: width,
                 border_color: color,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4242,11 +4357,12 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4299,13 +4415,14 @@ mod tests {
         let blue = Color::rgb(0, 0, 255);
         let node = |display, border_width, border_color, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width,
                 border_color,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4336,7 +4453,7 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent, line_style| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width: if display == Display::TableCell {
@@ -4347,7 +4464,8 @@ mod tests {
                 border_color: Color::rgb(0, 128, 0),
                 border_styles: [Some(line_style); 4],
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4392,7 +4510,7 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent, line_style| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width: if display == Display::TableCell {
@@ -4403,7 +4521,8 @@ mod tests {
                 border_color: Color::rgb(0, 128, 0),
                 border_styles: [Some(line_style); 4],
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4448,14 +4567,15 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent, width, line_style| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width: width,
                 border_color: Color::rgb(0, 128, 0),
                 border_styles: [Some(line_style); 4],
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4527,7 +4647,7 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width: if display == Display::TableCell {
@@ -4538,7 +4658,8 @@ mod tests {
                 border_color: Color::rgb(0, 128, 0),
                 border_styles: [Some(BorderLineStyle::Groove); 4],
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4608,14 +4729,15 @@ mod tests {
         use w3cos_std::style::BorderLineStyle;
         let node = |display, parent, line_style| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width: 10.0,
                 border_color: Color::rgb(0, 128, 0),
                 border_styles: [Some(line_style); 4],
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4644,33 +4766,36 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRow,
                     border_collapse: true,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     border_right_width: Some(20.0),
                     border_right_color: Some(start_color),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     border_left_width: Some(20.0),
                     border_left_color: Some(end_color),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -4705,35 +4830,38 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRow,
                     border_collapse: true,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     color: Color::BLACK,
                     border_right_width: Some(2.0),
                     border_color: Color::TRANSPARENT,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     color: Color::BLACK,
                     border_left_width: Some(2.0),
                     border_color: Color::TRANSPARENT,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -4749,13 +4877,14 @@ mod tests {
     fn collapsed_cell_visual_bounds_include_centered_inline_borders() {
         let node = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display: Display::TableCell,
                 border_collapse: true,
                 border_left_width: Some(25.0),
                 border_right_width: Some(25.0),
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -4781,13 +4910,14 @@ mod tests {
     fn collapsed_table_background_origin_uses_resolved_outer_edges() {
         let node = |display, border_width, parent| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 border_collapse: true,
                 border_width,
                 border_color: Color::rgb(0, 128, 0),
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4856,21 +4986,23 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRow,
                     visibility: Visibility::Collapse,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     visibility: Visibility::Visible,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -4885,7 +5017,7 @@ mod tests {
     fn collapsed_columns_preserve_partial_span_overflow_and_hide_full_cells() {
         let node = |display, visibility, parent, span: Option<&str>| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 visibility,
                 custom_properties: span.map(|span| {
@@ -4895,7 +5027,8 @@ mod tests {
                     )])
                 }),
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -4938,29 +5071,32 @@ mod tests {
             let mut nodes = vec![
                 PaintNode {
                     kind: ComponentKind::Box,
-                    style: Style {
+                    style: (Style {
                         display: Display::Table,
                         ..Style::default()
-                    },
+                    })
+                    .into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Box,
-                    style: Style {
+                    style: (Style {
                         display: Display::TableCaption,
                         caption_side_bottom: bottom,
                         ..Style::default()
-                    },
+                    })
+                    .into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Box,
-                    style: Style {
+                    style: (Style {
                         display: Display::TableRowGroup,
                         ..Style::default()
-                    },
+                    })
+                    .into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -5003,7 +5139,7 @@ mod tests {
     fn empty_top_caption_margin_is_inside_table_wrapper_overflow_clip() {
         let node = |display, parent: Option<usize>| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 overflow: if parent.is_none() {
                     Overflow::Hidden
@@ -5011,7 +5147,8 @@ mod tests {
                     Overflow::Visible
                 },
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -5095,29 +5232,32 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::Table,
                     border_top_width: Some(16.0),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCaption,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRow,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -5155,21 +5295,23 @@ mod tests {
         let nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::Table,
                     background: Color::rgb(0, 0, 255),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCaption,
                     caption_side_bottom: true,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -5214,39 +5356,43 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::Table,
                     border_collapse: false,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRowGroup,
                     background_image: Some("blue.png".into()),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableRow,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     display: Display::TableCell,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(2),
                 sticky_counter_signal: None,
             },
@@ -5346,21 +5492,23 @@ mod tests {
         for background in [Color::rgb(0, 128, 0), Color::TRANSPARENT] {
             let root = PaintNode {
                 kind: ComponentKind::Column,
-                style: Style {
+                style: (Style {
                     display: Display::None,
                     background,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: None,
                 sticky_counter_signal: None,
             };
             let body = PaintNode {
                 kind: ComponentKind::Column,
-                style: Style {
+                style: (Style {
                     background: Color::rgb(255, 0, 0),
                     background_image: Some("url(square-white.png)".into()),
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             };
@@ -5373,9 +5521,9 @@ mod tests {
 
     #[test]
     fn display_none_body_does_not_propagate_its_canvas_background() {
-        let node = |parent, style| PaintNode {
+        let node = |parent, style: Style| PaintNode {
             kind: ComponentKind::Column,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -5410,7 +5558,7 @@ mod tests {
         let artifact = PaintArtifact::build(
             [PaintNode {
                 kind: ComponentKind::Column,
-                style,
+                style: style.into(),
                 parent: None,
                 sticky_counter_signal: None,
             }],
@@ -5440,7 +5588,7 @@ mod tests {
     fn root_sentinel_does_not_raise_negative_descendants_above_normal_flow() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -5449,13 +5597,13 @@ mod tests {
         negative_style.z_index = -1;
         let negative = PaintNode {
             kind: ComponentKind::Box,
-            style: negative_style,
+            style: negative_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let normal = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -5476,7 +5624,7 @@ mod tests {
     fn transparent_block_text_paints_after_later_in_flow_block_background() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -5486,7 +5634,7 @@ mod tests {
             kind: ComponentKind::Text {
                 content: "instruction".into(),
             },
-            style: text_style,
+            style: text_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -5494,7 +5642,7 @@ mod tests {
         bar_style.background = Color::rgb(255, 165, 0);
         let bar = PaintNode {
             kind: ComponentKind::Box,
-            style: bar_style,
+            style: bar_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -5512,25 +5660,27 @@ mod tests {
         let nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     overflow: Overflow::Hidden,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style {
+                style: (Style {
                     position: Position::Absolute,
                     ..Style::default()
-                },
+                })
+                .into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -5546,9 +5696,9 @@ mod tests {
 
     #[test]
     fn overflow_clip_clips_paint_without_becoming_a_scroll_container() {
-        let node = |parent, style| PaintNode {
+        let node = |parent, style: Style| PaintNode {
             kind: ComponentKind::Box,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -5577,9 +5727,9 @@ mod tests {
 
     #[test]
     fn overflow_clip_margin_moves_the_clip_edge_and_body_clip_propagates() {
-        let node = |parent, style| PaintNode {
+        let node = |parent, style: Style| PaintNode {
             kind: ComponentKind::Box,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -5630,11 +5780,12 @@ mod tests {
     fn body_background_propagates_through_anonymous_table_wrappers() {
         let node = |parent, display, background| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display,
                 background,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -5667,7 +5818,7 @@ mod tests {
         root_style.border_width = 3.0;
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: root_style,
+            style: root_style.into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -5676,7 +5827,7 @@ mod tests {
         body_style.background_position = Some("top left".into());
         let body = PaintNode {
             kind: ComponentKind::Column,
-            style: body_style,
+            style: body_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -5712,7 +5863,7 @@ mod tests {
     fn propagated_body_percentage_position_uses_the_root_box() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -5721,7 +5872,7 @@ mod tests {
         body_style.background_position = Some("50% 50%".into());
         let body = PaintNode {
             kind: ComponentKind::Column,
-            style: body_style,
+            style: body_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -5756,7 +5907,7 @@ mod tests {
             let artifact = PaintArtifact::build(
                 [PaintNode {
                     kind: ComponentKind::Column,
-                    style: source.clone(),
+                    style: source.clone().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 }],
@@ -5802,13 +5953,13 @@ mod tests {
         let mut nodes = vec![
             PaintNode {
                 kind: ComponentKind::Box,
-                style,
+                style: style.into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Box,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -5829,7 +5980,7 @@ mod tests {
     fn builds_independent_property_trees_and_display_chunks() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -5837,7 +5988,7 @@ mod tests {
         scroll_style.overflow = Overflow::Scroll;
         let scroll = PaintNode {
             kind: ComponentKind::Column,
-            style: scroll_style,
+            style: scroll_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -5848,7 +5999,7 @@ mod tests {
             kind: ComponentKind::Text {
                 content: "row".into(),
             },
-            style: child_style,
+            style: child_style.into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -5878,9 +6029,9 @@ mod tests {
     #[test]
     fn fixed_auto_multicol_artifact_retains_physical_fragments_and_source_identity() {
         use w3cos_std::style::{ColumnFill, Dimension};
-        let node = |style, parent| PaintNode {
+        let node = |style: Style, parent| PaintNode {
             kind: ComponentKind::Column,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -5998,9 +6149,9 @@ mod tests {
     #[test]
     fn balanced_multicol_artifact_uses_shorter_fragmentainers_with_fixed_principal_height() {
         use w3cos_std::style::{ColumnFill, Dimension};
-        let node = |style, parent| PaintNode {
+        let node = |style: Style, parent| PaintNode {
             kind: ComponentKind::Column,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -6092,13 +6243,13 @@ mod tests {
         let nodes = [
             PaintNode {
                 kind: ComponentKind::Column,
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: None,
                 sticky_counter_signal: None,
             },
             PaintNode {
                 kind: ComponentKind::Column,
-                style: sticky_style,
+                style: sticky_style.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             },
@@ -6106,7 +6257,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: "inside".into(),
                 },
-                style: Style::default(),
+                style: Style::default().into(),
                 parent: Some(1),
                 sticky_counter_signal: None,
             },
@@ -6140,7 +6291,7 @@ mod tests {
     fn bidi_visual_fragments_paint_in_logical_order_without_changing_layout() {
         let mut nodes = vec![PaintNode {
             kind: ComponentKind::Row,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         }];
@@ -6155,7 +6306,7 @@ mod tests {
                 kind: ComponentKind::Text {
                     content: rank.to_string(),
                 },
-                style,
+                style: style.into(),
                 parent: Some(0),
                 sticky_counter_signal: None,
             });
@@ -6181,7 +6332,7 @@ mod tests {
     fn auto_positioned_subtree_paints_after_later_normal_flow_content() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -6189,13 +6340,13 @@ mod tests {
         absolute_style.position = Position::Absolute;
         let absolute = PaintNode {
             kind: ComponentKind::Column,
-            style: absolute_style,
+            style: absolute_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let normal = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -6222,10 +6373,11 @@ mod tests {
         ]
         .map(|(parent, position)| PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 position,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent,
             sticky_counter_signal: None,
         });
@@ -6247,36 +6399,39 @@ mod tests {
     fn nested_stacking_context_orders_background_auto_and_positive_children() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
         let wrapper = PaintNode {
             kind: ComponentKind::Column,
-            style: Style {
+            style: (Style {
                 position: Position::Relative,
                 z_index: 1,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let positive = PaintNode {
             kind: ComponentKind::Column,
-            style: Style {
+            style: (Style {
                 position: Position::Absolute,
                 z_index: 1,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
         let auto = PaintNode {
             kind: ComponentKind::Column,
-            style: Style {
+            style: (Style {
                 position: Position::Absolute,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -6298,11 +6453,11 @@ mod tests {
 
     #[test]
     fn split_positioned_inline_fragments_precede_independently_positioned_descendant() {
-        let node = |style, parent| PaintNode {
+        let node = |style: Style, parent| PaintNode {
             kind: ComponentKind::Text {
                 content: "B".into(),
             },
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -6348,9 +6503,9 @@ mod tests {
 
     #[test]
     fn transformed_static_float_paints_in_zero_level_stacking_phase() {
-        let node = |kind, style, parent| PaintNode {
+        let node = |kind, style: Style, parent| PaintNode {
             kind,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -6395,9 +6550,9 @@ mod tests {
     fn static_flex_item_z_index_orders_like_a_positioned_box() {
         // z-index applies to flex items even when `position` is static, so a
         // negative-z item paints below its parent's normal-flow ink.
-        let node = |kind, style, parent| PaintNode {
+        let node = |kind, style: Style, parent| PaintNode {
             kind,
-            style,
+            style: style.into(),
             parent,
             sticky_counter_signal: None,
         };
@@ -6430,7 +6585,7 @@ mod tests {
     fn fixed_auto_stacking_context_contains_negative_descendants() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -6438,7 +6593,7 @@ mod tests {
         relative_style.position = Position::Relative;
         let relative = PaintNode {
             kind: ComponentKind::Column,
-            style: relative_style,
+            style: relative_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -6446,7 +6601,7 @@ mod tests {
         fixed_style.position = Position::Fixed;
         let fixed = PaintNode {
             kind: ComponentKind::Column,
-            style: fixed_style,
+            style: fixed_style.into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -6455,7 +6610,7 @@ mod tests {
         negative_style.z_index = -1;
         let negative = PaintNode {
             kind: ComponentKind::Column,
-            style: negative_style,
+            style: negative_style.into(),
             parent: Some(2),
             sticky_counter_signal: None,
         };
@@ -6479,7 +6634,7 @@ mod tests {
     fn css2_paint_phases_group_float_descendants_between_blocks_and_inlines() {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -6487,13 +6642,13 @@ mod tests {
         float_style.float = w3cos_std::style::Float::Left;
         let floating = PaintNode {
             kind: ComponentKind::Column,
-            style: float_style,
+            style: float_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let float_child = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -6503,7 +6658,7 @@ mod tests {
             kind: ComponentKind::Text {
                 content: "inline".to_string(),
             },
-            style: inline_style,
+            style: inline_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -6511,7 +6666,7 @@ mod tests {
         relative_style.position = Position::Relative;
         let relative = PaintNode {
             kind: ComponentKind::Column,
-            style: relative_style,
+            style: relative_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -6521,7 +6676,7 @@ mod tests {
             kind: ComponentKind::Text {
                 content: "positioned inline".to_string(),
             },
-            style: positioned_inline_style,
+            style: positioned_inline_style.into(),
             parent: Some(4),
             sticky_counter_signal: None,
         };
@@ -6556,22 +6711,23 @@ mod tests {
     fn inline_block_descendants_remain_in_the_atomic_inline_paint_phase() {
         let root = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
         let inline_block = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 display: Display::InlineBlock,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let block_child = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -6590,16 +6746,17 @@ mod tests {
     fn positioned_auto_descendants_paint_after_the_positioned_background() {
         let root = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
         let positioned = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 position: Position::Relative,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -6607,7 +6764,7 @@ mod tests {
             kind: ComponentKind::Image {
                 src: "green.png".into(),
             },
-            style: Style::default(),
+            style: Style::default().into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -6624,34 +6781,37 @@ mod tests {
     fn float_descendants_do_not_escape_a_positioned_auto_subtree() {
         let root = PaintNode {
             kind: ComponentKind::Box,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
         let control = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 position: Position::Absolute,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let container = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 position: Position::Absolute,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
         let floating = PaintNode {
             kind: ComponentKind::Box,
-            style: Style {
+            style: (Style {
                 float: w3cos_std::style::Float::Left,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(2),
             sticky_counter_signal: None,
         };
@@ -6659,10 +6819,11 @@ mod tests {
             kind: ComponentKind::Text {
                 content: "XXXX".to_string(),
             },
-            style: Style {
+            style: (Style {
                 display: Display::Inline,
                 ..Style::default()
-            },
+            })
+            .into(),
             parent: Some(3),
             sticky_counter_signal: None,
         };
@@ -6702,7 +6863,7 @@ mod tests {
                 [
                     PaintNode {
                         kind: ComponentKind::Column,
-                        style: Style::default(),
+                        style: Style::default().into(),
                         parent: None,
                         sticky_counter_signal: None,
                     },
@@ -6710,13 +6871,13 @@ mod tests {
                         kind: ComponentKind::Text {
                             content: "Eight".into(),
                         },
-                        style: text.clone(),
+                        style: text.clone().into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
                     PaintNode {
                         kind: ComponentKind::Row,
-                        style: border,
+                        style: border.into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
@@ -6724,7 +6885,7 @@ mod tests {
                         kind: ComponentKind::Text {
                             content: "Nine".into(),
                         },
-                        style: text,
+                        style: text.into(),
                         parent: Some(0),
                         sticky_counter_signal: None,
                     },
@@ -6762,13 +6923,13 @@ mod tests {
             [
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Row,
-                    style: edge_style,
+                    style: edge_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -6776,7 +6937,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "Second line".into(),
                     },
-                    style: text_style,
+                    style: text_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },

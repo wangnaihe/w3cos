@@ -900,7 +900,7 @@ mod tests {
     fn scroll_tree() -> PaintArtifact {
         let root = PaintNode {
             kind: ComponentKind::Column,
-            style: Style::default(),
+            style: Style::default().into(),
             parent: None,
             sticky_counter_signal: None,
         };
@@ -908,7 +908,7 @@ mod tests {
         scroll_style.overflow = Overflow::Scroll;
         let scroll = PaintNode {
             kind: ComponentKind::Column,
-            style: scroll_style,
+            style: scroll_style.into(),
             parent: Some(0),
             sticky_counter_signal: None,
         };
@@ -919,7 +919,7 @@ mod tests {
             kind: ComponentKind::Text {
                 content: "row".into(),
             },
-            style: child_style,
+            style: child_style.into(),
             parent: Some(1),
             sticky_counter_signal: None,
         };
@@ -948,19 +948,19 @@ mod tests {
             [
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: positioned_style,
+                    style: positioned_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: float_style,
+                    style: float_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -968,7 +968,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "float".into(),
                     },
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: Some(2),
                     sticky_counter_signal: None,
                 },
@@ -1066,13 +1066,13 @@ mod tests {
             [
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: dirty_style,
+                    style: dirty_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
@@ -1080,7 +1080,7 @@ mod tests {
                     kind: ComponentKind::Text {
                         content: "dirty".into(),
                     },
-                    style: child_style,
+                    style: child_style.into(),
                     parent: Some(1),
                     sticky_counter_signal: None,
                 },
@@ -1103,7 +1103,7 @@ mod tests {
             .enumerate()
             .filter_map(|(idx, node)| {
                 let rect = artifact.rect_by_index.get(idx).copied().flatten()?;
-                Some((idx, rect, &node.kind, &node.style))
+                Some((idx, rect, &node.kind, node.style.as_style()))
             })
             .collect()
     }
@@ -1149,13 +1149,13 @@ mod tests {
             [
                 PaintNode {
                     kind: ComponentKind::Column,
-                    style: Style::default(),
+                    style: Style::default().into(),
                     parent: None,
                     sticky_counter_signal: None,
                 },
                 PaintNode {
                     kind: ComponentKind::Box,
-                    style: child_style,
+                    style: child_style.into(),
                     parent: Some(0),
                     sticky_counter_signal: None,
                 },
