@@ -2514,10 +2514,13 @@ fn flush_before_paint(viewport_w: f32, viewport_h: f32) -> bool {
         return true;
     }
     let structure = crate::dom::with_document(|document| document.structure_generation());
+    // No paint tree yet counts as behind: flushing first lets the first
+    // paint start in sync with the flush cache, so the next structural
+    // change splices the paint tree instead of building it again.
     let behind = PAINT.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_some_and(|cache| cache.structure != structure)
+            .is_none_or(|cache| cache.structure != structure)
     });
     let retained = CACHE.with(|slot| slot.borrow().is_some());
     behind && retained && flush()
@@ -3496,6 +3499,61 @@ mod paint_layout_tests {
                 "streamed text must splice the paint layout, got {}",
                 spliced - spliced_before
             );
+        }
+    }
+
+    #[test]
+    fn first_paint_with_pending_mutations_starts_a_splice_journal() {
+        struct Force;
+        impl Drop for Force {
+            fn drop(&mut self) {
+                splice::FORCE_PAINT_SPLICE.with(|force| force.set(None));
+            }
+        }
+        crate::dom::reset_document();
+        invalidate();
+        splice::FORCE_PAINT_SPLICE.with(|force| force.set(Some(true)));
+        let _force = Force;
+        let log = crate::dom::create_element("div");
+        crate::dom::set_style_property(log, "width", "300px");
+        crate::dom::set_style_property(log, "padding-bottom", "2px");
+        let paragraph = crate::dom::create_element("p");
+        let text = crate::dom::create_text_node("first words");
+        crate::dom::append_child(paragraph, text);
+        crate::dom::append_child(log, paragraph);
+        let footer = crate::dom::create_element("div");
+        crate::dom::set_style_property(footer, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), log);
+        crate::dom::append_child(crate::dom::body_id(), footer);
+        assert!(flush());
+        // A mutation the flush cache has not seen yet when the first paint
+        // runs: the paint must still leave a journal point behind.
+        let mut content = String::from("first words");
+        content.push_str(" and more words that wrap onto another line");
+        crate::dom::set_text_content(text, &content);
+        let (rebuilds_before, _) = paint_layout_stats();
+        let (spliced_before, mismatches_before) = paint_splice_stats();
+        let _ = paint_rect(footer);
+        for step in 0..3 {
+            content.push_str(" and more words that wrap onto another line");
+            crate::dom::set_text_content(text, &content);
+            let painted = paint_rect(footer);
+            let fresh = fresh_rect(footer);
+            assert!(
+                (painted.y - fresh.y).abs() < 0.05 && (painted.height - fresh.height).abs() < 0.05,
+                "step {step}: paint rect {painted:?} diverges from full layout {fresh:?}"
+            );
+        }
+        let (rebuilds, _) = paint_layout_stats();
+        let (spliced, mismatches) = paint_splice_stats();
+        assert_eq!(mismatches - mismatches_before, 0);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert_eq!(
+                rebuilds - rebuilds_before,
+                1,
+                "only the first paint may build the paint tree"
+            );
+            assert!(spliced - spliced_before >= 3, "later paints must splice");
         }
     }
 
