@@ -1679,10 +1679,14 @@ fn needs_reorder(levels: &[LeafLevel]) -> bool {
 fn text_line_metrics(content: &str, style: &Style) -> (f32, f32) {
     let height = inline_used_line_height(inline_style_line_height(style));
     let baseline = inline_font_baseline_from_line_top(style, height);
-    // Tabs are control items (never shaped), so they take the primary
-    // font's metrics, not a fallback face's.
+    // A pre-wrap visual fragment is already one line. Paint draws it as its
+    // own em box and steps a `<br>` reference by this CSS line height. The
+    // shaped face's line spacing (a fallback in `Ahem, monospace`) would
+    // open a gap the reference does not have.
     #[cfg(feature = "skia")]
-    if style.line_height_is_normal {
+    if style.line_height_is_normal
+        && !(bidi_fragment(style) && style.white_space == WhiteSpace::PreWrap)
+    {
         let shaped = content.replace('\t', "");
         let text = if content.contains('\t') {
             shaped.as_str()
