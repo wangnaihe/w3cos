@@ -3389,20 +3389,24 @@ fn is_positioned(style: &Style) -> bool {
 }
 
 fn establishes_stacking_context(node: &PaintNode) -> bool {
-    let specifies_z_index = node.style.z_index != 0
-        || node
-            .style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| {
-                properties.contains_key("--w3cos-internal-z-index-specified")
-            });
+    // The custom property lookup is a string hash: only positioned boxes
+    // without a nonzero z-index need it.
+    let specifies_z_index = || {
+        node.style.z_index != 0
+            || node
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-z-index-specified")
+                })
+    };
     node.parent.is_none()
-        || (is_positioned(&node.style)
-            && (specifies_z_index
-                || matches!(node.style.position, Position::Fixed | Position::Sticky)))
         || node.style.opacity < 1.0
         || !node.style.transform.is_identity()
+        || (is_positioned(&node.style)
+            && (matches!(node.style.position, Position::Fixed | Position::Sticky)
+                || specifies_z_index()))
 }
 
 #[cfg(test)]

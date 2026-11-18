@@ -166,7 +166,8 @@ fn layer_chunk_hashes(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> V
     layers
         .iter()
         .map(|layer| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            // Every display item feeds this each frame: FxHash, not SipHash.
+            let mut hasher = w3cos_std::fxhash::FxHasher::default();
             layer.chunk_ids.len().hash(&mut hasher);
             for &chunk_id in &layer.chunk_ids {
                 let Some(chunk) = artifact.chunks.get(chunk_id) else {
