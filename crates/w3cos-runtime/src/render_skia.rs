@@ -640,6 +640,39 @@ pub struct RetainedSkiaCache {
     tree: RetainedLayerTree,
     pictures: Vec<Picture>,
     glyph_clip_decisions: Vec<Vec<GlyphClipDecision>>,
+    /// Layers whose recording the last frame kept, and the layer count.
+    last_reused: (usize, usize),
+}
+
+impl RetainedSkiaCache {
+    pub(crate) fn last_reused(&self) -> (usize, usize) {
+        self.last_reused
+    }
+}
+
+thread_local! {
+    /// Paint clients invalidated since the recordings in the retained cache
+    /// were made (`retained_layers::paint_dirty_clients`), set by the caller
+    /// for the next `replay_frame` only.
+    static PENDING_PAINT_INVALIDATION: RefCell<Option<Vec<bool>>> = const { RefCell::new(None) };
+    /// Retained caches on this thread track which layers may keep their
+    /// recording across a content change (set by the kept headless
+    /// rasterizer).
+    static TRACK_PARTIAL_LAYERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn has_pending_paint_invalidation() -> bool {
+    PENDING_PAINT_INVALIDATION.with(|slot| slot.borrow().is_some())
+}
+
+pub(crate) fn set_track_partial_layers(track: bool) {
+    TRACK_PARTIAL_LAYERS.with(|cell| cell.set(track));
+}
+
+/// Hand the next `replay_frame` the clients whose paint changed since the
+/// cache's recordings; `None` re-records every layer whose content changed.
+pub(crate) fn set_pending_paint_invalidation(dirty: Option<Vec<bool>>) {
+    PENDING_PAINT_INVALIDATION.with(|slot| *slot.borrow_mut() = dirty);
 }
 
 #[derive(Clone)]
@@ -759,6 +792,12 @@ impl SkiaRasterizer {
 
     pub fn invalidate_recordings(&mut self) {
         self.retained.invalidate_recordings();
+    }
+
+    /// Layers the last frame kept from the previous recordings, and the
+    /// layer count.
+    pub(crate) fn last_reused_layers(&self) -> (usize, usize) {
+        self.retained.last_reused()
     }
 
     #[cfg(test)]
@@ -1564,7 +1603,11 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         }
         let default_overrides = CompositorOverrides::default();
         let overrides = overrides.unwrap_or(&default_overrides);
+        cache
+            .tree
+            .set_track_partial(TRACK_PARTIAL_LAYERS.with(std::cell::Cell::get));
         let action = cache.tree.sync(artifact, &scrolls, overrides);
+        let invalidation = PENDING_PAINT_INVALIDATION.with(|slot| slot.borrow_mut().take());
         let glyph_clips = cache
             .tree
             .layers
@@ -1585,12 +1628,16 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             && cache.pictures.len() == cache.tree.layers.len()
             && cache.glyph_clip_decisions.len() == cache.tree.layers.len();
         let can_replay = reusable
+            && invalidation
+                .as_ref()
+                .is_none_or(|dirty| !dirty.iter().any(|client| *client))
             && cache
                 .glyph_clip_decisions
                 .iter()
                 .zip(&glyph_clips)
                 .all(|(decisions, clip)| glyph_clip_decisions_match(decisions, *clip));
         if can_replay {
+            cache.last_reused = (cache.tree.layers.len(), cache.tree.layers.len());
             cache.tree.note_replay();
             crate::perf::record_paint_path("retained-layer-replay");
             composite_skia_layers(
@@ -1608,15 +1655,45 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         let _memo = ArtifactFrameMemo::enter(artifact);
         let mut pictures = Vec::with_capacity(cache.tree.layers.len());
         let mut glyph_clip_decisions = Vec::with_capacity(cache.tree.layers.len());
+        // A content change re-records only the layers holding an
+        // invalidated client (or whose bounds moved); the others keep their
+        // recording, as cc re-rasters only invalidated layers.
+        let partial: Option<Vec<bool>> = match (&invalidation, cache.tree.partial_layers()) {
+            (Some(dirty), Some(same_bounds))
+                if matches!(action, LayerPaintAction::Rebuild)
+                    && cache.pictures.len() == cache.tree.layers.len()
+                    && cache.glyph_clip_decisions.len() == cache.tree.layers.len() =>
+            {
+                Some(
+                    cache
+                        .tree
+                        .layers
+                        .iter()
+                        .zip(same_bounds)
+                        .map(|(layer, &same)| {
+                            same && !layer
+                                .client_indices
+                                .iter()
+                                .any(|&client| dirty.get(client).copied().unwrap_or(true))
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
         let keep: Vec<bool> = (0..cache.tree.layers.len())
             .map(|layer_index| {
-                reusable
+                (reusable || partial.as_ref().is_some_and(|clean| clean[layer_index]))
                     && glyph_clip_decisions_match(
                         &cache.glyph_clip_decisions[layer_index],
                         glyph_clips[layer_index],
                     )
             })
             .collect();
+        cache.last_reused = (
+            keep.iter().filter(|kept| **kept).count(),
+            cache.tree.layers.len(),
+        );
         // Bucket the frame's nodes by layer in one pass (frame order kept),
         // instead of scanning every layer's client list per node.
         let mut layer_of: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1682,7 +1759,11 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         cache.pictures = pictures;
         cache.glyph_clip_decisions = glyph_clip_decisions;
         cache.tree.note_rebuild();
-        crate::perf::record_paint_path("full-scene-rebuild");
+        crate::perf::record_paint_path(if partial.is_some() {
+            "partial-layer-rebuild"
+        } else {
+            "full-scene-rebuild"
+        });
         composite_skia_layers(
             canvas,
             &cache.pictures,

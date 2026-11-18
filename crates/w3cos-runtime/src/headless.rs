@@ -81,6 +81,49 @@ thread_local! {
 
 pub(crate) fn invalidate_retained_frame() {
     RETAINED_PAINT.with(|slot| *slot.borrow_mut() = None);
+    #[cfg(feature = "skia")]
+    HEADLESS_SKIA_CURRENT.with(|current| current.set(false));
+}
+
+#[cfg(feature = "skia")]
+thread_local! {
+    /// One headless rasterizer kept across frames when layer reuse is on.
+    static HEADLESS_SKIA: RefCell<Option<SkiaRasterizer>> = const { RefCell::new(None) };
+    /// The kept rasterizer painted the last frame, so its recordings match
+    /// the artifact in `RETAINED_PAINT`.
+    static HEADLESS_SKIA_CURRENT: Cell<bool> = const { Cell::new(false) };
+    /// Layers the kept rasterizer reused in its last frame, and the count.
+    static HEADLESS_SKIA_REUSED: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// Font registry revision when the kept recordings were made.
+    static HEADLESS_SKIA_FONTS: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+#[cfg(all(test, feature = "skia"))]
+thread_local! {
+    static PAINT_LAYER_REUSE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// `W3COS_PAINT_LAYER_REUSE=1`: keep the headless rasterizer and repaint
+/// only the compositor layers holding changed paint clients.
+#[cfg(feature = "skia")]
+fn paint_layer_reuse_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PAINT_LAYER_REUSE_OVERRIDE.with(Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("W3COS_PAINT_LAYER_REUSE").is_ok_and(|value| value == "1"))
+}
+
+/// `W3COS_PAINT_LAYER_REUSE_VERIFY=1`: also paint each frame from scratch
+/// and report differing bytes.
+#[cfg(feature = "skia")]
+fn paint_layer_reuse_verify() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("W3COS_PAINT_LAYER_REUSE_VERIFY").is_ok_and(|value| value == "1")
+    })
 }
 
 #[cfg(test)]
@@ -319,6 +362,23 @@ fn finish_headless_frame(
         width as f32,
         height as f32,
     );
+    #[cfg(feature = "skia")]
+    if paint_layer_reuse_enabled() {
+        // Diff against the artifact the retained recordings were made from.
+        // Loaded fonts change glyphs without changing the artifact.
+        let same_fonts = HEADLESS_SKIA_FONTS.with(Cell::get)
+            == crate::font_face::FontRegistry::global().revision();
+        let dirty = (same_fonts && HEADLESS_SKIA_CURRENT.with(Cell::get))
+            .then(|| {
+                RETAINED_PAINT.with(|slot| {
+                    slot.borrow().as_ref().and_then(|retained| {
+                        crate::retained_layers::paint_dirty_clients(&retained.artifact, &artifact)
+                    })
+                })
+            })
+            .flatten();
+        crate::render_skia::set_pending_paint_invalidation(dirty);
+    }
     let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact, force_cpu)?;
     let rect_independent = component_rect_independent(root);
     RETAINED_PAINT.with(|slot| {
@@ -586,6 +646,11 @@ fn rasterize_prepared_frame(
     force_cpu: bool,
 ) -> Result<Vec<u8>> {
     if force_cpu {
+        #[cfg(feature = "skia")]
+        {
+            crate::render_skia::set_pending_paint_invalidation(None);
+            HEADLESS_SKIA_CURRENT.with(|current| current.set(false));
+        }
         #[cfg(feature = "cpu-render")]
         {
             let _ = artifact;
@@ -603,24 +668,68 @@ fn rasterize_prepared_frame(
     // pixel tests keep a single backend.
     #[cfg(feature = "skia")]
     {
-        let mut rasterizer = SkiaRasterizer::new_host()
-            .ok_or_else(|| anyhow::anyhow!("host W3COS font is unavailable to Skia"))?;
-        return rasterizer
-            .render_frame(
-                width,
-                height,
-                nodes,
-                layout::layout_font(),
-                scroll_info,
-                &HashMap::new(),
-                None,
-                artifact.canvas_background,
-                Some(artifact),
-                None,
-                1.0,
-            )
-            .map(|rgba| rgba.to_vec())
-            .ok_or_else(|| anyhow::anyhow!("Skia failed to rasterize the headless document"));
+        let render = |rasterizer: &mut SkiaRasterizer| {
+            rasterizer
+                .render_frame(
+                    width,
+                    height,
+                    nodes,
+                    layout::layout_font(),
+                    scroll_info,
+                    &HashMap::new(),
+                    None,
+                    artifact.canvas_background,
+                    Some(artifact),
+                    None,
+                    1.0,
+                )
+                .map(|rgba| rgba.to_vec())
+                .ok_or_else(|| anyhow::anyhow!("Skia failed to rasterize the headless document"))
+        };
+        let new_rasterizer = || {
+            SkiaRasterizer::new_host()
+                .ok_or_else(|| anyhow::anyhow!("host W3COS font is unavailable to Skia"))
+        };
+        if !paint_layer_reuse_enabled() {
+            crate::render_skia::set_pending_paint_invalidation(None);
+            crate::render_skia::set_track_partial_layers(false);
+            return render(&mut new_rasterizer()?);
+        }
+        crate::render_skia::set_track_partial_layers(true);
+        HEADLESS_SKIA_CURRENT.with(|current| current.set(false));
+        // Keep one rasterizer, and with it the retained layer recordings,
+        // across headless frames (cc keeps its layers between commits).
+        let rgba = HEADLESS_SKIA.with(|slot| -> Result<(Vec<u8>, (usize, usize))> {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(new_rasterizer()?);
+            }
+            let rasterizer = slot.as_mut().expect("headless rasterizer");
+            if !crate::render_skia::has_pending_paint_invalidation() {
+                // Without a diff against the recordings' artifact, nothing
+                // proves a kept recording (or its images and fonts) current.
+                rasterizer.invalidate_recordings();
+            }
+            let rgba = render(rasterizer);
+            crate::render_skia::set_pending_paint_invalidation(None);
+            Ok((rgba?, rasterizer.last_reused_layers()))
+        })?;
+        HEADLESS_SKIA_CURRENT.with(|current| current.set(true));
+        HEADLESS_SKIA_REUSED.with(|reused| reused.set(rgba.1));
+        HEADLESS_SKIA_FONTS
+            .with(|fonts| fonts.set(crate::font_face::FontRegistry::global().revision()));
+        if paint_layer_reuse_verify() {
+            crate::render_skia::set_pending_paint_invalidation(None);
+            crate::render_skia::set_track_partial_layers(false);
+            let fresh = render(&mut new_rasterizer()?)?;
+            let differing = rgba.0.iter().zip(&fresh).filter(|(a, b)| a != b).count()
+                + rgba.0.len().abs_diff(fresh.len());
+            eprintln!(
+                "[paint-verify] kept {}/{} layers, {} differing bytes",
+                rgba.1.0, rgba.1.1, differing
+            );
+        }
+        return Ok(rgba.0);
     }
     #[cfg(all(feature = "cpu-render", not(feature = "skia")))]
     {
@@ -851,6 +960,75 @@ mod tests {
             let pixel = (y * 64 + 10) * 4;
             assert_eq!(&frame.rgba[pixel..pixel + 4], &expected, "clip at y={y}");
         }
+    }
+
+    fn with_layer_reuse<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+        PAINT_LAYER_REUSE_OVERRIDE.with(|value| value.set(Some(enabled)));
+        let result = run();
+        PAINT_LAYER_REUSE_OVERRIDE.with(|value| value.set(None));
+        result
+    }
+
+    #[test]
+    fn layer_reuse_keeps_unchanged_layers_and_matches_a_fresh_frame() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        invalidate_retained_frame();
+        let body = crate::dom::body_id();
+        let mut texts = Vec::new();
+        for index in 0..4 {
+            let card = crate::dom::create_element("div");
+            for (name, value) in [
+                ("will-change", "transform"),
+                ("width", "120px"),
+                ("background", "#eeeeff"),
+                ("border-bottom", "2px solid #3366cc"),
+            ] {
+                crate::dom::set_style_property(card, name, value);
+            }
+            let paragraph = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node(&format!("card {index} says hello"));
+            crate::dom::append_child(paragraph, text);
+            crate::dom::append_child(card, paragraph);
+            crate::dom::append_child(body, card);
+            texts.push(text);
+        }
+        let (first, edited, reused) = with_layer_reuse(true, || {
+            let first = render_document_rgba(160, 360).expect("first frame");
+            crate::dom::set_text_content(texts[3], "card 3 says goodbye");
+            let edited = render_document_rgba(160, 360).expect("edited frame");
+            (first, edited, HEADLESS_SKIA_REUSED.with(Cell::get))
+        });
+        assert_ne!(first.rgba, edited.rgba, "the edit must change pixels");
+        assert!(reused.1 > 1, "the cards must paint in several layers");
+        assert!(
+            reused.0 > 0 && reused.0 < reused.1,
+            "only the edited card's layers repaint, got {reused:?}"
+        );
+        let fresh = with_layer_reuse(false, || {
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            render_document_rgba(160, 360).expect("fresh frame")
+        });
+        assert_eq!(
+            edited.rgba, fresh.rgba,
+            "kept layer recordings must match a frame painted from scratch"
+        );
+        // Wrapping the first card moves every card below it.
+        let wrapped = with_layer_reuse(true, || {
+            render_document_rgba(160, 360).expect("warm frame");
+            crate::dom::set_text_content(texts[0], "card 0 now says a much longer hello");
+            render_document_rgba(160, 360).expect("wrapped frame")
+        });
+        let fresh = with_layer_reuse(false, || {
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            render_document_rgba(160, 360).expect("fresh wrapped frame")
+        });
+        assert_eq!(
+            wrapped.rgba, fresh.rgba,
+            "moved layers must match a frame painted from scratch"
+        );
     }
 
     #[test]

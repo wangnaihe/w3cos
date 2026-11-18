@@ -64,6 +64,17 @@ pub struct RetainedLayerTree {
     recordings_valid: bool,
     pub full_scene_rebuilds: u64,
     pub compositor_replays: u64,
+    /// Fingerprint of everything a layer recording reads that is not owned
+    /// by one paint client (layer list, property trees, self clips).
+    global_fingerprint: u64,
+    layer_chunk_hashes: Vec<u64>,
+    /// Compute `partial` on sync (off unless a backend keeps recordings
+    /// across content changes).
+    track_partial: bool,
+    /// After a `Rebuild` sync: per layer, whether its bounds and the global
+    /// inputs are unchanged since the recordings were made, so a backend may
+    /// keep that layer's recording when none of its clients was invalidated.
+    partial: Option<Vec<bool>>,
 }
 
 impl RetainedLayerTree {
@@ -76,12 +87,37 @@ impl RetainedLayerTree {
         let layers = build_layers(artifact);
         let content = content_fingerprint(artifact, &layers);
         let compositor = compositor_fingerprint(artifact, &layers, scroll_offsets, overrides);
+        let (global, chunk_hashes) = if self.track_partial {
+            (
+                global_fingerprint(artifact, &layers),
+                layer_chunk_hashes(artifact, &layers),
+            )
+        } else {
+            (0, Vec::new())
+        };
         let structure_changed = self.layers.len() != layers.len()
             || self
                 .layers
                 .iter()
                 .zip(&layers)
                 .any(|(old, new)| old.client_indices != new.client_indices);
+        self.partial = (self.track_partial
+            && self.recordings_valid
+            && !self.layers.is_empty()
+            && !structure_changed
+            && global == self.global_fingerprint)
+            .then(|| {
+                self.layers
+                    .iter()
+                    .zip(&layers)
+                    .zip(self.layer_chunk_hashes.iter().zip(&chunk_hashes))
+                    .map(|((old, new), (old_chunks, new_chunks))| {
+                        rects_equal(old.bounds, new.bounds) && old_chunks == new_chunks
+                    })
+                    .collect()
+            });
+        self.global_fingerprint = global;
+        self.layer_chunk_hashes = chunk_hashes;
         self.layers = layers;
 
         if !self.recordings_valid || structure_changed || content != self.content_fingerprint {
@@ -113,6 +149,327 @@ impl RetainedLayerTree {
     pub fn recordings_valid(&self) -> bool {
         self.recordings_valid && !self.layers.is_empty()
     }
+
+    pub fn set_track_partial(&mut self, track: bool) {
+        self.track_partial = track;
+    }
+
+    /// Per layer, whether its previous recording may be kept if none of its
+    /// clients changed (see `partial`). `None` when every layer re-records.
+    pub fn partial_layers(&self) -> Option<&[bool]> {
+        self.partial.as_deref()
+    }
+}
+
+/// What a layer's recording reads from its own paint chunks.
+fn layer_chunk_hashes(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> Vec<u64> {
+    layers
+        .iter()
+        .map(|layer| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            layer.chunk_ids.len().hash(&mut hasher);
+            for &chunk_id in &layer.chunk_ids {
+                let Some(chunk) = artifact.chunks.get(chunk_id) else {
+                    u64::MAX.hash(&mut hasher);
+                    continue;
+                };
+                hash_rect(chunk.bounds, &mut hasher);
+                chunk.properties.transform.hash(&mut hasher);
+                chunk.properties.clip.hash(&mut hasher);
+                chunk.properties.effect.hash(&mut hasher);
+                chunk.properties.scroll.hash(&mut hasher);
+                chunk.z_order.hash(&mut hasher);
+                for item in artifact
+                    .display_items
+                    .get(chunk.begin..chunk.end)
+                    .unwrap_or(&[])
+                {
+                    item.client_index.hash(&mut hasher);
+                }
+            }
+            hasher.finish()
+        })
+        .collect()
+}
+
+fn rects_equal(a: LayoutRect, b: LayoutRect) -> bool {
+    a.x.to_bits() == b.x.to_bits()
+        && a.y.to_bits() == b.y.to_bits()
+        && a.width.to_bits() == b.width.to_bits()
+        && a.height.to_bits() == b.height.to_bits()
+}
+
+/// Everything a layer recording reads that no single paint client or layer
+/// owns: the layer list, the property trees and self clips.
+fn global_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> u64 {
+    use std::fmt::Write as _;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    layers.len().hash(&mut hasher);
+    for layer in layers {
+        layer.properties.transform.hash(&mut hasher);
+        layer.properties.clip.hash(&mut hasher);
+        layer.properties.effect.hash(&mut hasher);
+        layer.properties.scroll.hash(&mut hasher);
+        layer.sticky_owner.hash(&mut hasher);
+        layer.effect_owner.hash(&mut hasher);
+        layer.transform_owner.hash(&mut hasher);
+        layer.scroll_host.hash(&mut hasher);
+    }
+    artifact.nodes.len().hash(&mut hasher);
+    artifact.self_clip.hash(&mut hasher);
+    // Property nodes carry floats without `Hash`; their `Debug` form is
+    // exact (shortest round-trip) and these trees are small.
+    let mut text = String::new();
+    let _ = write!(
+        text,
+        "{:?}{:?}{:?}{:?}",
+        artifact.properties.transforms,
+        artifact.properties.clips,
+        artifact.properties.effects,
+        artifact.properties.scrolls
+    );
+    text.hash(&mut hasher);
+    artifact.viewport_scroll.0.to_bits().hash(&mut hasher);
+    artifact.viewport_scroll.1.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Paint clients whose recording may differ from the previous artifact's,
+/// for keeping unchanged compositor layer recordings across frames (Blink
+/// keeps display items of clients that were not invalidated; cc re-rasters
+/// only invalidated layers). A client is marked when its own paint inputs
+/// changed, or when it shares a containing block (inline shaping, bidi
+/// reordering, decorations and inline backgrounds read across that block's
+/// inline content) or a table with a changed client. `None` means repaint
+/// every layer: a different node count, a different canvas background, or
+/// a changed client under a filter or with a resize indicator (effects that
+/// read across clients).
+pub fn paint_dirty_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<Vec<bool>> {
+    use w3cos_std::component::ComponentKind;
+    use w3cos_std::style::Display;
+    let n = cur.nodes.len();
+    if prev.nodes.len() != n
+        || prev.canvas_background != cur.canvas_background
+        || prev.canvas_background_style != cur.canvas_background_style
+        || prev.canvas_background_source != cur.canvas_background_source
+        || prev.body_index != cur.body_index
+        || prev.canvas_background_positioning_rect != cur.canvas_background_positioning_rect
+        || prev.viewport_scroll != cur.viewport_scroll
+    {
+        return None;
+    }
+    let item_hashes = |artifact: &PaintArtifact| {
+        let mut hashes = vec![0u64; n];
+        for item in &artifact.display_items {
+            if let Some(slot) = hashes.get_mut(item.client_index) {
+                let mut hasher = w3cos_std::fxhash::FxHasher::default();
+                slot.hash(&mut hasher);
+                hash_rect(item.visual_rect, &mut hasher);
+                item.chunk_id.hash(&mut hasher);
+                *slot = hasher.finish() | 1;
+            }
+        }
+        hashes
+    };
+    let (prev_items, cur_items) = (item_hashes(prev), item_hashes(cur));
+    let column_equal = |a: &[crate::paint_artifact::ColumnFragment],
+                        b: &[crate::paint_artifact::ColumnFragment]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                rects_equal(a.visual_rect, b.visual_rect)
+                    && a.translate_x.to_bits() == b.translate_x.to_bits()
+                    && a.translate_y.to_bits() == b.translate_y.to_bits()
+                    && a.clip_top.to_bits() == b.clip_top.to_bits()
+                    && a.clip_bottom.to_bits() == b.clip_bottom.to_bits()
+            })
+    };
+    let text_equal = |a: &[(LayoutRect, crate::layout_ng::FragmentText)],
+                      b: &[(LayoutRect, crate::layout_ng::FragmentText)]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(a, b)| rects_equal(a.0, b.0) && a.1 == b.1)
+    };
+    let rect_equal = |a: Option<LayoutRect>, b: Option<LayoutRect>| match (a, b) {
+        (Some(a), Some(b)) => rects_equal(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    let inline_level = |display: Display| {
+        matches!(
+            display,
+            Display::Inline | Display::InlineBlock | Display::InlineFlex
+        ) || display == Display::Contents
+    };
+    let volatile = |b: &crate::paint_artifact::PaintNode| {
+        matches!(
+            b.kind,
+            ComponentKind::Image { .. }
+                | ComponentKind::Canvas { .. }
+                | ComponentKind::SvgDocument { .. }
+                | ComponentKind::TextInput { .. }
+        ) || b
+            .style
+            .background_image
+            .as_deref()
+            .is_some_and(|value| value.contains("url("))
+            || b.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties.values().any(|value| value.contains("url(")))
+    };
+    let get = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+    let mut changed = Vec::new();
+    for index in 0..n {
+        let (a, b) = (&prev.nodes[index], &cur.nodes[index]);
+        // Geometry first: it is the cheap check and the common change.
+        let same = rect_equal(
+            prev.rect_by_index.get(index).copied().flatten(),
+            cur.rect_by_index.get(index).copied().flatten(),
+        ) && prev_items[index] == cur_items[index]
+            && a.parent == b.parent
+            && a.sticky_counter_signal == b.sticky_counter_signal
+            && a.kind == b.kind
+            && a.style == b.style
+            && prev.node_properties.get(index) == cur.node_properties.get(index)
+            && prev.self_clip.get(index) == cur.self_clip.get(index)
+            && prev.z_order.get(index) == cur.z_order.get(index)
+            && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
+            && prev.paint_order.get(index) == cur.paint_order.get(index)
+            && column_equal(
+                prev.column_fragments
+                    .get(index)
+                    .map_or(&[][..], Vec::as_slice),
+                cur.column_fragments
+                    .get(index)
+                    .map_or(&[][..], Vec::as_slice),
+            )
+            && text_equal(
+                prev.text_fragments
+                    .get(index)
+                    .map_or(&[][..], Vec::as_slice),
+                cur.text_fragments.get(index).map_or(&[][..], Vec::as_slice),
+            )
+            && get(&prev.vertical_text, index) == get(&cur.vertical_text, index);
+        // Clients painting resources the artifact does not describe
+        // (decoded `url()` images, canvas bitmaps, SVG documents, form
+        // control values) repaint every frame; their geometry did not change, so
+        // their containing block keeps its recording.
+        if same {
+            if volatile(b) {
+                changed.push((index, true));
+            }
+        } else {
+            // A block-level box whose own paint inputs are unchanged and only
+            // moved does not change what its siblings paint; each moved
+            // descendant is compared on its own.
+            let moved_only = a.parent == b.parent
+                && a.sticky_counter_signal == b.sticky_counter_signal
+                && a.kind == b.kind
+                && a.style == b.style
+                && prev.node_properties.get(index) == cur.node_properties.get(index)
+                && prev.self_clip.get(index) == cur.self_clip.get(index)
+                && prev.z_order.get(index) == cur.z_order.get(index)
+                && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
+                && prev.paint_order.get(index) == cur.paint_order.get(index)
+                && get(&prev.vertical_text, index) == get(&cur.vertical_text, index)
+                && !matches!(b.kind, ComponentKind::Text { .. })
+                && !inline_level(b.style.display)
+                && prev.text_fragments.get(index).is_none_or(Vec::is_empty)
+                && cur.text_fragments.get(index).is_none_or(Vec::is_empty);
+            changed.push((index, moved_only));
+            // Past this many changed clients most layers re-record anyway;
+            // stop diffing and repaint everything.
+            if changed.len() > n / 8 + 64 {
+                return None;
+            }
+        }
+    }
+    if cur
+        .nodes
+        .iter()
+        .enumerate()
+        .any(|(index, node)| node.parent.is_some_and(|parent| parent >= index))
+    {
+        return None;
+    }
+    let mut dirty = vec![false; n];
+    if changed.is_empty() {
+        return Some(dirty);
+    }
+    let reads_across_clients = |artifact: &PaintArtifact, index: usize| {
+        let node = &artifact.nodes[index];
+        if node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key(w3cos_dom::css_style::RESIZE_PROPERTY)
+            })
+        {
+            return true;
+        }
+        let mut effect = artifact
+            .node_properties
+            .get(index)
+            .map_or(0, |properties| properties.effect);
+        while effect != 0 {
+            let Some(node) = artifact.properties.effects.get(effect) else {
+                break;
+            };
+            if node.filter.is_some() {
+                return true;
+            }
+            if node.parent == effect {
+                break;
+            }
+            effect = node.parent;
+        }
+        false
+    };
+    let table_like = |display: Display| matches!(display, Display::Table | Display::InlineTable);
+    let mut roots = Vec::new();
+    for &(index, moved_only) in &changed {
+        if reads_across_clients(prev, index) || reads_across_clients(cur, index) {
+            return None;
+        }
+        dirty[index] = true;
+        if !moved_only {
+            // The nearest containing block above the changed client.
+            let mut block = cur.nodes[index].parent;
+            while let Some(candidate) = block {
+                if !inline_level(cur.nodes[candidate].style.display) {
+                    break;
+                }
+                block = cur.nodes[candidate].parent;
+            }
+            roots.push(block.unwrap_or(index));
+        }
+        let mut ancestor = cur.nodes[index].parent;
+        while let Some(candidate) = ancestor {
+            if table_like(cur.nodes[candidate].style.display) {
+                roots.push(candidate);
+            }
+            ancestor = cur.nodes[candidate].parent;
+        }
+        dirty[index] = true;
+    }
+    // Mark every descendant of a root; nodes are in tree order, so a node's
+    // parent is visited before it.
+    let mut root_mark = vec![false; n];
+    for root in roots {
+        root_mark[root] = true;
+    }
+    for index in 0..n {
+        let inherited = cur.nodes[index]
+            .parent
+            .is_some_and(|parent| root_mark[parent]);
+        if root_mark[index] || inherited {
+            root_mark[index] = true;
+            dirty[index] = true;
+        }
+    }
+    Some(dirty)
 }
 
 pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
