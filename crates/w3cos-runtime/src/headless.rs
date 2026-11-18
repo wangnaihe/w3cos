@@ -103,8 +103,9 @@ thread_local! {
     static PAINT_LAYER_REUSE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// `W3COS_PAINT_LAYER_REUSE=1`: keep the headless rasterizer and repaint
-/// only the compositor layers holding changed paint clients.
+/// Keep the headless rasterizer and repaint only the compositor layers
+/// holding changed paint clients; `W3COS_PAINT_LAYER_REUSE=0` repaints
+/// every layer with a fresh rasterizer each frame.
 #[cfg(feature = "skia")]
 fn paint_layer_reuse_enabled() -> bool {
     #[cfg(test)]
@@ -113,7 +114,7 @@ fn paint_layer_reuse_enabled() -> bool {
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
-        .get_or_init(|| std::env::var("W3COS_PAINT_LAYER_REUSE").is_ok_and(|value| value == "1"))
+        .get_or_init(|| std::env::var("W3COS_PAINT_LAYER_REUSE").map_or(true, |value| value != "0"))
 }
 
 /// `W3COS_PAINT_LAYER_REUSE_VERIFY=1`: also paint each frame from scratch
