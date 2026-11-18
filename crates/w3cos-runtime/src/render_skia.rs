@@ -4695,6 +4695,56 @@ fn draw_text_in_rect_with_line_painter(
     };
     // A single preserved line cannot soft-wrap. Keep its tabs as shifts until
     // positioning; preparing them as spaces would destroy block-stop context.
+    // ShapingLineBreaker: shape the paragraph once and measure a candidate
+    // line on its own only near the available edge. Only for text whose
+    // lines are prefixes of one font run in one direction, so the paragraph
+    // shaping and the standalone line shaping read the same face and glyphs.
+    let mut estimate = |prepared: &str| -> Option<text_layout::ParagraphWidths> {
+        if style_uses_ahem(style)
+            || style.direction != w3cos_std::style::TextDirection::Ltr
+            || prepared.contains(['\t', '\n', '\r'])
+        {
+            return None;
+        }
+        let (render_text, bidi_boundaries) =
+            text_layout::font_render_text_for_style_with_boundaries(prepared, style);
+        if !bidi_boundaries.is_empty()
+            || render_text.as_ref() != prepared
+            || prepared.chars().any(|character| {
+                matches!(
+                    unicode_bidi::bidi_class(character),
+                    unicode_bidi::BidiClass::R
+                        | unicode_bidi::BidiClass::AL
+                        | unicode_bidi::BidiClass::AN
+                        | unicode_bidi::BidiClass::LRE
+                        | unicode_bidi::BidiClass::RLE
+                        | unicode_bidi::BidiClass::LRO
+                        | unicode_bidi::BidiClass::RLO
+                        | unicode_bidi::BidiClass::PDF
+                        | unicode_bidi::BidiClass::LRI
+                        | unicode_bidi::BidiClass::RLI
+                        | unicode_bidi::BidiClass::FSI
+                        | unicode_bidi::BidiClass::PDI
+                )
+            })
+        {
+            return None;
+        }
+        let runs = css_font_runs_with_boundaries(prepared, typeface, style, &bidi_boundaries);
+        let [run] = runs.as_slice() else {
+            return None;
+        };
+        if run.text.len() != prepared.len() {
+            return None;
+        }
+        let shaped =
+            crate::skia_text_run::shape_visual_run_with_clusters(run.text, &run.typeface, style)?;
+        text_layout::ParagraphWidths::new(
+            &shaped.clusters,
+            prepared.len(),
+            style.font_size + style.letter_spacing.abs() * 2.0 + style.word_spacing.abs() * 2.0,
+        )
+    };
     let layout = if tab_context.is_some() {
         std::rc::Rc::new(text_layout::TextPaintLayout {
             lines: vec![text.to_string()],
@@ -4721,6 +4771,7 @@ fn draw_text_in_rect_with_line_painter(
                     Some(style),
                 )
             },
+            wrap_estimate_enabled().then_some(&mut estimate as &mut dyn FnMut(&str) -> _),
         )
     };
     let authored_styles = text_layout::authored_line_styles(text, style, &layout.lines);
@@ -6211,6 +6262,16 @@ mod ahem_segment_tests {
         );
         assert!(matches!(segments[2], AhemSegment::Cell("XX")));
     }
+}
+
+/// Paint line breaking skips measuring lines that the paragraph's single
+/// shaping shows far from the available edge. On by default;
+/// `W3COS_WRAP_ESTIMATE=0` measures every candidate line, and
+/// `W3COS_WRAP_ESTIMATE_VERIFY=1` measures skipped lines anyway and reports
+/// one that would have broken.
+fn wrap_estimate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_WRAP_ESTIMATE").is_none_or(|v| v != "0"))
 }
 
 fn measure_skia_text_advance(text: &str, typeface: &Typeface, style: &Style) -> f32 {

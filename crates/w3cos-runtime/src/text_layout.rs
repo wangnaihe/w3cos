@@ -700,8 +700,99 @@ fn wrap_greedy_with_line_width(
     max_defer_lines: usize,
     preserve_spaces: bool,
     mode: crate::line_break::BreakMode,
+    line_width: impl FnMut(usize) -> f32,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    wrap_greedy_with_line_width_estimated(
+        text,
+        max_defer_lines,
+        preserve_spaces,
+        mode,
+        line_width,
+        run_width,
+        None,
+    )
+}
+
+/// Cluster advances of a whole paragraph, shaped once, and the largest
+/// difference between a line measured from them and the same line shaped
+/// on its own (the contextual shaping lost at the two cut points).
+pub(crate) struct ParagraphWidths {
+    /// UTF-8 start of each cluster of the prepared text, ascending.
+    starts: Vec<usize>,
+    /// `before[i]` is the summed advance of clusters `0..i`.
+    before: Vec<f32>,
+    len: usize,
+    margin: f32,
+}
+
+impl ParagraphWidths {
+    pub(crate) fn new(clusters: &[(usize, f32)], len: usize, margin: f32) -> Option<Self> {
+        if clusters.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || clusters.last().is_some_and(|last| last.0 >= len)
+            || !margin.is_finite()
+        {
+            return None;
+        }
+        let mut before = Vec::with_capacity(clusters.len() + 1);
+        let mut sum = 0.0f32;
+        before.push(0.0);
+        for (_, advance) in clusters {
+            if !advance.is_finite() {
+                return None;
+            }
+            sum += advance;
+            before.push(sum);
+        }
+        Some(Self {
+            starts: clusters.iter().map(|(start, _)| *start).collect(),
+            before,
+            len,
+            margin,
+        })
+    }
+
+    /// Advance of the clusters starting before `byte`.
+    fn advance_before(&self, byte: usize) -> f32 {
+        self.before[self.starts.partition_point(|&start| start < byte)]
+    }
+
+    /// A cut that does not split a cluster (Blink reuses a ShapeResult only
+    /// at safe-to-break offsets; a partial cluster such as half an emoji ZWJ
+    /// sequence shapes to different glyphs on its own).
+    fn is_cluster_boundary(&self, byte: usize) -> bool {
+        byte == self.len || self.starts.binary_search(&byte).is_ok()
+    }
+
+    /// Whether `text[start..end]` certainly fits `available`: both cuts are
+    /// cluster boundaries and its paragraph advance stays a whole margin
+    /// short of it.
+    fn certainly_fits(&self, start: usize, end: usize, available: f32) -> bool {
+        self.is_cluster_boundary(start)
+            && self.is_cluster_boundary(end)
+            && self.advance_before(end) - self.advance_before(start) + self.margin < available
+    }
+}
+
+fn wrap_estimate_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_WRAP_ESTIMATE_VERIFY").is_some_and(|v| v != "0"))
+}
+
+/// Greedy wrapping that measures a candidate line on its own only when its
+/// advance in the paragraph's single shaping (`estimate`, Blink's
+/// ShapingLineBreaker reading line widths from the paragraph ShapeResult)
+/// comes within a margin of the available width. Lines far from the edge
+/// fit whatever the cut points' contextual shaping does, so skipping their
+/// exact measurement keeps every break where it was.
+fn wrap_greedy_with_line_width_estimated(
+    text: &str,
+    max_defer_lines: usize,
+    preserve_spaces: bool,
+    mode: crate::line_break::BreakMode,
     mut line_width: impl FnMut(usize) -> f32,
     mut run_width: impl FnMut(&str) -> f32,
+    mut estimate: Option<&mut dyn FnMut(&str) -> Option<ParagraphWidths>>,
 ) -> Vec<String> {
     // Shaping prefixes is not monotonic: a trailing directional control can
     // change neutral resolution and reduce the complete run's advance. Never
@@ -726,6 +817,8 @@ fn wrap_greedy_with_line_width(
     // UAX #14 opportunities (crate::line_break), computed on the first
     // overflow only: most runs fit and never need them.
     let mut opportunities: Option<Vec<usize>> = None;
+    // Shaped on the first overflow check, like the opportunities.
+    let mut paragraph: Option<Option<ParagraphWidths>> = None;
     let flush = |lines: &mut Vec<String>, current: &mut String| {
         if !current.is_empty() {
             lines.push(std::mem::take(current));
@@ -755,7 +848,30 @@ fn wrap_greedy_with_line_width(
         // ulps; do not turn that numerical loss into a CSS soft break. This is
         // far below a 1/64px LayoutUnit, so genuinely narrower lines still wrap.
         let fitting_roundoff = available_width.max(1.0) * f32::EPSILON * 4.0;
-        if current.chars().count() > 1 && run_width(&current) > available_width + fitting_roundoff {
+        let certainly_fits = estimate.as_mut().is_some_and(|estimate| {
+            paragraph
+                .get_or_insert_with(|| estimate(text))
+                .as_ref()
+                .is_some_and(|widths| {
+                    widths.certainly_fits(
+                        current_start,
+                        position + ch.len_utf8(),
+                        available_width + fitting_roundoff,
+                    )
+                })
+        });
+        if certainly_fits && wrap_estimate_verify() {
+            let exact = run_width(&current);
+            if exact > available_width + fitting_roundoff {
+                eprintln!(
+                    "[wrap-estimate-verify] {current:?} exact {exact} > available {available_width}"
+                );
+            }
+        }
+        if !certainly_fits
+            && current.chars().count() > 1
+            && run_width(&current) > available_width + fitting_roundoff
+        {
             if mode.hang_last_punctuation
                 && position + ch.len_utf8() == text.len()
                 && crate::line_break::is_hangable_last(ch)
@@ -1910,6 +2026,7 @@ pub fn retained_text_paint_layout_with_run_width_and_line_widths(
         font_identity,
         run_width,
         measure_ink,
+        None,
     )
 }
 
@@ -1923,6 +2040,7 @@ pub(crate) fn retained_text_paint_layout_with_run_width_and_line_widths_in(
     font_identity: u64,
     run_width: impl FnMut(&str) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
+    estimate: Option<&mut dyn FnMut(&str) -> Option<ParagraphWidths>>,
 ) -> Rc<TextPaintLayout> {
     cached_text_paint_layout(
         text,
@@ -1933,14 +2051,23 @@ pub(crate) fn retained_text_paint_layout_with_run_width_and_line_widths_in(
         mode,
         font_identity,
         || {
-            let lines = wrap_text_with_run_width_and_line_widths_in(
-                text,
-                max_width,
-                line_widths,
-                white_space,
-                mode,
-                run_width,
-            );
+            let prepared = prepare_text_for_white_space(text, white_space);
+            let lines = if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+                prepared
+                    .split(['\n', FORCED_LINE_BREAK])
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                wrap_greedy_with_line_width_estimated(
+                    &prepared,
+                    line_widths.len().max(1),
+                    white_space == WhiteSpace::PreWrap,
+                    mode,
+                    |index| line_widths.get(index).copied().unwrap_or(max_width),
+                    run_width,
+                    estimate,
+                )
+            };
             let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
             TextPaintLayout { lines, ink_bounds }
         },
@@ -3126,5 +3253,59 @@ mod tests {
         }
         style.white_space = WhiteSpace::Pre;
         assert!(fast_text_intrinsic_size("Item 1", &style, 360.0, &font).is_none());
+    }
+
+    #[test]
+    fn paragraph_width_estimate_keeps_every_break() {
+        // A run width with contextual shaping at the cuts: a line loses 3px
+        // when it ends in 'o' (a kerning pair) and gains 2px when it starts
+        // in 'W'.
+        let run_width = |line: &str| {
+            let mut width = line.chars().count() as f32 * 10.0;
+            if line.ends_with('o') {
+                width -= 3.0;
+            }
+            if line.starts_with('W') {
+                width += 2.0;
+            }
+            width
+        };
+        let text = "Wo Wo Wooo oWo Wo foo bar Wo baz quux Woo Wo";
+        let mut estimate = |prepared: &str| {
+            let clusters: Vec<(usize, f32)> =
+                prepared.char_indices().map(|(at, _)| (at, 10.0)).collect();
+            ParagraphWidths::new(&clusters, prepared.len(), 10.0)
+        };
+        for width in [25.0, 39.0, 40.0, 41.0, 57.0, 60.0, 97.0, 140.0] {
+            let plain = wrap_greedy_with_line_width(
+                text,
+                1,
+                false,
+                crate::line_break::BreakMode::default(),
+                |_| width,
+                run_width,
+            );
+            let estimated = wrap_greedy_with_line_width_estimated(
+                text,
+                1,
+                false,
+                crate::line_break::BreakMode::default(),
+                |_| width,
+                run_width,
+                Some(&mut estimate),
+            );
+            assert_eq!(plain, estimated, "width {width}");
+        }
+    }
+
+    #[test]
+    fn paragraph_width_estimate_never_cuts_a_cluster() {
+        // "e" + combining acute shaped as one cluster.
+        let widths = ParagraphWidths::new(&[(0, 10.0), (1, 10.0), (4, 10.0)], 5, 0.0).unwrap();
+        assert!(widths.certainly_fits(0, 4, 100.0));
+        assert!(!widths.certainly_fits(0, 2, 100.0));
+        assert!(widths.certainly_fits(1, 5, 100.0));
+        assert!(!widths.certainly_fits(0, 5, 30.0));
+        assert!(ParagraphWidths::new(&[(1, 1.0), (0, 1.0)], 2, 0.0).is_none());
     }
 }
