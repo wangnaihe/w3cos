@@ -562,21 +562,8 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
             || b.style.custom_properties.as_ref().is_some_and(has_url)
     };
     let get = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
-    // `viewport_attached` per box in one preorder pass (parents come first),
-    // built on the first move instead of walking ancestors per moved box.
-    let attached = std::cell::OnceCell::<Vec<bool>>::new();
-    let viewport_attached = |index: usize| {
-        attached.get_or_init(|| {
-            let mut attached = vec![false; n];
-            for (i, node) in cur.nodes.iter().enumerate() {
-                attached[i] = node.style.position == w3cos_std::style::Position::Fixed
-                    || node
-                        .parent
-                        .is_some_and(|parent| parent < i && attached[parent]);
-            }
-            attached
-        })[index]
-    };
+    // Remembered per box when the artifact was built.
+    let viewport_attached = |index: usize| cur.viewport_attached(index);
     let mut changed = Vec::new();
     let mut moved: Vec<Option<(f32, f32)>> = vec![None; n];
     for index in 0..n {

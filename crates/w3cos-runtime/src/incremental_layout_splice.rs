@@ -2539,18 +2539,18 @@ fn apply_paint_splice(
             )
         }
     };
+    // An ancestor's size: itself and the preceding siblings on the path
+    // (already summed into `starts`), the path child, and the following
+    // siblings; only the latter are counted here.
     let mut sizes = vec![0; path.len() + 1];
     sizes[path.len()] = target_size;
     for depth in (0..path.len()).rev() {
         let parent = at_path(root, &path[..depth]);
-        sizes[depth] = 1
+        sizes[depth] = (starts[depth + 1] - starts[depth])
             + sizes[depth + 1]
-            + parent
-                .children
+            + parent.children[path[depth] + 1..]
                 .iter()
-                .enumerate()
-                .filter(|(position, _)| *position != path[depth])
-                .map(|(_, child)| count(child))
+                .map(count)
                 .sum::<usize>();
     }
     // The same boxes `try_splice` moves and grows in the DOM, as preorder
