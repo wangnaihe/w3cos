@@ -2364,18 +2364,22 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// `W3COS_PAINT_SPLICE=1`: a headless paint after a structural splice
-/// applies the splice to its own tree and layout instead of lowering and
-/// laying out the whole document again (Blink paints from the layout tree
-/// the lifecycle just updated). LayoutNG only.
+/// A headless paint after a structural splice applies the splice to its
+/// own tree and layout instead of lowering and laying out the whole
+/// document again (Blink paints from the layout tree the lifecycle just
+/// updated). LayoutNG only; on by default, `W3COS_PAINT_SPLICE=0` rebuilds.
 pub(super) fn paint_splice_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     #[cfg(test)]
     if let Some(forced) = FORCE_PAINT_SPLICE.with(std::cell::Cell::get) {
         return forced && crate::layout_ng::mode() == crate::layout_ng::Mode::On;
     }
-    *ON.get_or_init(|| std::env::var("W3COS_PAINT_SPLICE").is_ok_and(|value| value == "1"))
-        && crate::layout_ng::mode() == crate::layout_ng::Mode::On
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("W3COS_PAINT_SPLICE").ok().as_deref(),
+            Some("0") | Some("false")
+        )
+    }) && crate::layout_ng::mode() == crate::layout_ng::Mode::On
 }
 
 /// `W3COS_PAINT_SPLICE_VERIFY=1`: compare each spliced paint layout with a

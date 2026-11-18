@@ -2306,7 +2306,7 @@ struct PaintCache {
     /// Absolute or fixed leaves whose used position is a px inset delta.
     shift_ok: Vec<bool>,
     /// The paint journal position this tree and layout equal the flush
-    /// cache at (`W3COS_PAINT_SPLICE`).
+    /// cache at (see `splice::paint_splice_enabled`).
     journal: Option<(u64, usize)>,
 }
 
