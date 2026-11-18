@@ -236,6 +236,63 @@ pub(crate) fn geometric_ink_bounds(
     Some(ink)
 }
 
+/// A parsed shaping face and the table bytes it borrows. `face` is declared
+/// first so it drops before the bytes; the bytes sit in an `Arc` that is
+/// never mutated, so the borrow stays valid while the entry lives.
+struct ShapingFace {
+    face: rustybuzz::Face<'static>,
+    _bytes: Arc<Vec<u8>>,
+}
+
+thread_local! {
+    static SHAPING_FACES: RefCell<w3cos_std::fxhash::FxHashMap<u32, std::rc::Rc<ShapingFace>>> =
+        RefCell::new(Default::default());
+}
+
+fn shaping_face_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_SHAPING_FACE_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// The rustybuzz face of a typeface, parsed once per face (Blink keeps one
+/// HarfBuzzFace per FontPlatformData in its HarfBuzzFontCache rather than
+/// rebuilding the face, and its lookup accelerators, for every run).
+/// On by default; `W3COS_SHAPING_FACE_CACHE=0` parses the face per call.
+fn with_shaping_face<R>(face: &Typeface, f: impl FnOnce(&rustybuzz::Face<'_>) -> R) -> Option<R> {
+    if !shaping_face_cache_enabled() {
+        let bytes = font_tables(face)?;
+        let shaping_face = rustybuzz::Face::from_slice(&bytes, 0)?;
+        return Some(f(&shaping_face));
+    }
+    let id = face.unique_id();
+    let cached = SHAPING_FACES.with(|cache| cache.borrow().get(&id).cloned());
+    let entry = match cached {
+        Some(entry) => entry,
+        None => {
+            let bytes = font_tables(face)?;
+            // SAFETY: the slice points into the Arc's heap buffer, which is
+            // never mutated and is kept alive by `_bytes` for as long as the
+            // face that borrows it (see ShapingFace).
+            let slice: &'static [u8] =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+            let entry = std::rc::Rc::new(ShapingFace {
+                face: rustybuzz::Face::from_slice(slice, 0)?,
+                _bytes: bytes,
+            });
+            SHAPING_FACES.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                // Bounded by concrete faces, like the table cache.
+                if cache.len() >= 64 {
+                    cache.clear();
+                }
+                cache.insert(id, entry.clone());
+            });
+            entry
+        }
+    };
+    Some(f(&entry.face))
+}
+
 // Skia resolves the concrete system/registered face. Repackage its tables in
 // memory so shaping cannot silently select a different font from painting.
 fn font_tables(face: &Typeface) -> Option<Arc<Vec<u8>>> {
@@ -476,12 +533,10 @@ fn shape_visual_run_uncached(
 /// The shaper uses the default language system. A feature merely present for
 /// another script must not suppress synthesis in this run.
 fn supports_small_caps(face: &Typeface, script: rustybuzz::Script) -> bool {
-    let Some(bytes) = font_tables(face) else {
-        return false;
-    };
-    let Some(face) = rustybuzz::Face::from_slice(&bytes, 0) else {
-        return false;
-    };
+    with_shaping_face(face, |face| face_supports_small_caps(face, script)).unwrap_or(false)
+}
+
+fn face_supports_small_caps(face: &rustybuzz::Face<'_>, script: rustybuzz::Script) -> bool {
     let Some(table) = face.tables().gsub else {
         return false;
     };
@@ -627,11 +682,37 @@ fn shape_buffer(
     style: &Style,
     collect_clusters: bool,
     expansion: Option<(crate::text_layout::JustificationExpansion, usize)>,
+    buffer: rustybuzz::UnicodeBuffer,
+    native_caps: bool,
+) -> Option<GlyphRun> {
+    with_shaping_face(face, |shaping_face| {
+        shape_buffer_with_face(
+            text,
+            face,
+            shaping_face,
+            style,
+            collect_clusters,
+            expansion,
+            buffer,
+            native_caps,
+        )
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_buffer_with_face(
+    text: &str,
+    face: &Typeface,
+    shaping_face: &rustybuzz::Face<'_>,
+    style: &Style,
+    collect_clusters: bool,
+    expansion: Option<(crate::text_layout::JustificationExpansion, usize)>,
     mut buffer: rustybuzz::UnicodeBuffer,
     native_caps: bool,
 ) -> Option<GlyphRun> {
-    let bytes = font_tables(face)?;
-    let shaping_face = rustybuzz::Face::from_slice(&bytes, 0)?;
+    // The typeface only supplies macOS nominal advances.
+    #[cfg(not(target_os = "macos"))]
+    let _ = face;
     // Bidi ordering and mirrored characters have already been resolved by
     // font_render_text_for_style. Do not reorder this visual run a second time.
     buffer.set_direction(rustybuzz::Direction::LeftToRight);
@@ -653,7 +734,7 @@ fn shape_buffer(
                 .filter_map(|feature| feature.parse::<rustybuzz::Feature>().ok()),
         );
     }
-    let shaped = rustybuzz::shape(&shaping_face, &features, buffer);
+    let shaped = rustybuzz::shape(shaping_face, &features, buffer);
     // Do not derive a cluster's width by subtracting accumulated f32 cursors:
     // its precision would depend on the unrelated text before the cluster.
     // Keep accumulation precise; Skia's point/advance boundary remains f32.
@@ -747,6 +828,48 @@ fn shape_buffer(
         glyph_clusters,
         glyph_font_sizes: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod shaping_face_tests {
+    use super::*;
+
+    #[test]
+    fn cached_shaping_face_shapes_like_a_freshly_parsed_face() {
+        // Any concrete system face; a host without fonts has nothing to shape.
+        let Some(face) =
+            skia_safe::FontMgr::new().legacy_make_typeface(None, skia_safe::FontStyle::normal())
+        else {
+            return;
+        };
+        let style = Style {
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let text = "Waffle office AVA To";
+        let buffer = || {
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(text);
+            buffer.guess_segment_properties();
+            buffer
+        };
+        let bytes = font_tables(&face).unwrap();
+        let fresh = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let expected =
+            shape_buffer_with_face(text, &face, &fresh, &style, true, None, buffer(), false)
+                .unwrap();
+        for _ in 0..2 {
+            let cached = shape_buffer(text, &face, &style, true, None, buffer(), false).unwrap();
+            assert_eq!(cached.glyphs, expected.glyphs);
+            assert_eq!(cached.positions, expected.positions);
+            assert_eq!(cached.advance.to_bits(), expected.advance.to_bits());
+            assert_eq!(cached.clusters, expected.clusters);
+        }
+        assert!(
+            !shaping_face_cache_enabled()
+                || SHAPING_FACES.with(|cache| cache.borrow().contains_key(&face.unique_id()))
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
