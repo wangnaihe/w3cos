@@ -1469,14 +1469,12 @@ thread_local! {
     static ELIG_HIGH_WATER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `W3COS_ELIG_KEEP=1` (or `verify`, which also runs the full walk and
-/// compares the verdict): keep accepted eligibility fingerprints across
-/// walks of smaller trees. Off by default.
+/// Keep accepted eligibility fingerprints across walks of smaller trees.
+/// On by default; `W3COS_ELIG_KEEP=0` restores the per-tree bound, `verify`
+/// also runs the full walk and compares the verdict.
 fn elig_keep_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("W3COS_ELIG_KEEP").is_ok_and(|value| value == "1" || value == "verify")
-    })
+    *ENABLED.get_or_init(|| std::env::var("W3COS_ELIG_KEEP").map_or(true, |value| value != "0"))
 }
 
 fn elig_keep_verify() -> bool {

@@ -1272,18 +1272,17 @@ thread_local! {
     > = RefCell::new(HashMap::new());
 }
 
-/// `W3COS_SHAPE_PLAN_CACHE=1` reuses shape plans across runs; `=verify`
-/// also shapes each plain run with a fresh plan and compares glyphs,
-/// clusters and positions. Off by default.
+/// Reuse shape plans across runs. On by default; `W3COS_SHAPE_PLAN_CACHE=0`
+/// compiles a plan per run, `=verify` also shapes each plain run with a
+/// fresh plan and compares glyphs, clusters and positions.
 fn shape_plan_cache_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = SHAPE_PLAN_OVERRIDE.with(std::cell::Cell::get) {
         return enabled;
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("W3COS_SHAPE_PLAN_CACHE").is_ok_and(|value| value == "1" || value == "verify")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("W3COS_SHAPE_PLAN_CACHE").map_or(true, |value| value != "0"))
 }
 
 fn shape_plan_cache_verify() -> bool {
