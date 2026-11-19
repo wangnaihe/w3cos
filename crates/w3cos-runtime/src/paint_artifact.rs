@@ -566,10 +566,8 @@ pub(crate) fn paint_append_reuse_enabled() -> bool {
         return enabled;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "1")
-            || artifact_splice_enabled()
-    })
+    *ON.get_or_init(|| std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "1"))
+        || artifact_splice_enabled()
 }
 
 /// `W3COS_PAINT_ARTIFACT_SPLICE=1`: with append reuse, copy each run of
@@ -4964,6 +4962,7 @@ mod tests {
     #[test]
     fn artifact_splice_copies_aligned_runs_and_matches_a_full_build() {
         ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
         let mut plain = Style::default();
         plain.display = Display::Block;
         let mut clipped = plain.clone();
