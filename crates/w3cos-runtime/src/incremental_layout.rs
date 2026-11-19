@@ -682,6 +682,17 @@ pub fn flush() -> bool {
     ok
 }
 
+/// `W3COS_WARM_REBUILD=1`: a rebuild lays the new tree out through its
+/// retained flat view under the cache's structure key, as a patch flush
+/// does, so the per-box data patch flushes keep (fingerprints, subtree
+/// flags, the flat output, the eligibility walk) is there for the next
+/// edit instead of being built on it (Blink's LayoutObjects carry it from
+/// the first layout).
+fn warm_rebuild_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_WARM_REBUILD").is_ok_and(|v| v == "1"))
+}
+
 fn rebuild(
     slot: &mut Option<Cache>,
     layout_gen: u64,
@@ -691,6 +702,74 @@ fn rebuild(
     viewport_h: f32,
     drain_epoch: u32,
 ) -> bool {
+    if warm_rebuild_enabled()
+        && crate::layout_ng::mode() == crate::layout_ng::Mode::On
+        && crate::layout_ng::box_tree_enabled()
+        && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
+    {
+        let key = (layout_gen, structure);
+        let mut tree = RetainedTree::new(crate::dom::to_component_tree());
+        let mut engine = LayoutEngine::new();
+        let laid = {
+            crate::layout_ng::forget_walk_fingerprints();
+            let (component, flat) = tree.flat(key);
+            configure_engine(&mut engine, component);
+            crate::layout_ng::set_patch_hint(Some((flat, key)));
+            let computed = engine.compute(component, flat, viewport_w, viewport_h);
+            crate::layout_ng::set_patch_hint(None);
+            match computed {
+                Ok(results)
+                    if !sync_column_scroll_marker_counts(
+                        flat,
+                        &results.layout_cache,
+                        (viewport_w, viewport_h),
+                    ) =>
+                {
+                    let node_ids = flat
+                        .iter()
+                        .map(|info| match info.on_click {
+                            EventAction::NativeHost { id, .. } => *id as u32,
+                            _ => u32::MAX,
+                        })
+                        .collect::<Vec<_>>();
+                    let snaps = host_rect_snaps(flat, &results.layout_cache);
+                    defer_client_rects(None, results.layout_cache, results.text_fragments);
+                    Some((node_ids, snaps))
+                }
+                // A failed layout or a column-count resync: the cold path
+                // (which lowers again for the resync).
+                _ => None,
+            }
+        };
+        if let Some((node_ids, snaps)) = laid {
+            let width_memos = memos_for_tree(&tree, layout_gen, viewport_w, viewport_h, snaps);
+            let splice_ok = splice::tree_is_spliceable(&tree);
+            let splice_owners_ok = splice_ok || splice::tree_is_spliceable_with_owners(&tree);
+            let skip_projections = can_skip_projections(&tree);
+            let measure_text = needs_text_metric(&tree);
+            *slot = Some(Cache {
+                drain_epoch,
+                sheet_generation: w3cos_dom::stylesheet::generation(),
+                splice_ok,
+                splice_owners_ok,
+                skip_projections,
+                measure_text,
+                node_ids_stale: false,
+                owner_counts: None,
+                component: tree,
+                engine,
+                structure: layout_gen,
+                source_structure: structure,
+                cascade,
+                node_ids: node_ids.into(),
+                width_memos,
+                engine_pending: Vec::new(),
+                viewport_w_bits: viewport_w.to_bits(),
+                viewport_h_bits: viewport_h.to_bits(),
+            });
+            return true;
+        }
+    }
     let phase = phase_log_enabled();
     let t0 = std::time::Instant::now();
     let mut component = crate::dom::to_component_tree();
