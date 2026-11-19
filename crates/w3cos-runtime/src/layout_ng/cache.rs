@@ -77,6 +77,21 @@ struct Pass {
 struct Retained {
     layouts: std::collections::HashMap<u64, (usize, Vec<LayoutEntry>)>,
     min_max: std::collections::HashMap<u64, Vec<MinMaxEntry>>,
+    /// Flat length of the pass that last replaced the kept results.
+    tree_len: usize,
+}
+
+/// A small pass (a splice's subtree) adds its results to the kept ones when
+/// it is small against the tree they came from, not against how many there
+/// are (`W3COS_RETAIN_MERGE_BY_TREE=0` restores the count test).
+fn retain_merge_by_tree() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("W3COS_RETAIN_MERGE_BY_TREE").ok().as_deref(),
+            Some("1")
+        )
+    })
 }
 
 thread_local! {
@@ -794,11 +809,25 @@ fn retain(pass: &mut Pass) {
         // box has any more is only unused.
         let kept = retained.layouts.len() + retained.min_max.len();
         let fresh = layouts.len() + min_max.len();
-        if pass.flat_len * 4 < kept && kept + fresh <= RETAINED_MERGE_MAX {
+        // Small against the tree the kept results came from: a pass keeps
+        // results for only the few boxes it laid out (an entry per box
+        // above the reused ones), so a 467-box splice next to 1,631 kept
+        // entries of a 75,556-box document is still small.
+        let small = if retain_merge_by_tree() {
+            pass.flat_len * 4 < retained.tree_len
+        } else {
+            pass.flat_len * 4 < kept
+        };
+        if small && kept + fresh <= RETAINED_MERGE_MAX {
             retained.layouts.extend(layouts);
             retained.min_max.extend(min_max);
         } else {
-            *retained = Retained { layouts, min_max };
+            let tree_len = pass.flat_len;
+            *retained = Retained {
+                layouts,
+                min_max,
+                tree_len,
+            };
         }
     });
     super::inline::retire_items();
