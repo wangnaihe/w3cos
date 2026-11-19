@@ -2477,6 +2477,7 @@ pub(super) fn replay_paint_splices(
     root: &mut Component,
     layouts: &mut Vec<(crate::layout::LayoutRect, usize)>,
     texts: &mut Vec<crate::layout_ng::TextFragment>,
+    sizes: &mut Option<Vec<u32>>,
 ) -> Option<(bool, usize)> {
     PAINT_JOURNAL.with(|journal| {
         let journal = journal.borrow();
@@ -2484,74 +2485,216 @@ pub(super) fn replay_paint_splices(
             return None;
         }
         let entries = &journal.entries[point.1..];
+        let incremental = paint_splice_incremental();
+        if !incremental {
+            *sizes = None;
+        } else if sizes.as_ref().is_some_and(|known| {
+            known.first().map(|&root_size| root_size as usize) != Some(known.len())
+        }) {
+            *sizes = None;
+        }
+        let verify = incremental && paint_splice_incremental_verify();
+        let mut shadow = verify.then(|| layouts.clone());
+        let mut lazy = LazyLayoutShifts::default();
         for entry in entries {
-            if !apply_paint_splice(root, layouts, texts, entry) {
+            let Some(geometry) = paint_splice_geometry(root, entry, sizes.as_deref(), verify)
+            else {
                 return Some((false, 0));
+            };
+            if !(incremental && lazy.add(layouts, entry, &geometry)) {
+                lazy.flush(layouts);
+                splice_layouts_eagerly(layouts, entry, &geometry);
+            }
+            if let Some(shadow) = shadow.as_mut() {
+                splice_layouts_eagerly(shadow, entry, &geometry);
+            }
+            splice_texts(texts, entry, &geometry);
+            splice_tree(root, entry, &geometry, sizes);
+        }
+        lazy.flush(layouts);
+        if let Some(shadow) = shadow {
+            let same = shadow.len() == layouts.len()
+                && shadow.iter().zip(layouts.iter()).all(|((a, i), (b, j))| {
+                    i == j
+                        && a.x.to_bits() == b.x.to_bits()
+                        && a.y.to_bits() == b.y.to_bits()
+                        && a.width.to_bits() == b.width.to_bits()
+                        && a.height.to_bits() == b.height.to_bits()
+                });
+            if !same {
+                eprintln!(
+                    "[paint-splice-incremental-verify] layout mismatch after {} entries",
+                    entries.len()
+                );
+                #[cfg(test)]
+                panic!("incremental paint splice layouts differ from the eager replay");
+                #[allow(unreachable_code)]
+                {
+                    *layouts = shadow;
+                }
             }
         }
         Some((true, entries.len()))
     })
 }
 
-fn apply_paint_splice(
-    root: &mut Component,
-    layouts: &mut Vec<(crate::layout::LayoutRect, usize)>,
-    texts: &mut Vec<crate::layout_ng::TextFragment>,
+/// `W3COS_PAINT_SPLICE_INCREMENTAL=1`: replay paint splices with kept
+/// preorder subtree sizes (instead of recounting the siblings of every box
+/// on the path) and with the vertical shifts of same-size leaf splices
+/// applied to the layout list once per replay instead of once per splice.
+pub(super) fn paint_splice_incremental() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if FORCE_PAINT_SPLICE.with(std::cell::Cell::get).is_some() {
+        return true;
+    }
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_PAINT_SPLICE_INCREMENTAL").is_ok_and(|value| value == "1")
+    })
+}
+
+/// `W3COS_PAINT_SPLICE_INCREMENTAL_VERIFY=1`: also count sizes and replay
+/// the layout list the eager way, compare, and keep the eager result.
+fn paint_splice_incremental_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if FORCE_PAINT_SPLICE.with(std::cell::Cell::get).is_some() {
+        return true;
+    }
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_PAINT_SPLICE_INCREMENTAL_VERIFY").is_ok_and(|value| value == "1")
+    })
+}
+
+/// Preorder subtree sizes of `component`, appended to `out`.
+pub(super) fn push_subtree_sizes(component: &Component, out: &mut Vec<u32>) -> usize {
+    let at = out.len();
+    out.push(0);
+    let mut size = 1;
+    for child in &component.children {
+        size += push_subtree_sizes(child, out);
+    }
+    out[at] = size as u32;
+    size
+}
+
+/// Where one paint splice lands in the preorder of the tree it is applied
+/// to, and which boxes it moves and grows.
+struct SpliceGeometry {
+    region_start: usize,
+    region_end: usize,
+    /// Preorder start of each box on the path, root first, target last.
+    starts: Vec<usize>,
+    shifted: Vec<(usize, usize)>,
+    grown: Vec<usize>,
+}
+
+fn paint_splice_geometry(
+    root: &Component,
     entry: &PaintSplice,
-) -> bool {
+    sizes: Option<&[u32]>,
+    verify: bool,
+) -> Option<SpliceGeometry> {
     let count = crate::layout::count_nodes;
     let path = &entry.path;
     if entry.levels > path.len() {
-        return false;
+        return None;
     }
+    // `sizes[i]`: node count of the subtree starting at preorder `i`. A
+    // child's start is its parent's plus one plus its preceding siblings'
+    // sizes, found by hopping over them instead of walking them.
+    let hop = |sizes: &[u32], parent_start: usize, children: usize| -> Option<usize> {
+        let mut at = parent_start + 1;
+        for _ in 0..children {
+            at += *sizes.get(at)? as usize;
+        }
+        Some(at)
+    };
     let mut starts = Vec::with_capacity(path.len() + 1);
     let mut node: &Component = root;
     let mut index = 0;
     starts.push(0);
     for &child in path {
         if child >= node.children.len() {
-            return false;
+            return None;
         }
-        index += 1 + node.children[..child].iter().map(count).sum::<usize>();
+        index = match sizes {
+            Some(sizes) => hop(sizes, index, child)?,
+            None => index + 1 + node.children[..child].iter().map(count).sum::<usize>(),
+        };
         starts.push(index);
         node = &node.children[child];
     }
     if host_id(node) != Some(entry.node) {
-        return false;
+        return None;
     }
     let target = node;
     let target_index = index;
-    let target_size = count(target);
+    let target_size = match sizes {
+        Some(sizes) => *sizes.get(target_index)? as usize,
+        None => count(target),
+    };
     let (region_start, region_end) = match entry.children {
         None => (target_index, target_index + target_size),
         Some((keep, removed)) => {
             if keep + removed > target.children.len() {
-                return false;
+                return None;
             }
-            let start = target_index + 1 + target.children[..keep].iter().map(count).sum::<usize>();
-            (
-                start,
-                start
-                    + target.children[keep..keep + removed]
-                        .iter()
-                        .map(count)
-                        .sum::<usize>(),
-            )
+            match sizes {
+                Some(sizes) => {
+                    let start = hop(sizes, target_index, keep)?;
+                    let end = hop(sizes, start - 1, removed)?;
+                    (start, end)
+                }
+                None => {
+                    let start =
+                        target_index + 1 + target.children[..keep].iter().map(count).sum::<usize>();
+                    (
+                        start,
+                        start
+                            + target.children[keep..keep + removed]
+                                .iter()
+                                .map(count)
+                                .sum::<usize>(),
+                    )
+                }
+            }
         }
     };
     // An ancestor's size: itself and the preceding siblings on the path
     // (already summed into `starts`), the path child, and the following
     // siblings; only the latter are counted here.
-    let mut sizes = vec![0; path.len() + 1];
-    sizes[path.len()] = target_size;
+    let mut ancestor_sizes = vec![0; path.len() + 1];
+    ancestor_sizes[path.len()] = target_size;
     for depth in (0..path.len()).rev() {
-        let parent = at_path(root, &path[..depth]);
-        sizes[depth] = (starts[depth + 1] - starts[depth])
-            + sizes[depth + 1]
-            + parent.children[path[depth] + 1..]
-                .iter()
-                .map(count)
-                .sum::<usize>();
+        ancestor_sizes[depth] = match sizes {
+            Some(sizes) => *sizes.get(starts[depth])? as usize,
+            None => {
+                let parent = at_path(root, &path[..depth]);
+                (starts[depth + 1] - starts[depth])
+                    + ancestor_sizes[depth + 1]
+                    + parent.children[path[depth] + 1..]
+                        .iter()
+                        .map(count)
+                        .sum::<usize>()
+            }
+        };
+    }
+    if verify && sizes.is_some() {
+        let counted = paint_splice_geometry(root, entry, None, false)?;
+        if counted.region_start != region_start
+            || counted.region_end != region_end
+            || counted.starts != starts
+        {
+            eprintln!(
+                "[paint-splice-incremental-verify] sizes mismatch: kept ({region_start}, {region_end}) counted ({}, {})",
+                counted.region_start, counted.region_end
+            );
+            #[cfg(test)]
+            panic!("kept subtree sizes differ from counted ones");
+            #[allow(unreachable_code)]
+            return Some(counted);
+        }
     }
     // The same boxes `try_splice` moves and grows in the DOM, as preorder
     // ranges (every box of a shifted subtree moves, not only its hosts).
@@ -2565,15 +2708,219 @@ fn apply_paint_splice(
         for level in 0..entry.levels {
             let depth = path.len() - 1 - level;
             let parent = at_path(root, &path[..depth]);
-            let child_end = starts[depth + 1] + sizes[depth + 1];
+            let child_end = starts[depth + 1] + ancestor_sizes[depth + 1];
             if !is_row_flex(parent) {
-                shifted.push((child_end, starts[depth] + sizes[depth]));
+                shifted.push((child_end, starts[depth] + ancestor_sizes[depth]));
             }
             if host_id(parent).is_some() && !matches!(parent.style.height, Dimension::Px(_)) {
                 grown.push(starts[depth]);
             }
         }
     }
+    Some(SpliceGeometry {
+        region_start,
+        region_end,
+        starts,
+        shifted,
+        grown,
+    })
+}
+
+/// Vertical shifts and growth of same-size leaf splices, applied to the
+/// layout list in one pass when the replay ends (or before a splice that
+/// renumbers). The result is the eager replay's: the replaced box goes
+/// where the eager list edit puts it, and every box gets the same f32
+/// additions in the same order (a replaced box only those of later
+/// splices).
+#[derive(Default)]
+struct LazyLayoutShifts {
+    /// Preorder index -> position in the layout list (`u32::MAX`: none).
+    position_of: Vec<u32>,
+    mapped: bool,
+    /// Per deferred splice: its shifted ranges and dh.
+    splices: Vec<(Vec<(usize, usize)>, f32)>,
+    /// Deferred growth: (layout position, splice order, dh).
+    growth: Vec<(usize, usize, f32)>,
+    /// Layout positions replaced by a deferred splice, with the number of
+    /// deferred splices before it (which no longer apply to that box).
+    since: Vec<(usize, usize)>,
+}
+
+impl LazyLayoutShifts {
+    fn map(&mut self, layouts: &[(crate::layout::LayoutRect, usize)]) {
+        self.mapped = true;
+        let len = layouts
+            .iter()
+            .map(|(_, index)| index + 1)
+            .max()
+            .unwrap_or(0);
+        self.position_of = vec![u32::MAX; len];
+        for (position, (_, index)) in layouts.iter().enumerate() {
+            let slot = &mut self.position_of[*index];
+            if *slot != u32::MAX {
+                // A repeated index: positions are not one per box.
+                self.position_of.clear();
+                return;
+            }
+            *slot = position as u32;
+        }
+    }
+
+    fn position(&self, index: usize) -> u32 {
+        self.position_of.get(index).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Defers `entry` when it replaces one leaf box by one box at the same
+    /// preorder index; false (touching nothing) when it must be applied
+    /// eagerly.
+    fn add(
+        &mut self,
+        layouts: &mut [(crate::layout::LayoutRect, usize)],
+        entry: &PaintSplice,
+        geometry: &SpliceGeometry,
+    ) -> bool {
+        if entry.children.is_some()
+            || entry.len != 1
+            || geometry.region_end != geometry.region_start + 1
+        {
+            return false;
+        }
+        if !self.mapped {
+            self.map(layouts);
+        }
+        if self.position_of.is_empty() && !layouts.is_empty() {
+            return false;
+        }
+        let mut inserted = entry
+            .raw
+            .layouts
+            .iter()
+            .filter(|(_, index)| *index == entry.first);
+        let replacement = inserted.next();
+        if inserted.next().is_some() {
+            return false;
+        }
+        let target = geometry.region_start;
+        let old = self.position(target);
+        match (replacement, old) {
+            (None, u32::MAX) => {}
+            (Some(&(mut rect, _)), old) if old != u32::MAX => {
+                let old = old as usize;
+                rect.x += entry.dx;
+                rect.y += entry.dy;
+                // The eager edit puts the new box before the first box at
+                // or after the region in list order.
+                let at = layouts
+                    .iter()
+                    .position(|(_, index)| *index >= target)
+                    .unwrap_or(old);
+                // The replaced box's deferred state goes with it.
+                self.since.retain(|&(position, _)| position != old);
+                self.growth.retain(|&(position, _, _)| position != old);
+                if at < old {
+                    layouts[at..=old].rotate_right(1);
+                    for (_, index) in &layouts[at + 1..=old] {
+                        self.position_of[*index] += 1;
+                    }
+                    let moved = |position: &mut usize| {
+                        if *position >= at && *position < old {
+                            *position += 1;
+                        }
+                    };
+                    self.since
+                        .iter_mut()
+                        .for_each(|(position, _)| moved(position));
+                    self.growth
+                        .iter_mut()
+                        .for_each(|(position, _, _)| moved(position));
+                }
+                layouts[at] = (rect, target);
+                self.position_of[target] = at as u32;
+                self.since.push((at, self.splices.len()));
+            }
+            _ => return false,
+        }
+        if entry.dh != 0.0 {
+            let order = self.splices.len();
+            for &grown in &geometry.grown {
+                let position = self.position(grown);
+                if position != u32::MAX {
+                    self.growth.push((position as usize, order, entry.dh));
+                }
+            }
+            self.splices.push((geometry.shifted.clone(), entry.dh));
+        }
+        true
+    }
+
+    fn flush(&mut self, layouts: &mut [(crate::layout::LayoutRect, usize)]) {
+        let splices = std::mem::take(&mut self.splices);
+        let since = std::mem::take(&mut self.since);
+        let growth = std::mem::take(&mut self.growth);
+        self.mapped = false;
+        self.position_of = Vec::new();
+        if splices.is_empty() {
+            return;
+        }
+        let after = |position: usize| {
+            since
+                .iter()
+                .find(|&&(at, _)| at == position)
+                .map_or(0, |&(_, after)| after)
+        };
+        // Cut the preorder at every range end; each segment between cuts is
+        // shifted by the same splices.
+        let mut cuts: Vec<usize> = splices
+            .iter()
+            .flat_map(|(ranges, _)| ranges.iter().flat_map(|&(a, b)| [a, b]))
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let segment_splices: Vec<Vec<usize>> = (0..cuts.len().saturating_sub(1))
+            .map(|segment| {
+                let at = cuts[segment];
+                splices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (ranges, _))| ranges.iter().any(|&(a, b)| at >= a && at < b))
+                    .map(|(order, _)| order)
+                    .collect()
+            })
+            .collect();
+        if let (Some(&first_cut), Some(&last_cut)) = (cuts.first(), cuts.last()) {
+            for (position, (rect, index)) in layouts.iter_mut().enumerate() {
+                if *index < first_cut || *index >= last_cut {
+                    continue;
+                }
+                let segment = cuts.partition_point(|&cut| cut <= *index) - 1;
+                let orders = &segment_splices[segment];
+                if orders.is_empty() {
+                    continue;
+                }
+                let after = if since.is_empty() { 0 } else { after(position) };
+                for &order in orders {
+                    if order >= after {
+                        rect.y += splices[order].1;
+                    }
+                }
+            }
+        }
+        // Growth in splice order (`growth` was pushed in that order).
+        for (position, order, dh) in growth {
+            if order >= after(position) {
+                layouts[position].0.height += dh;
+            }
+        }
+    }
+}
+
+fn splice_layouts_eagerly(
+    layouts: &mut Vec<(crate::layout::LayoutRect, usize)>,
+    entry: &PaintSplice,
+    geometry: &SpliceGeometry,
+) {
+    let (region_start, region_end) = (geometry.region_start, geometry.region_end);
+    let (shifted, grown) = (&geometry.shifted, &geometry.grown);
     let removed_len = region_end - region_start;
     let delta = entry.len as isize - removed_len as isize;
     let renumber = |index: usize| {
@@ -2642,6 +2989,27 @@ fn apply_paint_splice(
         }
         *layouts = out;
     }
+}
+
+fn splice_texts(
+    texts: &mut Vec<crate::layout_ng::TextFragment>,
+    entry: &PaintSplice,
+    geometry: &SpliceGeometry,
+) {
+    let (region_start, region_end) = (geometry.region_start, geometry.region_end);
+    let shifted = &geometry.shifted;
+    let removed_len = region_end - region_start;
+    let delta = entry.len as isize - removed_len as isize;
+    let renumber = |index: usize| {
+        if index >= region_end {
+            (index as isize + delta) as usize
+        } else {
+            index
+        }
+    };
+    let in_shift = |index: usize| shifted.iter().any(|&(a, b)| index >= a && index < b);
+    let in_region = |index: usize| index >= region_start && index < region_end;
+    let inserted = |index: usize| index >= entry.first && index < entry.first + entry.len;
     let text_inserted = || {
         entry
             .raw
@@ -2692,6 +3060,15 @@ fn apply_paint_splice(
         }
         *texts = out;
     }
+}
+
+fn splice_tree(
+    root: &mut Component,
+    entry: &PaintSplice,
+    geometry: &SpliceGeometry,
+    sizes: &mut Option<Vec<u32>>,
+) {
+    let path = &entry.path;
     let target = at_path_mut(root, path);
     match entry.children {
         None => *target = entry.inserted[0].clone(),
@@ -2701,7 +3078,27 @@ fn apply_paint_splice(
                 .splice(keep..keep + removed, entry.inserted.iter().cloned());
         }
     }
-    true
+    let Some(known) = sizes.as_mut() else {
+        return;
+    };
+    let mut fresh = Vec::new();
+    for component in &entry.inserted {
+        push_subtree_sizes(component, &mut fresh);
+    }
+    let delta = fresh.len() as isize - (geometry.region_end - geometry.region_start) as isize;
+    if geometry.region_end > known.len() {
+        *sizes = None;
+        return;
+    }
+    known.splice(geometry.region_start..geometry.region_end, fresh);
+    // Every box on the path holds the region, except a replaced target.
+    let holders = match entry.children {
+        None => &geometry.starts[..path.len()],
+        Some(_) => &geometry.starts[..],
+    };
+    for &start in holders {
+        known[start] = (known[start] as isize + delta) as u32;
+    }
 }
 
 /// Replace the items whose index is in `region` with `inserted` and run

@@ -2308,6 +2308,9 @@ struct PaintCache {
     /// The paint journal position this tree and layout equal the flush
     /// cache at (see `splice::paint_splice_enabled`).
     journal: Option<(u64, usize)>,
+    /// Preorder subtree sizes of `component`, kept across paint splices
+    /// (`splice::paint_splice_incremental`); `None` until known.
+    subtree_sizes: Option<Vec<u32>>,
 }
 
 /// Why the next headless paint can keep its artifact and only move rects.
@@ -2572,6 +2575,14 @@ pub(crate) fn paint_splice_stats() -> (u32, u32) {
 /// Replay the flush cache's splices since `point` on the paint tree and
 /// layout. `Some(true)`: the cache is current. `Some(false)`: it may be
 /// partly edited and must be rebuilt. `None`: untouched.
+/// Preorder subtree sizes from a flat tree's subtree ends.
+fn flat_subtree_sizes(flat: &[crate::layout::FlatNodeInfo<'_>]) -> Vec<u32> {
+    flat.iter()
+        .enumerate()
+        .map(|(index, node)| (node.subtree_end - index) as u32)
+        .collect()
+}
+
 fn splice_paint_cache(
     cache: &mut PaintCache,
     point: (u64, usize),
@@ -2585,6 +2596,7 @@ fn splice_paint_cache(
         &mut cache.component,
         &mut cache.results.layout_cache,
         &mut cache.results.text_fragments,
+        &mut cache.subtree_sizes,
     )?;
     if !applied {
         return Some(false);
@@ -2595,6 +2607,9 @@ fn splice_paint_cache(
         return Some(false);
     }
     let flat = pre_flatten(&cache.component);
+    if splice::paint_splice_incremental() {
+        cache.subtree_sizes = Some(flat_subtree_sizes(&flat));
+    }
     let slots = crate::layout::layout_slots(&cache.results.layout_cache, flat.len());
     let (scrollable, clip_only, scroll_ancestor) = crate::layout::scroll_containers_from_layout(
         &cache.results.layout_cache,
@@ -2745,6 +2760,8 @@ fn rebuild_paint_cache(
     write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let children = child_lists(&flat);
     let shift_ok = absolute_shift_ok(&flat);
+    let subtree_sizes = splice::paint_splice_incremental().then(|| flat_subtree_sizes(&flat));
+    drop(flat);
     *slot = Some(PaintCache {
         component,
         engine,
@@ -2757,6 +2774,7 @@ fn rebuild_paint_cache(
         children,
         shift_ok,
         journal: None,
+        subtree_sizes,
     });
     note_paint_rebuild();
     Ok(())
