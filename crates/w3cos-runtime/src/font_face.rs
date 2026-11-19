@@ -430,13 +430,13 @@ pub struct FontRegistry {
     fonts: Mutex<HashMap<FontKey, Vec<(Owner, LoadedFont)>>>,
     /// Ordered list of registered families (for CSS `font-family` stack resolution).
     families: Mutex<Vec<(Owner, String)>>,
-    /// With `W3COS_FONT_SCOPES=1`, one revision per document scope.
+    /// With font scopes on (the default), one revision per document scope.
     scope_revisions: Mutex<HashMap<u64, Arc<AtomicU64>>>,
 }
 
 /// Who registered a face, and which document may use it. Scope 0 is
-/// visible to every document: system, embedder and (with the flag off) all
-/// faces. With `W3COS_FONT_SCOPES=1` a stylesheet or `document.fonts` face
+/// visible to every document: system, embedder and (with `W3COS_FONT_SCOPES=0`) all
+/// faces. With font scopes on (the default) a stylesheet or `document.fonts` face
 /// belongs to the document that registered it, as Blink keeps web fonts in
 /// each document's FontFaceCache / CSSFontSelector (with its own version)
 /// while only the platform FontCache is process-wide.
@@ -452,15 +452,15 @@ impl Owner {
     }
 }
 
-/// `W3COS_FONT_SCOPES=1`: web fonts and the font revision become per
-/// document. Off by default.
+/// Web fonts and the font revision are per document (on by default;
+/// `W3COS_FONT_SCOPES=0` restores one process-wide set and revision).
 pub(crate) fn font_scopes_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = FONT_SCOPES_OVERRIDE.with(std::cell::Cell::get) {
         return enabled;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("W3COS_FONT_SCOPES").is_ok_and(|value| value == "1"))
+    *ON.get_or_init(|| std::env::var("W3COS_FONT_SCOPES").map_or(true, |value| value != "0"))
 }
 
 #[cfg(test)]
@@ -670,7 +670,7 @@ impl FontRegistry {
     }
 
     /// Revision for invalidating styles resolved before font loading completed.
-    /// With `W3COS_FONT_SCOPES=1` it is the calling document's: it moves for
+    /// With font scopes on (the default) it is the calling document's: it moves for
     /// faces every document sees and for this document's own, not for
     /// another document's web fonts.
     pub fn revision(&self) -> u64 {
@@ -729,7 +729,7 @@ impl FontRegistry {
     }
 
     /// Register a face of the calling document (`document.fonts`, an inline
-    /// `@font-face`). With `W3COS_FONT_SCOPES=1` only this document sees it;
+    /// `@font-face`). With font scopes on (the default) only this document sees it;
     /// otherwise it is registered for every document, as before.
     pub fn register_document(&self, face: FontFace) -> Result<(), String> {
         if font_scopes_enabled() {
