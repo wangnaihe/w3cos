@@ -570,10 +570,11 @@ pub(crate) fn paint_append_reuse_enabled() -> bool {
         || artifact_splice_enabled()
 }
 
-/// `W3COS_PAINT_ARTIFACT_SPLICE=1`: with append reuse, copy each run of
+/// `W3COS_PAINT_ARTIFACT_SPLICE`: with append reuse, copy each run of
 /// unchanged, aligned nodes as slices of last frame's output (`=verify`
 /// also builds in full and compares, like `W3COS_PAINT_APPEND_REUSE_VERIFY`).
-/// Off by default.
+/// On by default (last-message stream frame -9.5% wall, 13/16 rounds);
+/// `=0` turns it off.
 pub(crate) fn artifact_splice_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = ARTIFACT_SPLICE_OVERRIDE.with(std::cell::Cell::get) {
@@ -581,7 +582,7 @@ pub(crate) fn artifact_splice_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("W3COS_PAINT_ARTIFACT_SPLICE").is_some_and(|v| v == "1" || v == "verify")
+        !std::env::var_os("W3COS_PAINT_ARTIFACT_SPLICE").is_some_and(|v| v == "0" || v == "false")
     })
 }
 

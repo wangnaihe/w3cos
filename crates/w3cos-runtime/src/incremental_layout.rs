@@ -682,12 +682,13 @@ pub fn flush() -> bool {
     ok
 }
 
-/// `W3COS_WARM_REBUILD=1`: a rebuild lays the new tree out through its
+/// `W3COS_WARM_REBUILD` (on by default, `=0` turns it off): a rebuild lays the new tree out through its
 /// retained flat view under the cache's structure key, as a patch flush
 /// does, so the per-box data patch flushes keep (fingerprints, subtree
 /// flags, the flat output, the eligibility walk) is there for the next
 /// edit instead of being built on it (Blink's LayoutObjects carry it from
-/// the first layout).
+/// the first layout). Chat: mean class toggle -31% wall (16/16 rounds)
+/// for +1.9% on the full layout.
 #[cfg(test)]
 thread_local! {
     pub(crate) static WARM_REBUILD_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -700,7 +701,7 @@ fn warm_rebuild_enabled() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("W3COS_WARM_REBUILD").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("W3COS_WARM_REBUILD").is_ok_and(|v| v == "0" || v == "false"))
 }
 
 fn rebuild(
