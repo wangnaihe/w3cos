@@ -648,6 +648,10 @@ pub struct RetainedSkiaCache {
     /// Per picture, the device offset from its recording to the layer's
     /// current position (non-zero once a moved layer kept its recording).
     offsets: Vec<(f32, f32)>,
+    /// [`composite_key`] of the last frame this cache composited onto its
+    /// surface in full or under damage; `None` once anything else painted
+    /// there. Damage only applies on top of that frame.
+    last_composite: Option<u64>,
 }
 
 fn shift_rect(rect: Option<Rect>, by: (f32, f32)) -> Option<Rect> {
@@ -693,6 +697,55 @@ thread_local! {
     /// With the pending invalidation: per client, the offset (CSS px) it
     /// only moved by (`retained_layers::PaintDiff::moved`).
     static PENDING_PAINT_MOVED: RefCell<Option<Vec<Option<(f32, f32)>>>> = const { RefCell::new(None) };
+    /// With the pending invalidation: per changed client, a document rect
+    /// covering its old and new paint (`retained_layers::paint_damage`).
+    static PENDING_PAINT_DAMAGE: RefCell<Option<Vec<(usize, LayoutRect)>>> = const { RefCell::new(None) };
+    /// (frames composited under damage, of those the ones that differed from
+    /// a full composite in verify mode).
+    static PAINT_DAMAGE_STATS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DAMAGE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `W3COS_PAINT_DAMAGE=1`: composite only the damaged part of a frame onto
+/// the previous frame's pixels (cc's partial raster). Off by default.
+pub(crate) fn paint_damage_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PAINT_DAMAGE_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        paint_damage_verify() || std::env::var("W3COS_PAINT_DAMAGE").is_ok_and(|value| value == "1")
+    })
+}
+
+/// `W3COS_PAINT_DAMAGE_VERIFY=1`: also composite every damaged frame in
+/// full off-screen and compare every pixel.
+fn paint_damage_verify() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_VERIFY").is_ok_and(|value| value == "1"))
+}
+
+pub(crate) fn note_unbounded_damage() {
+    if paint_damage_verify() {
+        eprintln!("[paint-damage-verify] full: a change has no bounded damage");
+    }
+}
+
+pub(crate) fn set_pending_paint_damage(damage: Option<Vec<(usize, LayoutRect)>>) {
+    PENDING_PAINT_DAMAGE.with(|slot| *slot.borrow_mut() = damage);
+}
+
+/// (frames composited under damage, of those differing from a full
+/// composite in verify mode) since the thread started.
+#[allow(dead_code)]
+pub(crate) fn paint_damage_stats() -> (u32, u32) {
+    PAINT_DAMAGE_STATS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn set_pending_paint_moved(moved: Option<Vec<Option<(f32, f32)>>>) {
@@ -711,6 +764,7 @@ pub(crate) fn set_track_partial_layers(track: bool) {
 /// cache's recordings; `None` re-records every layer whose content changed.
 pub(crate) fn set_pending_paint_invalidation(dirty: Option<Vec<bool>>) {
     PENDING_PAINT_MOVED.with(|slot| slot.borrow_mut().take());
+    PENDING_PAINT_DAMAGE.with(|slot| slot.borrow_mut().take());
     PENDING_PAINT_INVALIDATION.with(|slot| *slot.borrow_mut() = dirty);
 }
 
@@ -1758,7 +1812,13 @@ fn paint_display_list_with_suppressed_effects(
 }
 
 pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: ReplayFrame<'_>) {
-    let retained = frame.retained.take();
+    let mut retained = frame.retained.take();
+    let damage = PENDING_PAINT_DAMAGE.with(|slot| slot.borrow_mut().take());
+    if frame.artifact.is_none()
+        && let Some(cache) = retained.as_mut()
+    {
+        cache.last_composite = None;
+    }
     let overrides = frame.compositor_overrides;
     let scale_factor = if frame.scale_factor > 0.0 {
         frame.scale_factor
@@ -1803,6 +1863,22 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 )
             })
             .collect::<Vec<_>>();
+        let key = paint_damage_enabled().then(|| {
+            composite_key(
+                canvas,
+                frame.scroll_info,
+                overrides,
+                frame.background,
+                scale_factor,
+            )
+        });
+        if paint_damage_verify() && damage.is_some() && cache.last_composite != key {
+            eprintln!("[paint-damage-verify] full: the surface does not hold the last frame");
+        }
+        let damage = damage
+            .as_deref()
+            .filter(|_| key.is_some() && cache.last_composite == key);
+        cache.last_composite = key;
         let reusable = matches!(action, LayerPaintAction::Replay)
             && cache.tree.recordings_valid()
             && cache.pictures.len() == cache.tree.layers.len()
@@ -1855,6 +1931,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 frame.background,
                 scale_factor,
                 &cache.offsets,
+                damage,
             );
             return;
         }
@@ -2052,6 +2129,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             frame.background,
             scale_factor,
             &cache.offsets,
+            damage,
         );
         return;
     }
@@ -2181,6 +2259,268 @@ fn compositor_layer_matrix(
 }
 
 fn composite_skia_layers(
+    canvas: &Canvas,
+    pictures: &[Picture],
+    layers: &[crate::retained_layers::CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    background: w3cos_std::color::Color,
+    scale_factor: f32,
+    offsets: &[(f32, f32)],
+    damage: Option<&[(usize, LayoutRect)]>,
+) {
+    let full = |canvas: &Canvas| {
+        composite_skia_layers_in(
+            canvas,
+            pictures,
+            layers,
+            artifact,
+            scroll_info,
+            overrides,
+            background,
+            scale_factor,
+            offsets,
+        )
+    };
+    let Some(damage) = damage else {
+        full(canvas);
+        return;
+    };
+    let size = canvas.base_layer_size();
+    let Some(rects) = damage_device_rects(
+        damage,
+        layers,
+        artifact,
+        scroll_info,
+        overrides,
+        scale_factor,
+        (size.width as f32, size.height as f32),
+    ) else {
+        if paint_damage_verify() {
+            eprintln!("[paint-damage-verify] full: damage not placeable");
+        }
+        full(canvas);
+        return;
+    };
+    let surface = skia_safe::IRect::from_wh(size.width, size.height);
+    let mut region = skia_safe::Region::new();
+    for rect in &rects {
+        if let Some(rect) = skia_safe::IRect::intersect(rect, &surface) {
+            region.op_rect(rect, skia_safe::region::RegionOp::Union);
+        }
+    }
+    let area = skia_safe::region::Iterator::new(&region)
+        .map(|rect| rect.width() as i64 * rect.height() as i64)
+        .sum::<i64>();
+    let clip = *region.bounds();
+    // Mostly damaged: a clipped composite saves nothing.
+    if area * 10 > surface.width() as i64 * surface.height() as i64 * 7 {
+        if paint_damage_verify() {
+            eprintln!(
+                "[paint-damage-verify] full: damage {area} px in {}x{} is most of the frame",
+                clip.width(),
+                clip.height()
+            );
+        }
+        full(canvas);
+        return;
+    }
+    if !region.is_empty() {
+        let save = canvas.save();
+        canvas.clip_region(&region, skia_safe::ClipOp::Intersect);
+        full(canvas);
+        canvas.restore_to_count(save);
+    }
+    PAINT_DAMAGE_STATS.with(|stats| {
+        let (frames, mismatched) = stats.get();
+        stats.set((frames + 1, mismatched));
+    });
+    if paint_damage_verify() {
+        let differing = verify_damage_composite(canvas, &full);
+        PAINT_DAMAGE_STATS.with(|stats| {
+            let (frames, mismatched) = stats.get();
+            stats.set((frames, mismatched + u32::from(differing > 0)));
+        });
+        eprintln!(
+            "[paint-damage-verify] clip {} rects {} px in {}x{} at ({}, {}) of {}x{}: {}",
+            rects.len(),
+            skia_safe::region::Iterator::new(&region)
+                .map(|rect| rect.width() as i64 * rect.height() as i64)
+                .sum::<i64>(),
+            clip.width(),
+            clip.height(),
+            clip.left,
+            clip.top,
+            surface.width(),
+            surface.height(),
+            if differing == 0 {
+                "same".to_string()
+            } else {
+                format!("DIFF {differing} pixels")
+            }
+        );
+    }
+}
+
+/// Composite in full off-screen and count the pixels that differ from
+/// `canvas`.
+fn verify_damage_composite(canvas: &Canvas, full: &dyn Fn(&Canvas)) -> usize {
+    let size = canvas.base_layer_size();
+    let info = ImageInfo::new(
+        (size.width, size.height),
+        ColorType::RGBA8888,
+        AlphaType::Premul,
+        None,
+    );
+    let Some(mut fresh) = Surface::new_raster(&info, None, None) else {
+        return usize::MAX;
+    };
+    full(fresh.canvas());
+    let row = size.width as usize * 4;
+    let mut a = vec![0u8; row * size.height as usize];
+    let mut b = vec![0u8; row * size.height as usize];
+    if !canvas.read_pixels(&info, &mut a, row, (0, 0))
+        || !fresh.read_pixels(&info, &mut b, row, (0, 0))
+    {
+        return usize::MAX;
+    }
+    a.chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count()
+}
+
+/// Device rects holding every damaged client's old and new paint, as placed
+/// by the layer that draws it now (entries for one client are adjacent).
+/// `None`: a damaged client is in no layer, or in a CSS-transformed one (its
+/// matrix follows the layer bounds, which change with content).
+fn damage_device_rects(
+    damage: &[(usize, LayoutRect)],
+    layers: &[crate::retained_layers::CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+    surface: (f32, f32),
+) -> Option<Vec<skia_safe::IRect>> {
+    let mut first = vec![u32::MAX; artifact.nodes.len()];
+    for (position, (client, _)) in damage.iter().enumerate().rev() {
+        *first.get_mut(*client)? = position as u32;
+    }
+    let mut placed = vec![false; damage.len()];
+    let mut out = Vec::new();
+    let mut local = Vec::new();
+    for layer in layers {
+        local.clear();
+        for &client in &layer.client_indices {
+            let Some(&start) = first.get(client) else {
+                continue;
+            };
+            if start == u32::MAX {
+                continue;
+            }
+            let mut position = start as usize;
+            while position < damage.len() && damage[position].0 == client {
+                placed[position] = true;
+                let rect = damage[position].1;
+                local.push(Rect::from_xywh(
+                    rect.x * scale_factor,
+                    rect.y * scale_factor,
+                    rect.width * scale_factor,
+                    rect.height * scale_factor,
+                ));
+                position += 1;
+            }
+        }
+        if local.is_empty() {
+            continue;
+        }
+        if !layer_css_transform(layer, artifact, overrides).is_identity() {
+            return None;
+        }
+        let matrix = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+        let (sx, sy) = layer
+            .client_indices
+            .first()
+            .map_or((0.0, 0.0), |&index| artifact.viewport_scroll_for(index));
+        // Without a CSS transform the layer matrix is a translation.
+        if !matrix.is_translate() {
+            return None;
+        }
+        let (tx, ty) = (
+            matrix.translate_x() - sx * scale_factor,
+            matrix.translate_y() - sy * scale_factor,
+        );
+        for rect in &local {
+            let (left, top) = (rect.left + tx, rect.top + ty);
+            let (right, bottom) = (rect.right + tx, rect.bottom + ty);
+            if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()) {
+                return None;
+            }
+            // Rounded out and padded a pixel for anti-aliasing; a rect off
+            // the surface damages nothing.
+            let (left, top) = (left.floor() - 1.0, top.floor() - 1.0);
+            let (right, bottom) = (right.ceil() + 1.0, bottom.ceil() + 1.0);
+            if right <= 0.0 || bottom <= 0.0 || left >= surface.0 || top >= surface.1 {
+                continue;
+            }
+            out.push(skia_safe::IRect::from_ltrb(
+                left.max(-1.0) as i32,
+                top.max(-1.0) as i32,
+                right.min(surface.0 + 1.0) as i32,
+                bottom.min(surface.1 + 1.0) as i32,
+            ));
+        }
+    }
+    if placed.iter().any(|placed| !placed) {
+        return None;
+    }
+    Some(out)
+}
+
+/// What a composite's pixels depend on besides the layers' recordings and
+/// the clients `paint_damage` follows: surface size, scroll offsets,
+/// compositor overrides, background and scale.
+fn composite_key(
+    canvas: &Canvas,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    background: w3cos_std::color::Color,
+    scale_factor: f32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
+    let size = canvas.base_layer_size();
+    (size.width, size.height, scale_factor.to_bits()).hash(&mut hasher);
+    format!("{background:?}").hash(&mut hasher);
+    scroll_info.len().hash(&mut hasher);
+    // Scroll offsets, not scrollports: a scrollport is its scroller's box,
+    // which `paint_damage` covers when it moves or resizes.
+    for (index, info) in scroll_info.iter().enumerate() {
+        if let Some((x, y, _)) = info {
+            (index, x.to_bits(), y.to_bits()).hash(&mut hasher);
+        }
+    }
+    let mut opacity = overrides
+        .opacity
+        .iter()
+        .map(|(k, v)| (*k, v.to_bits()))
+        .collect::<Vec<_>>();
+    opacity.sort_unstable();
+    opacity.hash(&mut hasher);
+    let mut transform = overrides
+        .transform
+        .iter()
+        .map(|(k, v)| (*k, format!("{v:?}")))
+        .collect::<Vec<_>>();
+    transform.sort_unstable();
+    transform.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_skia_layers_in(
     canvas: &Canvas,
     pictures: &[Picture],
     layers: &[crate::retained_layers::CompositorLayer],

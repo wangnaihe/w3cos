@@ -374,15 +374,33 @@ fn finish_headless_frame(
             .then(|| {
                 RETAINED_PAINT.with(|slot| {
                     slot.borrow().as_ref().and_then(|retained| {
-                        crate::retained_layers::paint_diff_clients(&retained.artifact, &artifact)
+                        let diff = crate::retained_layers::paint_diff_clients(
+                            &retained.artifact,
+                            &artifact,
+                        )?;
+                        let damage = crate::render_skia::paint_damage_enabled()
+                            .then(|| {
+                                crate::retained_layers::paint_damage(
+                                    &retained.artifact,
+                                    &artifact,
+                                    &diff,
+                                )
+                            })
+                            .flatten();
+                        if damage.is_none() && crate::render_skia::paint_damage_enabled() {
+                            crate::render_skia::note_unbounded_damage();
+                        }
+                        Some((diff, damage))
                     })
                 })
             })
             .flatten();
-        let (dirty, moved) =
-            dirty.map_or((None, None), |diff| (Some(diff.dirty), Some(diff.moved)));
+        let (dirty, moved, damage) = dirty.map_or((None, None, None), |(diff, damage)| {
+            (Some(diff.dirty), Some(diff.moved), damage)
+        });
         crate::render_skia::set_pending_paint_invalidation(dirty);
         crate::render_skia::set_pending_paint_moved(moved);
+        crate::render_skia::set_pending_paint_damage(damage);
     }
     let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact, force_cpu)?;
     let rect_independent = component_rect_independent(root);
@@ -1042,6 +1060,77 @@ mod tests {
             wrapped.rgba, fresh.rgba,
             "moved layers must match a frame painted from scratch"
         );
+    }
+
+    #[test]
+    fn damage_composite_matches_a_full_composite() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        invalidate_retained_frame();
+        let body = crate::dom::body_id();
+        let mut texts = Vec::new();
+        for index in 0..6 {
+            let card = crate::dom::create_element("div");
+            for (name, value) in [
+                ("width", "140px"),
+                ("background", "#eeeeff"),
+                ("border-bottom", "2px solid #3366cc"),
+                ("outline", "3px solid #cc3366"),
+            ] {
+                crate::dom::set_style_property(card, name, value);
+            }
+            let paragraph = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node(&format!("card {index} says hello"));
+            crate::dom::append_child(paragraph, text);
+            crate::dom::append_child(card, paragraph);
+            crate::dom::append_child(body, card);
+            texts.push(text);
+        }
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        let edits: [(usize, &str); 4] = [
+            (5, "card 5 says goodbye"),
+            (4, "card 4 now says a much longer hello that wraps"),
+            (5, "card 5"),
+            (4, "card 4"),
+        ];
+        let (frames, damaged) = with_layer_reuse(true, || {
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+            let before = crate::render_skia::paint_damage_stats().0;
+            render_document_rgba(160, 480).expect("first frame");
+            let mut frames = Vec::new();
+            for (card, text) in edits {
+                crate::dom::set_text_content(texts[card], text);
+                frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
+            }
+            (frames, crate::render_skia::paint_damage_stats().0 - before)
+        });
+        assert!(
+            damaged > 0,
+            "an edit near the bottom must composite under damage"
+        );
+        // The same document states painted from scratch.
+        crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+        for index in 0..6 {
+            crate::dom::set_text_content(texts[index], &format!("card {index} says hello"));
+        }
+        for (step, (card, text)) in edits.into_iter().enumerate() {
+            crate::dom::set_text_content(texts[card], text);
+            let fresh = with_layer_reuse(false, || {
+                crate::incremental_layout::invalidate();
+                invalidate_retained_frame();
+                render_document_rgba(160, 480).expect("fresh frame")
+            });
+            assert!(
+                frames[step] == fresh.rgba,
+                "step {step}: a damage composite differs from a full one"
+            );
+        }
     }
 
     #[test]

@@ -452,6 +452,225 @@ pub struct PaintDiff {
     pub moved: Vec<Option<(f32, f32)>>,
 }
 
+/// Raster invalidation for a [`PaintDiff`] (Blink's
+/// `RasterInvalidator`): per changed or moved client, a conservative rect
+/// (document CSS px) covering what it painted in `prev` and what it paints
+/// in `cur`. Pixels outside the union of these rects are the same in both
+/// frames. `None`: some change cannot be bounded this way (a property-tree
+/// or sticky change, shadows, filters, transforms, or a client that stopped
+/// painting), so the whole frame must be composited.
+pub fn paint_damage(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    diff: &PaintDiff,
+) -> Option<Vec<(usize, LayoutRect)>> {
+    let mut damage = Vec::new();
+    for index in 0..cur.nodes.len() {
+        let moved = diff.moved.get(index).copied().flatten().is_some();
+        if !diff.dirty.get(index).copied().unwrap_or(true) && !moved {
+            continue;
+        }
+        if prev.node_properties.get(index) != cur.node_properties.get(index)
+            || prev.sticky_owner.get(index).copied().flatten().is_some()
+            || cur.sticky_owner.get(index).copied().flatten().is_some()
+        {
+            return None;
+        }
+        if let Some(strips) = resized_box_damage(prev, cur, index) {
+            damage.extend(strips.into_iter().map(|strip| (index, strip)));
+            continue;
+        }
+        let old = client_ink_bounds(prev, index).ok()?;
+        // A client that only moved (`moved_by`: same style, size and display
+        // items relative to its box) paints its old ink shifted by the move.
+        let new = match diff.moved.get(index).copied().flatten() {
+            Some((dx, dy)) if !diff.dirty.get(index).copied().unwrap_or(true) => {
+                old.map(|old| LayoutRect {
+                    x: old.x + dx,
+                    y: old.y + dy,
+                    ..old
+                })
+            }
+            _ => client_ink_bounds(cur, index).ok()?,
+        };
+        match (old, new) {
+            (None, None) => {}
+            // It painted and now does not: no current layer places it.
+            (Some(_), None) => return None,
+            (None, Some(new)) => damage.push((index, new)),
+            (Some(old), Some(new)) => damage.push((index, union_rect(old, new))),
+        }
+    }
+    Some(damage)
+}
+
+/// Blink's incremental invalidation for a box that only changed size: when
+/// a plain block box (solid background, square corners, no scrollbars, no
+/// images) kept its paint inputs and its origin, only the strips along the
+/// right and bottom edges that it grew into or shrank from, plus its borders
+/// and outline there, can change. `None`: not such a change.
+fn resized_box_damage(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    index: usize,
+) -> Option<Vec<LayoutRect>> {
+    use w3cos_std::component::ComponentKind;
+    use w3cos_std::style::{Display, Overflow, Visibility};
+    let (a, b) = (prev.nodes.get(index)?, cur.nodes.get(index)?);
+    let old = prev.rect_by_index.get(index).copied().flatten()?;
+    let new = cur.rect_by_index.get(index).copied().flatten()?;
+    let style = b.style.as_style();
+    let plain_kind = matches!(
+        b.kind,
+        ComponentKind::Root | ComponentKind::Column | ComponentKind::Row | ComponentKind::Box
+    );
+    let visible = |overflow: Option<Overflow>| overflow.is_none_or(|o| o == Overflow::Visible);
+    // The inherited list-style-image is read by the DOM when it builds
+    // marker boxes, which are clients of their own; it paints nothing here.
+    let painted_by_name = |name: &str| {
+        name != "--w3cos-internal-list-style-image"
+            && [
+                "radius",
+                "background",
+                "border",
+                "outline",
+                "image",
+                "mask",
+                "clip",
+                "shadow",
+                "gradient",
+            ]
+            .iter()
+            .any(|word| name.contains(word))
+    };
+    let plain = plain_kind
+        && a.kind == b.kind
+        && a.style == b.style
+        && a.parent == b.parent
+        && style.visibility == Visibility::Visible
+        && !matches!(
+            style.display,
+            Display::Inline
+                | Display::InlineBlock
+                | Display::InlineFlex
+                | Display::Contents
+                | Display::ListItem
+        )
+        && style.overflow == Overflow::Visible
+        && visible(style.overflow_x)
+        && visible(style.overflow_y)
+        && style.border_radius == 0.0
+        && [
+            style.border_top_left_radius,
+            style.border_top_right_radius,
+            style.border_bottom_right_radius,
+            style.border_bottom_left_radius,
+        ]
+        .iter()
+        .all(|radius| radius.is_none_or(|radius| radius == 0.0))
+        && style.background_image.is_none()
+        && style
+            .custom_properties
+            .as_ref()
+            .is_none_or(|properties| !properties.keys().any(|name| painted_by_name(name)))
+        && prev.self_clip.get(index) == cur.self_clip.get(index)
+        && prev.z_order.get(index) == cur.z_order.get(index)
+        && prev.paint_order.get(index) == cur.paint_order.get(index)
+        && [prev, cur].iter().all(|artifact| {
+            artifact.text_fragments.get(index).is_none_or(Vec::is_empty)
+                && artifact
+                    .column_fragments
+                    .get(index)
+                    .is_none_or(|f| f.len() <= 1)
+        })
+        && old.x.to_bits() == new.x.to_bits()
+        && old.y.to_bits() == new.y.to_bits();
+    if !plain {
+        return None;
+    }
+    let border = [
+        style.border_width,
+        style.border_top_width.unwrap_or(0.0),
+        style.border_right_width.unwrap_or(0.0),
+        style.border_bottom_width.unwrap_or(0.0),
+        style.border_left_width.unwrap_or(0.0),
+    ]
+    .into_iter()
+    .fold(0.0f32, f32::max);
+    let reach = 16.0 + border + 2.0 * style.outline_width.max(0.0);
+    if !reach.is_finite() || !old.width.is_finite() || !old.height.is_finite() {
+        return None;
+    }
+    let (left, top) = (new.x - reach, new.y - reach);
+    let right = old.x + old.width.max(new.width) + reach;
+    let bottom = old.y + old.height.max(new.height) + reach;
+    let mut strips = Vec::new();
+    if old.width.to_bits() != new.width.to_bits() {
+        let x = old.x + old.width.min(new.width) - reach;
+        strips.push(LayoutRect {
+            x,
+            y: top,
+            width: right - x,
+            height: bottom - top,
+        });
+    }
+    if old.height.to_bits() != new.height.to_bits() {
+        let y = old.y + old.height.min(new.height) - reach;
+        strips.push(LayoutRect {
+            x: left,
+            y,
+            width: right - left,
+            height: bottom - y,
+        });
+    }
+    Some(strips)
+}
+
+/// A rect (document CSS px) holding everything client `index` paints, or
+/// `Ok(None)` when it paints nothing. Its border box, column fragments and
+/// text fragments, grown by a margin for glyph overhang, outlines and
+/// anti-aliasing. `Err`: paint that can reach farther (shadows, filters,
+/// transforms, backdrop effects).
+fn client_ink_bounds(artifact: &PaintArtifact, index: usize) -> Result<Option<LayoutRect>, ()> {
+    let Some(node) = artifact.nodes.get(index) else {
+        return Ok(None);
+    };
+    let Some(rect) = artifact.rect_by_index.get(index).copied().flatten() else {
+        return Ok(None);
+    };
+    let style = node.style.as_style();
+    // As `append_node`: a hidden box has no display items.
+    if style.visibility != w3cos_std::style::Visibility::Visible {
+        return Ok(None);
+    }
+    if style.filter.is_some()
+        || style.box_shadow.is_some()
+        || !style.box_shadows.is_empty()
+        || style.backdrop_blur.is_some()
+        || !style.text_shadows.is_empty()
+        || !style.transform.is_identity()
+    {
+        return Err(());
+    }
+    let mut bounds = rect;
+    for fragment in artifact.column_fragments.get(index).into_iter().flatten() {
+        bounds = union_rect(bounds, fragment.visual_rect);
+    }
+    for (fragment, _) in artifact.text_fragments.get(index).into_iter().flatten() {
+        bounds = union_rect(bounds, *fragment);
+    }
+    let margin = 16f32.max(style.font_size) + 2.0 * style.outline_width.max(0.0);
+    if !margin.is_finite() || !bounds.x.is_finite() || !bounds.y.is_finite() {
+        return Err(());
+    }
+    Ok(Some(LayoutRect {
+        x: bounds.x - margin,
+        y: bounds.y - margin,
+        width: bounds.width.max(0.0) + 2.0 * margin,
+        height: bounds.height.max(0.0) + 2.0 * margin,
+    }))
+}
+
 pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<PaintDiff> {
     use w3cos_std::component::ComponentKind;
     use w3cos_std::style::Display;
@@ -1285,6 +1504,41 @@ mod tests {
             &[(rect(0.0), 0), (rect(0.0), 1), (rect(80.0), 2)],
             1,
         )
+    }
+
+    #[test]
+    fn paint_damage_covers_old_and_new_paint_and_gives_up_on_filters() {
+        let node = |style: Style, parent| PaintNode {
+            kind: ComponentKind::Column,
+            style: style.into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let build = |y: f32, shadow: bool| {
+            let mut moved = Style::default();
+            if shadow {
+                moved.filter = Some("blur(2px)".into());
+            }
+            PaintArtifact::build(
+                [node(Style::default(), None), node(moved, Some(0))],
+                &[(rect(0.0), 0), (rect(y), 1)],
+                1,
+            )
+        };
+        let (prev, cur) = (build(80.0, false), build(120.0, false));
+        let diff = PaintDiff {
+            dirty: vec![false, true],
+            moved: vec![None, None],
+        };
+        let damage = paint_damage(&prev, &cur, &diff).expect("bounded");
+        assert_eq!(damage.len(), 1);
+        let (client, area) = damage[0];
+        assert_eq!(client, 1);
+        // Both the old (y 80..160) and new (y 120..200) boxes, with margin.
+        assert!(area.y <= 80.0 - 16.0 && area.y + area.height >= 200.0 + 16.0);
+        assert!(area.x <= -16.0 && area.x + area.width >= 320.0 + 16.0);
+        let shadowed = build(120.0, true);
+        assert!(paint_damage(&prev, &shadowed, &diff).is_none());
     }
 
     fn note(tree: &mut RetainedLayerTree, action: LayerPaintAction) {
