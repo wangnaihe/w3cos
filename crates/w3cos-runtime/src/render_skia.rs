@@ -2410,9 +2410,8 @@ fn damage_device_rects(
     }
     let mut placed = vec![false; damage.len()];
     let mut out = Vec::new();
-    let mut local = Vec::new();
     for layer in layers {
-        local.clear();
+        let mut translation = None;
         for &client in &layer.client_indices {
             let Some(&start) = first.get(client) else {
                 continue;
@@ -2420,57 +2419,66 @@ fn damage_device_rects(
             if start == u32::MAX {
                 continue;
             }
+            let (tx, ty) = match translation {
+                Some(translation) => translation,
+                None => {
+                    if !layer_css_transform(layer, artifact, overrides).is_identity() {
+                        return None;
+                    }
+                    let matrix = compositor_layer_matrix(
+                        layer,
+                        artifact,
+                        scroll_info,
+                        overrides,
+                        scale_factor,
+                    );
+                    // Without a CSS transform the layer matrix is a translation.
+                    if !matrix.is_translate() {
+                        return None;
+                    }
+                    let (sx, sy) = layer
+                        .client_indices
+                        .first()
+                        .map_or((0.0, 0.0), |&index| artifact.viewport_scroll_for(index));
+                    let value = (
+                        matrix.translate_x() - sx * scale_factor,
+                        matrix.translate_y() - sy * scale_factor,
+                    );
+                    translation = Some(value);
+                    value
+                }
+            };
             let mut position = start as usize;
             while position < damage.len() && damage[position].0 == client {
                 placed[position] = true;
                 let rect = damage[position].1;
-                local.push(Rect::from_xywh(
-                    rect.x * scale_factor,
-                    rect.y * scale_factor,
-                    rect.width * scale_factor,
-                    rect.height * scale_factor,
-                ));
                 position += 1;
+                let (x, y) = (rect.x * scale_factor, rect.y * scale_factor);
+                let left = x + tx;
+                let top = y + ty;
+                let right = (x + rect.width * scale_factor) + tx;
+                let bottom = (y + rect.height * scale_factor) + ty;
+                if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite())
+                {
+                    return None;
+                }
+                // Padded a pixel for anti-aliasing; a rect off the surface
+                // damages nothing.
+                if right <= -1.0
+                    || bottom <= -1.0
+                    || left >= surface.0 + 1.0
+                    || top >= surface.1 + 1.0
+                {
+                    continue;
+                }
+                // Rounded out and padded, inside the padded surface.
+                out.push(skia_safe::IRect::from_ltrb(
+                    (left.floor() - 1.0).max(-1.0) as i32,
+                    (top.floor() - 1.0).max(-1.0) as i32,
+                    (right.ceil() + 1.0).min(surface.0 + 1.0) as i32,
+                    (bottom.ceil() + 1.0).min(surface.1 + 1.0) as i32,
+                ));
             }
-        }
-        if local.is_empty() {
-            continue;
-        }
-        if !layer_css_transform(layer, artifact, overrides).is_identity() {
-            return None;
-        }
-        let matrix = compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
-        let (sx, sy) = layer
-            .client_indices
-            .first()
-            .map_or((0.0, 0.0), |&index| artifact.viewport_scroll_for(index));
-        // Without a CSS transform the layer matrix is a translation.
-        if !matrix.is_translate() {
-            return None;
-        }
-        let (tx, ty) = (
-            matrix.translate_x() - sx * scale_factor,
-            matrix.translate_y() - sy * scale_factor,
-        );
-        for rect in &local {
-            let (left, top) = (rect.left + tx, rect.top + ty);
-            let (right, bottom) = (rect.right + tx, rect.bottom + ty);
-            if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()) {
-                return None;
-            }
-            // Rounded out and padded a pixel for anti-aliasing; a rect off
-            // the surface damages nothing.
-            let (left, top) = (left.floor() - 1.0, top.floor() - 1.0);
-            let (right, bottom) = (right.ceil() + 1.0, bottom.ceil() + 1.0);
-            if right <= 0.0 || bottom <= 0.0 || left >= surface.0 || top >= surface.1 {
-                continue;
-            }
-            out.push(skia_safe::IRect::from_ltrb(
-                left.max(-1.0) as i32,
-                top.max(-1.0) as i32,
-                right.min(surface.0 + 1.0) as i32,
-                bottom.min(surface.1 + 1.0) as i32,
-            ));
         }
     }
     if placed.iter().any(|placed| !placed) {

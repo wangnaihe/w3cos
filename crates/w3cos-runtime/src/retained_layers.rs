@@ -466,32 +466,39 @@ pub fn paint_damage(
 ) -> Option<Vec<(usize, LayoutRect)>> {
     let mut damage = Vec::new();
     for index in 0..cur.nodes.len() {
-        let moved = diff.moved.get(index).copied().flatten().is_some();
-        if !diff.dirty.get(index).copied().unwrap_or(true) && !moved {
-            continue;
-        }
-        if prev.node_properties.get(index) != cur.node_properties.get(index)
-            || prev.sticky_owner.get(index).copied().flatten().is_some()
+        let dirty = diff.dirty.get(index).copied().unwrap_or(true);
+        // A client that only moved (`moved_by`: same style, properties,
+        // size and display items relative to its box) paints its old ink
+        // shifted by the move.
+        let shift = if dirty {
+            None
+        } else {
+            match diff.moved.get(index).copied().flatten() {
+                Some(delta) => Some(delta),
+                None => continue,
+            }
+        };
+        if prev.sticky_owner.get(index).copied().flatten().is_some()
             || cur.sticky_owner.get(index).copied().flatten().is_some()
+            || (shift.is_none()
+                && prev.node_properties.get(index) != cur.node_properties.get(index))
         {
             return None;
         }
-        if let Some(strips) = resized_box_damage(prev, cur, index) {
+        if shift.is_none()
+            && let Some(strips) = resized_box_damage(prev, cur, index)
+        {
             damage.extend(strips.into_iter().map(|strip| (index, strip)));
             continue;
         }
         let old = client_ink_bounds(prev, index).ok()?;
-        // A client that only moved (`moved_by`: same style, size and display
-        // items relative to its box) paints its old ink shifted by the move.
-        let new = match diff.moved.get(index).copied().flatten() {
-            Some((dx, dy)) if !diff.dirty.get(index).copied().unwrap_or(true) => {
-                old.map(|old| LayoutRect {
-                    x: old.x + dx,
-                    y: old.y + dy,
-                    ..old
-                })
-            }
-            _ => client_ink_bounds(cur, index).ok()?,
+        let new = match shift {
+            Some((dx, dy)) => old.map(|old| LayoutRect {
+                x: old.x + dx,
+                y: old.y + dy,
+                ..old
+            }),
+            None => client_ink_bounds(cur, index).ok()?,
         };
         match (old, new) {
             (None, None) => {}
@@ -519,6 +526,9 @@ fn resized_box_damage(
     let (a, b) = (prev.nodes.get(index)?, cur.nodes.get(index)?);
     let old = prev.rect_by_index.get(index).copied().flatten()?;
     let new = cur.rect_by_index.get(index).copied().flatten()?;
+    if old.x.to_bits() != new.x.to_bits() || old.y.to_bits() != new.y.to_bits() {
+        return None;
+    }
     let style = b.style.as_style();
     let plain_kind = matches!(
         b.kind,
