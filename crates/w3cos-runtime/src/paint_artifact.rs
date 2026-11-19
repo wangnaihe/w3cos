@@ -538,6 +538,10 @@ struct AppendMark {
     effects: u32,
     scrolls: u32,
     self_scroll: u32,
+    /// Display items, chunks and paint-order levels before the node.
+    items: u32,
+    chunks: u32,
+    levels: u32,
 }
 
 /// The previous build's per-node property-tree bookkeeping. Blink's
@@ -562,7 +566,36 @@ pub(crate) fn paint_append_reuse_enabled() -> bool {
         return enabled;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "1")
+            || artifact_splice_enabled()
+    })
+}
+
+/// `W3COS_PAINT_ARTIFACT_SPLICE=1`: with append reuse, copy each run of
+/// unchanged, aligned nodes as slices of last frame's output (`=verify`
+/// also builds in full and compares, like `W3COS_PAINT_APPEND_REUSE_VERIFY`).
+/// Off by default.
+pub(crate) fn artifact_splice_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = ARTIFACT_SPLICE_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("W3COS_PAINT_ARTIFACT_SPLICE").is_some_and(|v| v == "1" || v == "verify")
+    })
+}
+
+thread_local! {
+    /// Nodes copied in aligned runs since the thread started.
+    static ARTIFACT_SPLICE_RUN_NODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARTIFACT_SPLICE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// `W3COS_PAINT_APPEND_REUSE_VERIFY=1`: also run the full build and compare.
@@ -570,6 +603,7 @@ fn paint_append_reuse_verify() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("W3COS_PAINT_APPEND_REUSE_VERIFY").is_some_and(|v| v == "1")
+            || std::env::var_os("W3COS_PAINT_ARTIFACT_SPLICE").is_some_and(|v| v == "verify")
     })
 }
 
@@ -3342,7 +3376,121 @@ impl PaintArtifact {
             effects: self.properties.effects.len() as u32,
             scrolls: self.properties.scrolls.len() as u32,
             self_scroll: 0,
+            items: self.display_items.len() as u32,
+            chunks: self.chunks.len() as u32,
+            levels: self.paint_order.levels.len() as u32,
         }
+    }
+
+    /// Copies the previous build's output for the run of nodes from
+    /// `start` whose inputs and rects equal last frame's, whose parents'
+    /// output is the same, and whose every appended array is aligned with
+    /// last frame's at `start`: slices instead of per-node work (Blink's
+    /// PaintController copies a cached subsequence wholesale). Returns the
+    /// run's end (`start` when there is no run).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_aligned_run(
+        &mut self,
+        start: usize,
+        previous: &PaintArtifact,
+        record: &AppendRecord,
+        same: &mut [bool],
+        unchanged: &mut [bool],
+        memo: &mut AppendMemo,
+        marks: &mut Vec<AppendMark>,
+    ) -> usize {
+        let len = self.nodes.len();
+        let mark = self.mark();
+        let old = record.marks[start];
+        if (
+            mark.transforms,
+            mark.clips,
+            mark.effects,
+            mark.scrolls,
+            mark.items,
+            mark.chunks,
+            mark.levels,
+        ) != (
+            old.transforms,
+            old.clips,
+            old.effects,
+            old.scrolls,
+            old.items,
+            old.chunks,
+            old.levels,
+        ) {
+            return start;
+        }
+        let mut end = start;
+        while end < len {
+            let parent_same = self.nodes[end]
+                .parent
+                .is_none_or(|parent| parent >= start || same[parent]);
+            if !parent_same
+                || self.rect_by_index[end] != previous.rect_by_index[end]
+                || !self.column_fragments.get(end).is_none_or(Vec::is_empty)
+                || !previous.column_fragments.get(end).is_none_or(Vec::is_empty)
+                || !self.inputs_match(end, previous)
+            {
+                break;
+            }
+            end += 1;
+        }
+        // A parent inside the run is copied with it; one at or after `end`
+        // cannot precede its child.
+        if end - start < 8 {
+            return start;
+        }
+        let stop = record.marks.get(end).copied().unwrap_or(AppendMark {
+            transforms: previous.properties.transforms.len() as u32,
+            clips: previous.properties.clips.len() as u32,
+            effects: previous.properties.effects.len() as u32,
+            scrolls: previous.properties.scrolls.len() as u32,
+            self_scroll: 0,
+            items: previous.display_items.len() as u32,
+            chunks: previous.chunks.len() as u32,
+            levels: previous.paint_order.levels.len() as u32,
+        });
+        let range = |a: u32, b: u32| a as usize..b as usize;
+        self.properties.transforms.extend_from_slice(
+            &previous.properties.transforms[range(old.transforms, stop.transforms)],
+        );
+        self.properties
+            .clips
+            .extend_from_slice(&previous.properties.clips[range(old.clips, stop.clips)]);
+        self.properties
+            .effects
+            .extend_from_slice(&previous.properties.effects[range(old.effects, stop.effects)]);
+        self.properties
+            .scrolls
+            .extend_from_slice(&previous.properties.scrolls[range(old.scrolls, stop.scrolls)]);
+        self.display_items
+            .extend_from_slice(&previous.display_items[range(old.items, stop.items)]);
+        self.chunks
+            .extend_from_slice(&previous.chunks[range(old.chunks, stop.chunks)]);
+        self.paint_order
+            .levels
+            .extend_from_slice(&previous.paint_order.levels[range(old.levels, stop.levels)]);
+        let nodes = start..end;
+        self.paint_order.spans[nodes.clone()]
+            .copy_from_slice(&previous.paint_order.spans[nodes.clone()]);
+        self.node_properties[nodes.clone()]
+            .copy_from_slice(&previous.node_properties[nodes.clone()]);
+        self.self_clip[nodes.clone()].copy_from_slice(&previous.self_clip[nodes.clone()]);
+        self.z_order[nodes.clone()].copy_from_slice(&previous.z_order[nodes.clone()]);
+        self.viewport_attached_by_index[nodes.clone()]
+            .copy_from_slice(&previous.viewport_attached_by_index[nodes.clone()]);
+        self.sticky_owner[nodes.clone()].copy_from_slice(&previous.sticky_owner[nodes.clone()]);
+        let old_memo = &record.memo;
+        memo.fixed_owner[nodes.clone()].copy_from_slice(&old_memo.fixed_owner[nodes.clone()]);
+        memo.context_owner[nodes.clone()].copy_from_slice(&old_memo.context_owner[nodes.clone()]);
+        memo.owns_context[nodes.clone()].copy_from_slice(&old_memo.owns_context[nodes.clone()]);
+        memo.stacking[nodes.clone()].copy_from_slice(&old_memo.stacking[nodes.clone()]);
+        memo.ancestor_phase[nodes.clone()].copy_from_slice(&old_memo.ancestor_phase[nodes.clone()]);
+        marks.extend_from_slice(&record.marks[nodes.clone()]);
+        same[nodes.clone()].fill(true);
+        unchanged[nodes].fill(true);
+        end
     }
 
     /// `append_node` for every node, copying the previous build's output for
@@ -3374,8 +3522,26 @@ impl PaintArtifact {
         // last frame's, so a descendant reading them may be copied.
         let mut same = vec![false; len];
         let mut unchanged = vec![false; len];
-        let (mut copied, mut appended) = (0u64, 0u64);
-        for index in 0..len {
+        let (mut copied, mut appended, mut run_copied) = (0u64, 0u64, 0u64);
+        let splice = artifact_splice_enabled();
+        let mut index = 0;
+        while index < len {
+            if splice && let Some((previous, record)) = base {
+                let end = self.copy_aligned_run(
+                    index,
+                    previous,
+                    record,
+                    &mut same,
+                    &mut unchanged,
+                    &mut memo,
+                    &mut marks,
+                );
+                if end > index {
+                    run_copied += (end - index) as u64;
+                    index = end;
+                    continue;
+                }
+            }
             let mut mark = self.mark();
             let reused = base.is_some_and(|(previous, record)| {
                 self.copy_append_output(index, previous, record, &mark, &same, &mut memo)
@@ -3396,14 +3562,17 @@ impl PaintArtifact {
                 }
             }
             marks.push(mark);
+            index += 1;
         }
+        copied += run_copied;
+        ARTIFACT_SPLICE_RUN_NODES.with(|count| count.set(count.get() + run_copied));
         self.paint_classes = std::sync::OnceLock::new();
         APPEND_REUSE_STATS.with(|stats| {
             let (c, a, m) = stats.get();
             stats.set((c + copied, a + appended, m));
         });
         if verify {
-            eprintln!("[append-reuse] copied {copied} of {len}");
+            eprintln!("[append-reuse] copied {copied} of {len} ({run_copied} in aligned runs)");
         }
         if let Some(fresh) = fresh
             && !self.append_output_eq(&fresh)
@@ -3477,6 +3646,9 @@ impl PaintArtifact {
             effects: previous.properties.effects.len() as u32,
             scrolls: previous.properties.scrolls.len() as u32,
             self_scroll: 0,
+            items: previous.display_items.len() as u32,
+            chunks: previous.chunks.len() as u32,
+            levels: previous.paint_order.levels.len() as u32,
         });
         // Property node ids assigned so far line up with last frame's.
         if (mark.transforms, mark.clips, mark.effects, mark.scrolls)
@@ -4784,6 +4956,97 @@ mod tests {
             .append_unchanged_against(&first)
             .expect("built against first");
         assert!(!unchanged[2] && unchanged[4] && unchanged[6]);
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+    }
+
+    /// A frame whose last block grew copies the unchanged blocks before it
+    /// as one aligned run and matches a full build.
+    #[test]
+    fn artifact_splice_copies_aligned_runs_and_matches_a_full_build() {
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        let mut plain = Style::default();
+        plain.display = Display::Block;
+        let mut clipped = plain.clone();
+        clipped.overflow_x = Some(Overflow::Hidden);
+        clipped.overflow_y = Some(Overflow::Hidden);
+        let node = |kind: ComponentKind, style: &Style, parent: Option<usize>| PaintNode {
+            kind,
+            style: style.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let text = |content: &str| ComponentKind::Text {
+            content: content.into(),
+        };
+        let rect = |y: f32, height: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 200.0,
+            height,
+        };
+        let blocks = 10;
+        let nodes = |last: &str| {
+            let mut nodes = vec![node(ComponentKind::Root, &clipped, None)];
+            for index in 0..blocks {
+                nodes.push(node(ComponentKind::Root, &plain, Some(0)));
+                nodes.push(node(
+                    text(&format!("block {index}")),
+                    &plain,
+                    Some(2 * index + 1),
+                ));
+            }
+            nodes.push(node(ComponentKind::Root, &plain, Some(0)));
+            nodes.push(node(text(last), &plain, Some(2 * blocks + 1)));
+            nodes
+        };
+        let layouts = |grow: f32| {
+            let mut layouts = vec![(rect(0.0, 20.0 * blocks as f32 + 20.0 + grow), 0)];
+            for index in 0..blocks {
+                let y = 20.0 * index as f32;
+                layouts.push((rect(y, 20.0), 2 * index + 1));
+                layouts.push((rect(y, 20.0), 2 * index + 2));
+            }
+            let y = 20.0 * blocks as f32;
+            layouts.push((rect(y, 20.0 + grow), 2 * blocks + 1));
+            layouts.push((rect(y, 20.0 + grow), 2 * blocks + 2));
+            layouts
+        };
+        let first = PaintArtifact::build_reusing(nodes("last"), &layouts(0.0), 1, None, None, None);
+        let runs_before = ARTIFACT_SPLICE_RUN_NODES.with(std::cell::Cell::get);
+        let next = PaintArtifact::build_reusing(
+            nodes("last, and longer"),
+            &layouts(20.0),
+            2,
+            None,
+            None,
+            Some(&first),
+        );
+        let runs = ARTIFACT_SPLICE_RUN_NODES.with(std::cell::Cell::get) - runs_before;
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(false)));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(false)));
+        let fresh = PaintArtifact::build(nodes("last, and longer"), &layouts(20.0), 2);
+        assert!(next.append_output_eq(&fresh));
+        assert_eq!(
+            runs,
+            2 * blocks as u64,
+            "the unchanged blocks copy as one run"
+        );
+        // A third frame copies from a build that itself copied a run.
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+        let third = PaintArtifact::build_reusing(
+            nodes("last, and longer still"),
+            &layouts(40.0),
+            3,
+            None,
+            None,
+            Some(&next),
+        );
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(false)));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(false)));
+        let fresh = PaintArtifact::build(nodes("last, and longer still"), &layouts(40.0), 3);
+        assert!(third.append_output_eq(&fresh));
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(None));
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
