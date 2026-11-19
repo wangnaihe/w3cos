@@ -12157,7 +12157,7 @@ fn register_author_blocks(owner: u64, css: &str, media_queries: &mut Vec<(String
             let name = at_rule[..name_end].to_ascii_lowercase();
             match name.as_str() {
                 "font-face" => {
-                    let _ = crate::font_face::parse_and_register(body);
+                    let _ = crate::font_face::parse_and_register_for_document(body);
                 }
                 "media" => {
                     let query = at_rule[name_end..].trim();

@@ -222,8 +222,22 @@ thread_local! {
     static FACE_HIT: RefCell<Option<(u64, LoadedFont)>> = const { RefCell::new(None) };
 }
 
-fn face_hit_key(family: &str, weight: FontWeight, style: FontFaceStyle) -> u64 {
+fn face_hit_key(
+    registry: &FontRegistry,
+    family: &str,
+    weight: FontWeight,
+    style: FontFaceStyle,
+) -> u64 {
     let mut hasher = w3cos_std::fxhash::FxHasher::default();
+    // Per-document faces: the hit is only good for this document's fonts
+    // as of now (another thread may have changed them).
+    if font_scopes_enabled() {
+        (
+            registry as *const FontRegistry as usize,
+            registry.revision(),
+        )
+            .hash(&mut hasher);
+    }
     family.hash(&mut hasher);
     weight.hash(&mut hasher);
     style.hash(&mut hasher);
@@ -411,10 +425,73 @@ pub(crate) struct ResolvedFontRun {
 ///
 /// Access via `FontRegistry::global()`. Thread-safe.
 pub struct FontRegistry {
+    /// Moves when a face visible to every document changes (scope 0).
     revision: AtomicU64,
-    fonts: Mutex<HashMap<FontKey, Vec<(u64, LoadedFont)>>>,
+    fonts: Mutex<HashMap<FontKey, Vec<(Owner, LoadedFont)>>>,
     /// Ordered list of registered families (for CSS `font-family` stack resolution).
-    families: Mutex<Vec<(u64, String)>>,
+    families: Mutex<Vec<(Owner, String)>>,
+    /// With `W3COS_FONT_SCOPES=1`, one revision per document scope.
+    scope_revisions: Mutex<HashMap<u64, Arc<AtomicU64>>>,
+}
+
+/// Who registered a face, and which document may use it. Scope 0 is
+/// visible to every document: system, embedder and (with the flag off) all
+/// faces. With `W3COS_FONT_SCOPES=1` a stylesheet or `document.fonts` face
+/// belongs to the document that registered it, as Blink keeps web fonts in
+/// each document's FontFaceCache / CSSFontSelector (with its own version)
+/// while only the platform FontCache is process-wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owner {
+    id: u64,
+    scope: u64,
+}
+
+impl Owner {
+    fn visible(&self) -> bool {
+        self.scope == 0 || self.scope == current_font_scope()
+    }
+}
+
+/// `W3COS_FONT_SCOPES=1`: web fonts and the font revision become per
+/// document. Off by default.
+pub(crate) fn font_scopes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = FONT_SCOPES_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_FONT_SCOPES").is_ok_and(|value| value == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FONT_SCOPES_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Owner ids for a document's own faces (`document.fonts`, inline
+/// `@font-face` blocks), far above the stylesheet owner counter.
+const DOCUMENT_OWNER_BASE: u64 = 1 << 62;
+
+thread_local! {
+    /// This thread's document scope: the thread hosts one document at a
+    /// time (`dom::DOCUMENT` is thread-local), as a Blink frame does.
+    static FONT_SCOPE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The scope revision counter of `FontRegistry::global()` for this
+    /// thread's scope, so reading the revision takes no lock.
+    static GLOBAL_SCOPE_REVISION: RefCell<Option<(u64, Arc<AtomicU64>)>> =
+        const { RefCell::new(None) };
+}
+
+/// The document scope of the calling thread (never 0).
+pub(crate) fn current_font_scope() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    FONT_SCOPE.with(|scope| {
+        if scope.get() == 0 {
+            scope.set(NEXT.fetch_add(1, Ordering::Relaxed));
+        }
+        scope.get()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -583,6 +660,7 @@ impl FontRegistry {
             revision: AtomicU64::new(0),
             fonts: Mutex::new(HashMap::new()),
             families: Mutex::new(Vec::new()),
+            scope_revisions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -592,8 +670,73 @@ impl FontRegistry {
     }
 
     /// Revision for invalidating styles resolved before font loading completed.
+    /// With `W3COS_FONT_SCOPES=1` it is the calling document's: it moves for
+    /// faces every document sees and for this document's own, not for
+    /// another document's web fonts.
     pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+        let global = self.revision.load(Ordering::Acquire);
+        if !font_scopes_enabled() {
+            return global;
+        }
+        let scope = current_font_scope();
+        let local = if std::ptr::eq(self, Self::global()) {
+            GLOBAL_SCOPE_REVISION.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                match slot.as_ref() {
+                    Some((cached, counter)) if *cached == scope => counter.load(Ordering::Acquire),
+                    _ => {
+                        let counter = self.scope_revision(scope);
+                        let value = counter.load(Ordering::Acquire);
+                        *slot = Some((scope, counter));
+                        value
+                    }
+                }
+            })
+        } else {
+            self.scope_revision(scope).load(Ordering::Acquire)
+        };
+        let mut hasher = w3cos_std::fxhash::FxHasher::default();
+        (global, scope, local).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn scope_revision(&self, scope: u64) -> Arc<AtomicU64> {
+        self.scope_revisions
+            .lock()
+            .unwrap()
+            .entry(scope)
+            .or_default()
+            .clone()
+    }
+
+    /// Move the revision the caches of `owner`'s documents key on.
+    fn bump(&self, owner: Owner) {
+        if owner.scope == 0 {
+            self.revision.fetch_add(1, Ordering::Release);
+        } else {
+            self.scope_revision(owner.scope)
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn owner(id: u64) -> Owner {
+        let scope = if id != 0 && font_scopes_enabled() {
+            current_font_scope()
+        } else {
+            0
+        };
+        Owner { id, scope }
+    }
+
+    /// Register a face of the calling document (`document.fonts`, an inline
+    /// `@font-face`). With `W3COS_FONT_SCOPES=1` only this document sees it;
+    /// otherwise it is registered for every document, as before.
+    pub fn register_document(&self, face: FontFace) -> Result<(), String> {
+        if font_scopes_enabled() {
+            self.register_for_owner(DOCUMENT_OWNER_BASE + current_font_scope(), face)
+        } else {
+            self.register(face)
+        }
     }
 
     /// Resolve the font's own line metrics using the shared parsed face.
@@ -709,6 +852,7 @@ impl FontRegistry {
             skia_typeface: Arc::new(OnceLock::new()),
         };
 
+        let owner = Self::owner(owner);
         let mut fonts = self.fonts.lock().unwrap();
         let entries = fonts.entry(key).or_default();
         entries.retain(|(existing_owner, existing)| {
@@ -724,7 +868,8 @@ impl FontRegistry {
         {
             families.push((owner, face.family));
         }
-        self.revision.fetch_add(1, Ordering::Release);
+        drop(families);
+        self.bump(owner);
         Ok(())
     }
 
@@ -755,20 +900,31 @@ impl FontRegistry {
     /// (or was already cleared) must not invalidate the others.
     pub fn clear_owner(&self, owner: u64) {
         clear_face_hit();
-        let mut removed = false;
+        // The scopes the owner's faces were registered in.
+        let mut removed = Vec::new();
         let mut fonts = self.fonts.lock().unwrap();
         fonts.retain(|_, entries| {
-            let before = entries.len();
-            entries.retain(|(existing_owner, _)| *existing_owner != owner);
-            removed |= entries.len() != before;
+            entries.retain(|(existing_owner, _)| {
+                let keep = existing_owner.id != owner;
+                if !keep && !removed.contains(existing_owner) {
+                    removed.push(*existing_owner);
+                }
+                keep
+            });
             !entries.is_empty()
         });
+        drop(fonts);
         let mut families = self.families.lock().unwrap();
-        let before = families.len();
-        families.retain(|(existing_owner, _)| *existing_owner != owner);
-        removed |= families.len() != before;
-        if removed {
-            self.revision.fetch_add(1, Ordering::Release);
+        families.retain(|(existing_owner, _)| {
+            let keep = existing_owner.id != owner;
+            if !keep && !removed.contains(existing_owner) {
+                removed.push(*existing_owner);
+            }
+            keep
+        });
+        drop(families);
+        for owner in removed {
+            self.bump(owner);
         }
     }
 
@@ -854,7 +1010,7 @@ impl FontRegistry {
             w3cos_std::style::FontStyle::Oblique => FontFaceStyle::Oblique,
         };
         let weight = FontWeight(style.font_weight);
-        let key = face_hit_key(family, weight, face_style);
+        let key = face_hit_key(self, family, weight, face_style);
         let cached = FACE_HIT.with(|slot| {
             slot.borrow().as_ref().and_then(|(cached_key, font)| {
                 (*cached_key == key && font.supports_character(character)).then(|| font.clone())
@@ -887,7 +1043,7 @@ impl FontRegistry {
                         .is_some_and(|resolved| resolved.cache_key() == font.cache_key())
                 })
         };
-        let key = face_hit_key(stack, weight, style);
+        let key = face_hit_key(self, stack, weight, style);
         if let Some(cached) = FACE_HIT.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -1045,9 +1201,10 @@ impl FontRegistry {
                         character,
                         require_glyph,
                     ),
-                    fonts
-                        .keys()
-                        .any(|key| key.family.eq_ignore_ascii_case(family)),
+                    fonts.iter().any(|(key, entries)| {
+                        key.family.eq_ignore_ascii_case(family)
+                            && entries.iter().any(|(owner, _)| owner.visible())
+                    }),
                 )
             };
             if let Some(font) = registered {
@@ -1299,8 +1456,8 @@ impl FontRegistry {
     /// List all registered family names.
     pub fn families(&self) -> Vec<String> {
         let mut unique = Vec::new();
-        for (_, family) in self.families.lock().unwrap().iter() {
-            if !unique.contains(family) {
+        for (owner, family) in self.families.lock().unwrap().iter() {
+            if owner.visible() && !unique.contains(family) {
                 unique.push(family.clone());
             }
         }
@@ -1313,7 +1470,13 @@ impl FontRegistry {
             .lock()
             .unwrap()
             .values()
-            .filter_map(|entries| entries.last().map(|(_, font)| font))
+            .filter_map(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|(owner, _)| owner.visible())
+                    .map(|(_, font)| font)
+            })
             .any(|font| font.is_monospace)
     }
 
@@ -1323,14 +1486,20 @@ impl FontRegistry {
             .lock()
             .unwrap()
             .values()
-            .filter_map(|entries| entries.last().map(|(_, font)| font))
+            .filter_map(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|(owner, _)| owner.visible())
+                    .map(|(_, font)| font)
+            })
             .find(|font| font.is_monospace)
             .cloned()
     }
 }
 
 fn resolve_family(
-    fonts: &HashMap<FontKey, Vec<(u64, LoadedFont)>>,
+    fonts: &HashMap<FontKey, Vec<(Owner, LoadedFont)>>,
     family: &str,
     weight: FontWeight,
     style: FontFaceStyle,
@@ -1340,7 +1509,7 @@ fn resolve_family(
 }
 
 fn resolve_family_with_eligibility(
-    fonts: &HashMap<FontKey, Vec<(u64, LoadedFont)>>,
+    fonts: &HashMap<FontKey, Vec<(Owner, LoadedFont)>>,
     family: &str,
     weight: FontWeight,
     style: FontFaceStyle,
@@ -1363,7 +1532,12 @@ fn resolve_family_with_eligibility(
     };
     if let Some(font) = fonts
         .get(&exact)
-        .and_then(|entries| entries.iter().rev().find(|(_, font)| eligible(font)))
+        .and_then(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|(owner, font)| owner.visible() && eligible(font))
+        })
         .map(|(_, font)| font.clone())
     {
         return Some(font);
@@ -1379,7 +1553,7 @@ fn resolve_family_with_eligibility(
                 entries
                     .iter()
                     .rev()
-                    .find(|(_, font)| eligible(font))
+                    .find(|(owner, font)| owner.visible() && eligible(font))
                     .map(|(_, font)| {
                         (
                             (key.weight.0 as i32 - weight.0 as i32).unsigned_abs(),
@@ -1564,6 +1738,16 @@ fn source_bytes(src: &FontSource) -> Option<Vec<u8>> {
 }
 
 pub fn parse_and_register(css_block: &str) -> Result<(), String> {
+    FontRegistry::global().register(parse_font_face_block(css_block)?)
+}
+
+/// `parse_and_register` for a block in the calling document's own styles
+/// (see `FontRegistry::register_document`).
+pub fn parse_and_register_for_document(css_block: &str) -> Result<(), String> {
+    FontRegistry::global().register_document(parse_font_face_block(css_block)?)
+}
+
+fn parse_font_face_block(css_block: &str) -> Result<FontFace, String> {
     let mut family = String::new();
     let mut sources: Vec<FontSource> = Vec::new();
     let mut weight = FontWeight::NORMAL;
@@ -1613,8 +1797,7 @@ pub fn parse_and_register(css_block: &str) -> Result<(), String> {
         display,
         unicode_range,
     };
-
-    FontRegistry::global().register(face)
+    Ok(face)
 }
 
 fn strip_property<'a>(line: &'a str, prop: &str) -> Option<&'a str> {
@@ -1803,7 +1986,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(registry.revision() > before);
+        assert_ne!(registry.revision(), before);
         let font = registry
             .resolve("MetricFixture", FontWeight::NORMAL, FontFaceStyle::Normal)
             .unwrap();
@@ -1817,8 +2000,116 @@ mod tests {
         assert_eq!(registry.normal_line_height(&style), Some(expected));
         let loaded = registry.revision();
         registry.clear_owner(42);
-        assert!(registry.revision() > loaded);
+        assert_ne!(registry.revision(), loaded);
         assert!(registry.normal_line_height(&style).is_none());
+    }
+
+    fn scoped<T>(run: impl FnOnce() -> T) -> T {
+        FONT_SCOPES_OVERRIDE.with(|flag| flag.set(Some(true)));
+        let out = run();
+        FONT_SCOPES_OVERRIDE.with(|flag| flag.set(None));
+        out
+    }
+
+    fn inter(family: &str) -> FontFace {
+        FontFace {
+            family: family.into(),
+            src: FontSource::Bytes(include_bytes!("../assets/Inter-Regular.ttf").to_vec()),
+            ..Default::default()
+        }
+    }
+
+    /// Two documents (threads) share one registry: each sees its own web
+    /// fonts and the global ones, and only its own changes move its revision.
+    #[test]
+    fn document_font_scopes_isolate_web_fonts_and_revisions() {
+        let registry = Arc::new(FontRegistry::new());
+        scoped(|| {
+            registry.register(inter("SharedFixture")).unwrap();
+            registry.register_document(inter("DocAFixture")).unwrap();
+            let a_revision = registry.revision();
+            let other = Arc::clone(&registry);
+            let (b_saw_a, b_sees_own, b_sees_shared, b_families) = std::thread::spawn(move || {
+                scoped(|| {
+                    let before = other.revision();
+                    other.register_document(inter("DocBFixture")).unwrap();
+                    other
+                        .register_for_owner(77, inter("SheetBFixture"))
+                        .unwrap();
+                    assert_ne!(other.revision(), before);
+                    let saw_a = other
+                        .resolve("DocAFixture", FontWeight::NORMAL, FontFaceStyle::Normal)
+                        .is_some();
+                    let own = other
+                        .resolve("SheetBFixture", FontWeight::NORMAL, FontFaceStyle::Normal)
+                        .is_some();
+                    let shared = other
+                        .resolve("SharedFixture", FontWeight::NORMAL, FontFaceStyle::Normal)
+                        .is_some();
+                    (saw_a, own, shared, other.families())
+                })
+            })
+            .join()
+            .unwrap();
+            assert!(!b_saw_a);
+            assert!(b_sees_own && b_sees_shared);
+            assert!(!b_families.iter().any(|family| family == "DocAFixture"));
+            // Document B's fonts neither reach nor invalidate document A.
+            assert_eq!(registry.revision(), a_revision);
+            for family in ["DocBFixture", "SheetBFixture"] {
+                assert!(
+                    registry
+                        .resolve(family, FontWeight::NORMAL, FontFaceStyle::Normal)
+                        .is_none()
+                );
+                assert!(!registry.families().iter().any(|name| name == family));
+            }
+            assert!(
+                registry
+                    .resolve("DocAFixture", FontWeight::NORMAL, FontFaceStyle::Normal)
+                    .is_some()
+            );
+            // B tears down a stylesheet: A is untouched.
+            let other = Arc::clone(&registry);
+            std::thread::spawn(move || scoped(|| other.clear_owner(77)))
+                .join()
+                .unwrap();
+            assert_eq!(registry.revision(), a_revision);
+            // A global (system / embedder) face reaches every document.
+            registry.register(inter("LaterSharedFixture")).unwrap();
+            assert_ne!(registry.revision(), a_revision);
+        });
+    }
+
+    /// With the flag off every face stays visible to every document, as before.
+    #[test]
+    fn without_font_scopes_document_fonts_stay_global() {
+        let registry = Arc::new(FontRegistry::new());
+        FONT_SCOPES_OVERRIDE.with(|flag| flag.set(Some(false)));
+        registry
+            .register_document(inter("UnscopedFixture"))
+            .unwrap();
+        let revision = registry.revision();
+        let other = Arc::clone(&registry);
+        let seen = std::thread::spawn(move || {
+            FONT_SCOPES_OVERRIDE.with(|flag| flag.set(Some(false)));
+            other
+                .register_for_owner(78, inter("UnscopedSheet"))
+                .unwrap();
+            other
+                .resolve("UnscopedFixture", FontWeight::NORMAL, FontFaceStyle::Normal)
+                .is_some()
+        })
+        .join()
+        .unwrap();
+        FONT_SCOPES_OVERRIDE.with(|flag| flag.set(None));
+        assert!(seen);
+        assert_ne!(registry.revision(), revision);
+        assert!(
+            registry
+                .resolve("UnscopedSheet", FontWeight::NORMAL, FontFaceStyle::Normal)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1840,7 +2131,7 @@ mod tests {
         assert_eq!(registry.revision(), loaded);
         registry.clear_owner(5);
         let cleared = registry.revision();
-        assert!(cleared > loaded);
+        assert_ne!(cleared, loaded);
         registry.clear_owner(5);
         assert_eq!(registry.revision(), cleared);
     }
@@ -2318,9 +2609,10 @@ impl FontFaceSet {
         }
     }
 
-    /// Add a `FontFace` to the set and register it in the global `FontRegistry`.
+    /// Add a `FontFace` to the set and register it in the global `FontRegistry`
+    /// for the calling document (see `FontRegistry::register_document`).
     pub fn add(&self, face: FontFace) -> Result<(), String> {
-        FontRegistry::global().register(face)
+        FontRegistry::global().register_document(face)
     }
 
     /// Check if a font matching the given family/weight/style is available.
