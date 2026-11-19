@@ -688,7 +688,17 @@ pub fn flush() -> bool {
 /// flags, the flat output, the eligibility walk) is there for the next
 /// edit instead of being built on it (Blink's LayoutObjects carry it from
 /// the first layout).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WARM_REBUILD_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn warm_rebuild_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = WARM_REBUILD_OVERRIDE.with(|o| o.get()) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("W3COS_WARM_REBUILD").is_ok_and(|v| v == "1"))
 }
@@ -708,6 +718,12 @@ fn rebuild(
         && std::env::var_os("W3COS_SPLICE_VERIFY").is_none()
     {
         let key = (layout_gen, structure);
+        // A rebuild after a refused patch keeps the structure key (an
+        // in-place restyle does not bump the layout generation) but lowers
+        // a new tree: per-box data kept under the key describes the old
+        // one, and a restyle that drops one box and adds another (a column
+        // hidden in one table, shown in the next) keeps every length equal.
+        crate::layout_ng::forget_patch_memo();
         let mut tree = RetainedTree::new(crate::dom::to_component_tree());
         let mut engine = LayoutEngine::new();
         let laid = {
@@ -4288,6 +4304,95 @@ mod paint_layout_tests {
             w3cos_std::color::Color::from_css("purple").expect("purple")
         );
         assert_ne!(directed_style.direction, first_style.direction);
+    }
+
+    #[test]
+    fn hiding_a_column_after_a_warm_rebuild_matches_full_layout() {
+        // WPT css-tables/width-distribution/computing-column-measure-2.html
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                WARM_REBUILD_OVERRIDE.with(|o| o.set(None));
+            }
+        }
+        let _reset = Reset;
+        for warm in [false, true] {
+            WARM_REBUILD_OVERRIDE.with(|o| o.set(Some(warm)));
+            crate::dom::reset_document();
+            invalidate();
+            let wrapper = crate::dom::create_element("div");
+            crate::dom::set_style_property(wrapper, "width", "750px");
+            let heading = crate::dom::create_element("h1");
+            write_text(heading, "Width Distribution");
+            crate::dom::append_child(wrapper, heading);
+            let mut tables = Vec::new();
+            let mut cols = Vec::new();
+            for widths in [
+                [("100px", false), ("200px", false), ("300px", false)],
+                [("100px", true), ("200px", false), ("auto", false)],
+                [("100px", false), ("200px", false), ("auto", false)],
+            ] {
+                let table = crate::dom::create_element("table");
+                crate::dom::set_style_property(table, "border", "1px solid orange");
+                let group = crate::dom::create_element("colgroup");
+                let mut these = Vec::new();
+                for (width, hidden) in widths {
+                    let col = crate::dom::create_element("col");
+                    crate::dom::set_style_property(col, "width", width);
+                    if hidden {
+                        crate::dom::set_style_property(col, "display", "none");
+                    }
+                    crate::dom::append_child(group, col);
+                    these.push(col);
+                }
+                crate::dom::append_child(table, group);
+                let row = crate::dom::create_element("tr");
+                for label in ["100", "200", "300"] {
+                    let cell = crate::dom::create_element("td");
+                    crate::dom::set_style_property(cell, "padding", "0");
+                    let text = crate::dom::create_text_node(label);
+                    crate::dom::append_child(cell, text);
+                    crate::dom::append_child(row, cell);
+                }
+                crate::dom::append_child(table, row);
+                crate::dom::append_child(wrapper, table);
+                tables.push(table);
+                cols.push(these);
+            }
+            crate::dom::append_child(crate::dom::body_id(), wrapper);
+            // No oracle layout before the edit: it would replace the
+            // per-box data the rebuild left behind.
+            assert!(flush(), "layout flush");
+            // A patch flush first, so per-box data sits under the key.
+            crate::dom::set_style_property(wrapper, "padding-left", "1px");
+            assert!(flush(), "layout flush");
+            let reference = crate::dom::bounding_rect(tables[2]).width;
+            assert!(crate::dom::bounding_rect(tables[0]).width > reference);
+            // One table loses a column and the other gains one, so the new
+            // tree has as many boxes as the old one.
+            crate::dom::set_style_property(cols[1][0], "display", "table-column");
+            crate::dom::set_style_property(cols[0][2], "display", "none");
+            assert!(flush(), "layout flush");
+            for table in &tables[..2] {
+                let width = crate::dom::bounding_rect(*table).width;
+                assert!(
+                    (width - reference).abs() < 0.05,
+                    "warm {warm}: table width {width}, reference {reference}"
+                );
+            }
+            // And a patch flush over the rebuilt tree.
+            crate::dom::set_style_property(wrapper, "padding-left", "2px");
+            assert!(flush(), "layout flush");
+            for table in &tables[..2] {
+                let width = crate::dom::bounding_rect(*table).width;
+                assert!(
+                    (width - reference).abs() < 0.05,
+                    "warm {warm}: after a patch, table width {width}, reference {reference}"
+                );
+            }
+            assert_stored_matches_fresh(tables[0]);
+            assert_stored_matches_fresh(tables[1]);
+        }
     }
 }
 
