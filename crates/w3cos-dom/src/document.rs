@@ -122,6 +122,20 @@ const CHILD_LOG_CAP: usize = 256;
 
 /// Each edit gets its own tick: an edit stamped `t` is reflected in any cache
 /// built at tick > t and missing from any built at tick <= t.
+fn detached_edits_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DETACHED_EDITS_OVERRIDE.with(Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_DETACHED_EDITS").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DETACHED_EDITS_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
 fn log_child_change(change: ChildListChange) {
     let tick = structure_tick();
     CHILD_LOG.with(|log| {
@@ -944,6 +958,9 @@ pub struct Document {
     scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
+    /// An edit in progress touches only unrendered trees (see
+    /// [`Document::detached_scope`]).
+    detached_edit: bool,
     /// Bumps only for text edits that keep every used box (repaint-only).
     /// A retained component tree compares it to know its text is stale.
     repaint_text_generation: u64,
@@ -1217,6 +1234,7 @@ impl Document {
             scope_epoch: 1,
             scope_stamp: Vec::new(),
             structure_generation: 0,
+            detached_edit: false,
             repaint_text_generation: 0,
             layout_generation: 0,
             geometry_epoch: 1,
@@ -1439,6 +1457,75 @@ impl Document {
     // -----------------------------------------------------------------------
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        let detached = self.edit_is_detached(&[Some(parent), self.get_node(child).parent]);
+        self.detached_scope(detached, |doc| doc.append_child_inner(parent, child));
+    }
+
+    pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        let detached = self.edit_is_detached(&[Some(parent)]);
+        self.detached_scope(detached, |doc| doc.remove_child_inner(parent, child));
+    }
+
+    pub fn insert_before(&mut self, parent: NodeId, new_child: NodeId, ref_child: NodeId) {
+        let detached = self.edit_is_detached(&[Some(parent), self.get_node(new_child).parent]);
+        self.detached_scope(detached, |doc| {
+            doc.insert_before_inner(parent, new_child, ref_child)
+        });
+    }
+
+    pub(crate) fn mark_selector_dirty(&mut self, id: NodeId) {
+        let detached = self.edit_is_detached(&[Some(id)]);
+        self.detached_scope(detached, |doc| doc.mark_selector_dirty_inner(id));
+    }
+
+    pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
+        let detached = self.edit_is_detached(&[Some(id)]);
+        self.detached_scope(detached, |doc| doc.mark_inline_style_dirty_inner(id));
+    }
+
+    pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
+        let detached = self.edit_is_detached(&[Some(id)]);
+        self.detached_scope(detached, |doc| doc.mark_text_dirty_inner(id));
+    }
+
+    /// `W3COS_DETACHED_EDITS=1`: every node of an edit lies in a tree whose
+    /// root is neither the document nor a fragment (a shadow root or
+    /// template content can render): a node not yet inserted, or removed.
+    fn edit_is_detached(&self, nodes: &[Option<NodeId>]) -> bool {
+        detached_edits_enabled()
+            && nodes
+                .iter()
+                .flatten()
+                .all(|&node| self.in_unrendered_tree(node))
+    }
+
+    fn in_unrendered_tree(&self, mut id: NodeId) -> bool {
+        loop {
+            let node = self.get_node(id);
+            match node.parent {
+                Some(parent) => id = parent,
+                None => {
+                    return !matches!(
+                        node.node_type,
+                        NodeType::Document | NodeType::DocumentFragment
+                    ) && id != NodeId::ROOT;
+                }
+            }
+        }
+    }
+
+    /// Run `edit` with layout's dirty lists and generations left alone when
+    /// `detached` (Blink marks nothing for layout in a tree with no
+    /// LayoutObjects); styles and child-list caches still see it, and
+    /// inserting the tree later marks it dirty.
+    fn detached_scope(&mut self, detached: bool, edit: impl FnOnce(&mut Self)) {
+        let saved = self.detached_edit;
+        self.detached_edit = saved || detached;
+        edit(self);
+        self.detached_edit = saved;
+    }
+
+    fn append_child_inner(&mut self, parent: NodeId, child: NodeId) {
         if parent == child || self.insertion_would_create_cycle(parent, child) {
             return;
         }
@@ -1483,7 +1570,7 @@ impl Document {
         self.note_structure_change();
     }
 
-    pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+    fn remove_child_inner(&mut self, parent: NodeId, child: NodeId) {
         self.unlink_from_parent(child);
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
@@ -1569,7 +1656,7 @@ impl Document {
             .unwrap_or_default()
     }
 
-    pub fn insert_before(&mut self, parent: NodeId, new_child: NodeId, ref_child: NodeId) {
+    fn insert_before_inner(&mut self, parent: NodeId, new_child: NodeId, ref_child: NodeId) {
         if new_child == ref_child {
             return;
         }
@@ -2580,7 +2667,7 @@ impl Document {
 
     /// Invalidate selectors whose subject, ancestor chain, or preceding
     /// siblings can observe a class/id/attribute mutation.
-    pub(crate) fn mark_selector_dirty(&mut self, id: NodeId) {
+    fn mark_selector_dirty_inner(&mut self, id: NodeId) {
         let invalidation_root = if stylesheet::has_relational_dependencies() {
             NodeId::ROOT
         } else if stylesheet::has_sibling_dependencies() {
@@ -2595,7 +2682,7 @@ impl Document {
 
     /// Inline declarations cannot change selector matching, but inherited
     /// values and custom properties require the complete descendant subtree.
-    pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
+    fn mark_inline_style_dirty_inner(&mut self, id: NodeId) {
         let last_match_change = self.last_match_change;
         self.invalidate_style_subtree(id);
         if stylesheet::matched_rules_survive_inline_style_edits() {
@@ -2607,7 +2694,7 @@ impl Document {
 
     /// Text mutations can change the parent's `:empty` state. Relational
     /// selectors such as `:has()` conservatively fall back to document scope.
-    pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
+    fn mark_text_dirty_inner(&mut self, id: NodeId) {
         if self.text_box_is_stable(id)
             && !stylesheet::has_structural_dependencies()
             && !stylesheet::has_relational_dependencies()
@@ -2698,6 +2785,9 @@ impl Document {
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
+        if self.detached_edit || detached_edits_enabled() && self.in_unrendered_tree(id) {
+            return;
+        }
         // A child-list edit changes the subtree extent without a rect write.
         self.mark_extent_dirty(id);
         let scope = self.find_layout_scope(id);
@@ -2718,6 +2808,11 @@ impl Document {
     /// Tree shape or baked text metrics changed. A persistent layout tree
     /// must be rebuilt rather than patched.
     pub fn note_structure_change(&mut self) {
+        if self.detached_edit {
+            self.structure_generation = self.structure_generation.wrapping_add(1);
+            bump_structure_tick();
+            return;
+        }
         self.structure_generation = self.structure_generation.wrapping_add(1);
         self.layout_generation = self.layout_generation.wrapping_add(1);
         self.cascade_generation = self.cascade_generation.wrapping_add(1);
@@ -2737,6 +2832,9 @@ impl Document {
 
     /// Inherited or selector-matched styles may have changed below `id`.
     pub fn note_cascade_change(&mut self) {
+        if self.detached_edit {
+            return;
+        }
         self.cascade_generation = self.cascade_generation.wrapping_add(1);
         self.invalidate_text_box_stability();
     }
@@ -29574,6 +29672,48 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn edits_in_a_detached_tree_leave_layout_alone() {
+        DETACHED_EDITS_OVERRIDE.with(|flag| flag.set(Some(true)));
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        let shown = document.create_element("div");
+        body.append_child(&mut document, shown);
+        let _ = document.take_precise_dirty();
+        let generation = document.layout_generation();
+        let cascade = document.cascade_generation();
+        let structure = document.structure_generation();
+        let detached = document.create_element("div");
+        let child = document.create_element("span");
+        detached.append_child(&mut document, child);
+        detached
+            .style_mut(&mut document)
+            .set_property("flex-grow", "1");
+        document.mark_inline_style_dirty(detached.id);
+        document.remove_child(detached.id, child.id);
+        assert_eq!(document.layout_generation(), generation);
+        assert_eq!(document.cascade_generation(), cascade);
+        assert!(!document.has_precise_dirty());
+        assert_ne!(
+            document.structure_generation(),
+            structure,
+            "child caches see it"
+        );
+        // Inserting the tree is a layout edit as usual.
+        body.append_child(&mut document, detached);
+        assert_ne!(document.layout_generation(), generation);
+        assert!(document.has_precise_dirty());
+        // A shadow root (a fragment) renders: its edits are not detached.
+        let fragment = document.create_document_fragment();
+        let _ = document.take_precise_dirty();
+        let generation = document.layout_generation();
+        let inner = document.create_element("p");
+        document.append_child(fragment.id, inner.id);
+        assert_ne!(document.layout_generation(), generation);
+        DETACHED_EDITS_OVERRIDE.with(|flag| flag.set(None));
+    }
 
     #[test]
     fn definite_text_rewrite_reuses_the_computed_style() {
