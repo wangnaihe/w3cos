@@ -245,10 +245,10 @@ impl RetainedLayerTree {
     }
 }
 
-/// `W3COS_LAYER_SYNC_FAST=1`: the Skia replay passes the pending paint
-/// invalidation to `sync_known_changed`. `=verify` also computes the
-/// fingerprint and reports a dirty frame whose content hashed the same.
-/// Off by default.
+/// On by default (`W3COS_LAYER_SYNC_FAST=0` turns it off): the Skia replay
+/// passes the pending paint invalidation to `sync_known_changed`. `=verify`
+/// also computes the fingerprint and reports a dirty frame whose content
+/// hashed the same.
 pub(crate) fn layer_sync_fast_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = LAYER_SYNC_FAST_OVERRIDE.with(std::cell::Cell::get) {
@@ -256,7 +256,7 @@ pub(crate) fn layer_sync_fast_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("W3COS_LAYER_SYNC_FAST").is_ok_and(|v| v == "1" || v == "verify")
+        std::env::var("W3COS_LAYER_SYNC_FAST").map_or(true, |v| v != "0" && v != "false")
     })
 }
 
@@ -752,12 +752,11 @@ fn client_ink_bounds(artifact: &PaintArtifact, index: usize) -> Result<Option<La
     }))
 }
 
-/// `W3COS_PAINT_DIFF_RUNS=1`: clients inside an aligned run the artifact
+/// On by default (`W3COS_PAINT_DIFF_RUNS=0` turns it off): clients inside an aligned run the artifact
 /// copied from `prev` (same index, rect, inputs and display items; see
 /// `PaintArtifact::append_runs_against`) skip the display-item hashing and
 /// the input comparison (Blink's PaintController skips a cached
 /// subsequence the same way). `=verify` also diffs in full and compares.
-/// Off by default.
 fn paint_diff_runs_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_DIFF_RUNS_OVERRIDE.with(std::cell::Cell::get) {
@@ -766,9 +765,9 @@ fn paint_diff_runs_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_DIFF_RUNS").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
