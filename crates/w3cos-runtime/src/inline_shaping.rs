@@ -413,11 +413,12 @@ pub(crate) fn build_with_index(
                     // glyph to the preceding word's shaping context.
                     let paint_kind = match &node.kind {
                         ComponentKind::Text { content } if content.ends_with('\u{2028}') => {
-                            ComponentKind::Text {
+                            std::borrow::Cow::Owned(ComponentKind::Text {
                                 content: content.strip_suffix('\u{2028}').unwrap().into(),
-                            }
+                            })
                         }
-                        _ => node.kind.clone(),
+                        // No copy of the text for the common case.
+                        kind => std::borrow::Cow::Borrowed(kind),
                     };
                     crate::layout::is_plain_inline_word_fragment(&paint_kind, &style)
                 }
