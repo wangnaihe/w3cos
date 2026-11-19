@@ -1316,6 +1316,7 @@ impl Drop for SubtreeSizeScope<'_> {
 pub(crate) fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     use crate::image_loader::SvgIntrinsicLength;
 
+    crate::image_loader::ensure_data_image(src);
     if let Some(size) = crate::image_loader::svg_intrinsic_size(src) {
         if size.uses_default_image_size() {
             // The default object viewport supplies two fallback dimensions,
@@ -1335,6 +1336,47 @@ pub(crate) fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     })
 }
 
+/// Ratio used to size a replaced box. A specified CSS `aspect-ratio`
+/// replaces a known intrinsic ratio when exactly one axis is specified.
+/// `auto <ratio>` keeps a positive intrinsic ratio. A broken image (nothing
+/// decoded) is unchanged: the CSS ratio must not invent a size for it.
+pub(crate) fn replaced_layout_ratio(src: &str, style: &w3cos_std::style::Style) -> Option<f32> {
+    let natural = image_intrinsic_ratio(src);
+    let one_axis = matches!(style.width, WDim::Auto) != matches!(style.height, WDim::Auto);
+    if !one_axis {
+        return natural;
+    }
+    let marker = |key: &str| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(key))
+            .map(String::as_str)
+    };
+    // object-fit is not painted, so the natural box stays (replaced-element-024).
+    if marker("--w3cos-internal-object-fit").is_some() {
+        return natural;
+    }
+    let css = marker("--w3cos-internal-aspect-ratio")
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    let Some(css) = css else {
+        return natural;
+    };
+    if marker("--w3cos-internal-aspect-ratio-auto").is_some()
+        && natural.is_some_and(|ratio| ratio > 0.0)
+    {
+        return natural;
+    }
+    // A parsed SVG with no viewBox has a known resource and no intrinsic
+    // ratio, so the CSS ratio applies. An undecoded or broken image does not.
+    if natural.is_some() || crate::image_loader::svg_intrinsic_size(src).is_some() {
+        Some(css)
+    } else {
+        natural
+    }
+}
+
 pub(crate) fn image_intrinsic_size(
     src: &str,
     style: &w3cos_std::style::Style,
@@ -1342,6 +1384,7 @@ pub(crate) fn image_intrinsic_size(
 ) -> (f32, f32) {
     use crate::image_loader::SvgIntrinsicLength;
 
+    crate::image_loader::ensure_data_image(src);
     let decoded = crate::image_loader::dimensions(src)
         .map(|(width, height)| (width as f32, height as f32))
         .unwrap_or_else(|| {
@@ -1354,7 +1397,7 @@ pub(crate) fn image_intrinsic_size(
             }
         });
     let metadata = crate::image_loader::svg_intrinsic_size(src);
-    let ratio = image_intrinsic_ratio(src);
+    let ratio = replaced_layout_ratio(src, style);
     let (intrinsic_width, intrinsic_height) = if let Some(size) = metadata {
         let width = match size.width {
             SvgIntrinsicLength::Px(value) => Some(value),
@@ -23036,7 +23079,7 @@ fn build_taffy_tree(
             style.aspect_ratio = Some(*width as f32 / *height as f32);
         }
         let constrained_replaced_size = if let ComponentKind::Image { src } = &comp.kind
-            && let Some(ratio) = image_intrinsic_ratio(src)
+            && let Some(ratio) = replaced_layout_ratio(src, &comp.style)
         {
             // The intrinsic ratio derives an automatic axis; it must not
             // override two authored dimensions in Taffy's block algorithm.
@@ -23514,7 +23557,7 @@ fn build_taffy_tree(
             // Taffy's synthetic block/flex size must not turn it into zero;
             // derive the automatic replaced axis from the used width instead.
             let ratio = match &comp.kind {
-                ComponentKind::Image { src } => image_intrinsic_ratio(src),
+                ComponentKind::Image { src } => replaced_layout_ratio(src, &comp.style),
                 ComponentKind::SvgDocument { source, .. } => {
                     let intrinsic =
                         crate::image_loader::parse_svg_intrinsic_size(source.as_bytes());
