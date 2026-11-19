@@ -312,7 +312,7 @@ pub struct TransformNode {
     pub transform: Transform2D,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipNode {
     pub parent: PropertyNodeId,
     pub rect: Option<LayoutRect>,
@@ -328,7 +328,7 @@ pub struct EffectNode {
     pub isolates_surface: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollNode {
     pub parent: PropertyNodeId,
     pub host_index: Option<usize>,
@@ -336,7 +336,7 @@ pub struct ScrollNode {
     pub clip: Option<PropertyNodeId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PropertyTrees {
     pub transforms: Vec<TransformNode>,
     pub clips: Vec<ClipNode>,
@@ -371,7 +371,7 @@ impl Default for PropertyTrees {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayItem {
     pub client_index: usize,
     pub visual_rect: LayoutRect,
@@ -390,7 +390,7 @@ pub struct ColumnFragment {
     pub clip_bottom: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PaintChunk {
     pub begin: usize,
     pub end: usize,
@@ -448,6 +448,12 @@ pub struct PaintArtifact {
     /// (`TextFragment::vertical`); paint rotates them a quarter turn.
     pub vertical_text: Vec<bool>,
     pub generation: u64,
+    /// What `append_node` decided per node, kept (with
+    /// `W3COS_PAINT_APPEND_REUSE=1`) so the next frame's build can copy the
+    /// nodes whose inputs and context did not change.
+    append_record: Option<std::sync::Arc<AppendRecord>>,
+    /// Identifies this build for the next frame's `append_record.base`.
+    serial: u64,
 }
 
 impl Default for PaintArtifact {
@@ -476,6 +482,8 @@ impl Default for PaintArtifact {
             text_fragments: Vec::new(),
             vertical_text: Vec::new(),
             generation: 0,
+            append_record: None,
+            serial: 0,
         }
     }
 }
@@ -519,6 +527,67 @@ fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
         stack.extend(children[index].iter().rev().copied());
     }
     ordinals
+}
+
+/// Per node, the property tree lengths before `append_node` ran for it and
+/// the scroll node its own chunks paint under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AppendMark {
+    transforms: u32,
+    clips: u32,
+    effects: u32,
+    scrolls: u32,
+    self_scroll: u32,
+}
+
+/// The previous build's per-node property-tree bookkeeping. Blink's
+/// PaintController keeps each display item client's cached output and
+/// copies it for a client that is not invalidated; the artifact build keeps
+/// `append_node`'s per-node output the same way.
+struct AppendRecord {
+    marks: Vec<AppendMark>,
+    memo: AppendMemo,
+    /// `serial` of the artifact this build copied from (0: none).
+    base: u64,
+    /// Per node: its paint inputs other than geometry (parent, kind, style,
+    /// sticky signal) and its property / paint-order output equal `base`'s.
+    unchanged: Vec<bool>,
+}
+
+/// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
+/// inputs and ancestors' output are unchanged since the previous frame.
+pub(crate) fn paint_append_reuse_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = APPEND_REUSE_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "1"))
+}
+
+/// `W3COS_PAINT_APPEND_REUSE_VERIFY=1`: also run the full build and compare.
+fn paint_append_reuse_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("W3COS_PAINT_APPEND_REUSE_VERIFY").is_some_and(|v| v == "1")
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_REUSE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (nodes copied, nodes appended, verify mismatches) since start.
+    static APPEND_REUSE_STATS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn append_reuse_stats() -> (u64, u64, u64) {
+    APPEND_REUSE_STATS.with(std::cell::Cell::get)
 }
 
 /// Per-build ancestor lookups for `append_node`, filled in preorder.
@@ -2929,6 +2998,20 @@ impl PaintArtifact {
         body_index: Option<usize>,
         viewport: Option<(f32, f32)>,
     ) -> Self {
+        Self::build_reusing(nodes, layout_cache, generation, body_index, viewport, None)
+    }
+
+    /// `build_with_body_background_and_viewport`, copying per-node output
+    /// from `previous` (the last frame's artifact) where it still holds; see
+    /// [`paint_append_reuse_enabled`].
+    pub(crate) fn build_reusing(
+        nodes: impl IntoIterator<Item = PaintNode>,
+        layout_cache: &[(LayoutRect, usize)],
+        generation: u64,
+        body_index: Option<usize>,
+        viewport: Option<(f32, f32)>,
+        previous: Option<&PaintArtifact>,
+    ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
         // Reused snapshots include paint-only UA children; reconstruct them
         // from their live hosts rather than accumulating another copy.
@@ -3231,11 +3314,257 @@ impl PaintArtifact {
                 .collect();
         }
 
+        if paint_append_reuse_enabled() {
+            artifact.append_all_reusing(previous);
+            return artifact;
+        }
         let mut memo = AppendMemo::new(&artifact.nodes);
         for index in 0..artifact.nodes.len() {
             artifact.append_node(index, &mut memo);
         }
         artifact
+    }
+
+    /// Per node, whether its non-geometric paint inputs and property output
+    /// equal `previous`'s, when this artifact was built against `previous`.
+    pub(crate) fn append_unchanged_against(&self, previous: &PaintArtifact) -> Option<&[bool]> {
+        let record = self.append_record.as_deref()?;
+        (record.base != 0
+            && record.base == previous.serial
+            && record.unchanged.len() == self.nodes.len())
+        .then_some(record.unchanged.as_slice())
+    }
+
+    fn mark(&self) -> AppendMark {
+        AppendMark {
+            transforms: self.properties.transforms.len() as u32,
+            clips: self.properties.clips.len() as u32,
+            effects: self.properties.effects.len() as u32,
+            scrolls: self.properties.scrolls.len() as u32,
+            self_scroll: 0,
+        }
+    }
+
+    /// `append_node` for every node, copying the previous build's output for
+    /// a node whose own inputs equal last frame's, whose property trees so
+    /// far line up with last frame's, and whose ancestors' output is the
+    /// same. A copied node's display items are emitted from its new rect.
+    fn append_all_reusing(&mut self, previous: Option<&PaintArtifact>) {
+        let len = self.nodes.len();
+        let base = previous.and_then(|previous| {
+            let record = previous.append_record.as_deref()?;
+            (previous.nodes.len() == len
+                && record.marks.len() == len
+                && previous.body_index == self.body_index
+                && previous.column_fragments.len() == self.column_fragments.len())
+            .then_some((previous, record))
+        });
+        let verify = base.is_some() && paint_append_reuse_verify();
+        let fresh = verify.then(|| {
+            let mut fresh = self.clone();
+            let mut memo = AppendMemo::new(&fresh.nodes);
+            for index in 0..len {
+                fresh.append_node(index, &mut memo);
+            }
+            fresh
+        });
+        let mut memo = AppendMemo::new(&self.nodes);
+        let mut marks = Vec::with_capacity(len);
+        // Per node: its inputs (other than the rect) and its output equal
+        // last frame's, so a descendant reading them may be copied.
+        let mut same = vec![false; len];
+        let mut unchanged = vec![false; len];
+        let (mut copied, mut appended) = (0u64, 0u64);
+        for index in 0..len {
+            let mut mark = self.mark();
+            let reused = base.is_some_and(|(previous, record)| {
+                self.copy_append_output(index, previous, record, &mark, &same, &mut memo)
+            });
+            if reused {
+                mark.self_scroll = base.unwrap().1.marks[index].self_scroll;
+                same[index] = true;
+                unchanged[index] = true;
+                copied += 1;
+            } else {
+                mark.self_scroll = self.append_node_with_scroll(index, &mut memo) as u32;
+                appended += 1;
+                if let Some((previous, record)) = base {
+                    unchanged[index] = self.inputs_match(index, previous)
+                        && self.output_matches(index, previous, &memo, &record.memo);
+                    same[index] = unchanged[index]
+                        && self.nodes[index].parent.is_none_or(|parent| same[parent]);
+                }
+            }
+            marks.push(mark);
+        }
+        self.paint_classes = std::sync::OnceLock::new();
+        APPEND_REUSE_STATS.with(|stats| {
+            let (c, a, m) = stats.get();
+            stats.set((c + copied, a + appended, m));
+        });
+        if verify {
+            eprintln!("[append-reuse] copied {copied} of {len}");
+        }
+        if let Some(fresh) = fresh
+            && !self.append_output_eq(&fresh)
+        {
+            eprintln!(
+                "[append-reuse-verify] mismatch: {len} nodes, {copied} copied; using the full build"
+            );
+            APPEND_REUSE_STATS.with(|stats| {
+                let (c, a, m) = stats.get();
+                stats.set((c, a, m + 1));
+            });
+            // The next frame builds in full and records again.
+            *self = fresh;
+            return;
+        }
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = base.map_or(0, |(previous, _)| previous.serial);
+        self.append_record = Some(std::sync::Arc::new(AppendRecord {
+            marks,
+            memo,
+            base,
+            unchanged,
+        }));
+    }
+
+    fn inputs_match(&self, index: usize, previous: &PaintArtifact) -> bool {
+        let (node, old) = (&self.nodes[index], &previous.nodes[index]);
+        node.parent == old.parent
+            && node.sticky_counter_signal == old.sticky_counter_signal
+            && self.logical_paint_ordinals.get(index) == previous.logical_paint_ordinals.get(index)
+            && node.kind == old.kind
+            && node.style == old.style
+    }
+
+    fn output_matches(
+        &self,
+        index: usize,
+        previous: &PaintArtifact,
+        memo: &AppendMemo,
+        old: &AppendMemo,
+    ) -> bool {
+        self.node_properties[index] == previous.node_properties[index]
+            && self.self_clip[index] == previous.self_clip[index]
+            && self.z_order[index] == previous.z_order[index]
+            && self.viewport_attached_by_index[index] == previous.viewport_attached_by_index[index]
+            && self.sticky_owner[index] == previous.sticky_owner[index]
+            && self.paint_order.key(index) == previous.paint_order.key(index)
+            && memo.fixed_owner[index] == old.fixed_owner[index]
+            && memo.context_owner[index] == old.context_owner[index]
+            && memo.owns_context[index] == old.owns_context[index]
+            && memo.stacking[index] == old.stacking[index]
+            && memo.ancestor_phase[index] == old.ancestor_phase[index]
+    }
+
+    /// Copies `index`'s `append_node` output from `previous` when that is
+    /// exactly what `append_node` would produce now.
+    fn copy_append_output(
+        &mut self,
+        index: usize,
+        previous: &PaintArtifact,
+        record: &AppendRecord,
+        mark: &AppendMark,
+        same: &[bool],
+        memo: &mut AppendMemo,
+    ) -> bool {
+        let old_mark = record.marks[index];
+        let next = record.marks.get(index + 1).copied().unwrap_or(AppendMark {
+            transforms: previous.properties.transforms.len() as u32,
+            clips: previous.properties.clips.len() as u32,
+            effects: previous.properties.effects.len() as u32,
+            scrolls: previous.properties.scrolls.len() as u32,
+            self_scroll: 0,
+        });
+        // Property node ids assigned so far line up with last frame's.
+        if (mark.transforms, mark.clips, mark.effects, mark.scrolls)
+            != (
+                old_mark.transforms,
+                old_mark.clips,
+                old_mark.effects,
+                old_mark.scrolls,
+            )
+        {
+            return false;
+        }
+        if let Some(parent) = self.nodes[index].parent
+            && !same[parent]
+        {
+            return false;
+        }
+        // Overflow, `clip` and fragment clip nodes and scroll nodes carry the
+        // rect; any other output is rect-independent. A node that pushed
+        // none of them may move.
+        let geometry_free = next.clips == old_mark.clips && next.scrolls == old_mark.scrolls;
+        let rect = self.rect_by_index[index];
+        let old_rect = previous.rect_by_index[index];
+        let rect_ok = rect == old_rect
+            || (geometry_free
+                && match (rect, old_rect) {
+                    (Some(rect), Some(old)) => {
+                        rect.x == old.x && rect.width == old.width && rect.height == old.height
+                    }
+                    _ => false,
+                });
+        let no_columns = self.column_fragments.get(index).is_none_or(Vec::is_empty)
+            && previous
+                .column_fragments
+                .get(index)
+                .is_none_or(Vec::is_empty);
+        if !rect_ok || !no_columns || !self.inputs_match(index, previous) {
+            return false;
+        }
+        let range = |start: u32, end: u32| start as usize..end as usize;
+        if next.transforms != old_mark.transforms {
+            self.properties.transforms.extend_from_slice(
+                &previous.properties.transforms[range(old_mark.transforms, next.transforms)],
+            );
+        }
+        if next.clips != old_mark.clips {
+            self.properties
+                .clips
+                .extend_from_slice(&previous.properties.clips[range(old_mark.clips, next.clips)]);
+        }
+        if next.effects != old_mark.effects {
+            self.properties.effects.extend_from_slice(
+                &previous.properties.effects[range(old_mark.effects, next.effects)],
+            );
+        }
+        if next.scrolls != old_mark.scrolls {
+            self.properties.scrolls.extend_from_slice(
+                &previous.properties.scrolls[range(old_mark.scrolls, next.scrolls)],
+            );
+        }
+        self.node_properties[index] = previous.node_properties[index];
+        self.self_clip[index] = previous.self_clip[index];
+        self.z_order[index] = previous.z_order[index];
+        self.viewport_attached_by_index[index] = previous.viewport_attached_by_index[index];
+        self.sticky_owner[index] = previous.sticky_owner[index];
+        self.paint_order
+            .set(index, None, previous.paint_order.key(index));
+        let old = &record.memo;
+        memo.fixed_owner[index] = old.fixed_owner[index];
+        memo.context_owner[index] = old.context_owner[index];
+        memo.owns_context[index] = old.owns_context[index];
+        memo.stacking[index] = old.stacking[index];
+        memo.ancestor_phase[index] = old.ancestor_phase[index];
+        let properties = self.node_properties[index];
+        self.append_display_items(index, properties, old_mark.self_scroll as usize);
+        true
+    }
+
+    fn append_output_eq(&self, other: &PaintArtifact) -> bool {
+        self.node_properties == other.node_properties
+            && self.self_clip == other.self_clip
+            && self.z_order == other.z_order
+            && self.paint_order == other.paint_order
+            && self.viewport_attached_by_index == other.viewport_attached_by_index
+            && self.sticky_owner == other.sticky_owner
+            && self.properties == other.properties
+            && self.display_items == other.display_items
+            && self.chunks == other.chunks
     }
 
     fn build_column_fragments(
@@ -3353,7 +3682,13 @@ impl PaintArtifact {
         if fragmented { fragments } else { Vec::new() }
     }
 
+    #[inline]
     fn append_node(&mut self, index: usize, memo: &mut AppendMemo) {
+        self.append_node_with_scroll(index, memo);
+    }
+
+    /// `append_node`, returning the scroll node the box's own chunks use.
+    fn append_node_with_scroll(&mut self, index: usize, memo: &mut AppendMemo) -> usize {
         let node = &self.nodes[index];
         debug_assert!(node.parent.is_none_or(|parent| parent < index));
         let mut inherited = node
@@ -3644,7 +3979,19 @@ impl PaintArtifact {
         }
         self.node_properties[index] = properties;
         self.self_clip[index] = self_clip;
+        self.append_display_items(index, properties, self_scroll);
+        self_scroll
+    }
 
+    /// The display items and chunks of `index`'s own box.
+    #[inline(always)]
+    fn append_display_items(
+        &mut self,
+        index: usize,
+        properties: PaintProperties,
+        self_scroll: PropertyNodeId,
+    ) {
+        let node = &self.nodes[index];
         if node.style.visibility != Visibility::Visible {
             return;
         }
@@ -4354,6 +4701,90 @@ mod tests {
         ];
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
         assert!((artifact.nodes[2].style.padding_lengths().right - 48.018).abs() < 0.01);
+    }
+
+    /// A frame whose text changed and whose later siblings moved down
+    /// copies the unchanged nodes' output and matches a full build.
+    #[test]
+    fn append_reuse_copies_clean_nodes_and_matches_a_full_build() {
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        let block = |overflow: bool, opacity: f32| {
+            let mut style = Style::default();
+            style.display = Display::Block;
+            if overflow {
+                style.overflow_x = Some(Overflow::Hidden);
+                style.overflow_y = Some(Overflow::Hidden);
+            }
+            style.opacity = opacity;
+            style
+        };
+        let node = |kind: ComponentKind, style: &Style, parent: Option<usize>| PaintNode {
+            kind,
+            style: style.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let text = |content: &str| ComponentKind::Text {
+            content: content.into(),
+        };
+        let (plain, clipped, faded) = (block(false, 1.0), block(true, 1.0), block(false, 0.5));
+        let nodes = |first: &str| {
+            vec![
+                node(ComponentKind::Root, &plain, None),
+                node(ComponentKind::Root, &clipped, Some(0)),
+                node(text(first), &plain, Some(1)),
+                node(ComponentKind::Root, &faded, Some(1)),
+                node(text("second"), &plain, Some(3)),
+                node(ComponentKind::Root, &plain, Some(0)),
+                node(text("third"), &plain, Some(5)),
+            ]
+        };
+        let rect = |y: f32, height: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 200.0,
+            height,
+        };
+        let layouts = |grow: f32| {
+            vec![
+                (rect(0.0, 300.0 + grow), 0),
+                (rect(0.0, 100.0 + grow), 1),
+                (rect(0.0, 20.0 + grow), 2),
+                (rect(20.0 + grow, 20.0), 3),
+                (rect(20.0 + grow, 20.0), 4),
+                (rect(100.0 + grow, 50.0), 5),
+                (rect(100.0 + grow, 20.0), 6),
+            ]
+        };
+        let first =
+            PaintArtifact::build_reusing(nodes("first"), &layouts(0.0), 1, None, None, None);
+        let (copied_before, _, mismatches_before) = append_reuse_stats();
+        let next = PaintArtifact::build_reusing(
+            nodes("first, longer"),
+            &layouts(20.0),
+            2,
+            None,
+            None,
+            Some(&first),
+        );
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(false)));
+        let fresh = PaintArtifact::build(nodes("first, longer"), &layouts(20.0), 2);
+        let (copied, _, mismatches) = append_reuse_stats();
+        assert!(next.append_output_eq(&fresh));
+        assert_eq!(mismatches, mismatches_before);
+        // The moved faded box and its text, and the moved last block and
+        // its text, are copied; the grown clip container and the edited
+        // text are rebuilt.
+        assert!(
+            copied - copied_before >= 4,
+            "copied {}",
+            copied - copied_before
+        );
+        let unchanged = next
+            .append_unchanged_against(&first)
+            .expect("built against first");
+        assert!(!unchanged[2] && unchanged[4] && unchanged[6]);
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
     #[test]

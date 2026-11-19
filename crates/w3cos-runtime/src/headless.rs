@@ -268,18 +268,34 @@ fn finish_headless_frame(
         )
     });
     let mut recycled = RECYCLED_KINDS.with(|kinds| std::mem::take(&mut *kinds.borrow_mut()));
-    let mut artifact = PaintArtifact::build_with_body_background_and_viewport(
-        flat.iter().enumerate().map(|(index, node)| PaintNode {
-            kind: crate::paint_artifact::refill_kind(recycled.get_mut(index), node.kind),
-            style: crate::paint_artifact::shared_paint_style(node.component, node.style),
-            parent: node.parent,
-            sticky_counter_signal: node.sticky_counter_signal,
-        }),
-        &layout_cache,
-        1,
-        body_index,
-        Some((width as f32, height as f32)),
-    );
+    let paint_nodes = flat.iter().enumerate().map(|(index, node)| PaintNode {
+        kind: crate::paint_artifact::refill_kind(recycled.get_mut(index), node.kind),
+        style: crate::paint_artifact::shared_paint_style(node.component, node.style),
+        parent: node.parent,
+        sticky_counter_signal: node.sticky_counter_signal,
+    });
+    let viewport = Some((width as f32, height as f32));
+    let mut artifact = if crate::paint_artifact::paint_append_reuse_enabled() {
+        RETAINED_PAINT.with(|slot| {
+            let retained = slot.borrow();
+            PaintArtifact::build_reusing(
+                paint_nodes,
+                &layout_cache,
+                1,
+                body_index,
+                viewport,
+                retained.as_ref().map(|retained| &retained.artifact),
+            )
+        })
+    } else {
+        PaintArtifact::build_with_body_background_and_viewport(
+            paint_nodes,
+            &layout_cache,
+            1,
+            body_index,
+            viewport,
+        )
+    };
     artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
     let nodes = artifact

@@ -791,6 +791,23 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
             || b.style.custom_properties.as_ref().is_some_and(has_url)
     };
     let get = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+    // The build already compared these inputs and outputs per node against
+    // this `prev` (see `PaintArtifact::append_unchanged_against`).
+    let unchanged = cur.append_unchanged_against(prev);
+    let paint_inputs_equal = |index: usize,
+                              a: &crate::paint_artifact::PaintNode,
+                              b: &crate::paint_artifact::PaintNode| {
+        unchanged.is_some_and(|unchanged| unchanged[index])
+            || (a.parent == b.parent
+                && a.sticky_counter_signal == b.sticky_counter_signal
+                && a.kind == b.kind
+                && a.style == b.style
+                && prev.node_properties.get(index) == cur.node_properties.get(index)
+                && prev.self_clip.get(index) == cur.self_clip.get(index)
+                && prev.z_order.get(index) == cur.z_order.get(index)
+                && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
+                && prev.paint_order.get(index) == cur.paint_order.get(index))
+    };
     // Remembered per box when the artifact was built.
     let viewport_attached = |index: usize| cur.viewport_attached(index);
     let mut changed = Vec::new();
@@ -802,15 +819,7 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
             prev.rect_by_index.get(index).copied().flatten(),
             cur.rect_by_index.get(index).copied().flatten(),
         ) && prev_items[index] == cur_items[index]
-            && a.parent == b.parent
-            && a.sticky_counter_signal == b.sticky_counter_signal
-            && a.kind == b.kind
-            && a.style == b.style
-            && prev.node_properties.get(index) == cur.node_properties.get(index)
-            && prev.self_clip.get(index) == cur.self_clip.get(index)
-            && prev.z_order.get(index) == cur.z_order.get(index)
-            && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
-            && prev.paint_order.get(index) == cur.paint_order.get(index)
+            && paint_inputs_equal(index, a, b)
             && column_equal(
                 prev.column_fragments
                     .get(index)
@@ -847,15 +856,7 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
             // A block-level box whose own paint inputs are unchanged and only
             // moved does not change what its siblings paint; each moved
             // descendant is compared on its own.
-            let moved_only = a.parent == b.parent
-                && a.sticky_counter_signal == b.sticky_counter_signal
-                && a.kind == b.kind
-                && a.style == b.style
-                && prev.node_properties.get(index) == cur.node_properties.get(index)
-                && prev.self_clip.get(index) == cur.self_clip.get(index)
-                && prev.z_order.get(index) == cur.z_order.get(index)
-                && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
-                && prev.paint_order.get(index) == cur.paint_order.get(index)
+            let moved_only = paint_inputs_equal(index, a, b)
                 && get(&prev.vertical_text, index) == get(&cur.vertical_text, index)
                 && !matches!(b.kind, ComponentKind::Text { .. })
                 && !inline_level(b.style.display)
@@ -1029,15 +1030,18 @@ fn moved_by(
         return None;
     }
     let get = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
-    let same_inputs = a.parent == b.parent
-        && a.sticky_counter_signal == b.sticky_counter_signal
-        && a.kind == b.kind
-        && a.style == b.style
-        && prev.node_properties.get(index) == cur.node_properties.get(index)
-        && prev.self_clip.get(index) == cur.self_clip.get(index)
-        && prev.z_order.get(index) == cur.z_order.get(index)
-        && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
-        && prev.paint_order.get(index) == cur.paint_order.get(index)
+    let same_inputs = (cur
+        .append_unchanged_against(prev)
+        .is_some_and(|unchanged| unchanged[index])
+        || (a.parent == b.parent
+            && a.sticky_counter_signal == b.sticky_counter_signal
+            && a.kind == b.kind
+            && a.style == b.style
+            && prev.node_properties.get(index) == cur.node_properties.get(index)
+            && prev.self_clip.get(index) == cur.self_clip.get(index)
+            && prev.z_order.get(index) == cur.z_order.get(index)
+            && prev.sticky_owner.get(index) == cur.sticky_owner.get(index)
+            && prev.paint_order.get(index) == cur.paint_order.get(index)))
         && get(&prev.vertical_text, index) == get(&cur.vertical_text, index);
     if !same_inputs
         || cur.sticky_owner.get(index).copied().flatten().is_some()
