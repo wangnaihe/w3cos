@@ -688,6 +688,9 @@ fn positioned_inline_fragment_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
                 .or_insert(ordinals[index]);
         }
     }
+    if groups.is_empty() {
+        return ordinals;
+    }
     for (index, node) in nodes.iter().enumerate() {
         if let Some(owner) = split_positioned_inline_owner(node) {
             ordinals[index] = groups[&(node.parent, owner)];
@@ -2548,6 +2551,13 @@ fn annotate_table_caption_paint_insets(
     nodes: &mut [PaintNode],
     rect_by_index: &[Option<LayoutRect>],
 ) {
+    // Without a caption every inset is zero and nothing is annotated.
+    if !nodes
+        .iter()
+        .any(|node| node.style.display == Display::TableCaption)
+    {
+        return;
+    }
     let mut insets = vec![(0.0_f32, 0.0_f32); nodes.len()];
     let mut has_top_caption = vec![false; nodes.len()];
     let mut grid_widths = vec![None::<f32>; nodes.len()];
