@@ -1403,7 +1403,19 @@ pub(super) fn unsupported_tree_retained(
     // A fingerprint names a subtree's inputs, so an accepted one stays
     // accepted: add what this walk checked instead of re-inserting every
     // box. Rebuild when stale entries outgrow the tree.
-    if reason.is_none() && !before.is_empty() && before.len() + walked.len() <= 2 * flat.len() {
+    // `W3COS_ELIG_KEEP`: bound stale entries by the largest tree seen, not
+    // this one, so a small relayout tree does not drop the accepted set of
+    // the document (whose next walk would then check every box again).
+    let bound = if elig_keep_enabled() {
+        let high = ELIG_HIGH_WATER.with(|high| {
+            high.set(high.get().max(flat.len()));
+            high.get()
+        });
+        2 * high
+    } else {
+        2 * flat.len()
+    };
+    if reason.is_none() && !before.is_empty() && before.len() + walked.len() <= bound {
         before.extend(walked);
         SUPPORTED.with(|set| *set.borrow_mut() = before);
     } else if reason.is_none() {
@@ -1425,7 +1437,51 @@ pub(super) fn unsupported_tree_retained(
     }
     let fp = fp_slot.take();
     LAST_FP.with(|slot| *slot.borrow_mut() = Some((flat.as_ptr() as usize, flat.len(), fp)));
+    if elig_keep_verify() {
+        let mut full = None;
+        let mut index = 0;
+        while index < flat.len() {
+            let info = &flat[index];
+            if info.style.display == Display::None {
+                index = info.subtree_end.max(index + 1);
+                continue;
+            }
+            full = node_reason(index);
+            if full.is_some() {
+                break;
+            }
+            index += 1;
+        }
+        if full != reason {
+            eprintln!(
+                "[elig-verify] mismatch: retained {reason:?} full {full:?} ({} boxes)",
+                flat.len()
+            );
+        } else {
+            eprintln!("[elig-verify] ok {} boxes", flat.len());
+        }
+    }
     Some(reason)
+}
+
+thread_local! {
+    /// The largest flat tree an eligibility walk has seen on this thread.
+    static ELIG_HIGH_WATER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `W3COS_ELIG_KEEP=1` (or `verify`, which also runs the full walk and
+/// compares the verdict): keep accepted eligibility fingerprints across
+/// walks of smaller trees. Off by default.
+fn elig_keep_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("W3COS_ELIG_KEEP").is_ok_and(|value| value == "1" || value == "verify")
+    })
+}
+
+fn elig_keep_verify() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("W3COS_ELIG_KEEP").is_ok_and(|value| value == "verify"))
 }
 
 thread_local! {
