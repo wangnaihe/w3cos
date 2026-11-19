@@ -2538,10 +2538,11 @@ pub(super) fn replay_paint_splices(
     })
 }
 
-/// `W3COS_PAINT_SPLICE_INCREMENTAL=1`: replay paint splices with kept
-/// preorder subtree sizes (instead of recounting the siblings of every box
-/// on the path) and with the vertical shifts of same-size leaf splices
-/// applied to the layout list once per replay instead of once per splice.
+/// Replay paint splices with kept preorder subtree sizes (instead of
+/// recounting the siblings of every box on the path) and with the vertical
+/// shifts of same-size leaf splices applied to the layout list once per
+/// replay instead of once per splice. On by default;
+/// `W3COS_PAINT_SPLICE_INCREMENTAL=0` restores the eager replay.
 pub(super) fn paint_splice_incremental() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     #[cfg(test)]
@@ -2549,7 +2550,7 @@ pub(super) fn paint_splice_incremental() -> bool {
         return true;
     }
     *ON.get_or_init(|| {
-        std::env::var("W3COS_PAINT_SPLICE_INCREMENTAL").is_ok_and(|value| value == "1")
+        std::env::var("W3COS_PAINT_SPLICE_INCREMENTAL").map_or(true, |value| value != "0")
     })
 }
 
