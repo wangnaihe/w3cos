@@ -7707,6 +7707,20 @@ fn draw_rounded_rect(canvas: &Canvas, rect: LayoutRect, radii: [f32; 4], paint: 
     if radii.iter().all(|radius| *radius <= 0.0) {
         let mut crisp = paint.clone();
         crisp.set_anti_alias(false);
+        // An opaque solid fill without AA covers each pixel fully or not at
+        // all, and `src + dst * (1 - 1)` is `src`: the CSS SrcOver blender
+        // changes nothing, while Skia's own SrcOver turns an opaque solid
+        // colour into Src and fills spans without reading the destination.
+        if crisp.alpha() == 255
+            && crisp.style() == paint::Style::Fill
+            && crisp.shader().is_none()
+            && crisp.color_filter().is_none()
+            && crisp.mask_filter().is_none()
+            && crisp.image_filter().is_none()
+            && crisp.path_effect().is_none()
+        {
+            crisp.set_blend_mode(skia_safe::BlendMode::SrcOver);
+        }
         canvas.draw_rect(to_rect(rect), &crisp);
         return;
     }
