@@ -1843,7 +1843,15 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         cache
             .tree
             .set_track_partial(TRACK_PARTIAL_LAYERS.with(std::cell::Cell::get));
-        let action = cache.tree.sync(artifact, &scrolls, overrides);
+        let known_changed = crate::retained_layers::layer_sync_fast_enabled()
+            && PENDING_PAINT_INVALIDATION.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|dirty| dirty.iter().any(|client| *client))
+            });
+        let action = cache
+            .tree
+            .sync_known_changed(artifact, &scrolls, overrides, known_changed);
         let invalidation = PENDING_PAINT_INVALIDATION.with(|slot| slot.borrow_mut().take());
         let moved = PENDING_PAINT_MOVED.with(|slot| slot.borrow_mut().take());
         let moved_client = |client: usize| {

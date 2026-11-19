@@ -90,8 +90,36 @@ impl RetainedLayerTree {
         scroll_offsets: &HashMap<usize, (f32, f32)>,
         overrides: &CompositorOverrides,
     ) -> LayerPaintAction {
+        self.sync_known_changed(artifact, scroll_offsets, overrides, false)
+    }
+
+    /// `sync` when the caller already knows a paint client changed since the
+    /// recordings (a paint diff marked one dirty): the frame re-records, so
+    /// the whole-artifact content fingerprint that would only confirm it is
+    /// skipped (Blink's PaintArtifactCompositor takes its repaint path from
+    /// the paint invalidation, not from rehashing the artifact). The stored
+    /// fingerprint is cleared, so the next frame without that knowledge
+    /// rebuilds once.
+    pub fn sync_known_changed(
+        &mut self,
+        artifact: &PaintArtifact,
+        scroll_offsets: &HashMap<usize, (f32, f32)>,
+        overrides: &CompositorOverrides,
+        known_changed: bool,
+    ) -> LayerPaintAction {
         let layers = build_layers(artifact);
-        let content = content_fingerprint(artifact, &layers);
+        let content = if known_changed {
+            if layer_sync_fast_verify()
+                && content_fingerprint(artifact, &layers) | 1 == self.content_fingerprint
+                && self.recordings_valid
+            {
+                eprintln!("[layer-sync-fast] content unchanged under a dirty client");
+            }
+            0
+        } else {
+            // Non-zero: 0 marks a skipped fingerprint.
+            content_fingerprint(artifact, &layers) | 1
+        };
         let compositor = compositor_fingerprint(artifact, &layers, scroll_offsets, overrides);
         let (global, chunk_hashes) = if self.track_partial {
             (
@@ -166,8 +194,13 @@ impl RetainedLayerTree {
         self.layer_chunk_hashes = chunk_hashes;
         self.layers = layers;
 
-        if !self.recordings_valid || structure_changed || content != self.content_fingerprint {
-            self.content_fingerprint = content;
+        if known_changed
+            || !self.recordings_valid
+            || structure_changed
+            || content != self.content_fingerprint
+        {
+            // After a skipped fingerprint, the next computed one cannot match.
+            self.content_fingerprint = if known_changed { 0 } else { content };
             self.compositor_fingerprint = compositor;
             self.recordings_valid = false;
             LayerPaintAction::Rebuild
@@ -210,6 +243,32 @@ impl RetainedLayerTree {
     pub fn translated_layers(&self) -> Option<&[Option<(f32, f32)>]> {
         self.translated.as_deref()
     }
+}
+
+/// `W3COS_LAYER_SYNC_FAST=1`: the Skia replay passes the pending paint
+/// invalidation to `sync_known_changed`. `=verify` also computes the
+/// fingerprint and reports a dirty frame whose content hashed the same.
+/// Off by default.
+pub(crate) fn layer_sync_fast_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = LAYER_SYNC_FAST_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_LAYER_SYNC_FAST").is_ok_and(|v| v == "1" || v == "verify")
+    })
+}
+
+fn layer_sync_fast_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_LAYER_SYNC_FAST").is_ok_and(|v| v == "verify"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAYER_SYNC_FAST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 enum LayerMove {
@@ -1750,6 +1809,31 @@ mod tests {
         note(&mut tree, second);
         assert_eq!(tree.full_scene_rebuilds, 1);
         assert_eq!(tree.compositor_replays, 1);
+    }
+
+    #[test]
+    fn a_known_change_rebuilds_without_the_fingerprint_and_the_next_frame_rebuilds_once() {
+        let artifact = scroll_tree();
+        let mut tree = RetainedLayerTree::default();
+        let scrolls = HashMap::new();
+        let overrides = CompositorOverrides::default();
+        let first = tree.sync(&artifact, &scrolls, &overrides);
+        note(&mut tree, first);
+        assert_eq!(
+            tree.sync(&artifact, &scrolls, &overrides),
+            LayerPaintAction::Replay
+        );
+        let known = tree.sync_known_changed(&artifact, &scrolls, &overrides, true);
+        assert_eq!(known, LayerPaintAction::Rebuild);
+        note(&mut tree, known);
+        // The skipped fingerprint cannot vouch for the recordings.
+        let after = tree.sync(&artifact, &scrolls, &overrides);
+        assert_eq!(after, LayerPaintAction::Rebuild);
+        note(&mut tree, after);
+        assert_eq!(
+            tree.sync(&artifact, &scrolls, &overrides),
+            LayerPaintAction::Replay
+        );
     }
 
     #[test]
