@@ -2292,6 +2292,23 @@ fn can_skip_projections(root: &Component) -> bool {
     walk(root)
 }
 
+struct ShiftLists {
+    /// Preorder child lists.
+    children: Vec<Vec<usize>>,
+    /// Absolute or fixed leaves whose used position is a px inset delta.
+    shift_ok: Vec<bool>,
+}
+
+impl ShiftLists {
+    fn of(component: &Component) -> Self {
+        let flat = pre_flatten(component);
+        Self {
+            children: child_lists(&flat),
+            shift_ok: absolute_shift_ok(&flat),
+        }
+    }
+}
+
 struct PaintCache {
     component: Component,
     engine: LayoutEngine,
@@ -2301,10 +2318,11 @@ struct PaintCache {
     viewport_h_bits: u32,
     node_ids: Vec<u32>,
     results: crate::layout::LayoutResults,
-    /// Preorder child lists captured with the retained tree.
-    children: Vec<Vec<usize>>,
-    /// Absolute or fixed leaves whose used position is a px inset delta.
-    shift_ok: Vec<bool>,
+    /// Preorder child lists and [`absolute_shift_ok`] of `component`, built
+    /// on first use by an inset shift (`None` after a rebuild or splice).
+    /// Style patches keep both: they change neither the tree nor the styles
+    /// these read (see [`paint_geometry_edit`], [`local_paint_only`]).
+    shift_lists: Option<ShiftLists>,
     /// The paint journal position this tree and layout equal the flush
     /// cache at (see `splice::paint_splice_enabled`).
     journal: Option<(u64, usize)>,
@@ -2621,8 +2639,7 @@ fn splice_paint_cache(
     cache.results.scroll_ancestor = scroll_ancestor;
     cache.results.layout_slots = Some(slots);
     cache.node_ids = flat.iter().map(flat_host_id).collect();
-    cache.children = child_lists(&flat);
-    cache.shift_ok = absolute_shift_ok(&flat);
+    cache.shift_lists = None;
     drop(flat);
     // The retained Taffy tree no longer matches the spliced component.
     let mut engine = LayoutEngine::new();
@@ -2758,8 +2775,6 @@ fn rebuild_paint_cache(
     }
     let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
     write_rects(&flat, &results.layout_cache, &results.text_fragments);
-    let children = child_lists(&flat);
-    let shift_ok = absolute_shift_ok(&flat);
     let subtree_sizes = splice::paint_splice_incremental().then(|| flat_subtree_sizes(&flat));
     drop(flat);
     *slot = Some(PaintCache {
@@ -2771,8 +2786,7 @@ fn rebuild_paint_cache(
         viewport_h_bits: viewport_h.to_bits(),
         node_ids,
         results,
-        children,
-        shift_ok,
+        shift_lists: None,
         journal: None,
         subtree_sizes,
     });
@@ -2896,7 +2910,10 @@ fn try_shift_absolute_insets(
         let Some(flat_index) = cache.node_ids.iter().position(|node| *node == id.as_u32()) else {
             return None;
         };
-        if !cache.shift_ok.get(flat_index).copied().unwrap_or(false) {
+        let lists = cache
+            .shift_lists
+            .get_or_insert_with(|| ShiftLists::of(&cache.component));
+        if !lists.shift_ok.get(flat_index).copied().unwrap_or(false) {
             return None;
         }
         if cache
@@ -2925,10 +2942,13 @@ fn try_shift_absolute_insets(
             return Some(false);
         }
     }
+    let Some(lists) = cache.shift_lists.as_ref() else {
+        return Some(false);
+    };
     for (_, _, index, dx, dy) in &plan {
         if !shift_descendants(
             &mut cache.results.layout_cache,
-            &cache.children,
+            &lists.children,
             *index,
             *dx,
             *dy,
@@ -3676,6 +3696,67 @@ mod paint_layout_tests {
                 && (after.height - fresh.height).abs() < 0.05,
             "shifted child {after:?} diverges from full layout {fresh:?}"
         );
+    }
+
+    #[test]
+    fn absolute_shift_lists_survive_style_patches_and_appends() {
+        crate::dom::reset_document();
+        let layer = crate::dom::create_element("div");
+        crate::dom::set_style_property(layer, "position", "relative");
+        crate::dom::set_style_property(layer, "width", "400px");
+        crate::dom::set_style_property(layer, "height", "300px");
+        let mover = crate::dom::create_element("div");
+        for (name, value) in [
+            ("position", "absolute"),
+            ("width", "20px"),
+            ("height", "20px"),
+            ("left", "8px"),
+            ("top", "0px"),
+        ] {
+            crate::dom::set_style_property(mover, name, value);
+        }
+        let inner = crate::dom::create_element("div");
+        crate::dom::set_style_property(inner, "width", "6px");
+        crate::dom::set_style_property(inner, "height", "6px");
+        crate::dom::append_child(mover, inner);
+        let sibling = crate::dom::create_element("div");
+        crate::dom::set_style_property(sibling, "width", "50px");
+        crate::dom::set_style_property(sibling, "height", "10px");
+        crate::dom::append_child(layer, sibling);
+        crate::dom::append_child(layer, mover);
+        crate::dom::append_child(crate::dom::body_id(), layer);
+        let close = |a: crate::layout::LayoutRect, b: crate::layout::LayoutRect| {
+            (a.x - b.x).abs() < 0.05
+                && (a.y - b.y).abs() < 0.05
+                && (a.width - b.width).abs() < 0.05
+                && (a.height - b.height).abs() < 0.05
+        };
+        let _ = paint_rect(inner);
+        let shifts = paint_shift_count();
+        // First shift builds the lists; a geometry patch keeps them; the
+        // second shift reuses them; an append drops them; the third shift
+        // builds them again for the new tree.
+        crate::dom::set_style_property(mover, "top", "30px");
+        let first = paint_rect(inner);
+        assert!(close(first, fresh_rect(inner)), "first shift {first:?}");
+        crate::dom::set_style_property(sibling, "width", "70px");
+        let _ = paint_rect(sibling);
+        crate::dom::set_style_property(mover, "top", "60px");
+        let second = paint_rect(inner);
+        assert!(close(second, fresh_rect(inner)), "second shift {second:?}");
+        assert!(second.y > first.y + 25.0, "{first:?} -> {second:?}");
+        let extra = crate::dom::create_element("div");
+        crate::dom::set_style_property(extra, "width", "5px");
+        crate::dom::set_style_property(extra, "height", "5px");
+        crate::dom::append_child(layer, extra);
+        let _ = paint_rect(extra);
+        crate::dom::set_style_property(mover, "top", "90px");
+        let third = paint_rect(inner);
+        assert!(close(third, fresh_rect(inner)), "third shift {third:?}");
+        assert!(third.y > second.y + 25.0, "{second:?} -> {third:?}");
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert!(paint_shift_count() - shifts >= 2, "inset edits must shift");
+        }
     }
 
     #[test]
