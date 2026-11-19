@@ -986,6 +986,22 @@ mod tests {
         }
     }
 
+    /// Run `run` again when the process-wide font registry moved while it
+    /// ran (tests on other threads register and clear fonts): a font change
+    /// correctly re-records every layer, which these tests cannot tell from
+    /// lost reuse. `run` must set up the document state it renders.
+    fn with_stable_fonts<T>(mut run: impl FnMut() -> T) -> T {
+        let registry = crate::font_face::FontRegistry::global();
+        for _ in 0..8 {
+            let before = registry.revision();
+            let result = run();
+            if registry.revision() == before {
+                return result;
+            }
+        }
+        panic!("the font registry kept changing under the test");
+    }
+
     fn with_layer_reuse<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
         PAINT_LAYER_REUSE_OVERRIDE.with(|value| value.set(Some(enabled)));
         let result = run();
@@ -1017,11 +1033,15 @@ mod tests {
             crate::dom::append_child(body, card);
             texts.push(text);
         }
-        let (first, edited, reused) = with_layer_reuse(true, || {
-            let first = render_document_rgba(160, 360).expect("first frame");
-            crate::dom::set_text_content(texts[3], "card 3 says goodbye");
-            let edited = render_document_rgba(160, 360).expect("edited frame");
-            (first, edited, HEADLESS_SKIA_REUSED.with(Cell::get))
+        let (first, edited, reused) = with_stable_fonts(|| {
+            with_layer_reuse(true, || {
+                crate::dom::set_text_content(texts[3], "card 3 says hello");
+                render_document_rgba(160, 360).expect("settled frame");
+                let first = render_document_rgba(160, 360).expect("first frame");
+                crate::dom::set_text_content(texts[3], "card 3 says goodbye");
+                let edited = render_document_rgba(160, 360).expect("edited frame");
+                (first, edited, HEADLESS_SKIA_REUSED.with(Cell::get))
+            })
         });
         assert_ne!(first.rgba, edited.rgba, "the edit must change pixels");
         assert!(reused.1 > 1, "the cards must paint in several layers");
@@ -1039,11 +1059,14 @@ mod tests {
             "kept layer recordings must match a frame painted from scratch"
         );
         // Wrapping the first card moves every card below it.
-        let (wrapped, moved_reuse) = with_layer_reuse(true, || {
-            render_document_rgba(160, 360).expect("warm frame");
-            crate::dom::set_text_content(texts[0], "card 0 now says a much longer hello");
-            let wrapped = render_document_rgba(160, 360).expect("wrapped frame");
-            (wrapped, HEADLESS_SKIA_REUSED.with(Cell::get))
+        let (wrapped, moved_reuse) = with_stable_fonts(|| {
+            with_layer_reuse(true, || {
+                crate::dom::set_text_content(texts[0], "card 0 says hello");
+                render_document_rgba(160, 360).expect("warm frame");
+                crate::dom::set_text_content(texts[0], "card 0 now says a much longer hello");
+                let wrapped = render_document_rgba(160, 360).expect("wrapped frame");
+                (wrapped, HEADLESS_SKIA_REUSED.with(Cell::get))
+            })
         });
         // The cards below only moved: their layers keep their recordings
         // under the offset (the first card's layers re-record).
@@ -1099,16 +1122,21 @@ mod tests {
             (5, "card 5"),
             (4, "card 4"),
         ];
-        let (frames, damaged) = with_layer_reuse(true, || {
-            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
-            let before = crate::render_skia::paint_damage_stats().0;
-            render_document_rgba(160, 480).expect("first frame");
-            let mut frames = Vec::new();
-            for (card, text) in edits {
-                crate::dom::set_text_content(texts[card], text);
-                frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
-            }
-            (frames, crate::render_skia::paint_damage_stats().0 - before)
+        let (frames, damaged) = with_stable_fonts(|| {
+            with_layer_reuse(true, || {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                for (index, text) in texts.iter().enumerate() {
+                    crate::dom::set_text_content(*text, &format!("card {index} says hello"));
+                }
+                let before = crate::render_skia::paint_damage_stats().0;
+                render_document_rgba(160, 480).expect("first frame");
+                let mut frames = Vec::new();
+                for (card, text) in edits {
+                    crate::dom::set_text_content(texts[card], text);
+                    frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
+                }
+                (frames, crate::render_skia::paint_damage_stats().0 - before)
+            })
         });
         assert!(
             damaged > 0,

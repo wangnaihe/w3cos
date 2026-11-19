@@ -748,16 +748,28 @@ impl FontRegistry {
     }
 
     /// Remove every font registered by one page/stylesheet lifecycle owner.
+    ///
+    /// The revision, which every font-dependent layout and paint cache keys
+    /// on, moves only when the owner had fonts: the registry is shared by
+    /// every document in the process, and an owner that registered nothing
+    /// (or was already cleared) must not invalidate the others.
     pub fn clear_owner(&self, owner: u64) {
         clear_face_hit();
+        let mut removed = false;
         let mut fonts = self.fonts.lock().unwrap();
         fonts.retain(|_, entries| {
+            let before = entries.len();
             entries.retain(|(existing_owner, _)| *existing_owner != owner);
+            removed |= entries.len() != before;
             !entries.is_empty()
         });
         let mut families = self.families.lock().unwrap();
+        let before = families.len();
         families.retain(|(existing_owner, _)| *existing_owner != owner);
-        self.revision.fetch_add(1, Ordering::Release);
+        removed |= families.len() != before;
+        if removed {
+            self.revision.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Resolve a font by family name, weight, and style.
@@ -1807,6 +1819,30 @@ mod tests {
         registry.clear_owner(42);
         assert!(registry.revision() > loaded);
         assert!(registry.normal_line_height(&style).is_none());
+    }
+
+    #[test]
+    fn clearing_an_owner_without_fonts_keeps_the_revision() {
+        let registry = FontRegistry::new();
+        registry
+            .register_for_owner(
+                5,
+                FontFace {
+                    family: "OwnedFixture".into(),
+                    src: FontSource::Bytes(include_bytes!("../assets/Inter-Regular.ttf").to_vec()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let loaded = registry.revision();
+        // Another document's teardown that registered nothing.
+        registry.clear_owner(6);
+        assert_eq!(registry.revision(), loaded);
+        registry.clear_owner(5);
+        let cleared = registry.revision();
+        assert!(cleared > loaded);
+        registry.clear_owner(5);
+        assert_eq!(registry.revision(), cleared);
     }
 
     #[test]
