@@ -556,6 +556,9 @@ struct AppendRecord {
     /// Per node: its paint inputs other than geometry (parent, kind, style,
     /// sticky signal) and its property / paint-order output equal `base`'s.
     unchanged: Vec<bool>,
+    /// Aligned runs copied from `base`: `[node start, node end, display
+    /// item start, display item end)`, at the same indices in both.
+    runs: Vec<[u32; 4]>,
 }
 
 /// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
@@ -3368,6 +3371,16 @@ impl PaintArtifact {
         .then_some(record.unchanged.as_slice())
     }
 
+    /// The aligned runs this artifact copied from `previous` (see
+    /// `AppendRecord::runs`), when it was built against `previous`.
+    pub(crate) fn append_runs_against(&self, previous: &PaintArtifact) -> Option<&[[u32; 4]]> {
+        let record = self.append_record.as_deref()?;
+        (record.base != 0
+            && record.base == previous.serial
+            && record.unchanged.len() == self.nodes.len())
+        .then_some(record.runs.as_slice())
+    }
+
     fn mark(&self) -> AppendMark {
         AppendMark {
             transforms: self.properties.transforms.len() as u32,
@@ -3397,6 +3410,7 @@ impl PaintArtifact {
         unchanged: &mut [bool],
         memo: &mut AppendMemo,
         marks: &mut Vec<AppendMark>,
+        runs: &mut Vec<[u32; 4]>,
     ) -> usize {
         let len = self.nodes.len();
         let mark = self.mark();
@@ -3450,6 +3464,7 @@ impl PaintArtifact {
             chunks: previous.chunks.len() as u32,
             levels: previous.paint_order.levels.len() as u32,
         });
+        runs.push([start as u32, end as u32, old.items, stop.items]);
         let range = |a: u32, b: u32| a as usize..b as usize;
         self.properties.transforms.extend_from_slice(
             &previous.properties.transforms[range(old.transforms, stop.transforms)],
@@ -3521,6 +3536,7 @@ impl PaintArtifact {
         // last frame's, so a descendant reading them may be copied.
         let mut same = vec![false; len];
         let mut unchanged = vec![false; len];
+        let mut runs = Vec::new();
         let (mut copied, mut appended, mut run_copied) = (0u64, 0u64, 0u64);
         let splice = artifact_splice_enabled();
         let mut index = 0;
@@ -3534,6 +3550,7 @@ impl PaintArtifact {
                     &mut unchanged,
                     &mut memo,
                     &mut marks,
+                    &mut runs,
                 );
                 if end > index {
                     run_copied += (end - index) as u64;
@@ -3595,6 +3612,7 @@ impl PaintArtifact {
             memo,
             base,
             unchanged,
+            runs,
         }));
     }
 
@@ -4960,6 +4978,78 @@ mod tests {
 
     /// A frame whose last block grew copies the unchanged blocks before it
     /// as one aligned run and matches a full build.
+    #[test]
+    fn paint_diff_skips_copied_runs_and_matches_the_full_diff() {
+        use crate::retained_layers::{PAINT_DIFF_RUNS_OVERRIDE, paint_diff_clients};
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+        let mut plain = Style::default();
+        plain.display = Display::Block;
+        let node = |kind: ComponentKind, parent: Option<usize>| PaintNode {
+            kind,
+            style: plain.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let text = |content: &str| ComponentKind::Text {
+            content: content.into(),
+        };
+        let rect = |y: f32, height: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 200.0,
+            height,
+        };
+        let blocks = 12;
+        // The edited block sits in the middle: runs before and after it.
+        let nodes = |edited: &str| {
+            let mut nodes = vec![node(ComponentKind::Root, None)];
+            for index in 0..blocks {
+                nodes.push(node(ComponentKind::Root, Some(0)));
+                let content = if index == blocks / 2 {
+                    edited.to_string()
+                } else {
+                    format!("block {index}")
+                };
+                nodes.push(node(text(&content), Some(2 * index + 1)));
+            }
+            nodes
+        };
+        let layouts = || {
+            let mut layouts = vec![(rect(0.0, 20.0 * blocks as f32), 0)];
+            for index in 0..blocks {
+                let y = 20.0 * index as f32;
+                layouts.push((rect(y, 20.0), 2 * index + 1));
+                layouts.push((rect(y, 20.0), 2 * index + 2));
+            }
+            layouts
+        };
+        let first = PaintArtifact::build_reusing(nodes("middle"), &layouts(), 1, None, None, None);
+        let next = PaintArtifact::build_reusing(
+            nodes("middle, edited"),
+            &layouts(),
+            2,
+            None,
+            None,
+            Some(&first),
+        );
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(None));
+        let runs = next
+            .append_runs_against(&first)
+            .expect("built against first");
+        assert!(runs.len() >= 1, "unchanged blocks copy as runs");
+        assert!(next.append_runs_against(&next).is_none());
+        PAINT_DIFF_RUNS_OVERRIDE.with(|mode| mode.set(Some(0)));
+        let full = paint_diff_clients(&first, &next).expect("full diff");
+        PAINT_DIFF_RUNS_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let skipped = paint_diff_clients(&first, &next).expect("diff with runs");
+        PAINT_DIFF_RUNS_OVERRIDE.with(|mode| mode.set(None));
+        assert_eq!(full.dirty, skipped.dirty);
+        assert_eq!(full.moved, skipped.moved);
+        assert!(full.dirty[2 * (blocks / 2) + 2], "the edited text is dirty");
+        assert_eq!(full.dirty.iter().filter(|&&d| d).count() >= 1, true);
+    }
+
     #[test]
     fn artifact_splice_copies_aligned_runs_and_matches_a_full_build() {
         ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));

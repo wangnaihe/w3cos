@@ -681,7 +681,84 @@ fn client_ink_bounds(artifact: &PaintArtifact, index: usize) -> Result<Option<La
     }))
 }
 
+/// `W3COS_PAINT_DIFF_RUNS=1`: clients inside an aligned run the artifact
+/// copied from `prev` (same index, rect, inputs and display items; see
+/// `PaintArtifact::append_runs_against`) skip the display-item hashing and
+/// the input comparison (Blink's PaintController skips a cached
+/// subsequence the same way). `=verify` also diffs in full and compares.
+/// Off by default.
+fn paint_diff_runs_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DIFF_RUNS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_DIFF_RUNS").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DIFF_RUNS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (diffs that used runs, verify mismatches) since the thread started.
+    pub(crate) static PAINT_DIFF_RUNS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<PaintDiff> {
+    let mode = paint_diff_runs_mode();
+    let runs = (mode != 0).then(|| cur.append_runs_against(prev)).flatten();
+    let Some(runs) = runs else {
+        return paint_diff_clients_with(prev, cur, None);
+    };
+    let diff = paint_diff_clients_with(prev, cur, Some(runs));
+    PAINT_DIFF_RUNS_STATS.with(|stats| {
+        let (used, mismatched) = stats.get();
+        stats.set((used + 1, mismatched));
+    });
+    if mode == 2 {
+        let full = paint_diff_clients_with(prev, cur, None);
+        let equal = match (&diff, &full) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.dirty == b.dirty
+                    && a.moved.len() == b.moved.len()
+                    && a.moved.iter().zip(&b.moved).all(|(x, y)| match (x, y) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => {
+                            x.0.to_bits() == y.0.to_bits() && x.1.to_bits() == y.1.to_bits()
+                        }
+                        _ => false,
+                    })
+            }
+            _ => false,
+        };
+        if !equal {
+            eprintln!("[paint-diff-runs] mismatch against the full diff");
+            PAINT_DIFF_RUNS_STATS.with(|stats| {
+                let (used, mismatched) = stats.get();
+                stats.set((used, mismatched + 1));
+            });
+            return full;
+        }
+    }
+    diff
+}
+
+fn paint_diff_clients_with(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    runs: Option<&[[u32; 4]]>,
+) -> Option<PaintDiff> {
     use w3cos_std::component::ComponentKind;
     use w3cos_std::style::Display;
     let n = cur.nodes.len();
@@ -697,9 +774,36 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
     }
     // Display item rects relative to their client's box: with equal boxes
     // this is the absolute comparison, and a moved client compares equal.
+    // Clients inside a copied run: equal rects, inputs and display items.
+    let mut in_run = Vec::new();
+    // Display items outside the runs, as index ranges (the same in both).
+    let mut item_spans = Vec::new();
+    if let Some(runs) = runs {
+        in_run = vec![false; n];
+        let mut next = 0usize;
+        for &[start, end, items_start, items_end] in runs {
+            let (start, end) = (start as usize, end.min(n as u32) as usize);
+            if start < end {
+                in_run[start..end].fill(true);
+            }
+            if items_start as usize > next {
+                item_spans.push((next, items_start as usize));
+            }
+            next = next.max(items_end as usize);
+        }
+        item_spans.push((next, usize::MAX));
+    }
     let item_hashes = |artifact: &PaintArtifact| {
         let mut hashes = vec![0u64; n];
-        for item in &artifact.display_items {
+        let all = [(0usize, usize::MAX)];
+        let spans: &[(usize, usize)] = if runs.is_some() { &item_spans } else { &all };
+        let items = &artifact.display_items;
+        for item in spans.iter().flat_map(|&(a, b)| {
+            items
+                .get(a.min(items.len())..b.min(items.len()))
+                .into_iter()
+                .flatten()
+        }) {
             if let Some(slot) = hashes.get_mut(item.client_index) {
                 let (ox, oy) = artifact
                     .rect_by_index
@@ -814,6 +918,21 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
     let mut moved: Vec<Option<(f32, f32)>> = vec![None; n];
     for index in 0..n {
         let (a, b) = (&prev.nodes[index], &cur.nodes[index]);
+        if in_run.get(index).copied().unwrap_or(false) {
+            // Copied with its display items from `prev` at this index.
+            let same = text_equal(
+                prev.text_fragments
+                    .get(index)
+                    .map_or(&[][..], Vec::as_slice),
+                cur.text_fragments.get(index).map_or(&[][..], Vec::as_slice),
+            ) && get(&prev.vertical_text, index) == get(&cur.vertical_text, index);
+            if same {
+                if volatile(b) {
+                    changed.push((index, true));
+                }
+                continue;
+            }
+        }
         // Geometry first: it is the cheap check and the common change.
         let same = rect_equal(
             prev.rect_by_index.get(index).copied().flatten(),
