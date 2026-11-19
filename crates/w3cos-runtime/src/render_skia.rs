@@ -60,6 +60,12 @@ thread_local! {
     /// face; this does not copy the underlying system font into application memory.
     static FONT_FALLBACK_CACHE: RefCell<HashMap<(u32, char, u16), Option<Typeface>>> =
         RefCell::new(HashMap::new());
+    /// The primary family's own face at a weight and slant, resolved once
+    /// like Blink's FontCache does for a FontDescription, so a bold run of
+    /// characters the family covers does not need a per-character system
+    /// fallback match (`W3COS_WEIGHTED_FACE`).
+    static WEIGHTED_FACE_CACHE: RefCell<HashMap<(String, u16, u8), Option<Typeface>>> =
+        RefCell::new(HashMap::new());
     static GENERIC_SLANTED_TYPEFACES: RefCell<HashMap<(u32, u8), Option<Typeface>>> =
         RefCell::new(HashMap::new());
     static INTRINSIC_PRIMARY_TYPEFACE: Typeface = {
@@ -7399,6 +7405,43 @@ fn fallback_font_runs<'a>(
     runs
 }
 
+fn weighted_face_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("W3COS_WEIGHTED_FACE").is_ok_and(|value| value == "1"))
+}
+
+fn weighted_face_verify() -> bool {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFY
+        .get_or_init(|| std::env::var("W3COS_WEIGHTED_FACE_VERIFY").is_ok_and(|value| value == "1"))
+}
+
+/// The primary family's face for `style`, or `None` when the system resolves
+/// the family name to a different family at that weight. Cached per family,
+/// weight and slant; the result does not depend on the character.
+fn weighted_family_face(
+    primary: &Typeface,
+    style: FontStyle,
+    font_weight: u16,
+) -> Option<Typeface> {
+    let family = primary.family_name();
+    let key = (family, font_weight, style.slant() as u8);
+    if let Some(cached) = WEIGHTED_FACE_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let face = crate::font_face::pinned_font_mgr()
+        .match_family_style(&key.0, style)
+        .filter(|face| face.family_name() == key.0);
+    WEIGHTED_FACE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= FONT_FALLBACK_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, face.clone());
+    });
+    face
+}
+
 fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16) -> Typeface {
     if font_weight == 400 && primary.unichar_to_glyph(character as i32) != 0 {
         return primary.clone();
@@ -7444,12 +7487,40 @@ fn typeface_for_character(primary: &Typeface, character: char, font_weight: u16)
             let matched = if covered {
                 Some(primary.clone())
             } else {
-                crate::font_face::pinned_font_mgr().match_family_style_character(
-                    &primary.family_name(),
-                    style,
-                    &["en", "zh-Hans"],
-                    character as i32,
-                )
+                let weighted = if font_weight != 400 && weighted_face_enabled() {
+                    weighted_family_face(primary, style, font_weight)
+                        .filter(|face| face.unichar_to_glyph(character as i32) != 0)
+                } else {
+                    None
+                };
+                if weighted.is_some() && !weighted_face_verify() {
+                    weighted
+                } else {
+                    let full = crate::font_face::pinned_font_mgr().match_family_style_character(
+                        &primary.family_name(),
+                        style,
+                        &["en", "zh-Hans"],
+                        character as i32,
+                    );
+                    if let Some(face) = weighted.as_ref() {
+                        let same = full.as_ref().is_some_and(|full| {
+                            full.unique_id() == face.unique_id()
+                                || (full.family_name() == face.family_name()
+                                    && full.font_style() == face.font_style())
+                        });
+                        if !same {
+                            eprintln!(
+                                "[weighted-face-verify] mismatch U+{:04X} w{} {:?}: weighted {:?} full {:?}",
+                                character as u32,
+                                font_weight,
+                                primary.family_name(),
+                                face.family_name(),
+                                full.as_ref().map(|full| full.family_name())
+                            );
+                        }
+                    }
+                    full
+                }
             };
             FONT_FALLBACK_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
@@ -8766,6 +8837,62 @@ mod tests {
             &[217, 217, 255, 255],
             "V4066 original Blue glyph coverage"
         );
+    }
+
+    #[test]
+    fn weighted_family_face_matches_per_character_fallback() {
+        let mgr = crate::font_face::pinned_font_mgr();
+        let mut checked = 0;
+        for family in [
+            "Noto Sans",
+            "Noto Serif",
+            "Arimo",
+            "Tinos",
+            "Cousine",
+            "Noto Sans CJK SC",
+        ] {
+            let Some(primary) = mgr.match_family_style(family, FontStyle::normal()) else {
+                continue;
+            };
+            for weight in [100u16, 300, 500, 600, 700, 900] {
+                for slant in [
+                    skia_safe::font_style::Slant::Upright,
+                    skia_safe::font_style::Slant::Italic,
+                ] {
+                    let style = FontStyle::new(
+                        (weight as i32).into(),
+                        skia_safe::font_style::Width::NORMAL,
+                        slant,
+                    );
+                    let Some(face) = weighted_family_face(&primary, style, weight) else {
+                        continue;
+                    };
+                    for character in "aZ09 .,?(".chars() {
+                        if face.unichar_to_glyph(character as i32) == 0 {
+                            continue;
+                        }
+                        let full = mgr
+                            .match_family_style_character(
+                                &primary.family_name(),
+                                style,
+                                &["en", "zh-Hans"],
+                                character as i32,
+                            )
+                            .expect("per-character match");
+                        assert!(
+                            full.unique_id() == face.unique_id()
+                                || (full.family_name() == face.family_name()
+                                    && full.font_style() == face.font_style()),
+                            "{family} w{weight} {slant:?} {character:?}: {} vs {}",
+                            face.family_name(),
+                            full.family_name()
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "checked {checked}");
     }
 
     #[cfg(target_os = "macos")]
