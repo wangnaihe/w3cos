@@ -286,6 +286,8 @@ struct ClipChainMoves<'a> {
     new: &'a [Option<LayoutRect>],
     scrollport: Vec<bool>,
     memo: Vec<Option<Option<ClipMove>>>,
+    /// The last (self clip, contents clip, wanted move) and its answer.
+    last: Option<((usize, usize, ClipMove), bool)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -315,6 +317,7 @@ impl<'a> ClipChainMoves<'a> {
             new,
             scrollport,
             memo: vec![None; new.len()],
+            last: None,
         }
     }
 
@@ -369,7 +372,14 @@ impl<'a> ClipChainMoves<'a> {
             .node_properties
             .get(client)
             .map_or(0, |properties| properties.clip);
-        [self_clip, contents_clip]
+        // Neighbouring clients mostly share both clips.
+        let key = (self_clip, contents_clip, want);
+        if let Some((last, moved)) = self.last
+            && last == key
+        {
+            return moved;
+        }
+        let moved = [self_clip, contents_clip]
             .into_iter()
             .all(|clip| match self.chain(clip) {
                 Some(ClipMove::Any) => true,
@@ -378,7 +388,9 @@ impl<'a> ClipChainMoves<'a> {
                         || (zero && f32::from_bits(x) == 0.0 && f32::from_bits(y) == 0.0)
                 }
                 None => false,
-            })
+            });
+        self.last = Some((key, moved));
+        moved
     }
 }
 
@@ -1291,9 +1303,11 @@ pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
             let layer = layers.last_mut().expect("current layer");
             layer.chunk_ids.push(chunk_id);
             layer.bounds = union_rect(layer.bounds, chunk.bounds);
-            for item in &artifact.display_items[chunk.begin..chunk.end] {
-                layer.client_indices.push(item.client_index);
-            }
+            layer.client_indices.extend(
+                artifact.display_items[chunk.begin..chunk.end]
+                    .iter()
+                    .map(|item| item.client_index),
+            );
             continue;
         }
         let mut client_indices = Vec::with_capacity(chunk.end.saturating_sub(chunk.begin));
