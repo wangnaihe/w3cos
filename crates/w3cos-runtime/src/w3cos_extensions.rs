@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::jsdom::realm_function;
 use crate::tray_host::{TrayEventKind, TrayMenuEntry, TraySpec};
@@ -41,6 +41,10 @@ struct Shortcut {
 
 thread_local! {
     static SHORTCUTS: RefCell<Vec<Shortcut>> = const { RefCell::new(Vec::new()) };
+    /// Whether this thread's `SHORTCUTS` is non-empty. Per thread like the
+    /// list it summarises: a process-wide flag let one document's
+    /// unregister switch off another document's shortcuts.
+    static SHORTCUTS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(all(
@@ -52,7 +56,6 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-static SHORTCUTS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_SHORTCUT: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROCESS: AtomicU64 = AtomicU64::new(1);
 
@@ -104,11 +107,11 @@ fn refuse(permission: &str, feature: &str) -> Value {
 
 fn refresh_active_flag() {
     let active = SHORTCUTS.with(|shortcuts| !shortcuts.borrow().is_empty());
-    SHORTCUTS_ACTIVE.store(active, Ordering::Relaxed);
+    SHORTCUTS_ACTIVE.with(|flag| flag.set(active));
 }
 
 pub fn shortcuts_active() -> bool {
-    SHORTCUTS_ACTIVE.load(Ordering::Relaxed)
+    SHORTCUTS_ACTIVE.with(std::cell::Cell::get)
 }
 
 fn parse_accelerator(accelerator: &str) -> Result<(bool, bool, bool, bool, String), String> {
@@ -1449,6 +1452,9 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(handle.get_property("scope").to_js_string(), "application");
+        // Another document (thread) with no shortcuts must not switch this
+        // one's off.
+        std::thread::spawn(refresh_active_flag).join().unwrap();
         assert!(dispatch_accelerator("Control+Shift+K"));
         assert_eq!(*hits.borrow(), 1);
         assert!(!dispatch_matching_shortcut("k", false, false, false, false));
