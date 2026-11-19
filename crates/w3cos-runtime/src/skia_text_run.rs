@@ -734,7 +734,22 @@ fn shape_buffer_with_face(
                 .filter_map(|feature| feature.parse::<rustybuzz::Feature>().ok()),
         );
     }
-    let shaped = rustybuzz::shape(shaping_face, &features, buffer);
+    let features_key = (
+        native_caps,
+        style.letter_spacing != 0.0,
+        !style.font_feature_kern.unwrap_or(style.font_kerning),
+    );
+    let verify_text = (shape_plan_cache_verify()
+        && style.font_variant != w3cos_std::style::FontVariant::SmallCaps)
+        .then_some(text);
+    let shaped = shape_with_cached_plan(
+        face.unique_id(),
+        shaping_face,
+        &features,
+        features_key,
+        buffer,
+        verify_text,
+    );
     // Do not derive a cluster's width by subtracting accumulated f32 cursors:
     // its precision would depend on the unrelated text before the cluster.
     // Keep accumulation precise; Skia's point/advance boundary remains f32.
@@ -869,6 +884,64 @@ mod shaping_face_tests {
             !shaping_face_cache_enabled()
                 || SHAPING_FACES.with(|cache| cache.borrow().contains_key(&face.unique_id()))
         );
+    }
+
+    #[test]
+    fn cached_shape_plans_shape_like_fresh_plans() {
+        let Some(face) =
+            skia_safe::FontMgr::new().legacy_make_typeface(None, skia_safe::FontStyle::normal())
+        else {
+            return;
+        };
+        let bytes = font_tables(&face).unwrap();
+        let shaping_face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let buffer = |text: &str| {
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(text);
+            buffer.guess_segment_properties();
+            buffer.set_direction(rustybuzz::Direction::LeftToRight);
+            buffer
+        };
+        let feature_sets: [(&[&str], (bool, bool, bool)); 3] = [
+            (&[], (false, false, false)),
+            (&["liga=0", "clig=0"], (false, true, false)),
+            (&["kern=0"], (false, false, true)),
+        ];
+        SHAPE_PLAN_OVERRIDE.with(|cell| cell.set(Some(true)));
+        for text in ["Waffle office AVA To", "fi fl ffi", "Привет мир", "x"] {
+            for (names, key) in feature_sets {
+                let features: Vec<rustybuzz::Feature> =
+                    names.iter().filter_map(|name| name.parse().ok()).collect();
+                let expected = rustybuzz::shape(&shaping_face, &features, buffer(text));
+                // The second round shapes with the plan the first cached.
+                for _ in 0..2 {
+                    let cached = shape_with_cached_plan(
+                        face.unique_id(),
+                        &shaping_face,
+                        &features,
+                        key,
+                        buffer(text),
+                        None,
+                    );
+                    let ids = |run: &rustybuzz::GlyphBuffer| {
+                        run.glyph_infos()
+                            .iter()
+                            .map(|info| (info.glyph_id, info.cluster))
+                            .collect::<Vec<_>>()
+                    };
+                    let positions = |run: &rustybuzz::GlyphBuffer| {
+                        run.glyph_positions()
+                            .iter()
+                            .map(|p| (p.x_advance, p.y_advance, p.x_offset, p.y_offset))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(ids(&cached), ids(&expected), "{text} {names:?}");
+                    assert_eq!(positions(&cached), positions(&expected), "{text} {names:?}");
+                }
+            }
+        }
+        assert!(SHAPE_PLANS.with(|plans| !plans.borrow().is_empty()));
+        SHAPE_PLAN_OVERRIDE.with(|cell| cell.set(None));
     }
 }
 
@@ -1182,4 +1255,128 @@ mod precision_tests {
             "the same n/t shaping context must not inherit accumulated cursor rounding"
         );
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHAPE_PLAN_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// HarfBuzz's `hb_shape_plan_create_cached`: one plan per (face,
+    /// direction, script, language, user features), as Blink's HarfBuzz
+    /// shaper reuses. Faces are keyed by Skia's typeface id, which is never
+    /// reused, so a plan never outlives its face's tables.
+    static SHAPE_PLANS: RefCell<
+        HashMap<(u32, u32, Option<String>, (bool, bool, bool)), std::rc::Rc<rustybuzz::ShapePlan>>,
+    > = RefCell::new(HashMap::new());
+}
+
+/// `W3COS_SHAPE_PLAN_CACHE=1` reuses shape plans across runs; `=verify`
+/// also shapes each plain run with a fresh plan and compares glyphs,
+/// clusters and positions. Off by default.
+fn shape_plan_cache_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SHAPE_PLAN_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("W3COS_SHAPE_PLAN_CACHE").is_ok_and(|value| value == "1" || value == "verify")
+    })
+}
+
+fn shape_plan_cache_verify() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("W3COS_SHAPE_PLAN_CACHE").is_ok_and(|value| value == "verify")
+    })
+}
+
+fn shape_with_cached_plan(
+    face_id: u32,
+    shaping_face: &rustybuzz::Face<'_>,
+    features: &[rustybuzz::Feature],
+    features_key: (bool, bool, bool),
+    mut buffer: rustybuzz::UnicodeBuffer,
+    verify_text: Option<&str>,
+) -> rustybuzz::GlyphBuffer {
+    if !shape_plan_cache_enabled() {
+        return rustybuzz::shape(shaping_face, features, buffer);
+    }
+    buffer.guess_segment_properties();
+    let script = buffer.script();
+    // `shape` plans with the buffer's optional script; an unknown one
+    // keeps the uncached path so the plan sees exactly the same input.
+    if script == rustybuzz::script::UNKNOWN
+        || buffer.direction() != rustybuzz::Direction::LeftToRight
+    {
+        return rustybuzz::shape(shaping_face, features, buffer);
+    }
+    let language = buffer.language();
+    let key = (
+        face_id,
+        u32::from_be_bytes(script.tag().to_bytes()),
+        language
+            .as_ref()
+            .map(|language| language.as_str().to_string()),
+        features_key,
+    );
+    let plan = SHAPE_PLANS.with(|plans| {
+        let mut plans = plans.borrow_mut();
+        if let Some(plan) = plans.get(&key) {
+            return plan.clone();
+        }
+        if plans.len() >= 256 {
+            plans.clear();
+        }
+        let plan = std::rc::Rc::new(rustybuzz::ShapePlan::new(
+            shaping_face,
+            rustybuzz::Direction::LeftToRight,
+            Some(script),
+            language.as_ref(),
+            features,
+        ));
+        plans.insert(key, plan.clone());
+        plan
+    });
+    let length = buffer.len();
+    let shaped = rustybuzz::shape_with_plan(shaping_face, &plan, buffer);
+    if let Some(text) = verify_text {
+        let mut fresh = rustybuzz::UnicodeBuffer::new();
+        fresh.push_str(text);
+        fresh.guess_segment_properties();
+        fresh.set_direction(rustybuzz::Direction::LeftToRight);
+        if fresh.len() == length && fresh.script() == script && fresh.language() == language {
+            let expected = rustybuzz::shape(shaping_face, features, fresh);
+            let same = expected.len() == shaped.len()
+                && expected
+                    .glyph_infos()
+                    .iter()
+                    .zip(shaped.glyph_infos())
+                    .all(|(a, b)| a.glyph_id == b.glyph_id && a.cluster == b.cluster)
+                && expected
+                    .glyph_positions()
+                    .iter()
+                    .zip(shaped.glyph_positions())
+                    .all(|(a, b)| {
+                        (a.x_advance, a.y_advance, a.x_offset, a.y_offset)
+                            == (b.x_advance, b.y_advance, b.x_offset, b.y_offset)
+                    });
+            if !same {
+                eprintln!("[shape-plan-verify] mismatch for {text:?}");
+            }
+            thread_local! {
+                static CHECKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+            }
+            let checked = CHECKED.with(|checked| {
+                checked.set(checked.get() + 1);
+                checked.get()
+            });
+            if checked.is_power_of_two() {
+                eprintln!("[shape-plan-verify] checked {checked} runs");
+            }
+        }
+    }
+    shaped
 }
