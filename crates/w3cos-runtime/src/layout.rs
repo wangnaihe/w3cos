@@ -1215,10 +1215,30 @@ pub struct FlatNodeInfo<'a> {
 }
 
 pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
+    thread_local! {
+        /// The last two flattened roots (by address) and their node counts:
+        /// a capacity hint for re-flattening the same retained trees (the
+        /// paint cache's and the frame's), so sizing the output does not
+        /// walk the whole tree a second time. Other trees (wrapper solves,
+        /// temporaries) are counted as before. A stale hint only changes
+        /// the initial capacity.
+        static LAST_FLATS: std::cell::Cell<[(usize, usize); 2]> =
+            const { std::cell::Cell::new([(0, 0); 2]) };
+    }
     install_font_unit_provider();
-    let n = count_nodes(root);
-    let mut out = Vec::with_capacity(n);
+    let address = root as *const Component as usize;
+    let mut last = LAST_FLATS.with(std::cell::Cell::get);
+    let capacity = match last.iter().find(|(at, _)| *at == address) {
+        Some(&(_, len)) => len,
+        None => count_nodes(root),
+    };
+    let mut out = Vec::with_capacity(capacity);
     pre_flatten_recursive(root, None, 0xcbf2_9ce4_8422_2325, &mut out);
+    if last[0].0 != address {
+        last[1] = last[0];
+    }
+    last[0] = (address, out.len());
+    LAST_FLATS.with(|slot| slot.set(last));
     out
 }
 
