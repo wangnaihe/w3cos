@@ -530,6 +530,7 @@ pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     splice::clear_paint_journal();
     PAINT.with(|cache| *cache.borrow_mut() = None);
+    crate::layout::forget_paint_scroll_plan();
     drop_pending_client_rects();
     CLIENT_RECTS.with(|rects| rects.borrow_mut().clear());
     PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
@@ -2681,6 +2682,12 @@ thread_local! {
     static PAINT_SPLICE_MISMATCHES: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Test override of the paint splice (`None`: the default).
+#[cfg(test)]
+pub(crate) fn force_paint_splice(forced: Option<bool>) {
+    splice::FORCE_PAINT_SPLICE.with(|force| force.set(forced));
+}
+
 /// (paint layouts spliced, spliced layouts that differed from a full one).
 #[cfg(test)]
 pub(crate) fn paint_splice_stats() -> (u32, u32) {
@@ -2741,11 +2748,24 @@ fn splice_paint_cache(
         cache.subtree_sizes = Some(flat_subtree_sizes(&flat));
     }
     let slots = crate::layout::layout_slots(&cache.results.layout_cache, flat.len());
-    let (scrollable, clip_only, scroll_ancestor) = crate::layout::scroll_containers_from_layout(
-        &cache.results.layout_cache,
-        &flat,
-        Some((viewport_w, viewport_h)),
-    );
+    let (scrollable, clip_only, scroll_ancestor) = if crate::layout::paint_scroll_plan_mode() != 0 {
+        splice::with_paint_changes(|changes| {
+            crate::layout::scroll_containers_after_paint_splice(
+                &cache.results.layout_cache,
+                &flat,
+                Some((viewport_w, viewport_h)),
+                &slots,
+                changes,
+                paint_layout_generation(),
+            )
+        })
+    } else {
+        crate::layout::scroll_containers_from_layout(
+            &cache.results.layout_cache,
+            &flat,
+            Some((viewport_w, viewport_h)),
+        )
+    };
     cache.results.scrollable_nodes = scrollable;
     cache.results.clip_only_nodes = clip_only;
     cache.results.scroll_ancestor = scroll_ancestor;

@@ -2743,6 +2743,11 @@ pub(crate) fn paint_changes_wanted() -> bool {
         || crate::paint_artifact::paint_touched_mode() != 0
 }
 
+/// The changes of the last paint replay, without taking them.
+pub(crate) fn with_paint_changes<R>(read: impl FnOnce(Option<&PaintChanges>) -> R) -> R {
+    LAST_PAINT_CHANGES.with(|slot| read(slot.borrow().as_ref()))
+}
+
 /// The changes of the last paint replay, once.
 pub(crate) fn take_paint_changes() -> Option<PaintChanges> {
     LAST_PAINT_CHANGES.with(|slot| slot.borrow_mut().take())

@@ -1210,6 +1210,91 @@ mod tests {
     }
 
     #[test]
+    fn paint_scroll_plan_kept_across_splices_matches_a_built_plan() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::layout::PAINT_SCROLL_PLAN_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::layout::PAINT_SCROLL_PLAN_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            // Paint splices follow a flush laid out at the painted size.
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            // A closed bottom edge lets the streamed text splice as a tail.
+            crate::dom::set_style_property(log, "padding-bottom", "2px");
+            let mut messages = Vec::new();
+            for index in 0..5 {
+                let message = crate::dom::create_element("div");
+                crate::dom::set_style_property(message, "padding", "4px");
+                if index == 3 {
+                    crate::dom::set_style_property(message, "transform", "translateX(6px)");
+                }
+                let paragraph = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("message {index} says hi"));
+                crate::dom::append_child(paragraph, text);
+                crate::dom::append_child(message, paragraph);
+                crate::dom::append_child(log, message);
+                messages.push(message);
+            }
+            let scroller = crate::dom::create_element("div");
+            crate::dom::set_style_property(scroller, "height", "40px");
+            crate::dom::set_style_property(scroller, "overflow", "auto");
+            for line in 0..4 {
+                let row = crate::dom::create_element("p");
+                crate::dom::append_child(row, crate::dom::create_text_node(&format!("row {line}")));
+                crate::dom::append_child(scroller, row);
+            }
+            crate::dom::append_child(body, log);
+            crate::dom::append_child(body, scroller);
+            let streamed = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("streamed");
+            crate::dom::append_child(streamed, text);
+            crate::dom::append_child(messages[2], streamed);
+            assert!(crate::incremental_layout::flush());
+            let before = crate::layout::paint_scroll_plan_stats();
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut content = String::from("streamed");
+            for step in 0..6 {
+                content.push_str(" more words");
+                crate::dom::set_text_content(text, &content);
+                if step == 3 {
+                    crate::dom::set_scroll_offset(scroller, None, Some(20.0));
+                }
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = crate::layout::paint_scroll_plan_stats();
+            (frames, (after.0 - before.0, after.2 - before.2))
+        };
+        let (verified, (kept, mismatched)) = run(2);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(kept > 0, "stream splices must keep the paint scroll plan");
+        }
+        assert_eq!(
+            mismatched, 0,
+            "a kept paint scroll plan differs from a built one"
+        );
+        let (reused, _) = run(1);
+        let (fresh, (off_kept, _)) = run(0);
+        assert_eq!(off_kept, 0);
+        assert!(verified == fresh, "verify-mode frames differ");
+        assert!(
+            reused == fresh,
+            "frames with a kept paint scroll plan differ"
+        );
+    }
+
+    #[test]
     fn damage_composite_matches_a_full_composite() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();

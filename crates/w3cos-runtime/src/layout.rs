@@ -20875,6 +20875,7 @@ fn refresh_scroll_container_rects(
 /// scroll container, the scroll-container candidates (with whether they
 /// clip as `hidden`), and the accumulated transform shifts. Box-tree mode
 /// keeps it per structure (Blink keeps these bits on the LayoutObject).
+#[derive(PartialEq)]
 struct ScrollPlan {
     scroll_ancestor: Vec<Option<usize>>,
     /// Per box: the scroll container whose extent it extends (its scroll
@@ -21129,6 +21130,159 @@ fn scroll_containers_with_slots(
     Vec<(usize, LayoutRect)>,
     Vec<Option<usize>>,
 ) {
+    let plan = scroll_plan(flat);
+    scroll_containers_with_plan(layouts, flat, viewport, layout_slot, &plan)
+}
+
+/// `W3COS_PAINT_SCROLL_PLAN=1|verify`: a paint splice keeps the scroll
+/// plan of the paint tree it edits when the boxes its change set names
+/// kept their parent and scroll inputs (every other box did by the set's
+/// contract); `verify` also builds the plan and compares. Off by default.
+pub(crate) fn paint_scroll_plan_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_SCROLL_PLAN_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_SCROLL_PLAN").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+/// Per box: what [`build_scroll_plan`] reads of it.
+#[derive(Clone, Copy, PartialEq)]
+struct PaintScrollInput {
+    input: ScrollInput,
+    parent: u32,
+    body: bool,
+}
+
+fn paint_scroll_input(info: &FlatNodeInfo<'_>, body_host: u32) -> PaintScrollInput {
+    PaintScrollInput {
+        input: scroll_input(info.style),
+        parent: info.parent.map_or(u32::MAX, |parent| parent as u32),
+        body: matches!(
+            info.on_click,
+            EventAction::NativeHost { id, .. } if *id == u64::from(body_host)
+        ),
+    }
+}
+
+struct PaintScrollPlan {
+    /// The paint layout whose tree `plan` describes.
+    generation: u64,
+    body_host: u32,
+    inputs: Vec<PaintScrollInput>,
+    plan: std::rc::Rc<ScrollPlan>,
+}
+
+thread_local! {
+    static PAINT_SCROLL_PLAN: std::cell::RefCell<Option<PaintScrollPlan>> =
+        const { std::cell::RefCell::new(None) };
+    /// (kept, built, verify mismatches) since the thread started.
+    static PAINT_SCROLL_PLAN_STATS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_SCROLL_PLAN_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn paint_scroll_plan_stats() -> (u64, u64, u64) {
+    PAINT_SCROLL_PLAN_STATS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn forget_paint_scroll_plan() {
+    PAINT_SCROLL_PLAN.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// [`scroll_containers_from_layout`] for the paint tree a splice replay
+/// just edited (paint layout `generation`; `changes`: the replay's change
+/// set). Keeps the plan made for the tree of the paint layout before when
+/// every box the set names kept its parent and scroll inputs.
+pub(crate) fn scroll_containers_after_paint_splice(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+    layout_slot: &[u32],
+    changes: Option<&crate::incremental_layout::PaintChanges>,
+    generation: u64,
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    let body_host = crate::dom::body_id();
+    let kept = PAINT_SCROLL_PLAN.with(|slot| slot.borrow_mut().take());
+    let kept = kept.and_then(|mut kept| {
+        let changes = changes?;
+        if kept.generation + 1 != generation
+            || changes.generation != generation
+            || changes.len != flat.len()
+            || kept.inputs.len() != flat.len()
+            || kept.body_host != body_host
+        {
+            return None;
+        }
+        for &(start, end) in &changes.changed {
+            for index in start as usize..(end as usize).min(flat.len()) {
+                if kept.inputs[index] != paint_scroll_input(&flat[index], body_host) {
+                    return None;
+                }
+            }
+        }
+        kept.generation = generation;
+        Some(kept)
+    });
+    let mut stats = PAINT_SCROLL_PLAN_STATS.with(std::cell::Cell::get);
+    let kept = match kept {
+        Some(kept) => {
+            stats.0 += 1;
+            if paint_scroll_plan_mode() == 2 && build_scroll_plan(flat) != *kept.plan {
+                stats.2 += 1;
+                eprintln!(
+                    "[paint-scroll-plan-verify] kept plan differs at generation {generation}"
+                );
+            }
+            kept
+        }
+        None => {
+            stats.1 += 1;
+            PaintScrollPlan {
+                generation,
+                body_host,
+                inputs: flat
+                    .iter()
+                    .map(|info| paint_scroll_input(info, body_host))
+                    .collect(),
+                plan: std::rc::Rc::new(build_scroll_plan(flat)),
+            }
+        }
+    };
+    PAINT_SCROLL_PLAN_STATS.with(|cell| cell.set(stats));
+    let plan = kept.plan.clone();
+    PAINT_SCROLL_PLAN.with(|slot| *slot.borrow_mut() = Some(kept));
+    scroll_containers_with_plan(layouts, flat, viewport, layout_slot, &plan)
+}
+
+fn scroll_containers_with_plan(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+    layout_slot: &[u32],
+    plan: &ScrollPlan,
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
     debug_assert_eq!(layout_slot, layout_slots(layouts, flat.len()));
     let slot_of = |index: usize| {
         layout_slot
@@ -21136,7 +21290,6 @@ fn scroll_containers_with_slots(
             .filter(|slot| **slot != u32::MAX)
             .map(|slot| *slot as usize)
     };
-    let plan = scroll_plan(flat);
     let mut shifted = None::<Vec<(LayoutRect, usize)>>;
     for &(index, shift) in &plan.shifts {
         if let Some(slot) = slot_of(index) {
