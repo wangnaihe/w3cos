@@ -674,7 +674,7 @@ mod tests {
                             &face,
                             crate::layout::layout_font(),
                             None,
-                            fragments.get(&index),
+                            fragments.get(&index).map(|fragment| &**fragment),
                             &owner,
                         );
                     }

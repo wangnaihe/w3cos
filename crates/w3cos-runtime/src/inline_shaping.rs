@@ -513,7 +513,7 @@ pub(crate) fn build(
     artifact: &PaintArtifact,
     clients: impl Iterator<Item = usize>,
     face: &Typeface,
-) -> HashMap<usize, Fragment> {
+) -> HashMap<usize, std::rc::Rc<Fragment>> {
     build_with_index(artifact, clients, face, &index(artifact))
 }
 
@@ -522,7 +522,7 @@ pub(crate) fn build_with_index(
     clients: impl Iterator<Item = usize>,
     face: &Typeface,
     shaping_index: &ShapingIndex,
-) -> HashMap<usize, Fragment> {
+) -> HashMap<usize, std::rc::Rc<Fragment>> {
     let clients = clients.collect::<HashSet<_>>();
     let is_quote_word = |index: usize| shaping_index.is_quote_word(artifact, index);
     let inline_owner = |mut parent: usize| -> Option<usize> {
@@ -583,8 +583,27 @@ pub(crate) fn build_with_index(
                 .children_of(artifact, *parent)
                 .map(|children| (*parent, children))
         });
+    let cache_mode = owner_shape_cache_mode();
+    let cache_frame = (cache_mode != 0).then(|| OwnerShapeFrame {
+        face_id: face.unique_id(),
+        revision: crate::font_face::FontRegistry::global().revision(),
+    });
     let mut result = HashMap::new();
     for (parent, children) in siblings {
+        let cached = cache_frame
+            .as_ref()
+            .and_then(|frame| owner_shape_cache_get(artifact, parent, &children, &clients, frame));
+        if cache_mode == 1 && cached.is_some() {
+            result.extend(
+                cached
+                    .unwrap()
+                    .into_iter()
+                    .map(|(offset, fragment)| (parent + offset as usize, fragment)),
+            );
+            continue;
+        }
+        let mut owner_fragments: Vec<(usize, std::rc::Rc<Fragment>)> = Vec::new();
+        let mut group_firsts = Vec::new();
         let eligible = |index: usize| {
             artifact.rect_by_index[index].is_some_and(|rect| {
                 rect.width > 0.0 && {
@@ -642,12 +661,277 @@ pub(crate) fn build_with_index(
             }
             if let Some(mut fragments) = shape_group(&children[start..end], artifact, face) {
                 share_source_decoration(&mut fragments, artifact, &clients);
-                result.extend(fragments);
+                group_firsts.push(children[start]);
+                owner_fragments.extend(
+                    fragments
+                        .into_iter()
+                        .map(|(index, fragment)| (index, std::rc::Rc::new(fragment))),
+                );
             }
             start = end;
         }
+        if let Some(frame) = &cache_frame {
+            if let Some(cached) = cached {
+                // verify: the reused fragments must be the ones just shaped.
+                let same = cached.len() == owner_fragments.len()
+                    && cached
+                        .iter()
+                        .zip(&owner_fragments)
+                        .all(|((offset, a), (index, b))| {
+                            parent + *offset as usize == *index && same_fragment(a, b)
+                        });
+                if !same {
+                    eprintln!("[owner-shape-cache] mismatch: owner {parent}");
+                    OWNER_SHAPE_CACHE_MISMATCHES.with(|count| count.set(count.get() + 1));
+                }
+            }
+            owner_shape_cache_put(
+                artifact,
+                parent,
+                &children,
+                &clients,
+                frame,
+                &owner_fragments,
+                &group_firsts,
+            );
+        }
+        result.extend(owner_fragments);
     }
     result
+}
+
+/// `W3COS_OWNER_SHAPE_CACHE=1` (default off): keep each inline formatting
+/// context's shaped glyph fragments across frames, like Blink keeps an
+/// NGInlineNode's ShapeResult and a cached drawing for an unchanged client.
+/// A re-recorded layer reuses an owner's fragments when everything they are
+/// derived from is unchanged: the owner's style, its children (relative
+/// offsets, kind, shared style, their parents' styles, x, width and the
+/// vertical offset from the first child), which children are clients of
+/// this recording, the face and the font registry revision, and the
+/// ancestor-decoration test of each shared source decoration. Fragments
+/// carry no y, so a box that only moves vertically keeps its glyphs.
+/// `=verify` shapes anyway and compares.
+fn owner_shape_cache_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_OWNER_SHAPE_CACHE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+struct OwnerShapeFrame {
+    face_id: skia_safe::typeface::TypefaceId,
+    revision: u64,
+}
+
+struct OwnerShapeChild {
+    offset: u32,
+    parent_offset: Option<u32>,
+    /// The parent's style when it is not the owner (a transparent quote
+    /// word between them).
+    parent_style: Option<w3cos_std::component::ComponentStyle>,
+    style: w3cos_std::component::ComponentStyle,
+    kind: ComponentKind,
+    /// x, width, y - first child's y.
+    rect: Option<(f32, f32, f32)>,
+    client: bool,
+}
+
+struct OwnerShapeEntry {
+    owner_style: w3cos_std::component::ComponentStyle,
+    face_id: skia_safe::typeface::TypefaceId,
+    revision: u64,
+    children: Vec<OwnerShapeChild>,
+    /// Per shared source decoration: its first fragment and whether its
+    /// ancestors applied no text decoration.
+    decorated_firsts: Vec<(u32, bool)>,
+    fragments: Vec<(u32, std::rc::Rc<Fragment>)>,
+}
+
+thread_local! {
+    static OWNER_SHAPE_CACHE: std::cell::RefCell<HashMap<u64, OwnerShapeEntry, w3cos_std::fxhash::FxBuildHasher>> = Default::default();
+    static OWNER_SHAPE_CACHE_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn owner_shape_key(artifact: &PaintArtifact, owner: usize, children: &[usize]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
+    (artifact.nodes[owner].style.as_style() as *const Style as usize).hash(&mut hasher);
+    children.len().hash(&mut hasher);
+    for &child in children.iter().take(2) {
+        (child - owner).hash(&mut hasher);
+        if let ComponentKind::Text { content } = &artifact.nodes[child].kind {
+            content.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn owner_shape_child_rect(
+    artifact: &PaintArtifact,
+    index: usize,
+    base_y: f32,
+) -> Option<(f32, f32, f32)> {
+    artifact.rect_by_index[index].map(|rect| (rect.x, rect.width, rect.y - base_y))
+}
+
+fn owner_shape_base_y(artifact: &PaintArtifact, children: &[usize]) -> f32 {
+    children
+        .first()
+        .and_then(|&first| artifact.rect_by_index[first])
+        .map_or(0.0, |rect| rect.y)
+}
+
+fn owner_shape_cache_get(
+    artifact: &PaintArtifact,
+    owner: usize,
+    children: &[usize],
+    clients: &HashSet<usize>,
+    frame: &OwnerShapeFrame,
+) -> Option<Vec<(u32, std::rc::Rc<Fragment>)>> {
+    let key = owner_shape_key(artifact, owner, children);
+    OWNER_SHAPE_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let entry = cache.get(&key)?;
+        if entry.face_id != frame.face_id
+            || entry.revision != frame.revision
+            || !entry.owner_style.ptr_eq(&artifact.nodes[owner].style)
+            || entry.children.len() != children.len()
+        {
+            return None;
+        }
+        let base_y = owner_shape_base_y(artifact, children);
+        for (known, &child) in entry.children.iter().zip(children) {
+            let node = &artifact.nodes[child];
+            let parent_offset = node.parent.map(|parent| parent.wrapping_sub(owner) as u32);
+            if known.offset as usize != child - owner
+                || known.parent_offset != parent_offset
+                || !known.style.ptr_eq(&node.style)
+                || known.client != clients.contains(&child)
+                || known.rect != owner_shape_child_rect(artifact, child, base_y)
+                || known.kind != node.kind
+            {
+                return None;
+            }
+            match (&known.parent_style, node.parent) {
+                (None, Some(parent)) if parent == owner => {}
+                (Some(style), Some(parent)) if parent != owner => {
+                    if !style.ptr_eq(&artifact.nodes[parent].style) {
+                        return None;
+                    }
+                }
+                (None, None) => {}
+                _ => return None,
+            }
+        }
+        for &(first, undecorated) in &entry.decorated_firsts {
+            if artifact
+                .ancestor_text_decorations(owner + first as usize)
+                .is_empty()
+                != undecorated
+            {
+                return None;
+            }
+        }
+        Some(entry.fragments.clone())
+    })
+}
+
+fn owner_shape_cache_put(
+    artifact: &PaintArtifact,
+    owner: usize,
+    children: &[usize],
+    clients: &HashSet<usize>,
+    frame: &OwnerShapeFrame,
+    fragments: &[(usize, std::rc::Rc<Fragment>)],
+    group_firsts: &[usize],
+) {
+    let base_y = owner_shape_base_y(artifact, children);
+    let children_keys = children
+        .iter()
+        .map(|&child| {
+            let node = &artifact.nodes[child];
+            OwnerShapeChild {
+                offset: (child - owner) as u32,
+                parent_offset: node.parent.map(|parent| parent.wrapping_sub(owner) as u32),
+                parent_style: node
+                    .parent
+                    .filter(|parent| *parent != owner)
+                    .map(|parent| artifact.nodes[parent].style.clone()),
+                style: node.style.clone(),
+                kind: node.kind.clone(),
+                rect: owner_shape_child_rect(artifact, child, base_y),
+                client: clients.contains(&child),
+            }
+        })
+        .collect();
+    // share_source_decoration reads a group's ancestor decorations only
+    // for an undecorated source-run piece at its start.
+    let decorated_firsts = group_firsts
+        .iter()
+        .filter(|&&first| {
+            let style = &artifact.nodes[first].style;
+            style.text_decoration == w3cos_std::style::TextDecoration::None
+                && style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
+                })
+        })
+        .map(|&first| {
+            (
+                (first - owner) as u32,
+                artifact.ancestor_text_decorations(first).is_empty(),
+            )
+        })
+        .collect();
+    let entry = OwnerShapeEntry {
+        owner_style: artifact.nodes[owner].style.clone(),
+        face_id: frame.face_id,
+        revision: frame.revision,
+        children: children_keys,
+        decorated_firsts,
+        fragments: fragments
+            .iter()
+            .map(|(index, fragment)| ((*index - owner) as u32, fragment.clone()))
+            .collect(),
+    };
+    let key = owner_shape_key(artifact, owner, children);
+    OWNER_SHAPE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 1 << 15 {
+            cache.clear();
+        }
+        cache.insert(key, entry);
+    });
+}
+
+fn same_slice(a: &GlyphSlice, b: &GlyphSlice) -> bool {
+    a.origin_x.to_bits() == b.origin_x.to_bits()
+        && a.face.unique_id() == b.face.unique_id()
+        && a.glyphs == b.glyphs
+        && a.positions == b.positions
+        && a.glyph_font_sizes == b.glyph_font_sizes
+}
+
+fn same_fragment(a: &Fragment, b: &Fragment) -> bool {
+    a.source_x.to_bits() == b.source_x.to_bits()
+        && a.ascent.to_bits() == b.ascent.to_bits()
+        && a.runs.len() == b.runs.len()
+        && a.runs.iter().zip(&b.runs).all(|(a, b)| same_slice(a, b))
+        && match (&a.decoration, &b.decoration) {
+            (None, None) => true,
+            (Some((a, a_first, a_last)), Some((b, b_first, b_last))) => {
+                a_first == b_first
+                    && a_last == b_last
+                    && a.x.to_bits() == b.x.to_bits()
+                    && a.width.to_bits() == b.width.to_bits()
+                    && a.runs.len() == b.runs.len()
+                    && a.runs.iter().zip(&b.runs).all(|(a, b)| same_slice(a, b))
+            }
+            _ => false,
+        }
 }
 
 fn share_source_decoration(

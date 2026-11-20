@@ -1943,20 +1943,22 @@ fn paint_display_list_with_suppressed_effects(
                 // Replay can combine several source words under the first client
                 // ID. That ID's original glyph slice no longer describes the new
                 // Text; reshape it instead of silently painting only the first word.
-                shaped_fragments.get(&idx).filter(|_| {
-                    frame.artifact.is_some_and(|artifact| {
-                        artifact
-                            .nodes
-                            .get(idx)
-                            .is_some_and(|source| match (kind, &source.kind) {
-                                (
-                                    ComponentKind::Text { content },
-                                    ComponentKind::Text { content: original },
-                                ) => content == original,
-                                _ => false,
+                shaped_fragments
+                    .get(&idx)
+                    .map(|fragment| &**fragment)
+                    .filter(|_| {
+                        frame.artifact.is_some_and(|artifact| {
+                            artifact.nodes.get(idx).is_some_and(|source| {
+                                match (kind, &source.kind) {
+                                    (
+                                        ComponentKind::Text { content },
+                                        ComponentKind::Text { content: original },
+                                    ) => content == original,
+                                    _ => false,
+                                }
                             })
-                    })
-                }),
+                        })
+                    }),
                 &applied_decorations,
                 frame.artifact.and_then(|artifact| {
                     terminal_inline_padding_fragment(artifact, idx, render_rect)
