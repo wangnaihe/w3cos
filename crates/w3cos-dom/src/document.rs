@@ -17075,8 +17075,24 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             text.push(control);
             logical.push((control, unit_index));
         }
+        // `unicode-bidi: bidi-override` applies to every line of the element.
+        // A preserved newline is a paragraph separator to UAX #9, which would
+        // drop the override after the first line. Feed the bidi pass a
+        // segment separator instead; line breaking still sees the newline.
+        let override_across_lines = matches!(
+            component.style.unicode_bidi,
+            UnicodeBidi::BidiOverride | UnicodeBidi::IsolateOverride
+        ) && matches!(
+            component.style.white_space,
+            WhiteSpace::Pre | WhiteSpace::PreWrap
+        ) && !component.style.break_spaces;
         for character in unit.content.chars() {
-            text.push(character);
+            let bidi_character = if override_across_lines && character == '\n' {
+                '\u{000B}'
+            } else {
+                character
+            };
+            text.push(bidi_character);
             logical.push((character, unit_index));
             if character == '\u{202c}'
                 && component.style.flex_wrap != FlexWrap::NoWrap
@@ -17211,6 +17227,15 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             Dimension::Px(width) => Some(width),
             Dimension::Em(width) => Some(width * component.style.font_size),
             Dimension::Rem(width) => Some(width * 16.0),
+            // pre-wrap hanging tests size the line in `ch`. Use the same
+            // advance layout uses for the used width, so the estimate and
+            // the line box agree. break-spaces does not hang.
+            Dimension::Ch(width)
+                if component.style.white_space == WhiteSpace::PreWrap
+                    && !component.style.break_spaces =>
+            {
+                Some(width * component.style.ch_advance())
+            }
             _ => None,
         };
         width.map(|mut width| {
@@ -17314,9 +17339,19 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         let mut line_start = words[0].start;
         let mut line_end = words[0].end;
         let mut line_width = advances[words[0].clone()].iter().sum::<f32>();
+        // A preserved newline is a forced break (CSS Text 3). break-spaces
+        // keeps its previous gap treatment and does not hang.
+        let preserved_newline = matches!(
+            component.style.white_space,
+            WhiteSpace::Pre | WhiteSpace::PreWrap
+        ) && !component.style.break_spaces;
         for word in words.into_iter().skip(1) {
+            let forced = preserved_newline
+                && logical[line_end..word.start]
+                    .iter()
+                    .any(|(character, _)| *character == '\n');
             let candidate_width = advances[line_end..word.end].iter().sum::<f32>();
-            if line_width + candidate_width > width {
+            if forced || line_width + candidate_width > width {
                 ranges.push(line_start..line_end);
                 line_start = word.start;
                 line_width = advances[word.clone()].iter().sum::<f32>();
@@ -17587,6 +17622,19 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             break_style.border_left_width = None;
             break_style.background = w3cos_std::Color::TRANSPARENT;
             break_style.background_image = None;
+            // A `ch`-width pre-wrap line break is a frozen estimate. Give it
+            // the paragraph's white-space and font so LayoutNG can keep the
+            // line instead of bailing on a mismatched break.
+            if component.style.white_space == WhiteSpace::PreWrap && !component.style.break_spaces {
+                break_style.white_space = component.style.white_space;
+                break_style.font_family = component.style.font_family.clone();
+                break_style.font_size = component.style.font_size;
+                break_style.font_weight = component.style.font_weight;
+                break_style.font_style = component.style.font_style;
+                break_style.line_height = component.style.line_height;
+                break_style.line_height_is_normal = component.style.line_height_is_normal;
+                mark_bidi_visual_order(&mut break_style);
+            }
             normalized.push(w3cos_std::Component::text_shared("\u{2028}", break_style));
         } else if starts_new_line
             && fragment.line_index > 0

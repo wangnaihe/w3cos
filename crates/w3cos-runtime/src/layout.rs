@@ -3948,9 +3948,22 @@ pub(crate) fn install_font_unit_provider() {
         #[cfg(feature = "skia")]
         let advance = crate::render_skia::measure_skia_font_zero_advance(&font_style);
         #[cfg(not(feature = "skia"))]
-        let advance = layout_font()
-            .metrics('0', font_style.font_size)
-            .advance_width;
+        let advance = if font_style.font_family.as_deref().is_some_and(|families| {
+            families.split(',').any(|family| {
+                family
+                    .trim()
+                    .trim_matches(['"', '\''])
+                    .eq_ignore_ascii_case("ahem")
+            })
+        }) {
+            // WPT Ahem defines ch as 1em. Skia already returns font-size for
+            // that family; the CPU face's measured '0' is not one em.
+            font_style.font_size
+        } else {
+            layout_font()
+                .metrics('0', font_style.font_size)
+                .advance_width
+        };
         if advance.is_finite() && advance >= 0.0 {
             CH_ADVANCE_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
