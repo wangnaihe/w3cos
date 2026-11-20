@@ -621,10 +621,153 @@ fn paint_damage_spans_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_SPANS").map_or(true, |v| v != "0"))
 }
 
+/// Per client of the artifact whose serial is `serial`, its
+/// `client_ink_bounds` (`W3COS_PAINT_DAMAGE_INK_CACHE`).
+struct InkCache {
+    serial: u64,
+    /// `None`: not measured yet (measure in the previous artifact).
+    ink: Vec<Option<Ink>>,
+}
+
+type Ink = Result<Option<LayoutRect>, ()>;
+
+/// Where `paint_damage_with` reads a client's old ink and records its new.
+trait InkSource {
+    fn old(&mut self, prev: &PaintArtifact, index: usize) -> Ink;
+    fn store(&mut self, index: usize, ink: Ink);
+}
+
+/// Measure every time, keep nothing.
+struct MeasureInk;
+
+impl InkSource for MeasureInk {
+    #[inline(always)]
+    fn old(&mut self, prev: &PaintArtifact, index: usize) -> Ink {
+        client_ink_bounds(prev, index)
+    }
+    #[inline(always)]
+    fn store(&mut self, _index: usize, _ink: Ink) {}
+}
+
+impl InkSource for Vec<Option<Ink>> {
+    #[inline]
+    fn old(&mut self, prev: &PaintArtifact, index: usize) -> Ink {
+        match self[index] {
+            Some(ink) => ink,
+            None => client_ink_bounds(prev, index),
+        }
+    }
+    #[inline]
+    fn store(&mut self, index: usize, ink: Ink) {
+        self[index] = Some(ink);
+    }
+}
+
+thread_local! {
+    static INK_CACHE: std::cell::RefCell<Option<InkCache>> = const { std::cell::RefCell::new(None) };
+    static INK_CACHE_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `W3COS_PAINT_DAMAGE_INK_CACHE=1`: keep each client's ink bounds from
+/// the previous frame, so a moved client's old ink is a lookup and its new
+/// ink is the old one shifted by the move (Blink keeps each fragment's
+/// visual rect the same way), instead of measuring every moved box twice.
+/// `=verify` also measures and compares (within 0.01 px: a shifted rect may
+/// round differently from a measured one).
+fn ink_cache_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_DAMAGE_INK_CACHE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+fn ink_close(a: Result<Option<LayoutRect>, ()>, b: Result<Option<LayoutRect>, ()>) -> bool {
+    match (a, b) {
+        (Ok(Some(a)), Ok(Some(b))) => {
+            (a.x - b.x).abs() <= 0.01
+                && (a.y - b.y).abs() <= 0.01
+                && (a.width - b.width).abs() <= 0.01
+                && (a.height - b.height).abs() <= 0.01
+        }
+        (a, b) => a == b,
+    }
+}
+
 pub fn paint_damage(
     prev: &PaintArtifact,
     cur: &PaintArtifact,
     diff: &PaintDiff,
+) -> Option<Vec<ClientDamage>> {
+    let mode = ink_cache_mode();
+    if mode == 0 {
+        return paint_damage_with(prev, cur, diff, &mut MeasureInk);
+    }
+    INK_CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let mut cache = slot
+            .take()
+            .filter(|cache| cache.serial == prev.serial() && cache.ink.len() == prev.nodes.len())
+            .unwrap_or_else(|| InkCache {
+                serial: prev.serial(),
+                ink: vec![None; prev.nodes.len()],
+            });
+        if mode == 2 {
+            let mut bad = 0;
+            for (index, ink) in cache.ink.iter_mut().enumerate() {
+                let measured = client_ink_bounds(prev, index);
+                if let Some(kept) = *ink
+                    && !ink_close(kept, measured)
+                {
+                    bad += 1;
+                    *ink = Some(measured);
+                }
+            }
+            if bad > 0 {
+                eprintln!("[ink-cache-verify] mismatch: {bad} clients' ink bounds differ");
+                INK_CACHE_MISMATCHES.with(|count| count.set(count.get() + bad));
+            }
+        }
+        // Clients past `prev`'s painted nothing there.
+        cache.ink.resize(cur.nodes.len(), Some(Ok(None)));
+        let damage = paint_damage_with(prev, cur, diff, &mut cache.ink);
+        // Bounded: every changed client's entry now holds its `cur` ink.
+        // Unbounded: the walk stopped part way, so drop the cache.
+        if damage.is_some() {
+            cache.serial = cur.serial();
+            *slot = Some(cache);
+        }
+        damage
+    })
+}
+
+/// The first client at or after `from` that changed or moved (`len` when
+/// none does). Clients past `diff`'s tables count as changed.
+#[inline(never)]
+fn next_changed_client(diff: &PaintDiff, from: usize, len: usize) -> usize {
+    let known = len.min(diff.dirty.len()).min(diff.moved.len());
+    let (dirty, moved) = (&diff.dirty[..known], &diff.moved[..known]);
+    let mut index = from;
+    while index < known {
+        if dirty[index] || moved[index].is_some() {
+            return index;
+        }
+        index += 1;
+    }
+    index.max(from).min(len)
+}
+
+/// `paint_damage`, reading old ink from `ink` (`prev`'s per client) when
+/// given and advancing it to `cur`'s: changed clients are measured, moved
+/// ones shift, the rest keep theirs.
+fn paint_damage_with<S: InkSource>(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    diff: &PaintDiff,
+    ink: &mut S,
 ) -> Option<Vec<ClientDamage>> {
     let spans = paint_damage_spans_enabled();
     let mut damage = Vec::new();
@@ -641,7 +784,22 @@ pub fn paint_damage(
             damage.push((first, end, union_rect(old, new)));
         }
     };
-    for index in 0..cur.nodes.len() {
+    let shifted = |old: Option<LayoutRect>, (dx, dy): (f32, f32)| {
+        old.map(|old| LayoutRect {
+            x: old.x + dx,
+            y: old.y + dy,
+            ..old
+        })
+    };
+    let len = cur.nodes.len();
+    let mut next = 0;
+    while next < len {
+        // Skip the clients that neither changed nor moved in one tight scan.
+        let index = next_changed_client(diff, next, len);
+        if index >= len {
+            break;
+        }
+        next = index + 1;
         let dirty = diff.dirty.get(index).copied().unwrap_or(true);
         // A client that only moved (`moved_by`: same style, properties,
         // size and display items relative to its box) paints its old ink
@@ -649,10 +807,7 @@ pub fn paint_damage(
         let shift = if dirty {
             None
         } else {
-            match diff.moved.get(index).copied().flatten() {
-                Some(delta) => Some(delta),
-                None => continue,
-            }
+            diff.moved.get(index).copied().flatten()
         };
         if prev.sticky_owner.get(index).copied().flatten().is_some()
             || cur.sticky_owner.get(index).copied().flatten().is_some()
@@ -664,16 +819,18 @@ pub fn paint_damage(
         if shift.is_none()
             && let Some(strips) = resized_box_damage(prev, cur, index)
         {
+            ink.store(index, client_ink_bounds(cur, index));
             flush(&mut span, &mut damage);
             damage.extend(strips.into_iter().map(|strip| (index, index + 1, strip)));
             continue;
         }
-        let old = client_ink_bounds(prev, index).ok()?;
-        if spans && let Some((dx, dy)) = shift {
+        let old = ink.old(prev, index).ok()?;
+        if spans && let Some(delta) = shift {
+            ink.store(index, Ok(shifted(old, delta)));
             let Some(old) = old else {
                 continue;
             };
-            let bits = (dx.to_bits(), dy.to_bits());
+            let bits = (delta.0.to_bits(), delta.1.to_bits());
             match &mut span {
                 Some((_, end, offset, _, union)) if *end == index && *offset == bits => {
                     *end = index + 1;
@@ -681,20 +838,17 @@ pub fn paint_damage(
                 }
                 _ => {
                     flush(&mut span, &mut damage);
-                    span = Some((index, index + 1, bits, (dx, dy), old));
+                    span = Some((index, index + 1, bits, delta, old));
                 }
             }
             continue;
         }
         flush(&mut span, &mut damage);
         let new = match shift {
-            Some((dx, dy)) => old.map(|old| LayoutRect {
-                x: old.x + dx,
-                y: old.y + dy,
-                ..old
-            }),
+            Some(delta) => shifted(old, delta),
             None => client_ink_bounds(cur, index).ok()?,
         };
+        ink.store(index, Ok(new));
         match (old, new) {
             (None, None) => {}
             // It painted and now does not: no current layer places it.
