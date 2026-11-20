@@ -1424,7 +1424,20 @@ pub(crate) fn image_intrinsic_size(
             // apply, so the used width is the default object size. It is a
             // constant, not the containing block width - only the *ratio*
             // rule above derives the width from the containing block.
-            (None, None, _) => (300.0, 150.0),
+            //
+            // A `data:` SVG we have only parsed (no raster) is still the
+            // undecoded 200×200 placeholder. Treating it as 300×150 makes a
+            // column flex item scale that box like a ratio
+            // (flex-svg-no-intrinsic-column-001). A rasterized SVG keeps
+            // the 300×150 default object size.
+            (None, None, _) => {
+                let raster = crate::image_loader::dimensions(src);
+                if raster.is_none_or(|(width, height)| width == 0 || height == 0) {
+                    (200.0, 200.0)
+                } else {
+                    (300.0, 150.0)
+                }
+            }
         }
     } else {
         decoded
