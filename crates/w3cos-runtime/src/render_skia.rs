@@ -877,10 +877,13 @@ thread_local! {
     static CULL_INCREMENTAL_MISMATCHES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// `W3COS_CULL_INCREMENTAL=1`: update last frame's cull extents for the
-/// nodes the artifact did not copy as aligned runs, instead of rebuilding
-/// them for the whole document every frame (Blink keeps cached subsequences'
-/// visual rects the same way). `=verify` also builds in full and compares.
+/// `W3COS_CULL_INCREMENTAL` (on by default; `=0` turns it off): update
+/// last frame's cull extents for the nodes the artifact did not copy as
+/// aligned runs, instead of rebuilding them for the whole document every
+/// frame (Blink keeps cached subsequences' visual rects the same way).
+/// `=verify` also builds in full and compares. Last-message stream frame
+/// -5.7% (15/16 rounds) and -3.3% (12/16) wall, on-screen frame -0.1% and
+/// -2.0% (9/16 each).
 fn cull_incremental_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = CULL_INCREMENTAL_OVERRIDE.with(Cell::get) {
@@ -889,9 +892,9 @@ fn cull_incremental_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_CULL_INCREMENTAL").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
