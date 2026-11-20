@@ -235,7 +235,13 @@ impl Fragment {
 
 /// The artifact-wide inputs of [`build`]: they read every node, so a frame
 /// that records several layers computes them once, not once per layer.
+/// With `W3COS_SHAPING_INDEX_LAZY` they are found per queried owner instead.
 pub(crate) struct ShapingIndex {
+    eager: Option<EagerShapingIndex>,
+    lazy: Option<std::cell::RefCell<LazyShapingIndex>>,
+}
+
+struct EagerShapingIndex {
     quote_words: HashSet<usize, w3cos_std::fxhash::FxBuildHasher>,
     /// Per inline owner, its children in tree order: one list of children
     /// grouped by owner, and each owner's range in it (built per frame from
@@ -244,14 +250,191 @@ pub(crate) struct ShapingIndex {
     owner_ranges: Vec<(u32, u32)>,
 }
 
+/// Per-frame memo of what a query has scanned.
+#[derive(Default)]
+struct LazyShapingIndex {
+    quote_words: HashMap<usize, bool, w3cos_std::fxhash::FxBuildHasher>,
+    children: HashMap<usize, std::rc::Rc<[usize]>, w3cos_std::fxhash::FxBuildHasher>,
+    /// Start of the paint-only nodes appended after the source nodes.
+    paint_only_start: Option<usize>,
+}
+
+/// An owner's children (see [`ShapingIndex::children_of`]).
+pub(crate) enum OwnerChildren<'a> {
+    Borrowed(&'a [usize]),
+    Shared(std::rc::Rc<[usize]>),
+}
+
+impl std::ops::Deref for OwnerChildren<'_> {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] {
+        match self {
+            OwnerChildren::Borrowed(children) => children,
+            OwnerChildren::Shared(children) => children,
+        }
+    }
+}
+
+thread_local! {
+    static SHAPING_INDEX_LAZY_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `W3COS_SHAPING_INDEX_LAZY=1` (default off): instead of indexing every
+/// node's inline owner each frame, scan only the subtrees of the owners the
+/// recorded layers ask about (preorder: an owner's subtree is the run after
+/// it whose parents are at or after it, plus the paint-only tail).
+/// `=verify` builds both and compares every answer.
+fn shaping_index_lazy_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_SHAPING_INDEX_LAZY").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+const GENERATED_QUOTE: &str = "--w3cos-internal-generated-quote";
+const UNBROKEN_WORD: &str = "--w3cos-internal-unbroken-inline-word";
+
+fn has_property(artifact: &PaintArtifact, index: usize, key: &str) -> bool {
+    artifact.nodes[index]
+        .style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|p| p.contains_key(key))
+}
+
+impl LazyShapingIndex {
+    fn paint_only_start(&mut self, artifact: &PaintArtifact) -> usize {
+        *self.paint_only_start.get_or_insert_with(|| {
+            let mut start = artifact.nodes.len();
+            while start > 0 && artifact.nodes[start - 1].is_paint_only() {
+                start -= 1;
+            }
+            start
+        })
+    }
+
+    /// The nodes after `owner` in its preorder subtree, then the
+    /// paint-only tail (whose parents may sit anywhere).
+    fn subtree(&mut self, artifact: &PaintArtifact, owner: usize) -> (usize, usize, usize) {
+        let tail = self.paint_only_start(artifact);
+        let mut end = owner + 1;
+        while end < tail
+            && artifact.nodes[end]
+                .parent
+                .is_some_and(|parent| parent >= owner)
+        {
+            end += 1;
+        }
+        (end, tail, artifact.nodes.len())
+    }
+
+    fn is_quote_word(&mut self, artifact: &PaintArtifact, index: usize) -> bool {
+        if index >= artifact.nodes.len() || !has_property(artifact, index, UNBROKEN_WORD) {
+            return false;
+        }
+        if let Some(&known) = self.quote_words.get(&index) {
+            return known;
+        }
+        let (end, tail, len) = self.subtree(artifact, index);
+        let found = (index + 1..end).chain(tail.max(end)..len).any(|child| {
+            artifact.nodes[child].parent == Some(index)
+                && has_property(artifact, child, GENERATED_QUOTE)
+        });
+        self.quote_words.insert(index, found);
+        found
+    }
+
+    fn inline_owner(&mut self, artifact: &PaintArtifact, mut parent: usize) -> Option<usize> {
+        while self.is_quote_word(artifact, parent) {
+            parent = artifact.nodes[parent].parent?;
+        }
+        Some(parent)
+    }
+
+    fn children_of(&mut self, artifact: &PaintArtifact, owner: usize) -> std::rc::Rc<[usize]> {
+        if let Some(children) = self.children.get(&owner) {
+            return children.clone();
+        }
+        let (end, tail, len) = self.subtree(artifact, owner);
+        let mut children = Vec::new();
+        for index in (owner + 1..end).chain(tail.max(end)..len) {
+            if self.is_quote_word(artifact, index) {
+                continue;
+            }
+            let Some(parent) = artifact.nodes[index].parent else {
+                continue;
+            };
+            if self.inline_owner(artifact, parent) == Some(owner) {
+                children.push(index);
+            }
+        }
+        let children: std::rc::Rc<[usize]> = children.into();
+        self.children.insert(owner, children.clone());
+        children
+    }
+}
+
 impl ShapingIndex {
-    fn children_of(&self, owner: usize) -> Option<&[usize]> {
-        let &(start, len) = self.owner_ranges.get(owner)?;
-        (len > 0).then(|| &self.owner_children[start as usize..(start + len) as usize])
+    pub(crate) fn is_quote_word(&self, artifact: &PaintArtifact, index: usize) -> bool {
+        let eager = self
+            .eager
+            .as_ref()
+            .map(|eager| eager.quote_words.contains(&index));
+        let Some(lazy) = &self.lazy else {
+            return eager.unwrap_or(false);
+        };
+        let found = lazy.borrow_mut().is_quote_word(artifact, index);
+        if let Some(eager) = eager
+            && eager != found
+        {
+            eprintln!("[shaping-index-lazy] mismatch: quote word {index}");
+            SHAPING_INDEX_LAZY_MISMATCHES.with(|count| count.set(count.get() + 1));
+            return eager;
+        }
+        found
+    }
+
+    pub(crate) fn children_of(
+        &self,
+        artifact: &PaintArtifact,
+        owner: usize,
+    ) -> Option<OwnerChildren<'_>> {
+        let eager = self.eager.as_ref().map(|eager| {
+            eager.owner_ranges.get(owner).and_then(|&(start, len)| {
+                (len > 0).then(|| &eager.owner_children[start as usize..(start + len) as usize])
+            })
+        });
+        let Some(lazy) = &self.lazy else {
+            return eager.flatten().map(OwnerChildren::Borrowed);
+        };
+        if owner >= artifact.nodes.len() {
+            return None;
+        }
+        let found = lazy.borrow_mut().children_of(artifact, owner);
+        if let Some(eager) = eager {
+            if eager.unwrap_or(&[]) != &found[..] {
+                eprintln!("[shaping-index-lazy] mismatch: children of {owner}");
+                SHAPING_INDEX_LAZY_MISMATCHES.with(|count| count.set(count.get() + 1));
+            }
+            return eager.map(OwnerChildren::Borrowed);
+        }
+        (!found.is_empty()).then_some(OwnerChildren::Shared(found))
     }
 }
 
 pub(crate) fn index(artifact: &PaintArtifact) -> ShapingIndex {
+    let mode = shaping_index_lazy_mode();
+    ShapingIndex {
+        eager: (mode != 1).then(|| eager_index(artifact)),
+        lazy: (mode != 0).then(Default::default),
+    }
+}
+
+fn eager_index(artifact: &PaintArtifact) -> EagerShapingIndex {
     // No-break quote words constrain line fitting, not the shaping extent
     // of the adjacent authored text. Recover the transparent word's inline
     // owner so its text can share glyph slices with later spaces/words.
@@ -317,7 +500,7 @@ pub(crate) fn index(artifact: &PaintArtifact) -> ShapingIndex {
             *slot += 1;
         }
     }
-    ShapingIndex {
+    EagerShapingIndex {
         quote_words,
         owner_children,
         owner_ranges,
@@ -339,9 +522,9 @@ pub(crate) fn build_with_index(
     shaping_index: &ShapingIndex,
 ) -> HashMap<usize, Fragment> {
     let clients = clients.collect::<HashSet<_>>();
-    let quote_words = &shaping_index.quote_words;
+    let is_quote_word = |index: usize| shaping_index.is_quote_word(artifact, index);
     let inline_owner = |mut parent: usize| -> Option<usize> {
-        while quote_words.contains(&parent) {
+        while is_quote_word(parent) {
             parent = artifact.nodes[parent].parent?;
         }
         Some(parent)
@@ -362,7 +545,7 @@ pub(crate) fn build_with_index(
         if ![a.parent, b.parent]
             .into_iter()
             .flatten()
-            .any(|parent| quote_words.contains(&parent))
+            .any(|parent| is_quote_word(parent))
         {
             return false;
         }
@@ -378,24 +561,28 @@ pub(crate) fn build_with_index(
         .iter()
         .filter_map(|index| inline_owner(artifact.nodes.get(*index)?.parent?))
         .collect::<HashSet<_>>();
-    let siblings = parents.iter().filter_map(|parent| {
-        shaping_index
-            .children_of(*parent)
-            .map(|children| (*parent, children))
-    });
-    let mut result = HashMap::new();
-    for (parent, children) in siblings {
+    // Only an LTR inline formatting context shapes across its children:
+    // test that before looking its children up.
+    let shapes_children = |parent: usize| {
         let style = &artifact.nodes[parent].style;
-        if !matches!(
+        matches!(
             style.display,
             Display::Block | Display::Flex | Display::Inline
-        ) || style.direction != TextDirection::Ltr
-            || !style.custom_properties.as_ref().is_some_and(|properties| {
+        ) && style.direction == TextDirection::Ltr
+            && style.custom_properties.as_ref().is_some_and(|properties| {
                 properties.contains_key("--w3cos-internal-inline-formatting-context")
             })
-        {
-            continue;
-        }
+    };
+    let siblings = parents
+        .iter()
+        .filter(|parent| shapes_children(**parent))
+        .filter_map(|parent| {
+            shaping_index
+                .children_of(artifact, *parent)
+                .map(|children| (*parent, children))
+        });
+    let mut result = HashMap::new();
+    for (parent, children) in siblings {
         let eligible = |index: usize| {
             artifact.rect_by_index[index].is_some_and(|rect| {
                 rect.width > 0.0 && {
