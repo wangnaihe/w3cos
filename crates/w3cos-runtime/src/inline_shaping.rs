@@ -753,7 +753,7 @@ pub(crate) fn build_with_index(
     result
 }
 
-/// `W3COS_OWNER_SHAPE_CACHE=1` (default off): keep each inline formatting
+/// `W3COS_OWNER_SHAPE_CACHE` (on by default; `=0` turns it off): keep each inline formatting
 /// context's shaped glyph fragments across frames, like Blink keeps an
 /// NGInlineNode's ShapeResult and a cached drawing for an unchanged client.
 /// A re-recorded layer reuses an owner's fragments when everything they are
@@ -763,14 +763,16 @@ pub(crate) fn build_with_index(
 /// this recording, the face and the font registry revision, and the
 /// ancestor-decoration test of each shared source decoration. Fragments
 /// carry no y, so a box that only moves vertically keeps its glyphs.
-/// `=verify` shapes anyway and compares.
+/// `=verify` shapes anyway and compares. Idle 16-round A/B (07:28–07:31
+/// CST Nov 21, same binary): on screen 48.08 -> 46.04 ms (-4.2%, faster in
+/// 13/16 rounds), last message 44.36 -> 41.88 ms (-5.6%, 15/16).
 fn owner_shape_cache_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_OWNER_SHAPE_CACHE").as_deref() {
-            Ok("1") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
