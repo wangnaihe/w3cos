@@ -4606,10 +4606,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// `W3COS_PAINT_TOUCHED=1`: the reusing artifact build trusts the layout
-/// splice's change set and skips the input comparison for boxes it did not
-/// touch. `=verify` also compares and reports (and honours) a difference.
-/// Off by default.
+/// `W3COS_PAINT_TOUCHED` (on by default, `=0` turns it off): the reusing
+/// artifact build trusts the layout splice's change set and skips the input
+/// comparison for boxes it did not touch. `=verify` also compares and
+/// reports (and honours) a difference.
 pub(crate) fn paint_touched_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_TOUCHED_OVERRIDE.with(std::cell::Cell::get) {
@@ -4618,9 +4618,9 @@ pub(crate) fn paint_touched_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_TOUCHED").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
