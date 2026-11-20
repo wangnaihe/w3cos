@@ -608,12 +608,39 @@ pub struct PaintDiff {
 /// frames. `None`: some change cannot be bounded this way (a property-tree
 /// or sticky change, shadows, filters, transforms, or a client that stopped
 /// painting), so the whole frame must be composited.
+/// One raster invalidation rect for the clients `first..end` (document CSS
+/// px; see [`paint_damage`]).
+pub type ClientDamage = (usize, usize, LayoutRect);
+
+/// `W3COS_PAINT_DAMAGE_SPANS=0` turns it off: consecutive clients that only
+/// moved, by one offset, share one damage rect covering their old and new
+/// paint (Blink invalidates a subtree that moved as a whole by its visual
+/// rect, not box by box).
+fn paint_damage_spans_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_SPANS").map_or(true, |v| v != "0"))
+}
+
 pub fn paint_damage(
     prev: &PaintArtifact,
     cur: &PaintArtifact,
     diff: &PaintDiff,
-) -> Option<Vec<(usize, LayoutRect)>> {
+) -> Option<Vec<ClientDamage>> {
+    let spans = paint_damage_spans_enabled();
     let mut damage = Vec::new();
+    // The open run of moved clients: first, end, offset bits, old ink union.
+    let mut span: Option<(usize, usize, (u32, u32), (f32, f32), LayoutRect)> = None;
+    let flush = |span: &mut Option<(usize, usize, (u32, u32), (f32, f32), LayoutRect)>,
+                 damage: &mut Vec<ClientDamage>| {
+        if let Some((first, end, _, (dx, dy), old)) = span.take() {
+            let new = LayoutRect {
+                x: old.x + dx,
+                y: old.y + dy,
+                ..old
+            };
+            damage.push((first, end, union_rect(old, new)));
+        }
+    };
     for index in 0..cur.nodes.len() {
         let dirty = diff.dirty.get(index).copied().unwrap_or(true);
         // A client that only moved (`moved_by`: same style, properties,
@@ -637,10 +664,29 @@ pub fn paint_damage(
         if shift.is_none()
             && let Some(strips) = resized_box_damage(prev, cur, index)
         {
-            damage.extend(strips.into_iter().map(|strip| (index, strip)));
+            flush(&mut span, &mut damage);
+            damage.extend(strips.into_iter().map(|strip| (index, index + 1, strip)));
             continue;
         }
         let old = client_ink_bounds(prev, index).ok()?;
+        if spans && let Some((dx, dy)) = shift {
+            let Some(old) = old else {
+                continue;
+            };
+            let bits = (dx.to_bits(), dy.to_bits());
+            match &mut span {
+                Some((_, end, offset, _, union)) if *end == index && *offset == bits => {
+                    *end = index + 1;
+                    *union = union_rect(*union, old);
+                }
+                _ => {
+                    flush(&mut span, &mut damage);
+                    span = Some((index, index + 1, bits, (dx, dy), old));
+                }
+            }
+            continue;
+        }
+        flush(&mut span, &mut damage);
         let new = match shift {
             Some((dx, dy)) => old.map(|old| LayoutRect {
                 x: old.x + dx,
@@ -653,10 +699,11 @@ pub fn paint_damage(
             (None, None) => {}
             // It painted and now does not: no current layer places it.
             (Some(_), None) => return None,
-            (None, Some(new)) => damage.push((index, new)),
-            (Some(old), Some(new)) => damage.push((index, union_rect(old, new))),
+            (None, Some(new)) => damage.push((index, index + 1, new)),
+            (Some(old), Some(new)) => damage.push((index, index + 1, union_rect(old, new))),
         }
     }
+    flush(&mut span, &mut damage);
     Some(damage)
 }
 
@@ -2112,13 +2159,47 @@ mod tests {
         };
         let damage = paint_damage(&prev, &cur, &diff).expect("bounded");
         assert_eq!(damage.len(), 1);
-        let (client, area) = damage[0];
-        assert_eq!(client, 1);
+        let (client, end, area) = damage[0];
+        assert_eq!((client, end), (1, 2));
         // Both the old (y 80..160) and new (y 120..200) boxes, with margin.
         assert!(area.y <= 80.0 - 16.0 && area.y + area.height >= 200.0 + 16.0);
         assert!(area.x <= -16.0 && area.x + area.width >= 320.0 + 16.0);
         let shadowed = build(120.0, true);
         assert!(paint_damage(&prev, &shadowed, &diff).is_none());
+    }
+
+    #[test]
+    fn consecutive_clients_moved_by_one_offset_share_one_damage_rect() {
+        let node = |parent| PaintNode {
+            kind: ComponentKind::Column,
+            style: Style::default().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let build = |dy: f32| {
+            PaintArtifact::build(
+                [node(None), node(Some(0)), node(Some(0))],
+                &[(rect(0.0), 0), (rect(80.0 + dy), 1), (rect(160.0 + dy), 2)],
+                1,
+            )
+        };
+        let (prev, cur) = (build(0.0), build(40.0));
+        let diff = PaintDiff {
+            dirty: vec![false, false, false],
+            moved: vec![None, Some((0.0, 40.0)), Some((0.0, 40.0))],
+        };
+        let damage = paint_damage(&prev, &cur, &diff).expect("bounded");
+        assert_eq!(damage.len(), 1);
+        let (first, end, area) = damage[0];
+        assert_eq!((first, end), (1, 3));
+        // Old (80..240) and new (120..280) paint of both, with margin.
+        assert!(area.y <= 80.0 - 16.0 && area.y + area.height >= 280.0 + 16.0);
+        // A different offset starts its own rect.
+        let diff = PaintDiff {
+            dirty: vec![false, false, false],
+            moved: vec![None, Some((0.0, 40.0)), Some((0.0, 41.0))],
+        };
+        assert_eq!(paint_damage(&prev, &cur, &diff).expect("bounded").len(), 2);
     }
 
     fn note(tree: &mut RetainedLayerTree, action: LayerPaintAction) {

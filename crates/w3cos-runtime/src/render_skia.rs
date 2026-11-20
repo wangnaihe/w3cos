@@ -705,7 +705,7 @@ thread_local! {
     static PENDING_PAINT_MOVED: RefCell<Option<Vec<Option<(f32, f32)>>>> = const { RefCell::new(None) };
     /// With the pending invalidation: per changed client, a document rect
     /// covering its old and new paint (`retained_layers::paint_damage`).
-    static PENDING_PAINT_DAMAGE: RefCell<Option<Vec<(usize, LayoutRect)>>> = const { RefCell::new(None) };
+    static PENDING_PAINT_DAMAGE: RefCell<Option<Vec<crate::retained_layers::ClientDamage>>> = const { RefCell::new(None) };
     /// (frames composited under damage, of those the ones that differed from
     /// a full composite in verify mode).
     static PAINT_DAMAGE_STATS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
@@ -743,7 +743,7 @@ pub(crate) fn note_unbounded_damage() {
     }
 }
 
-pub(crate) fn set_pending_paint_damage(damage: Option<Vec<(usize, LayoutRect)>>) {
+pub(crate) fn set_pending_paint_damage(damage: Option<Vec<crate::retained_layers::ClientDamage>>) {
     PENDING_PAINT_DAMAGE.with(|slot| *slot.borrow_mut() = damage);
 }
 
@@ -2282,7 +2282,7 @@ fn composite_skia_layers(
     background: w3cos_std::color::Color,
     scale_factor: f32,
     offsets: &[(f32, f32)],
-    damage: Option<&[(usize, LayoutRect)]>,
+    damage: Option<&[crate::retained_layers::ClientDamage]>,
 ) {
     let full = |canvas: &Canvas| {
         composite_skia_layers_in(
@@ -2406,11 +2406,15 @@ fn verify_damage_composite(canvas: &Canvas, full: &dyn Fn(&Canvas)) -> usize {
 }
 
 /// Device rects holding every damaged client's old and new paint, as placed
-/// by the layer that draws it now (entries for one client are adjacent).
-/// `None`: a damaged client is in no layer, or in a CSS-transformed one (its
-/// matrix follows the layer bounds, which change with content).
+/// by the layer that draws it now (entries are in client order). A span
+/// entry is placed once; every client of it that a layer draws must be
+/// drawn under the same translation.
+/// `None`: an entry has no client in any layer, a span's clients are drawn
+/// under different translations, or a damaged client is in a
+/// CSS-transformed layer (its matrix follows the layer bounds, which change
+/// with content).
 fn damage_device_rects(
-    damage: &[(usize, LayoutRect)],
+    damage: &[crate::retained_layers::ClientDamage],
     layers: &[crate::retained_layers::CompositorLayer],
     artifact: &PaintArtifact,
     scroll_info: &[Option<(f32, f32, LayoutRect)>],
@@ -2418,11 +2422,15 @@ fn damage_device_rects(
     scale_factor: f32,
     surface: (f32, f32),
 ) -> Option<Vec<skia_safe::IRect>> {
+    // Per client: the first entry covering it. Single-client entries of one
+    // client are adjacent; a span covers its clients alone.
     let mut first = vec![u32::MAX; artifact.nodes.len()];
-    for (position, (client, _)) in damage.iter().enumerate().rev() {
-        *first.get_mut(*client)? = position as u32;
+    for (position, &(start, end, _)) in damage.iter().enumerate().rev() {
+        for slot in first.get_mut(start..end)? {
+            *slot = position as u32;
+        }
     }
-    let mut placed = vec![false; damage.len()];
+    let mut placed: Vec<Option<(u32, u32)>> = vec![None; damage.len()];
     let mut out = Vec::new();
     for layer in layers {
         let mut translation = None;
@@ -2462,11 +2470,22 @@ fn damage_device_rects(
                     value
                 }
             };
+            let bits = (tx.to_bits(), ty.to_bits());
             let mut position = start as usize;
-            while position < damage.len() && damage[position].0 == client {
-                placed[position] = true;
-                let rect = damage[position].1;
+            while position < damage.len()
+                && (damage[position].0..damage[position].1).contains(&client)
+            {
+                let rect = damage[position].2;
+                let span = damage[position].1 - damage[position].0 > 1;
+                let previous = placed[position].replace(bits);
                 position += 1;
+                if span {
+                    match previous {
+                        Some(previous) if previous == bits => continue,
+                        Some(_) => return None,
+                        None => {}
+                    }
+                }
                 let (x, y) = (rect.x * scale_factor, rect.y * scale_factor);
                 let left = x + tx;
                 let top = y + ty;
@@ -2492,10 +2511,14 @@ fn damage_device_rects(
                     (right.ceil() + 1.0).min(surface.0 + 1.0) as i32,
                     (bottom.ceil() + 1.0).min(surface.1 + 1.0) as i32,
                 ));
+                if span {
+                    // A span is one entry: later clients only check it.
+                    break;
+                }
             }
         }
     }
-    if placed.iter().any(|placed| !placed) {
+    if placed.iter().any(Option::is_none) {
         return None;
     }
     Some(out)

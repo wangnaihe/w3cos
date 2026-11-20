@@ -209,6 +209,8 @@ pub fn shared_paint_style(
 
 /// `source` as an owned kind, built in `slot`'s storage when there is one:
 /// a text kind copies into the old buffer instead of allocating a new one.
+/// Inlined: it runs once per box per frame and is a match on two kinds.
+#[inline]
 pub(crate) fn refill_kind(
     slot: Option<&mut ComponentKind>,
     source: &ComponentKind,
