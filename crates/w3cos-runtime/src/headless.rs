@@ -73,6 +73,43 @@ thread_local! {
     /// The next build copies into them (`refill_kind`), so an unchanged text
     /// keeps its buffer instead of being allocated and freed every frame.
     static RECYCLED_KINDS: RefCell<Vec<w3cos_std::ComponentKind>> = const { RefCell::new(Vec::new()) };
+    /// With `RECYCLED_KINDS`: the box count and the changed ranges of the
+    /// frame that replaced their artifact, when that frame used a touched set
+    /// (`W3COS_PAINT_KIND_KEEP`).
+    static RECYCLED_CHANGED: RefCell<Option<(usize, Vec<(u32, u32)>)>> = const { RefCell::new(None) };
+    /// (kinds kept without a copy, kinds copied, verify mismatches).
+    static PAINT_KIND_KEEP_STATS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_KIND_KEEP_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+/// `W3COS_PAINT_KIND_KEEP=1|verify`: a recycled kind comes from the artifact
+/// two frames back. A box that neither of the last two layout splices
+/// touched (the `PAINT_TOUCHED` rule: an untouched box keeps its inputs, its
+/// kind among them) already holds this frame's kind, so the paint node takes
+/// it as it is instead of copying the text again. `verify` compares each such
+/// kind and copies on a difference. Off by default.
+fn paint_kind_keep_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_KIND_KEEP_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_KIND_KEEP").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn paint_kind_keep_stats() -> (u64, u64, u64) {
+    PAINT_KIND_KEEP_STATS.with(Cell::get)
 }
 
 #[cfg(feature = "cpu-render")]
@@ -290,17 +327,11 @@ fn finish_headless_frame(
                 if *id == u64::from(crate::dom::body_id())
         )
     });
-    let mut recycled = RECYCLED_KINDS.with(|kinds| std::mem::take(&mut *kinds.borrow_mut()));
-    let paint_nodes = flat.iter().enumerate().map(|(index, node)| PaintNode {
-        kind: crate::paint_artifact::refill_kind(recycled.get_mut(index), node.kind),
-        style: crate::paint_artifact::shared_paint_style(node.component, node.style),
-        parent: node.parent,
-        sticky_counter_signal: node.sticky_counter_signal,
-    });
     let viewport = Some((width as f32, height as f32));
     // What the layout splice of this frame touched (if it replayed one).
     #[cfg_attr(not(feature = "skia"), allow(unused_variables))]
     let changes = crate::incremental_layout::take_paint_changes();
+    let mut frame_changed: Option<Vec<(u32, u32)>> = None;
     let touched_on = crate::paint_artifact::paint_touched_mode() != 0;
     if touched_on {
         // Paint-only UA boxes come after every layout box; a set that does
@@ -318,8 +349,62 @@ fn finish_headless_frame(
             .filter(|changes| changes.generation == now && base.map(|base| base + 1) == Some(now))
             .filter(|changes| changes.len == flat.len())
             .cloned();
+        frame_changed = touched.as_ref().map(|touched| touched.changed.clone());
         crate::paint_artifact::set_paint_touched(touched);
     }
+    let frame_len = flat.len();
+    let keep_mode = paint_kind_keep_mode();
+    let mut recycled = RECYCLED_KINDS.with(|kinds| std::mem::take(&mut *kinds.borrow_mut()));
+    let previous_changed = RECYCLED_CHANGED.with(|slot| slot.borrow_mut().take());
+    // Boxes either of the last two splices touched; the rest keep their kind.
+    let dirty = (keep_mode != 0 && recycled.len() == frame_len)
+        .then_some(())
+        .and_then(|()| {
+            let (len, previous) = previous_changed.as_ref()?;
+            let now = frame_changed.as_ref()?;
+            (*len == frame_len).then(|| {
+                let mut dirty = previous.clone();
+                dirty.extend_from_slice(now);
+                crate::incremental_layout::normalize_ranges(&mut dirty);
+                dirty
+            })
+        });
+    let mut cursor = 0;
+    let (mut kept, mut copied, mut mismatched) = (0u64, 0u64, 0u64);
+    let paint_nodes = flat.iter().enumerate().map(|(index, node)| {
+        let slot = recycled.get_mut(index);
+        let keep = dirty.as_deref().is_some_and(|dirty| {
+            while dirty
+                .get(cursor)
+                .is_some_and(|&(_, end)| end as usize <= index)
+            {
+                cursor += 1;
+            }
+            dirty
+                .get(cursor)
+                .is_none_or(|&(start, _)| index < start as usize)
+        });
+        let kind = match slot {
+            Some(slot) if keep && (keep_mode == 1 || *slot == *node.kind) => {
+                kept += 1;
+                std::mem::replace(slot, w3cos_std::ComponentKind::Root)
+            }
+            slot => {
+                if keep {
+                    mismatched += 1;
+                    eprintln!("[paint-kind-keep-verify] mismatch: box {index} kept a stale kind");
+                }
+                copied += 1;
+                crate::paint_artifact::refill_kind(slot, node.kind)
+            }
+        };
+        PaintNode {
+            kind,
+            style: crate::paint_artifact::shared_paint_style(node.component, node.style),
+            parent: node.parent,
+            sticky_counter_signal: node.sticky_counter_signal,
+        }
+    });
     let mut artifact = if crate::paint_artifact::paint_append_reuse_enabled() {
         RETAINED_PAINT.with(|slot| {
             let retained = slot.borrow();
@@ -343,6 +428,12 @@ fn finish_headless_frame(
     };
     if touched_on {
         crate::paint_artifact::set_paint_touched(None);
+    }
+    if keep_mode != 0 {
+        PAINT_KIND_KEEP_STATS.with(|stats| {
+            let (k, c, m) = stats.get();
+            stats.set((k + kept, c + copied, m + mismatched));
+        });
     }
     artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
@@ -489,6 +580,11 @@ fn finish_headless_frame(
         recycled.clear();
         recycled.extend(replaced.artifact.nodes.into_iter().map(|node| node.kind));
         RECYCLED_KINDS.with(|kinds| *kinds.borrow_mut() = recycled);
+        if keep_mode != 0
+            && let Some(changed) = frame_changed
+        {
+            RECYCLED_CHANGED.with(|slot| *slot.borrow_mut() = Some((frame_len, changed)));
+        }
     }
 
     Ok(HeadlessFrame {
@@ -1326,6 +1422,82 @@ mod tests {
         assert!(
             reused == fresh,
             "frames with a kept paint scroll plan differ"
+        );
+    }
+
+    /// Kinds kept from two frames back for boxes no splice touched equal the
+    /// copied ones, and the frames are the same.
+    #[test]
+    fn paint_kind_keep_matches_copied_kinds() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                PAINT_KIND_KEEP_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::PAINT_TOUCHED_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            PAINT_KIND_KEEP_OVERRIDE.with(|value| value.set(Some(mode)));
+            // Default-on flags the kept kinds rely on, pinned.
+            crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+            crate::paint_artifact::PAINT_TOUCHED_OVERRIDE.with(|value| value.set(Some(1)));
+            crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            let mut texts = Vec::new();
+            for index in 0..6 {
+                let message = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("message {index} says hi"));
+                crate::dom::append_child(message, text);
+                crate::dom::append_child(log, message);
+                texts.push(text);
+            }
+            crate::dom::append_child(body, log);
+            assert!(crate::incremental_layout::flush());
+            let before = paint_kind_keep_stats();
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut contents: Vec<String> = (0..6)
+                .map(|index| format!("message {index} says hi"))
+                .collect();
+            for step in 0..6 {
+                // Alternate two messages so a kind changed two frames back is
+                // in the older touched set.
+                let at = 2 + step % 2;
+                contents[at].push_str(" more");
+                crate::dom::set_text_content(texts[at], &contents[at]);
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = paint_kind_keep_stats();
+            (
+                frames,
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            )
+        };
+        let (verified, (_, _, mismatched)) = run(2);
+        assert_eq!(mismatched, 0, "a kept kind differs from the copied one");
+        let (kept_frames, (kept, _, _)) = run(1);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(
+                kept > 0,
+                "boxes untouched for two frames must keep their kind"
+            );
+        }
+        let (fresh, (off_kept, _, _)) = run(0);
+        assert_eq!(off_kept, 0);
+        assert!(
+            verified == fresh && kept_frames == fresh,
+            "kept kinds changed the frames"
         );
     }
 
