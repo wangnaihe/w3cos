@@ -14,6 +14,11 @@ impl ComponentStyle {
         Self(style)
     }
 
+    /// Whether both share one style allocation.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn as_style(&self) -> &Style {
         &self.0
     }

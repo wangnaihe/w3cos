@@ -1760,6 +1760,14 @@ impl Style {
         })
     }
 
+    /// `padding_lengths().left` without resolving the other three edges.
+    pub fn padding_left_length(&self) -> f32 {
+        match self.padding.left {
+            Spacing::Px(left) => used_box_spacing(left),
+            _ => self.padding_lengths().left,
+        }
+    }
+
     pub fn margin_lengths(&self) -> EdgeLengths {
         self.margin.px_lengths().unwrap_or_else(|| {
             self.margin

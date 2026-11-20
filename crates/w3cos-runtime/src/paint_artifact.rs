@@ -1122,6 +1122,113 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
     }
 }
 
+/// Per-node used-style adjustments of [`PaintArtifact::build_reusing`]
+/// (fixed-background viewport, used border widths); returns whether any
+/// padding needs a percentage basis. They read the style alone (and the
+/// viewport), so with `W3COS_STYLE_ADJUST_MEMO` a node whose shared style
+/// is the allocation seen at its index last frame reuses that result.
+fn adjust_used_styles(nodes: &mut [PaintNode], viewport: Option<(f32, f32)>) -> bool {
+    let mode = style_adjust_memo_mode();
+    if mode == 0 {
+        let mut has_percentage_padding = false;
+        for node in nodes.iter_mut() {
+            has_percentage_padding |= adjust_used_style(node, viewport);
+        }
+        return has_percentage_padding;
+    }
+    STYLE_ADJUST_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.viewport != viewport {
+            memo.entries.clear();
+            memo.viewport = viewport;
+        }
+        memo.entries.resize_with(nodes.len(), || None);
+        let mut has_percentage_padding = false;
+        for (node, entry) in nodes.iter_mut().zip(memo.entries.iter_mut()) {
+            if let Some(known) = entry
+                && known.source.ptr_eq(&node.style)
+            {
+                if mode == 2 {
+                    let mut fresh = node.clone();
+                    let percent = adjust_used_style(&mut fresh, viewport);
+                    let adjusted = known.adjusted.as_ref().unwrap_or(&known.source);
+                    if percent != known.percent_padding || *fresh.style != **adjusted {
+                        eprintln!("[style-adjust-memo] mismatch");
+                        STYLE_ADJUST_MEMO_MISMATCHES.with(|count| count.set(count.get() + 1));
+                    }
+                }
+                if let Some(adjusted) = &known.adjusted {
+                    node.style = adjusted.clone();
+                }
+                has_percentage_padding |= known.percent_padding;
+                continue;
+            }
+            let source = node.style.clone();
+            let percent_padding = adjust_used_style(node, viewport);
+            let adjusted = (!node.style.ptr_eq(&source)).then(|| node.style.clone());
+            *entry = Some(StyleAdjustEntry {
+                source,
+                adjusted,
+                percent_padding,
+            });
+            has_percentage_padding |= percent_padding;
+        }
+        has_percentage_padding
+    })
+}
+
+fn adjust_used_style(node: &mut PaintNode, viewport: Option<(f32, f32)>) -> bool {
+    // Write through the shared style only when a value changes.
+    if crate::background_image::fixed_background_viewport_touches(&node.style) {
+        crate::background_image::annotate_fixed_background_viewport(
+            node.style.make_mut(),
+            viewport,
+        );
+    }
+    if node.style.needs_used_border_widths() {
+        node.style.make_mut().resolve_used_border_widths();
+    }
+    [
+        node.style.padding.top,
+        node.style.padding.right,
+        node.style.padding.bottom,
+        node.style.padding.left,
+    ]
+    .into_iter()
+    .any(|edge| matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. }))
+}
+
+struct StyleAdjustEntry {
+    /// Held so the allocation (and its address) stays this style's.
+    source: w3cos_std::component::ComponentStyle,
+    adjusted: Option<w3cos_std::component::ComponentStyle>,
+    percent_padding: bool,
+}
+
+#[derive(Default)]
+struct StyleAdjustMemo {
+    viewport: Option<(f32, f32)>,
+    entries: Vec<Option<StyleAdjustEntry>>,
+}
+
+thread_local! {
+    static STYLE_ADJUST_MEMO: std::cell::RefCell<StyleAdjustMemo> = Default::default();
+    static STYLE_ADJUST_MEMO_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `W3COS_STYLE_ADJUST_MEMO=1` (default off); `=verify` recomputes each
+/// reused result and reports a difference.
+fn style_adjust_memo_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_STYLE_ADJUST_MEMO").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
 fn trim_collapsible_inline_whitespace_at_line_start(
     nodes: &mut [PaintNode],
     rect_by_index: &[Option<LayoutRect>],
@@ -1164,7 +1271,7 @@ fn trim_collapsible_inline_whitespace_at_line_start(
             + parent_style
                 .border_left_width
                 .unwrap_or(parent_style.border_width)
-            + parent_style.padding_lengths().left;
+            + parent_style.padding_left_length();
         if (rect.x - line_start).abs() > 0.01 {
             continue;
         }
@@ -3131,27 +3238,7 @@ impl PaintArtifact {
         for index in z_items {
             nodes[index].style.position = Position::Relative;
         }
-        let mut has_percentage_padding = false;
-        for node in &mut nodes {
-            // Write through the shared style only when a value changes.
-            if crate::background_image::fixed_background_viewport_touches(&node.style) {
-                crate::background_image::annotate_fixed_background_viewport(
-                    node.style.make_mut(),
-                    viewport,
-                );
-            }
-            if node.style.needs_used_border_widths() {
-                node.style.make_mut().resolve_used_border_widths();
-            }
-            has_percentage_padding |= [
-                node.style.padding.top,
-                node.style.padding.right,
-                node.style.padding.bottom,
-                node.style.padding.left,
-            ]
-            .into_iter()
-            .any(|edge| matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. }));
-        }
+        let has_percentage_padding = adjust_used_styles(&mut nodes, viewport);
         if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
             resolve_translate_percent(&mut nodes, layout_cache);
         }
