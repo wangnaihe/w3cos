@@ -56,9 +56,12 @@ pub(super) fn draw(
     if let Some(ink) = ink {
         let mut device_ink = matrix.map_rect(ink).0;
         device_ink.outset((1.0, 1.0));
+        crate::render_skia::note_clip_read(canvas, Some(device_ink));
         if !bounds.intersect(device_ink) {
             return;
         }
+    } else {
+        crate::render_skia::note_clip_read(canvas, None);
     }
     let bounds: skia_safe::IRect = bounds.round_out();
     let info = ImageInfo::new(

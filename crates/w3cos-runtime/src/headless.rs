@@ -1140,6 +1140,76 @@ mod tests {
     }
 
     #[test]
+    fn node_paint_reuse_matches_frames_painted_from_scratch() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        invalidate_retained_frame();
+        let body = crate::dom::body_id();
+        let mut texts = Vec::new();
+        for index in 0..6 {
+            let card = crate::dom::create_element("div");
+            crate::dom::set_style_property(card, "width", "140px");
+            let paragraph = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node(&format!("card {index} says hello"));
+            crate::dom::append_child(paragraph, text);
+            crate::dom::append_child(card, paragraph);
+            crate::dom::append_child(body, card);
+            texts.push(text);
+        }
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::NODE_PAINT_REUSE_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        let edits: [(usize, &str); 4] = [
+            (5, "card 5 says goodbye"),
+            (2, "card 2 now says a much longer hello that wraps"),
+            (5, "card 5"),
+            (2, "card 2"),
+        ];
+        for mode in [2u8, 1] {
+            crate::render_skia::NODE_PAINT_REUSE_OVERRIDE.with(|value| value.set(Some(mode)));
+            let (frames, (reused, mismatched)) = with_stable_fonts(|| {
+                with_layer_reuse(true, || {
+                    invalidate_retained_frame();
+                    for (index, text) in texts.iter().enumerate() {
+                        crate::dom::set_text_content(*text, &format!("card {index} says hello"));
+                    }
+                    let before = crate::render_skia::node_paint_stats();
+                    render_document_rgba(160, 480).expect("first frame");
+                    let mut frames = Vec::new();
+                    for (card, text) in edits {
+                        crate::dom::set_text_content(texts[card], text);
+                        frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
+                    }
+                    let after = crate::render_skia::node_paint_stats();
+                    (frames, (after.0 - before.0, after.2 - before.2))
+                })
+            });
+            assert!(reused > 0, "mode {mode}: unchanged text clients must reuse");
+            assert_eq!(mismatched, 0, "mode {mode}: a reused drawing differs");
+            crate::render_skia::NODE_PAINT_REUSE_OVERRIDE.with(|value| value.set(Some(0)));
+            for index in 0..6 {
+                crate::dom::set_text_content(texts[index], &format!("card {index} says hello"));
+            }
+            for (step, (card, text)) in edits.into_iter().enumerate() {
+                crate::dom::set_text_content(texts[card], text);
+                let fresh = with_layer_reuse(false, || {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(160, 480).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "mode {mode} step {step}: a frame reusing text drawings differs"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn damage_composite_matches_a_full_composite() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();

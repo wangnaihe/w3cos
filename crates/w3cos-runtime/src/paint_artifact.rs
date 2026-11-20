@@ -125,7 +125,7 @@ pub(crate) struct AppliedTextDecoration<'a> {
     pub baseline_shift: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct InlineLineContext {
     pub line_box: LayoutRect,
     pub first_line_box: LayoutRect,

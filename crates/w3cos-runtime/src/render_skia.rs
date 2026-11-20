@@ -658,6 +658,8 @@ pub struct RetainedSkiaCache {
     /// surface in full or under damage; `None` once anything else painted
     /// there. Damage only applies on top of that frame.
     last_composite: Option<u64>,
+    /// Text clients' cached drawings (`W3COS_NODE_PAINT_REUSE`).
+    node_pictures: NodePictures,
 }
 
 fn shift_rect(rect: Option<Rect>, by: (f32, f32)) -> Option<Rect> {
@@ -822,6 +824,535 @@ impl Drop for GlyphClipRecordingScope {
             GLYPH_CLIP_RECORDING.with(|recording| recording.replace(self.previous.take()));
         }
     }
+}
+
+/// `W3COS_NODE_PAINT_REUSE=1` (default off): a re-recorded layer replays a
+/// text client's cached drawing when the paint diff found the client neither
+/// changed nor moved since it was recorded, as Blink's `PaintController`
+/// reuses a `DisplayItemClient`'s cached display items when the client is
+/// not invalidated. The drawing is a sub-picture recorded under the layer
+/// canvas's matrix and device clip, so every query the paint code makes
+/// (matrix, local / device clip bounds, glyph clip culling) sees the same
+/// state; reuse also requires those, every non-local paint input (line box,
+/// decorations, shaped glyphs, inline background membership, the face and
+/// the font registry revision) and the layer's glyph clip to be unchanged.
+/// `=verify` records anyway and compares the serialized pictures.
+pub(crate) fn node_paint_reuse_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = NODE_PAINT_REUSE_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_NODE_PAINT_REUSE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static NODE_PAINT_REUSE_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+const IDENTITY_M44_BITS: [u32; 16] = {
+    let mut bits = [0u32; 16];
+    let one = 1.0f32.to_bits();
+    bits[0] = one;
+    bits[5] = one;
+    bits[10] = one;
+    bits[15] = one;
+    bits
+};
+
+/// Client, column fragment, layer.
+type NodePictureId = (usize, u32, usize);
+
+/// What a client's drawing reads besides its own (diffed) paint inputs.
+struct NodePaintProbe<'a, 'b> {
+    matrix: [u32; 16],
+    device_clip: skia_safe::IRect,
+    glyph_clip: Option<[u32; 4]>,
+    face_id: skia_safe::typeface::TypefaceId,
+    revision: u64,
+    rect: LayoutRect,
+    clips: &'a [LayoutRect],
+    scroll_clip: Option<LayoutRect>,
+    kind: &'a ComponentKind,
+    line_context: Option<crate::paint_artifact::InlineLineContext>,
+    decoration_line_box: Option<LayoutRect>,
+    leading: bool,
+    has_content: bool,
+    extra: &'a [(LayoutRect, String)],
+    fragment: Option<&'a std::rc::Rc<crate::inline_shaping::Fragment>>,
+    decorations: &'a [crate::paint_artifact::AppliedTextDecoration<'b>],
+    terminal: Option<LayoutRect>,
+    multisample: bool,
+    focused: bool,
+    grouped: bool,
+    bake: bool,
+}
+
+impl NodePaintProbe<'_, '_> {
+    fn to_owned(&self) -> NodePaintInputs {
+        NodePaintInputs {
+            matrix: self.matrix,
+            device_clip: self.device_clip,
+            glyph_clip: self.glyph_clip,
+            face_id: self.face_id,
+            revision: self.revision,
+            rect: self.rect,
+            clips: self.clips.to_vec(),
+            scroll_clip: self.scroll_clip,
+            kind: self.kind.clone(),
+            line_context: self.line_context,
+            decoration_line_box: self.decoration_line_box,
+            leading: self.leading,
+            has_content: self.has_content,
+            extra: self.extra.to_vec(),
+            fragment: self.fragment.cloned(),
+            decorations: self
+                .decorations
+                .iter()
+                .map(|decoration| {
+                    (
+                        decoration.style.as_ref().clone(),
+                        decoration.baseline_shift.to_bits(),
+                    )
+                })
+                .collect(),
+            terminal: self.terminal,
+            multisample: self.multisample,
+            focused: self.focused,
+            grouped: self.grouped,
+            bake: self.bake,
+        }
+    }
+}
+
+struct NodePaintInputs {
+    matrix: [u32; 16],
+    device_clip: skia_safe::IRect,
+    glyph_clip: Option<[u32; 4]>,
+    face_id: skia_safe::typeface::TypefaceId,
+    revision: u64,
+    rect: LayoutRect,
+    clips: Vec<LayoutRect>,
+    scroll_clip: Option<LayoutRect>,
+    kind: ComponentKind,
+    line_context: Option<crate::paint_artifact::InlineLineContext>,
+    decoration_line_box: Option<LayoutRect>,
+    leading: bool,
+    has_content: bool,
+    extra: Vec<(LayoutRect, String)>,
+    fragment: Option<std::rc::Rc<crate::inline_shaping::Fragment>>,
+    decorations: Vec<(Style, u32)>,
+    terminal: Option<LayoutRect>,
+    multisample: bool,
+    focused: bool,
+    grouped: bool,
+    bake: bool,
+}
+
+fn rect_bits(rect: LayoutRect) -> [u32; 4] {
+    [
+        rect.x.to_bits(),
+        rect.y.to_bits(),
+        rect.width.to_bits(),
+        rect.height.to_bits(),
+    ]
+}
+
+impl NodePaintInputs {
+    fn same(&self, other: &NodePaintProbe<'_, '_>) -> bool {
+        self.matrix == other.matrix
+            && self.glyph_clip == other.glyph_clip
+            && self.face_id == other.face_id
+            && self.revision == other.revision
+            && rect_bits(self.rect) == rect_bits(other.rect)
+            && self.scroll_clip.map(rect_bits) == other.scroll_clip.map(rect_bits)
+            && self.clips.len() == other.clips.len()
+            && self
+                .clips
+                .iter()
+                .zip(other.clips)
+                .all(|(a, b)| rect_bits(*a) == rect_bits(*b))
+            && self.leading == other.leading
+            && self.has_content == other.has_content
+            && self.multisample == other.multisample
+            && self.focused == other.focused
+            && self.grouped == other.grouped
+            && self.bake == other.bake
+            && self.kind == *other.kind
+            && self.line_context == other.line_context
+            && self.decoration_line_box.map(rect_bits) == other.decoration_line_box.map(rect_bits)
+            && self.terminal.map(rect_bits) == other.terminal.map(rect_bits)
+            && self.extra.len() == other.extra.len()
+            && self
+                .extra
+                .iter()
+                .zip(other.extra)
+                .all(|(a, b)| rect_bits(a.0) == rect_bits(b.0) && a.1 == b.1)
+            && match (&self.fragment, other.fragment) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    std::rc::Rc::ptr_eq(a, b) || crate::inline_shaping::same_fragment(a, b)
+                }
+                _ => false,
+            }
+            && self.decorations.len() == other.decorations.len()
+            && self
+                .decorations
+                .iter()
+                .zip(other.decorations)
+                .all(|(a, b)| a.1 == b.baseline_shift.to_bits() && a.0 == *b.style)
+    }
+}
+
+struct NodePicture {
+    inputs: NodePaintInputs,
+    picture: Picture,
+    decisions: Vec<GlyphClipDecision>,
+    /// Device rects the drawing tested against the clip.
+    clip_reads: Vec<Rect>,
+    /// The canvas size, when the drawing read it.
+    size_read: Option<(i32, i32)>,
+}
+
+impl NodePicture {
+    /// The drawing's clip tests and canvas size read come out the same on
+    /// `canvas`: the old and new (pixel-rect) clips agree on every tested
+    /// rect.
+    fn reads_match(&self, canvas: &Canvas, clip: skia_safe::IRect) -> bool {
+        let part = |rect: Rect, clip: skia_safe::IRect| {
+            let mut rect = rect;
+            rect.intersect(Rect::from(clip)).then(|| {
+                [
+                    rect.left.to_bits(),
+                    rect.top.to_bits(),
+                    rect.right.to_bits(),
+                    rect.bottom.to_bits(),
+                ]
+            })
+        };
+        let old = self.inputs.device_clip;
+        (old == clip
+            || self
+                .clip_reads
+                .iter()
+                .all(|&rect| part(rect, old) == part(rect, clip)))
+            && self.size_read.is_none_or(|size| {
+                let info = canvas.image_info();
+                size == (info.width(), info.height())
+            })
+    }
+}
+
+/// While a client's drawing records into its sub-picture: the layer
+/// canvas state the paint code may read, and what it read.
+struct NodePaintReads {
+    recording: *const Canvas,
+    size: (i32, i32),
+    clip_reads: Vec<Rect>,
+    size_read: bool,
+    /// A read the cached drawing cannot be validated against.
+    opaque: bool,
+}
+
+thread_local! {
+    static NODE_PAINT_READS: RefCell<Option<NodePaintReads>> = const { RefCell::new(None) };
+}
+
+/// The paint code tests `device_rect` (`None`: the whole clip) against
+/// `canvas`'s clip.
+pub(crate) fn note_clip_read(canvas: &Canvas, device_rect: Option<Rect>) {
+    NODE_PAINT_READS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().as_mut()
+            && std::ptr::eq(reads.recording, canvas)
+        {
+            match device_rect {
+                // Exact only while the clip stays one pixel rect.
+                Some(rect) if canvas.is_clip_rect() => reads.clip_reads.push(rect),
+                _ => reads.opaque = true,
+            }
+        }
+    });
+}
+
+/// `canvas`'s size as the layer canvas a client's sub-picture stands in
+/// for reports it.
+fn paint_canvas_size(canvas: &Canvas) -> (i32, i32) {
+    let real = NODE_PAINT_READS.with(|reads| {
+        let mut reads = reads.borrow_mut();
+        let reads = reads
+            .as_mut()
+            .filter(|reads| std::ptr::eq(reads.recording, canvas))?;
+        reads.size_read = true;
+        Some(reads.size)
+    });
+    real.unwrap_or_else(|| {
+        let info = canvas.image_info();
+        (info.width(), info.height())
+    })
+}
+
+/// Per retained cache: each recorded text client's last drawing.
+#[derive(Default)]
+pub(crate) struct NodePictures {
+    entries: w3cos_std::fxhash::FxHashMap<NodePictureId, NodePicture>,
+    /// Clients painted once while clean: the next clean paint records
+    /// their drawing. A client that changes or moves every frame (the
+    /// boxes below a growing message) never pays for a sub-picture.
+    seen: std::collections::HashSet<NodePictureId, w3cos_std::fxhash::FxBuildHasher>,
+}
+
+impl NodePictures {
+    /// Drop the drawings of clients the paint diff changed or moved; with
+    /// no diff (structure change, first frame) drop all.
+    fn retain_clean(&mut self, dirty: Option<&[bool]>, moved: Option<&[Option<(f32, f32)>]>) {
+        let Some(dirty) = dirty else {
+            self.clear();
+            return;
+        };
+        let clean = |client: usize| {
+            !dirty.get(client).copied().unwrap_or(true)
+                && moved
+                    .and_then(|moved| moved.get(client).copied().flatten())
+                    .is_none()
+        };
+        self.entries.retain(|&(client, _, _), _| clean(client));
+        self.seen.retain(|&(client, _, _)| clean(client));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.seen.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.seen.is_empty()
+    }
+}
+
+struct NodePaintScope {
+    layer: usize,
+    pictures: NodePictures,
+}
+
+thread_local! {
+    /// Set while a retained cache re-records one layer.
+    static NODE_PAINT_SCOPE: RefCell<Option<NodePaintScope>> = const { RefCell::new(None) };
+    /// (reused, recorded, verify mismatches).
+    static NODE_PAINT_STATS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+}
+
+/// `W3COS_NODE_PAINT_REUSE_STATS=1`: print the running counts per frame.
+fn node_paint_stats_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("W3COS_NODE_PAINT_REUSE_STATS").is_some())
+}
+
+#[cfg(test)]
+pub(crate) fn node_paint_stats() -> (u64, u64, u64) {
+    NODE_PAINT_STATS.with(Cell::get)
+}
+
+fn node_paint_scope_layer() -> Option<usize> {
+    NODE_PAINT_SCOPE.with(|scope| scope.borrow().as_ref().map(|scope| scope.layer))
+}
+
+fn glyph_clip_recording_clip() -> Option<[u32; 4]> {
+    GLYPH_CLIP_RECORDING.with(|recording| {
+        recording.borrow().as_ref().and_then(|recording| {
+            recording.clip.map(|clip| {
+                [
+                    clip.left.to_bits(),
+                    clip.top.to_bits(),
+                    clip.right.to_bits(),
+                    clip.bottom.to_bits(),
+                ]
+            })
+        })
+    })
+}
+
+fn glyph_clip_decisions_len() -> usize {
+    GLYPH_CLIP_RECORDING.with(|recording| {
+        recording
+            .borrow()
+            .as_ref()
+            .map_or(0, |recording| recording.decisions.len())
+    })
+}
+
+/// A picture's serialized form without its header (`SkPictInfo`: magic,
+/// version, cull rect). The cull rect is the clip the drawing was recorded
+/// under, which may differ when the drawing's clip reads agree; playback
+/// does not use it.
+fn picture_ops_bytes(picture: &Picture) -> Vec<u8> {
+    let data = picture.serialize();
+    let bytes = data.as_bytes();
+    const HEADER: usize = 8 + 4 + 16;
+    if bytes.len() >= HEADER && &bytes[..8] == b"skiapict" {
+        bytes[HEADER..].to_vec()
+    } else {
+        bytes.to_vec()
+    }
+}
+
+/// Paint one text client through its cached drawing (see
+/// [`node_paint_reuse_mode`]).
+fn paint_node_reusing<'a, 'b: 'a>(
+    canvas: &Canvas,
+    id: NodePictureId,
+    inputs: impl FnOnce(&Canvas) -> Option<NodePaintProbe<'a, 'b>>,
+    paint: impl Fn(&Canvas),
+) {
+    let mode = node_paint_reuse_mode();
+    let paint_direct = |paint: &dyn Fn(&Canvas)| {
+        let save = canvas.save();
+        paint(canvas);
+        canvas.restore_to_count(save);
+    };
+    // A client seen for the first time while clean paints directly; only
+    // its next clean paint records (no inputs read before then).
+    if mode == 1
+        && NODE_PAINT_SCOPE.with(|scope| {
+            scope.borrow_mut().as_mut().is_some_and(|scope| {
+                !scope.pictures.entries.contains_key(&id) && scope.pictures.seen.insert(id)
+            })
+        })
+    {
+        paint_direct(&paint);
+        return;
+    }
+    let Some(inputs) = inputs(canvas) else {
+        paint_direct(&paint);
+        return;
+    };
+    let cached = NODE_PAINT_SCOPE.with(|scope| {
+        scope.borrow().as_ref().and_then(|scope| {
+            scope
+                .pictures
+                .entries
+                .get(&id)
+                .filter(|entry| {
+                    entry.inputs.same(&inputs) && entry.reads_match(canvas, inputs.device_clip)
+                })
+                .map(|entry| (entry.picture.clone(), entry.decisions.clone()))
+        })
+    });
+    // The sub-picture sets the absolute matrix; play its ops into the
+    // layer recording (no nested picture to raster).
+    // Under the identity matrix (the common case in a layer recording) the
+    // sub-picture records no matrix and plays back as is.
+    let identity = inputs.matrix == IDENTITY_M44_BITS;
+    let replay = |picture: &Picture| {
+        if identity {
+            picture.playback(canvas);
+        } else {
+            canvas.save();
+            canvas.reset_matrix();
+            picture.playback(canvas);
+            canvas.restore();
+        }
+    };
+    if mode == 1
+        && let Some((picture, decisions)) = &cached
+    {
+        replay(picture);
+        GLYPH_CLIP_RECORDING.with(|recording| {
+            if let Some(recording) = recording.borrow_mut().as_mut() {
+                recording.decisions.extend(decisions.iter().cloned());
+            }
+        });
+        NODE_PAINT_STATS.with(|stats| {
+            let (reused, recorded, mismatched) = stats.get();
+            stats.set((reused + 1, recorded, mismatched));
+        });
+        return;
+    }
+    let device = inputs.device_clip;
+    let owned_inputs = inputs.to_owned();
+    let mut recorder = PictureRecorder::new();
+    let recording = recorder.begin_recording(Rect::from(device), false);
+    if !identity {
+        recording.set_matrix(&canvas.local_to_device());
+    }
+    let first_decision = glyph_clip_decisions_len();
+    let size = canvas.image_info();
+    NODE_PAINT_READS.with(|reads| {
+        *reads.borrow_mut() = Some(NodePaintReads {
+            recording: std::ptr::from_ref(recording),
+            size: (size.width(), size.height()),
+            clip_reads: Vec::new(),
+            size_read: false,
+            opaque: false,
+        });
+    });
+    paint(recording);
+    let reads = NODE_PAINT_READS
+        .with(|reads| reads.borrow_mut().take())
+        .expect("node paint reads");
+    let decisions = GLYPH_CLIP_RECORDING.with(|recording| {
+        recording
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |recording| {
+                recording.decisions[first_decision.min(recording.decisions.len())..].to_vec()
+            })
+    });
+    let Some(picture) = recorder.finish_recording_as_picture(None) else {
+        return;
+    };
+    let mut mismatch = false;
+    if let Some((cached, cached_decisions)) = &cached {
+        mismatch = picture_ops_bytes(cached) != picture_ops_bytes(&picture)
+            || cached_decisions.len() != decisions.len()
+            || cached_decisions
+                .iter()
+                .zip(&decisions)
+                .any(|(a, b)| a.visible != b.visible || a.ink != b.ink);
+        if mismatch {
+            eprintln!("[node-paint-reuse-verify] mismatch: client {}", id.0);
+        }
+    }
+    replay(&picture);
+    NODE_PAINT_STATS.with(|stats| {
+        let (reused, recorded, mismatched) = stats.get();
+        let next = (
+            reused + u64::from(cached.is_some()),
+            recorded + 1,
+            mismatched + u64::from(mismatch),
+        );
+        stats.set(next);
+        if mode == 2 && next.1 % 4096 == 0 {
+            eprintln!(
+                "[node-paint-reuse] verify: {} recorded, {} reusable, {} mismatched",
+                next.1, next.0, next.2
+            );
+        }
+    });
+    NODE_PAINT_SCOPE.with(|scope| {
+        if let Some(scope) = scope.borrow_mut().as_mut() {
+            if reads.opaque {
+                scope.pictures.entries.remove(&id);
+                return;
+            }
+            scope.pictures.entries.insert(
+                id,
+                NodePicture {
+                    inputs: owned_inputs,
+                    picture,
+                    decisions,
+                    clip_reads: reads.clip_reads,
+                    size_read: reads.size_read.then_some(reads.size),
+                },
+            );
+        }
+    });
 }
 
 fn glyph_ink_visible(ink: Rect, clip: Option<Rect>) -> bool {
@@ -1137,6 +1668,7 @@ fn glyph_clip_decisions_match(decisions: &[GlyphClipDecision], clip: Option<Rect
 impl RetainedSkiaCache {
     pub fn invalidate_recordings(&mut self) {
         self.tree.invalidate_recordings();
+        self.node_pictures.clear();
     }
 
     #[cfg(test)]
@@ -1422,6 +1954,9 @@ fn paint_display_list_with_suppressed_effects(
     let background_groups = &backgrounds.groups;
     let grouped_backgrounds = &backgrounds.grouped;
     let blur_bounds = small_blur_input_bounds(&frame, bake_compositor_props);
+    // Text clients may replay their cached drawing only in a layer
+    // recording (not inside a small-blur input).
+    let node_layer = suppressed.is_empty().then(node_paint_scope_layer).flatten();
     // Layer recordings must not bake a background clear; composite applies
     // the canvas background, then opacity / transform / scroll.
     if bake_compositor_props && paint_background {
@@ -1577,33 +2112,7 @@ fn paint_display_list_with_suppressed_effects(
             .and_then(|artifact| artifact.column_fragments.get(idx))
             .filter(|fragments| !fragments.is_empty());
         for fragment_index in 0..fragments.map_or(1, Vec::len) {
-            let save = canvas.save();
-            if bake_compositor_props && let Some(artifact) = frame.artifact {
-                let (sx, sy) = artifact.viewport_scroll_for(idx);
-                canvas.translate((-sx * frame.scale_factor, -sy * frame.scale_factor));
-            }
-            if let Some(fragment) = fragments.and_then(|fragments| fragments.get(fragment_index)) {
-                let scale = frame.scale_factor;
-                if let Some(bounds) = canvas.local_clip_bounds() {
-                    canvas.clip_rect(
-                        Rect::new(
-                            bounds.left(),
-                            fragment.clip_top * scale,
-                            bounds.right(),
-                            fragment.clip_bottom * scale,
-                        ),
-                        None,
-                        Some(false),
-                    );
-                }
-                canvas.translate((fragment.translate_x * scale, fragment.translate_y * scale));
-            }
-            for clip in clip_path(frame.artifact, idx, !bake_compositor_props) {
-                canvas.clip_rect(to_rect(clip), None, Some(false));
-            }
-            if let Some(clip) = clip {
-                canvas.clip_rect(to_rect(clip), None, Some(false));
-            }
+            let clips = clip_path(frame.artifact, idx, !bake_compositor_props);
             let local_filter = frame.artifact.is_none().then(|| {
                 style
                     .filter
@@ -1616,88 +2125,6 @@ fn paint_display_list_with_suppressed_effects(
                         paint
                     })
             });
-            if let Some(Some(paint)) = local_filter.as_ref() {
-                canvas.save_layer(&SaveLayerRec::default().paint(paint));
-            }
-            // With a PaintArtifact, opacity belongs to the Effect tree and must be
-            // applied once to the whole subtree. Avoid multiplying it into this
-            // display item a second time.
-            if let Some(group) = background_groups.get(&idx) {
-                let artifact = frame.artifact.expect("groups require retained nodes");
-                let origin = artifact.rect_by_index[idx].expect("group has layout");
-                let first_line_font_box = style
-                    .custom_properties
-                    .as_ref()
-                    .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
-                    .filter(|source| source.as_str() == "first-line")
-                    .and_then(|_| artifact.nodes[idx].parent)
-                    .and_then(|parent| {
-                        group.iter().find(|&&member| {
-                            let font = &artifact.nodes[member].style;
-                            let owner = &artifact.nodes[parent].style;
-                            font.font_size == owner.font_size
-                                && font.font_family == owner.font_family
-                                && font.font_weight == owner.font_weight
-                                && font.font_style == owner.font_style
-                        })
-                    })
-                    .and_then(|&member| {
-                        artifact.rect_by_index[member].map(|font_box| {
-                            let font = &artifact.nodes[member].style;
-                            (
-                                font_box.y + rect.y - origin.y,
-                                resolved_font_geometry(font)
-                                    .map_or(font.font_size, ResolvedFontGeometry::height),
-                            )
-                        })
-                    });
-                for &member in group {
-                    let node = &artifact.nodes[member];
-                    let ComponentKind::Text { content } = &node.kind else {
-                        continue;
-                    };
-                    let Some(mut member_rect) = artifact.rect_by_index[member] else {
-                        continue;
-                    };
-                    member_rect.x += rect.x - origin.x;
-                    member_rect.y += rect.y - origin.y;
-                    let mut background_style = node.style.clone();
-                    background_style.opacity = 1.0;
-                    if plain_inline_background(&background_style)
-                        && background_style
-                            .background_image
-                            .as_deref()
-                            .is_none_or(|image| image.trim().eq_ignore_ascii_case("none"))
-                        && let Some((y, height)) = first_line_font_box
-                    {
-                        // A first-line pseudo owns one principal font box. A
-                        // larger descendant's ink does not enlarge that source.
-                        background_style
-                            .custom_properties
-                            .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-inline-background-font-box".into(),
-                                format!("{y} {height}"),
-                            );
-                    }
-                    let context = artifact.inline_line_context(member).map(|mut context| {
-                        context.line_box.x += rect.x - origin.x;
-                        context.line_box.y += rect.y - origin.y;
-                        context
-                    });
-                    draw_text_in_rect_with_line_painter(
-                        canvas,
-                        member_rect,
-                        content,
-                        &background_style,
-                        typeface,
-                        frame.metrics_font,
-                        context,
-                        true,
-                        &mut |_, _, _, _, advance, _, _| advance,
-                    );
-                }
-            }
             let passive_split_inline = style.display == Display::Flex
                 && style.custom_properties.as_ref().is_some_and(|properties| {
                     properties.contains_key("--w3cos-internal-split-inline-fragment")
@@ -1920,60 +2347,229 @@ fn paint_display_list_with_suppressed_effects(
             let applied_decorations = frame
                 .artifact
                 .map_or_else(Vec::new, |artifact| artifact.ancestor_text_decorations(idx));
-            render_node_with_applied_decorations(
-                canvas,
-                idx,
-                render_rect,
-                kind,
-                normalized_style.as_ref().unwrap_or(style),
-                typeface,
-                frame.metrics_font,
-                frame.text_input_values.get(&idx).map(String::as_str),
-                frame.focused_index == Some(idx),
-                bake_compositor_props,
-                line_context,
-                inline_decoration_line_box,
-                inline_text_leading.unwrap_or(false),
+            // Replay can combine several source words under the first client
+            // ID. That ID's original glyph slice no longer describes the new
+            // Text; reshape it instead of silently painting only the first word.
+            let shaped_fragment = shaped_fragments.get(&idx).filter(|_| {
                 frame.artifact.is_some_and(|artifact| {
-                    style.display == Display::Inline
-                        && matches!(kind, ComponentKind::Row | ComponentKind::Box)
-                        && inline_has_content(artifact, idx)
-                }),
-                &extra_inline_background_rects,
-                // Replay can combine several source words under the first client
-                // ID. That ID's original glyph slice no longer describes the new
-                // Text; reshape it instead of silently painting only the first word.
-                shaped_fragments
-                    .get(&idx)
-                    .map(|fragment| &**fragment)
-                    .filter(|_| {
-                        frame.artifact.is_some_and(|artifact| {
-                            artifact.nodes.get(idx).is_some_and(|source| {
-                                match (kind, &source.kind) {
-                                    (
-                                        ComponentKind::Text { content },
-                                        ComponentKind::Text { content: original },
-                                    ) => content == original,
-                                    _ => false,
-                                }
+                    artifact
+                        .nodes
+                        .get(idx)
+                        .is_some_and(|source| match (kind, &source.kind) {
+                            (
+                                ComponentKind::Text { content },
+                                ComponentKind::Text { content: original },
+                            ) => content == original,
+                            _ => false,
+                        })
+                })
+            });
+            let terminal_inline_padding = frame
+                .artifact
+                .and_then(|artifact| terminal_inline_padding_fragment(artifact, idx, render_rect));
+            let multisample = multisampled_effects.contains(
+                &frame
+                    .artifact
+                    .and_then(|artifact| artifact.node_properties.get(idx))
+                    .map_or(0, |properties| properties.effect),
+            );
+            let inline_has_content = frame.artifact.is_some_and(|artifact| {
+                style.display == Display::Inline
+                    && matches!(kind, ComponentKind::Row | ComponentKind::Box)
+                    && inline_has_content(artifact, idx)
+            });
+            let text_input_value = frame.text_input_values.get(&idx).map(String::as_str);
+            let focused = frame.focused_index == Some(idx);
+            // Everything this client draws between its save and restore.
+            let body = |canvas: &Canvas| {
+                if bake_compositor_props && let Some(artifact) = frame.artifact {
+                    let (sx, sy) = artifact.viewport_scroll_for(idx);
+                    canvas.translate((-sx * frame.scale_factor, -sy * frame.scale_factor));
+                }
+                if let Some(fragment) =
+                    fragments.and_then(|fragments| fragments.get(fragment_index))
+                {
+                    let scale = frame.scale_factor;
+                    if let Some(bounds) = canvas.local_clip_bounds() {
+                        canvas.clip_rect(
+                            Rect::new(
+                                bounds.left(),
+                                fragment.clip_top * scale,
+                                bounds.right(),
+                                fragment.clip_bottom * scale,
+                            ),
+                            None,
+                            Some(false),
+                        );
+                    }
+                    canvas.translate((fragment.translate_x * scale, fragment.translate_y * scale));
+                }
+                for clip in &clips {
+                    canvas.clip_rect(to_rect(*clip), None, Some(false));
+                }
+                if let Some(clip) = clip {
+                    canvas.clip_rect(to_rect(clip), None, Some(false));
+                }
+                if let Some(Some(paint)) = local_filter.as_ref() {
+                    canvas.save_layer(&SaveLayerRec::default().paint(paint));
+                }
+                // With a PaintArtifact, opacity belongs to the Effect tree and must be
+                // applied once to the whole subtree. Avoid multiplying it into this
+                // display item a second time.
+                if let Some(group) = background_groups.get(&idx) {
+                    let artifact = frame.artifact.expect("groups require retained nodes");
+                    let origin = artifact.rect_by_index[idx].expect("group has layout");
+                    let first_line_font_box = style
+                        .custom_properties
+                        .as_ref()
+                        .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
+                        .filter(|source| source.as_str() == "first-line")
+                        .and_then(|_| artifact.nodes[idx].parent)
+                        .and_then(|parent| {
+                            group.iter().find(|&&member| {
+                                let font = &artifact.nodes[member].style;
+                                let owner = &artifact.nodes[parent].style;
+                                font.font_size == owner.font_size
+                                    && font.font_family == owner.font_family
+                                    && font.font_weight == owner.font_weight
+                                    && font.font_style == owner.font_style
                             })
                         })
-                    }),
-                &applied_decorations,
-                frame.artifact.and_then(|artifact| {
-                    terminal_inline_padding_fragment(artifact, idx, render_rect)
-                }),
-                multisampled_effects.contains(
-                    &frame
-                        .artifact
-                        .and_then(|artifact| artifact.node_properties.get(idx))
-                        .map_or(0, |properties| properties.effect),
-                ),
-            );
-            if matches!(local_filter, Some(Some(_))) {
-                canvas.restore();
+                        .and_then(|&member| {
+                            artifact.rect_by_index[member].map(|font_box| {
+                                let font = &artifact.nodes[member].style;
+                                (
+                                    font_box.y + rect.y - origin.y,
+                                    resolved_font_geometry(font)
+                                        .map_or(font.font_size, ResolvedFontGeometry::height),
+                                )
+                            })
+                        });
+                    for &member in group {
+                        let node = &artifact.nodes[member];
+                        let ComponentKind::Text { content } = &node.kind else {
+                            continue;
+                        };
+                        let Some(mut member_rect) = artifact.rect_by_index[member] else {
+                            continue;
+                        };
+                        member_rect.x += rect.x - origin.x;
+                        member_rect.y += rect.y - origin.y;
+                        let mut background_style = node.style.clone();
+                        background_style.opacity = 1.0;
+                        if plain_inline_background(&background_style)
+                            && background_style
+                                .background_image
+                                .as_deref()
+                                .is_none_or(|image| image.trim().eq_ignore_ascii_case("none"))
+                            && let Some((y, height)) = first_line_font_box
+                        {
+                            // A first-line pseudo owns one principal font box. A
+                            // larger descendant's ink does not enlarge that source.
+                            background_style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    "--w3cos-internal-inline-background-font-box".into(),
+                                    format!("{y} {height}"),
+                                );
+                        }
+                        let context = artifact.inline_line_context(member).map(|mut context| {
+                            context.line_box.x += rect.x - origin.x;
+                            context.line_box.y += rect.y - origin.y;
+                            context
+                        });
+                        draw_text_in_rect_with_line_painter(
+                            canvas,
+                            member_rect,
+                            content,
+                            &background_style,
+                            typeface,
+                            frame.metrics_font,
+                            context,
+                            true,
+                            &mut |_, _, _, _, advance, _, _| advance,
+                        );
+                    }
+                }
+                render_node_with_applied_decorations(
+                    canvas,
+                    idx,
+                    render_rect,
+                    kind,
+                    normalized_style.as_ref().unwrap_or(style),
+                    typeface,
+                    frame.metrics_font,
+                    text_input_value,
+                    focused,
+                    bake_compositor_props,
+                    line_context,
+                    inline_decoration_line_box,
+                    inline_text_leading.unwrap_or(false),
+                    inline_has_content,
+                    &extra_inline_background_rects,
+                    shaped_fragment.map(|fragment| &**fragment),
+                    &applied_decorations,
+                    terminal_inline_padding,
+                    multisample,
+                );
+                if matches!(local_filter, Some(Some(_))) {
+                    canvas.restore();
+                }
+            };
+            match node_layer {
+                Some(layer)
+                    if matches!(kind, ComponentKind::Text { .. })
+                        && text_input_value.is_none()
+                        && fragments.is_none()
+                        && !bake_compositor_props
+                        && matches!(local_filter, None | Some(None))
+                        && !background_groups.contains_key(&idx) =>
+                {
+                    paint_node_reusing(
+                        canvas,
+                        (idx, fragment_index as u32, layer),
+                        |canvas| {
+                            Some(NodePaintProbe {
+                                matrix: {
+                                    let mut matrix = [0.0f32; 16];
+                                    canvas.local_to_device().get_col_major(&mut matrix);
+                                    matrix.map(f32::to_bits)
+                                },
+                                device_clip: canvas
+                                    .is_clip_rect()
+                                    .then(|| canvas.device_clip_bounds())
+                                    .flatten()?,
+                                glyph_clip: glyph_clip_recording_clip(),
+                                face_id: typeface.unique_id(),
+                                revision: crate::font_face::FontRegistry::global().revision(),
+                                rect: render_rect,
+                                clips: &clips,
+                                scroll_clip: clip,
+                                kind,
+                                line_context,
+                                decoration_line_box: inline_decoration_line_box,
+                                leading: inline_text_leading.unwrap_or(false),
+                                has_content: inline_has_content,
+                                extra: &extra_inline_background_rects,
+                                fragment: shaped_fragment,
+                                decorations: &applied_decorations,
+                                terminal: terminal_inline_padding,
+                                multisample,
+                                focused,
+                                grouped: grouped_backgrounds.contains(&idx),
+                                bake: bake_compositor_props,
+                            })
+                        },
+                        body,
+                    );
+                }
+                _ => {
+                    let save = canvas.save();
+                    body(canvas);
+                    canvas.restore_to_count(save);
+                }
             }
-            canvas.restore_to_count(save);
         }
     }
     for _ in 0..active_filters.len() {
@@ -1988,6 +2584,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         && let Some(cache) = retained.as_mut()
     {
         cache.last_composite = None;
+        cache.node_pictures.clear();
     }
     let overrides = frame.compositor_overrides;
     let scale_factor = if frame.scale_factor > 0.0 {
@@ -2018,6 +2615,14 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             .sync_known_changed(artifact, &scrolls, overrides, known_changed);
         let invalidation = PENDING_PAINT_INVALIDATION.with(|slot| slot.borrow_mut().take());
         let moved = PENDING_PAINT_MOVED.with(|slot| slot.borrow_mut().take());
+        let node_reuse = node_paint_reuse_mode() != 0;
+        if node_reuse {
+            cache
+                .node_pictures
+                .retain_clean(invalidation.as_deref(), moved.as_deref());
+        } else if !cache.node_pictures.is_empty() {
+            cache.node_pictures.clear();
+        }
         let moved_client = |client: usize| {
             moved
                 .as_ref()
@@ -2264,6 +2869,15 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             );
             let recording = recorder.begin_recording(bounds, false);
             let glyph_clip = GlyphClipRecordingScope::new(glyph_clips[layer_index]);
+            if node_reuse {
+                let pictures = std::mem::take(&mut cache.node_pictures);
+                NODE_PAINT_SCOPE.with(|scope| {
+                    *scope.borrow_mut() = Some(NodePaintScope {
+                        layer: layer_index,
+                        pictures,
+                    });
+                });
+            }
             paint_display_list(
                 recording,
                 typeface,
@@ -2281,11 +2895,23 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 },
                 false,
             );
+            if node_reuse {
+                if let Some(scope) = NODE_PAINT_SCOPE.with(|scope| scope.borrow_mut().take()) {
+                    cache.node_pictures = scope.pictures;
+                }
+            }
             let decisions = glyph_clip.finish();
             if let Some(picture) = recorder.finish_recording_as_picture(None) {
                 pictures.push(picture);
                 glyph_clip_decisions.push(decisions);
             }
+        }
+        if node_reuse && node_paint_stats_trace() {
+            let (reused, recorded, mismatched) = NODE_PAINT_STATS.with(Cell::get);
+            eprintln!(
+                "[node-paint-reuse] frame: {reused} reused, {recorded} recorded, {mismatched} mismatched, {} cached",
+                cache.node_pictures.entries.len()
+            );
         }
         cache.pictures = pictures;
         cache.glyph_clip_decisions = glyph_clip_decisions;
@@ -5117,11 +5743,19 @@ fn draw_text_in_rect_with_line_painter(
             ..context.fragment_box(style, false, false)
         })
         .unwrap_or_else(|| text_continuation_paint_box(rect, style));
-    let image_info = canvas.image_info();
+    // Only viewport units read the canvas size.
+    let (viewport_width, viewport_height) = if matches!(
+        style.text_indent,
+        w3cos_std::style::Dimension::Vw(_) | w3cos_std::style::Dimension::Vh(_)
+    ) {
+        paint_canvas_size(canvas)
+    } else {
+        (0, 0)
+    };
     let indent = style.resolved_text_indent(
         line_context.map_or(content.width, |context| context.line_box.width),
-        image_info.width() as f32,
-        image_info.height() as f32,
+        viewport_width as f32,
+        viewport_height as f32,
     );
     let mut first_line_content =
         match line_context.map_or(style.direction, |context| context.direction) {
@@ -6355,6 +6989,7 @@ pub(crate) fn glyph_ink_intersects_clip(
     if !bounds.is_finite() {
         return true;
     }
+    note_clip_read(canvas, Some(bounds));
     let late_visible = GLYPH_CLIP_RECORDING.with(|recording| {
         let mut recording = recording.borrow_mut();
         let Some(recording) = recording
@@ -6873,7 +7508,7 @@ fn positioned_tab_runs<'a>(
 /// count the block's space advance, including its letter-spacing and
 /// word-spacing; Blink's `Font::TabWidth` skips to the following stop when
 /// the nearest one is closer than half a space.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TabStops {
     space: f32,
     minimum_gap: f32,

@@ -968,7 +968,7 @@ fn same_slice(a: &GlyphSlice, b: &GlyphSlice) -> bool {
         && a.glyph_font_sizes == b.glyph_font_sizes
 }
 
-fn same_fragment(a: &Fragment, b: &Fragment) -> bool {
+pub(crate) fn same_fragment(a: &Fragment, b: &Fragment) -> bool {
     a.source_x.to_bits() == b.source_x.to_bits()
         && a.ascent.to_bits() == b.ascent.to_bits()
         && a.runs.len() == b.runs.len()
