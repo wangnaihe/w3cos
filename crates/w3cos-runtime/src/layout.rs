@@ -84,9 +84,13 @@ pub(crate) const ROOT_FONT_SIZE: f32 = 16.0;
 /// Typical mobile content width for pre-wrap intrinsic sizing.
 const DEFAULT_TEXT_WRAP_WIDTH: f32 = 360.0;
 
-const TEXT_MEASURE_CACHE_CAPACITY: usize = 4096;
+/// Whole-cache reset bound. One full layout of the 1000-message chat
+/// measures about 24k distinct (string, style) pairs; at 4096 the table was
+/// reset several times per layout, so a second layout re-shaped every string
+/// (full-layout Ir, 2nd run: 1710M at 4096 vs 1402M at 65536).
+const TEXT_MEASURE_CACHE_CAPACITY: usize = 65_536;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TextMeasureKey {
     fragment_boundaries: u64,
     typography: u64,
@@ -118,7 +122,13 @@ struct WrappedTextMeasure {
 
 #[derive(Default)]
 struct TextMeasureCache {
-    intrinsic: w3cos_std::fxhash::FxHashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
+    /// Keyed by measure key, then string: one string in many styles (a word
+    /// space, a repeated label) is one probe instead of a scan of every
+    /// style it was measured in.
+    intrinsic: w3cos_std::fxhash::FxHashMap<
+        TextMeasureKey,
+        w3cos_std::fxhash::FxHashMap<String, (f32, f32)>,
+    >,
     wrapped_height: w3cos_std::fxhash::FxHashMap<String, Vec<WrappedTextMeasure>>,
     entries: usize,
 }
@@ -4147,9 +4157,9 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         cache
             .borrow()
             .intrinsic
-            .get(content)
-            .and_then(|entries| entries.iter().find(|(cached, _)| *cached == key))
-            .map(|(_, measured)| *measured)
+            .get(&key)
+            .and_then(|entries| entries.get(content))
+            .copied()
     }) {
         return measured;
     }
@@ -4198,9 +4208,9 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         cache.make_room();
         cache
             .intrinsic
-            .entry(content.to_owned())
+            .entry(key)
             .or_default()
-            .push((key, measured));
+            .insert(content.to_owned(), measured);
         cache.entries += 1;
     });
     measured

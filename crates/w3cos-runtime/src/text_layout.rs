@@ -33,6 +33,26 @@ pub(crate) fn authored_line_styles(
     style: &Style,
     lines: &[String],
 ) -> Option<Vec<Style>> {
+    // One line and no fragment-end or CSSOM-owner stamp: the line's ends
+    // are just its length and it has no owner ranges, which reads the same as
+    // `style` (`line_metadata_reads_unchanged`), so the answer is `None`
+    // whether or not the line is found below.
+    if lines.len() == 1
+        && style.custom_properties.as_ref().is_none_or(|properties| {
+            properties
+                .get(w3cos_std::inline_text::FRAGMENT_ENDS)
+                .is_none()
+                && properties
+                    .get(w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+                    .is_none()
+        })
+    {
+        return None;
+    }
+    authored_line_styles_full(text, style, lines)
+}
+
+fn authored_line_styles_full(text: &str, style: &Style, lines: &[String]) -> Option<Vec<Style>> {
     let ends =
         w3cos_std::inline_text::fragment_ends(text, style).unwrap_or_else(|| vec![text.len()]);
     let normalized = prepare_text_for_white_space(text, style.white_space);
@@ -2170,6 +2190,36 @@ pub fn clear_paint_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_line_styles_one_line_early_out_matches_full_path() {
+        // The early out claims the full path returns `None` for one line of
+        // a run with no fragment-end or owner stamp, whatever the line is.
+        let mut styles = vec![Style::default()];
+        let mut pre = Style::default();
+        pre.white_space = WhiteSpace::Pre;
+        styles.push(pre);
+        let mut source = Style::default();
+        source.custom_properties = Some(Default::default());
+        source.custom_properties.as_mut().unwrap().insert(
+            w3cos_std::inline_text::SOURCE_RUN.to_string(),
+            "1".to_string(),
+        );
+        styles.push(source);
+        for style in &styles {
+            for text in ["", "one", "  one  two ", "a\nb", "x"] {
+                for line in ["", "one", "one two", "zzz", text] {
+                    let lines = [line.to_string()];
+                    assert_eq!(
+                        authored_line_styles(text, style, &lines),
+                        authored_line_styles_full(text, style, &lines),
+                        "{text:?} {line:?}"
+                    );
+                    assert_eq!(authored_line_styles(text, style, &lines), None);
+                }
+            }
+        }
+    }
 
     #[test]
     fn break_spaces_leading_space_is_a_wrap_opportunity_that_keeps_the_word() {
