@@ -17406,3 +17406,177 @@ fn wide_space() -> ConstraintSpace {
         line_clamp: None,
     }
 }
+
+/// Replaced elements whose CSS `aspect-ratio` replaces (or, for
+/// `auto <ratio>`, falls back from) the intrinsic ratio. The boxes are the
+/// WPT pages' DOM: a `data:` SVG is not preinstalled, and the green square
+/// is the reference div in `ref-filled-green-100px-square.xht`.
+#[test]
+fn wpt_replaced_css_aspect_ratio_matches_the_reference_square() {
+    use crate::html_parser_host::InertParserScriptHost;
+    use crate::html_parser_state::StreamingDocumentParser;
+    use std::rc::Rc;
+    use w3cos_std::ComponentKind;
+
+    let reference = r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+<div style="width: 100px; height: 100px; background-color: green;"></div>
+"#;
+    let pages = [
+        (
+            "replaced-element-004.html",
+            r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 5 1' style='background-color: green'%3E%3C/svg%3E" style="width: 100px; aspect-ratio: 1/1;">
+"#,
+        ),
+        (
+            "replaced-element-006.html",
+            r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+<object type="image/svg+xml" data="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 5 1' style='background-color: green'%3E%3C/svg%3E" style="width: 100px; aspect-ratio: 1/1;"></object>
+"#,
+        ),
+        (
+            "replaced-element-020.html",
+            r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+<object type="image/svg+xml" data="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1' style='background-color: green'%3E%3C/svg%3E" style="width: 100px; aspect-ratio: auto 5/1;"></object>
+"#,
+        ),
+        (
+            "replaced-element-021.html",
+            r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+<object type="image/svg+xml" data="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' style='background-color: green'%3E%3C/svg%3E" style="width: 100px; aspect-ratio: auto 1/1;"></object>
+"#,
+        ),
+    ];
+
+    let parse = |html: &str, url: &str| {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::incremental_layout::invalidate();
+        let mut parser =
+            StreamingDocumentParser::new_with_script_host(Rc::new(InertParserScriptHost), url)
+                .expect("parser");
+        parser.write(html).expect("html");
+        parser.finish().expect("finish");
+        crate::dom::with_document(|document| document.to_component_tree())
+    };
+    let square = |tree: &Component| {
+        let flat = pre_flatten(tree);
+        let ng = layout_tree(tree, &flat, 800.0, 600.0).expect("ng");
+        let legacy = crate::layout::legacy_layout_rects(tree, 800.0, 600.0).expect("legacy");
+        let index = flat
+            .iter()
+            .position(|node| {
+                matches!(node.kind, ComponentKind::Image { .. })
+                    || (node.style.width == Dimension::Px(100.0)
+                        && node.style.height == Dimension::Px(100.0))
+            })
+            .expect("square");
+        (rect(&ng, index), rect(&legacy, index))
+    };
+    let (reference_ng, reference_legacy) =
+        square(&parse(reference, "https://example.test/ref.html"));
+    assert_eq!(
+        (reference_ng.2, reference_ng.3),
+        (100.0, 100.0),
+        "reference div"
+    );
+    for (name, html) in pages {
+        let (ng, legacy) = square(&parse(html, &format!("https://example.test/{name}")));
+        assert_eq!(ng, reference_ng, "{name} ng");
+        assert_eq!(legacy, reference_legacy, "{name} legacy");
+    }
+}
+
+/// An SVG image's root `background-color` fills the CSS viewport, including
+/// the bars outside a letterboxed viewBox.
+#[test]
+fn svg_image_background_fills_the_css_viewport() {
+    let src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 5 1' style='background-color: green'%3E%3C/svg%3E";
+    crate::image_loader::ensure_data_image(src);
+    let image = crate::image_loader::get_or_load(src)
+        .expect("data svg")
+        .svg_viewport(100.0, 100.0)
+        .expect("viewport");
+    assert_eq!(image.data[..4], [0, 128, 0, 255], "top-left viewport pixel");
+    let mid = (50 * image.width as usize + 50) * 4;
+    assert_eq!(image.data[mid..mid + 4], [0, 128, 0, 255]);
+}
+
+/// `flex-svg-no-intrinsic-column-001`: an SVG image with no intrinsic size
+/// in a column flex container of height 0 is a 150×150 square. Parsing the
+/// data URL must not turn the 300×150 default object size into a ratio.
+#[test]
+fn wpt_flex_svg_no_intrinsic_column_is_a_square() {
+    use crate::html_parser_host::InertParserScriptHost;
+    use crate::html_parser_state::StreamingDocumentParser;
+    use std::rc::Rc;
+    use w3cos_std::ComponentKind;
+
+    let parse = |html: &str, url: &str| {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        crate::incremental_layout::invalidate();
+        let mut parser =
+            StreamingDocumentParser::new_with_script_host(Rc::new(InertParserScriptHost), url)
+                .expect("parser");
+        parser.write(html).expect("html");
+        parser.finish().expect("finish");
+        crate::dom::with_document(|document| document.to_component_tree())
+    };
+    let square = |tree: &Component| {
+        let flat = pre_flatten(tree);
+        let ng = layout_tree(tree, &flat, 800.0, 600.0).expect("ng");
+        let legacy = crate::layout::legacy_layout_rects(tree, 800.0, 600.0).expect("legacy");
+        let index = flat
+            .iter()
+            .position(|node| {
+                matches!(node.kind, ComponentKind::Image { .. })
+                    || (node.style.width == Dimension::Px(150.0)
+                        && node.style.height == Dimension::Px(150.0))
+            })
+            .expect("square");
+        (rect(&ng, index), rect(&legacy, index))
+    };
+    let reference = r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square.</p>
+<div style="width: 150px; height: 150px; background: green;"></div>
+"#;
+    let page = r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square.</p>
+<div style="display: flex; flex-direction: column; width: 150px; height: 0;">
+  <img src='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" />' style="background: green;">
+</div>
+"#;
+    let (reference_ng, reference_legacy) = square(&parse(
+        reference,
+        "https://example.test/flex-svg-no-intrinsic-column-ref.html",
+    ));
+    assert_eq!(
+        (reference_ng.2, reference_ng.3),
+        (150.0, 150.0),
+        "reference div"
+    );
+    let (ng, legacy) = square(&parse(
+        page,
+        "https://example.test/flex-svg-no-intrinsic-column-001.html",
+    ));
+    assert_eq!(ng, reference_ng, "flex svg column ng");
+    // Legacy keeps the undecoded 200×200 placeholder (container height 0
+    // shrinks the item). Parsing the data URL must not change that box.
+    let uncached = r#"<!DOCTYPE html>
+<p>Test passes if there is a filled green square.</p>
+<div style="display: flex; flex-direction: column; width: 150px; height: 0;">
+  <img src="missing-flex-svg.svg" style="background: green;">
+</div>
+"#;
+    let (_, uncached_legacy) = square(&parse(
+        uncached,
+        "https://example.test/flex-svg-no-intrinsic-column-uncached.html",
+    ));
+    assert_eq!(legacy, uncached_legacy, "flex svg column legacy");
+}
