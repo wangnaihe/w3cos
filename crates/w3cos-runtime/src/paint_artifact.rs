@@ -460,6 +460,12 @@ pub struct PaintArtifact {
     /// `touched` is set and no box has column fragments: untouched gaps
     /// may be jumped in one step.
     touched_gaps: bool,
+    /// Sorted indices of the boxes that repaint every frame
+    /// ([`paint_node_volatile`]), recorded by the reusing build when
+    /// `W3COS_PAINT_DIFF_SPARSE` is on.
+    volatile_nodes: Option<Vec<u32>>,
+    /// Sorted indices of the boxes with text fragments.
+    fragment_nodes: Vec<u32>,
 }
 
 impl Default for PaintArtifact {
@@ -492,6 +498,8 @@ impl Default for PaintArtifact {
             serial: 0,
             touched: None,
             touched_gaps: false,
+            volatile_nodes: None,
+            fragment_nodes: Vec::new(),
         }
     }
 }
@@ -2757,9 +2765,19 @@ impl PaintArtifact {
     pub(crate) fn set_text_fragments(&mut self, fragments: &[crate::layout_ng::TextFragment]) {
         self.text_fragments.clear();
         self.vertical_text.clear();
+        self.fragment_nodes.clear();
         if fragments.is_empty() {
             return;
         }
+        let len = self.nodes.len();
+        self.fragment_nodes.extend(
+            fragments
+                .iter()
+                .filter(|fragment| fragment.index < len)
+                .map(|fragment| fragment.index as u32),
+        );
+        self.fragment_nodes.sort_unstable();
+        self.fragment_nodes.dedup();
         self.text_fragments = vec![Vec::new(); self.nodes.len()];
         for fragment in fragments {
             if let Some(slot) = self.text_fragments.get_mut(fragment.index) {
@@ -2774,6 +2792,16 @@ impl PaintArtifact {
                 }
             }
         }
+    }
+
+    /// See `volatile_nodes`.
+    pub(crate) fn volatile_nodes(&self) -> Option<&[u32]> {
+        self.volatile_nodes.as_deref()
+    }
+
+    /// Sorted indices of the boxes with text fragments.
+    pub(crate) fn fragment_nodes(&self) -> &[u32] {
+        &self.fragment_nodes
     }
 
     pub(crate) fn is_vertical_text(&self, index: usize) -> bool {
@@ -3593,6 +3621,13 @@ impl PaintArtifact {
         let mut runs = Vec::new();
         let (mut copied, mut appended, mut run_copied) = (0u64, 0u64, 0u64);
         let splice = artifact_splice_enabled();
+        // Volatile boxes, for the sparse paint diff: a copied run takes the
+        // previous build's entries in its range (same inputs, same answer).
+        let record_volatile = crate::retained_layers::paint_diff_sparse_mode() != 0;
+        let previous_volatile = base.and_then(|(previous, _)| previous.volatile_nodes.as_deref());
+        let mut volatile_ok = record_volatile && (base.is_none() || previous_volatile.is_some());
+        let mut volatile = Vec::new();
+        let mut url_memo = UrlMemo::default();
         let mut index = 0;
         while index < len {
             if splice && let Some((previous, record)) = base {
@@ -3607,6 +3642,11 @@ impl PaintArtifact {
                     &mut runs,
                 );
                 if end > index {
+                    if volatile_ok && let Some(old) = previous_volatile {
+                        let a = old.partition_point(|&i| (i as usize) < index);
+                        let b = old.partition_point(|&i| (i as usize) < end);
+                        volatile.extend_from_slice(&old[a..b]);
+                    }
                     run_copied += (end - index) as u64;
                     index = end;
                     continue;
@@ -3631,9 +3671,14 @@ impl PaintArtifact {
                         && self.nodes[index].parent.is_none_or(|parent| same[parent]);
                 }
             }
+            if volatile_ok && paint_node_volatile(&self.nodes[index], &mut url_memo) {
+                volatile.push(index as u32);
+            }
             marks.push(mark);
             index += 1;
         }
+        volatile_ok &= record_volatile;
+        self.volatile_nodes = volatile_ok.then_some(volatile);
         copied += run_copied;
         ARTIFACT_SPLICE_RUN_NODES.with(|count| count.set(count.get() + run_copied));
         self.paint_classes = std::sync::OnceLock::new();
@@ -4591,6 +4636,53 @@ pub(crate) fn paint_touched_mismatches() -> u32 {
     PAINT_TOUCHED_MISMATCHES.with(std::cell::Cell::get)
 }
 
+/// A box whose paint reads resources the artifact does not describe
+/// (decoded `url()` images, canvas bitmaps, SVG documents, form control
+/// values): it repaints every frame. The paint diff's rule.
+pub(crate) fn paint_node_volatile(node: &PaintNode, memo: &mut UrlMemo) -> bool {
+    matches!(
+        node.kind,
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::SvgDocument { .. }
+            | ComponentKind::TextInput { .. }
+    ) || node
+        .style
+        .background_image
+        .as_deref()
+        .is_some_and(|value| value.contains("url("))
+        || node
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| memo.has_url(properties))
+}
+
+/// Inherited custom properties share one map across many boxes: scan each
+/// map for `url(` once (the paint diff's memo).
+#[derive(Default)]
+pub(crate) struct UrlMemo {
+    last: Option<(usize, bool)>,
+    known: w3cos_std::fxhash::FxHashMap<usize, bool>,
+}
+
+impl UrlMemo {
+    fn has_url(&mut self, properties: &w3cos_std::style::CustomProperties) -> bool {
+        let key = properties.identity();
+        if let Some((last, found)) = self.last
+            && last == key
+        {
+            return found;
+        }
+        let found = *self
+            .known
+            .entry(key)
+            .or_insert_with(|| properties.values().any(|value| value.contains("url(")));
+        self.last = Some((key, found));
+        found
+    }
+}
+
 pub(crate) fn stable_order_by_class(classes: &[usize]) -> Vec<usize> {
     let buckets = classes.iter().copied().max().map_or(0, |max| max + 1);
     let mut starts = vec![0usize; buckets + 1];
@@ -5212,6 +5304,92 @@ mod tests {
         assert!(verified.append_output_eq(&fresh));
         assert!(paint_touched_mismatches() > before);
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+    }
+
+    /// `W3COS_PAINT_DIFF_SPARSE`: inside copied runs only the listed
+    /// volatile clients are visited, and the diff equals the dense one.
+    #[test]
+    fn sparse_paint_diff_visits_volatile_clients_in_runs_and_matches_the_dense_diff() {
+        use crate::retained_layers::{PAINT_DIFF_SPARSE_OVERRIDE, paint_diff_clients};
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+        PAINT_DIFF_SPARSE_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let mut plain = Style::default();
+        plain.display = Display::Block;
+        let node = |kind: ComponentKind, parent: Option<usize>| PaintNode {
+            kind,
+            style: plain.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let text = |content: &str| ComponentKind::Text {
+            content: content.into(),
+        };
+        let rect = |y: f32, height: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 200.0,
+            height,
+        };
+        let blocks = 12;
+        // The edited block sits in the middle: runs before and after it.
+        let nodes = |edited: &str| {
+            let mut nodes = vec![node(ComponentKind::Root, None)];
+            for index in 0..blocks {
+                nodes.push(node(ComponentKind::Root, Some(0)));
+                let content = if index == blocks / 2 {
+                    edited.to_string()
+                } else {
+                    format!("block {index}")
+                };
+                // An image inside the first run repaints every frame.
+                let kind = if index == 1 {
+                    ComponentKind::Image {
+                        src: "a.png".into(),
+                    }
+                } else {
+                    text(&content)
+                };
+                nodes.push(node(kind, Some(2 * index + 1)));
+            }
+            nodes
+        };
+        let layouts = || {
+            let mut layouts = vec![(rect(0.0, 20.0 * blocks as f32), 0)];
+            for index in 0..blocks {
+                let y = 20.0 * index as f32;
+                layouts.push((rect(y, 20.0), 2 * index + 1));
+                layouts.push((rect(y, 20.0), 2 * index + 2));
+            }
+            layouts
+        };
+        let first = PaintArtifact::build_reusing(nodes("middle"), &layouts(), 1, None, None, None);
+        let next = PaintArtifact::build_reusing(
+            nodes("middle, edited"),
+            &layouts(),
+            2,
+            None,
+            None,
+            Some(&first),
+        );
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(None));
+        assert_eq!(next.volatile_nodes(), Some(&[4u32][..]));
+        let runs = next.append_runs_against(&first).expect("runs");
+        assert!(
+            runs.iter().any(|run| run[0] <= 4 && 4 < run[1]),
+            "the image is in a run"
+        );
+        let sparse = paint_diff_clients(&first, &next).expect("sparse diff");
+        PAINT_DIFF_SPARSE_OVERRIDE.with(|mode| mode.set(Some(0)));
+        let dense = paint_diff_clients(&first, &next).expect("dense diff");
+        PAINT_DIFF_SPARSE_OVERRIDE.with(|mode| mode.set(None));
+        assert_eq!(sparse.dirty, dense.dirty);
+        assert_eq!(sparse.moved, dense.moved);
+        assert!(dense.dirty[4], "the image repaints");
+        assert!(
+            dense.dirty[2 * (blocks / 2) + 2],
+            "the edited text is dirty"
+        );
     }
 
     /// A frame whose last block grew copies the unchanged blocks before it

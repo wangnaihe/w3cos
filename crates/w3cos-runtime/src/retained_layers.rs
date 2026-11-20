@@ -791,34 +791,90 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
 }
 
+fn diffs_equal(a: &Option<PaintDiff>, b: &Option<PaintDiff>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.dirty == b.dirty
+                && a.moved.len() == b.moved.len()
+                && a.moved.iter().zip(&b.moved).all(|(x, y)| match (x, y) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        x.0.to_bits() == y.0.to_bits() && x.1.to_bits() == y.1.to_bits()
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `W3COS_PAINT_DIFF_SPARSE=1`: with runs, the diff visits inside a copied
+/// run only the clients the artifact build listed as volatile or that have
+/// text fragments, instead of every client of the run. `=verify` also diffs
+/// densely and compares. Off by default; the build records the volatile
+/// list only when this is on.
+pub(crate) fn paint_diff_sparse_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DIFF_SPARSE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_DIFF_SPARSE").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DIFF_SPARSE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static PAINT_DIFF_SPARSE_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<PaintDiff> {
     let mode = paint_diff_runs_mode();
     let runs = (mode != 0).then(|| cur.append_runs_against(prev)).flatten();
     let Some(runs) = runs else {
-        return paint_diff_clients_with(prev, cur, None);
+        return paint_diff_clients_with(prev, cur, None, false);
     };
-    let diff = paint_diff_clients_with(prev, cur, Some(runs));
+    let sparse_mode = paint_diff_sparse_mode();
+    let sparse = sparse_mode != 0 && cur.volatile_nodes().is_some();
+    if sparse_mode == 2 {
+        eprintln!(
+            "[paint-diff-sparse] sparse {sparse} volatile {:?} runs {} covering {} of {}",
+            cur.volatile_nodes().map(<[u32]>::len),
+            runs.len(),
+            runs.iter()
+                .map(|run| run[1].saturating_sub(run[0]) as usize)
+                .sum::<usize>(),
+            cur.nodes.len()
+        );
+    }
+    let diff = paint_diff_clients_with(prev, cur, Some(runs), sparse);
+    if sparse && sparse_mode == 2 {
+        let dense = paint_diff_clients_with(prev, cur, Some(runs), false);
+        if !diffs_equal(&diff, &dense) {
+            eprintln!("[paint-diff-sparse] mismatch against the dense diff");
+            PAINT_DIFF_SPARSE_MISMATCHES.with(|count| count.set(count.get() + 1));
+            return dense;
+        }
+    }
     PAINT_DIFF_RUNS_STATS.with(|stats| {
         let (used, mismatched) = stats.get();
         stats.set((used + 1, mismatched));
     });
     if mode == 2 {
-        let full = paint_diff_clients_with(prev, cur, None);
-        let equal = match (&diff, &full) {
-            (None, None) => true,
-            (Some(a), Some(b)) => {
-                a.dirty == b.dirty
-                    && a.moved.len() == b.moved.len()
-                    && a.moved.iter().zip(&b.moved).all(|(x, y)| match (x, y) {
-                        (None, None) => true,
-                        (Some(x), Some(y)) => {
-                            x.0.to_bits() == y.0.to_bits() && x.1.to_bits() == y.1.to_bits()
-                        }
-                        _ => false,
-                    })
-            }
-            _ => false,
-        };
+        let full = paint_diff_clients_with(prev, cur, None, false);
+        let equal = diffs_equal(&diff, &full);
         if !equal {
             eprintln!("[paint-diff-runs] mismatch against the full diff");
             PAINT_DIFF_RUNS_STATS.with(|stats| {
@@ -835,6 +891,7 @@ fn paint_diff_clients_with(
     prev: &PaintArtifact,
     cur: &PaintArtifact,
     runs: Option<&[[u32; 4]]>,
+    sparse: bool,
 ) -> Option<PaintDiff> {
     use w3cos_std::component::ComponentKind;
     use w3cos_std::style::Display;
@@ -993,7 +1050,11 @@ fn paint_diff_clients_with(
     let viewport_attached = |index: usize| cur.viewport_attached(index);
     let mut changed = Vec::new();
     let mut moved: Vec<Option<(f32, f32)>> = vec![None; n];
-    for index in 0..n {
+    // One client; false: too many changed clients, give up the diff.
+    let visit = |index: usize,
+                 changed: &mut Vec<(usize, bool)>,
+                 moved: &mut [Option<(f32, f32)>]|
+     -> bool {
         let (a, b) = (&prev.nodes[index], &cur.nodes[index]);
         if in_run.get(index).copied().unwrap_or(false) {
             // Copied with its display items from `prev` at this index.
@@ -1007,7 +1068,7 @@ fn paint_diff_clients_with(
                 if volatile(b) {
                     changed.push((index, true));
                 }
-                continue;
+                return true;
             }
         }
         // Geometry first: it is the cheap check and the common change.
@@ -1062,8 +1123,67 @@ fn paint_diff_clients_with(
             // Past this many changed clients most layers re-record anyway;
             // stop diffing and repaint everything.
             if changed.len() > n / 8 + 64 {
-                return None;
+                return false;
             }
+        }
+        true
+    };
+    // The clients to visit: all, or (sparse) the gaps between copied runs
+    // plus, inside a run, only a volatile client or one with text fragments
+    // in either frame (the rest of a run cannot differ). One loop below, so
+    // the visit stays inlined.
+    let sparse_list = match (sparse, runs, cur.volatile_nodes()) {
+        (true, Some(runs), Some(volatile)) => {
+            let within = |list: &[u32], start: usize, end: usize| {
+                let a = list.partition_point(|&i| (i as usize) < start);
+                let b = list.partition_point(|&i| (i as usize) < end);
+                a..b
+            };
+            let mut list: Vec<usize> = Vec::new();
+            let mut index = 0usize;
+            for &[start, end, _, _] in runs {
+                let (start, end) = (start as usize, (end as usize).min(n));
+                list.extend(index..start.min(n).max(index));
+                let start = start.max(index);
+                if start < end {
+                    let from = list.len();
+                    for picks in [volatile, prev.fragment_nodes(), cur.fragment_nodes()] {
+                        list.extend(picks[within(picks, start, end)].iter().map(|&i| i as usize));
+                    }
+                    list[from..].sort_unstable();
+                    let mut kept = from;
+                    for at in from..list.len() {
+                        if at == from || list[at] != list[kept - 1] {
+                            list[kept] = list[at];
+                            kept += 1;
+                        }
+                    }
+                    list.truncate(kept);
+                }
+                index = index.max(end);
+            }
+            list.extend(index..n);
+            Some(list)
+        }
+        _ => None,
+    };
+    let count = sparse_list.as_ref().map_or(n, Vec::len);
+    for at in 0..count {
+        let index = sparse_list.as_ref().map_or(at, |list| list[at]);
+        // The common case, kept out of the (not inlined) visit: a client of
+        // a copied run with equal text pieces.
+        if in_run.get(index).copied().unwrap_or(false)
+            && prev.text_fragments.get(index).is_none_or(Vec::is_empty)
+            && cur.text_fragments.get(index).is_none_or(Vec::is_empty)
+            && get(&prev.vertical_text, index) == get(&cur.vertical_text, index)
+        {
+            if volatile(&cur.nodes[index]) {
+                changed.push((index, true));
+            }
+            continue;
+        }
+        if !visit(index, &mut changed, &mut moved) {
+            return None;
         }
     }
     if cur
