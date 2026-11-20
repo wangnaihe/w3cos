@@ -380,6 +380,9 @@ fn finish_headless_frame(
         width as f32,
         height as f32,
     );
+    // What the layout splice of this frame touched (if it was one splice).
+    #[cfg_attr(not(feature = "skia"), allow(unused_variables))]
+    let changes = crate::incremental_layout::take_paint_changes();
     #[cfg(feature = "skia")]
     if paint_layer_reuse_enabled() {
         // Diff against the artifact the retained recordings were made from.
@@ -394,6 +397,14 @@ fn finish_headless_frame(
                             &retained.artifact,
                             &artifact,
                         )?;
+                        if paint_changes_verify() {
+                            verify_paint_changes(
+                                changes.as_ref(),
+                                &diff,
+                                &retained.artifact,
+                                &artifact,
+                            );
+                        }
                         let damage = crate::render_skia::paint_damage_enabled()
                             .then(|| {
                                 crate::retained_layers::paint_damage(
@@ -1357,4 +1368,78 @@ fn clamp_scroll_offset_ng(x: f32, y: f32, extent: &crate::layout::ScrollExtent) 
         x.clamp(0.0, extent.max_x.max(0.0)),
         y.clamp(0.0, extent.max_y.max(0.0)),
     )
+}
+
+/// `W3COS_PAINT_CHANGES_VERIFY=1`: report paint clients the full paint diff
+/// marks dirty or moved that the layout splice's change set does not cover.
+fn paint_changes_verify() -> bool {
+    crate::incremental_layout::paint_changes_wanted()
+}
+
+#[cfg(feature = "skia")]
+fn verify_paint_changes(
+    changes: Option<&crate::incremental_layout::PaintChanges>,
+    diff: &crate::retained_layers::PaintDiff,
+    prev: &crate::paint_artifact::PaintArtifact,
+    cur: &crate::paint_artifact::PaintArtifact,
+) {
+    let len = cur.nodes.len();
+    let Some(changes) = changes else {
+        eprintln!("[paint-changes-verify] no change set");
+        return;
+    };
+    let touched = &changes.touched;
+    if touched.len() != len {
+        eprintln!("[paint-changes-verify] size {} vs {len}", touched.len());
+        return;
+    }
+    let changed: Vec<usize> = (0..len)
+        .filter(|&i| {
+            diff.dirty.get(i).copied().unwrap_or(true)
+                || diff.moved.get(i).copied().flatten().is_some()
+        })
+        .collect();
+    let uncovered: Vec<usize> = changed.iter().copied().filter(|&i| !touched[i]).collect();
+    if std::env::var_os("W3COS_PAINT_CHANGES_DUMP").is_some() {
+        for &i in uncovered.iter().take(6) {
+            eprintln!(
+                "[paint-changes-dump] {i} dirty {} moved {:?} parent {:?} kind_same {} style_same {} rect {:?} -> {:?} kind {:?}",
+                diff.dirty[i],
+                diff.moved[i],
+                cur.nodes[i].parent,
+                prev.nodes
+                    .get(i)
+                    .is_some_and(|n| n.kind == cur.nodes[i].kind),
+                prev.nodes
+                    .get(i)
+                    .is_some_and(|n| n.style == cur.nodes[i].style),
+                prev.rect_by_index.get(i),
+                cur.rect_by_index.get(i),
+                cur.nodes[i].kind
+            );
+        }
+    }
+    // Clients whose own inputs moved (the rest are marked by the diff's
+    // propagation to their containing block or table, which paint applies
+    // to the change set the same way).
+    let own: Vec<usize> = uncovered
+        .iter()
+        .copied()
+        .filter(|&i| {
+            !(prev.nodes.get(i).is_some_and(|n| {
+                n.kind == cur.nodes[i].kind
+                    && n.style == cur.nodes[i].style
+                    && n.parent == cur.nodes[i].parent
+            }) && prev.rect_by_index.get(i) == cur.rect_by_index.get(i)
+                && prev.text_fragments.get(i) == cur.text_fragments.get(i))
+        })
+        .collect();
+    eprintln!(
+        "[paint-changes-verify] nodes {len} touched {} changed {} uncovered {} own {} first {:?}",
+        touched.iter().filter(|t| **t).count(),
+        changed.len(),
+        uncovered.len(),
+        own.len(),
+        &own[..own.len().min(8)]
+    );
 }

@@ -23,6 +23,7 @@ use crate::layout::{LayoutEngine, pre_flatten};
 
 #[path = "incremental_layout_splice.rs"]
 mod splice;
+pub(crate) use splice::{PaintChanges, paint_changes_wanted, take_paint_changes};
 
 struct WidthMemo {
     structure: u64,
@@ -2713,9 +2714,11 @@ fn splice_paint_cache(
         &mut cache.subtree_sizes,
     )?;
     if !applied {
+        let _ = splice::take_paint_changes();
         return Some(false);
     }
     if count == 0 {
+        let _ = splice::take_paint_changes();
         // The structure moved without a splice (an off-document edit, or
         // a change the flush did not lay out): rebuild.
         return Some(false);

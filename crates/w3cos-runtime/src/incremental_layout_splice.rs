@@ -2493,6 +2493,9 @@ pub(super) fn replay_paint_splices(
         }) {
             *sizes = None;
         }
+        LAST_PAINT_CHANGES.with(|slot| slot.borrow_mut().take());
+        // Only a consumer pays for the per-box set.
+        let mut changes = paint_changes_wanted().then(PaintChanges::default);
         let verify = incremental && paint_splice_incremental_verify();
         let mut shadow = verify.then(|| layouts.clone());
         let mut lazy = LazyLayoutShifts::default();
@@ -2501,6 +2504,15 @@ pub(super) fn replay_paint_splices(
             else {
                 return Some((false, 0));
             };
+            changes = changes.and_then(|mut changes| {
+                let inserted = entry
+                    .inserted
+                    .iter()
+                    .map(crate::layout::count_nodes)
+                    .sum::<usize>();
+                changes.add(&geometry, inserted)?;
+                Some(changes)
+            });
             if !(incremental && lazy.add(layouts, entry, &geometry)) {
                 lazy.flush(layouts);
                 splice_layouts_eagerly(layouts, entry, &geometry);
@@ -2512,6 +2524,7 @@ pub(super) fn replay_paint_splices(
             splice_tree(root, entry, &geometry, sizes);
         }
         lazy.flush(layouts);
+        LAST_PAINT_CHANGES.with(|slot| *slot.borrow_mut() = changes);
         if let Some(shadow) = shadow {
             let same = shadow.len() == layouts.len()
                 && shadow.iter().zip(layouts.iter()).all(|((a, i), (b, j))| {
@@ -2581,7 +2594,76 @@ pub(super) fn push_subtree_sizes(component: &Component, out: &mut Vec<u32>) -> u
 
 /// Where one paint splice lands in the preorder of the tree it is applied
 /// to, and which boxes it moves and grows.
+/// Per box of the paint tree after a replay: whether a replayed splice
+/// replaced, moved or grew it (Blink's layout tells paint which objects need
+/// a paint invalidation instead of paint diffing the whole tree).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PaintChanges {
+    /// Set by the first splice (the tree size before the replay).
+    started: bool,
+    pub(crate) touched: Vec<bool>,
+}
+
+impl PaintChanges {
+    /// Fold one splice in; its geometry is in the indices of the tree it
+    /// edits (after the splices before it). `None`: sizes do not add up.
+    fn add(&mut self, geometry: &SpliceGeometry, inserted: usize) -> Option<()> {
+        if !self.started {
+            self.started = true;
+            self.touched = vec![false; geometry.total];
+        }
+        let (start, end) = (geometry.region_start, geometry.region_end);
+        if self.touched.len() != geometry.total || end > self.touched.len() || start > end {
+            return None;
+        }
+        let delta = inserted as isize - (end - start) as isize;
+        let map = |old: usize| -> usize {
+            if old >= end {
+                (old as isize + delta) as usize
+            } else {
+                old
+            }
+        };
+        let mut next = Vec::with_capacity((self.touched.len() as isize + delta) as usize);
+        next.extend_from_slice(&self.touched[..start]);
+        next.extend(std::iter::repeat_n(true, inserted));
+        next.extend_from_slice(&self.touched[end..]);
+        for &index in geometry.starts.iter().chain(&geometry.grown) {
+            *next.get_mut(map(index))? = true;
+        }
+        for &(from, to) in &geometry.shifted {
+            for old in from..to {
+                *next.get_mut(map(old))? = true;
+            }
+        }
+        self.touched = next;
+        Some(())
+    }
+}
+
+thread_local! {
+    /// Set by a paint splice replay, taken by the paint build of the same
+    /// frame.
+    static LAST_PAINT_CHANGES: std::cell::RefCell<Option<PaintChanges>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `W3COS_PAINT_CHANGES_VERIFY=1`: record [`PaintChanges`] and have the
+/// headless paint check them against its full diff. Off by default (no
+/// consumer uses the set yet).
+pub(crate) fn paint_changes_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_CHANGES_VERIFY").is_ok_and(|v| v == "1"))
+}
+
+/// The changes of the last paint replay, once.
+pub(crate) fn take_paint_changes() -> Option<PaintChanges> {
+    LAST_PAINT_CHANGES.with(|slot| slot.borrow_mut().take())
+}
+
 struct SpliceGeometry {
+    /// Boxes in the tree before the splice.
+    total: usize,
     region_start: usize,
     region_end: usize,
     /// Preorder start of each box on the path, root first, target last.
@@ -2719,6 +2801,7 @@ fn paint_splice_geometry(
         }
     }
     Some(SpliceGeometry {
+        total: ancestor_sizes[0],
         region_start,
         region_end,
         starts,
