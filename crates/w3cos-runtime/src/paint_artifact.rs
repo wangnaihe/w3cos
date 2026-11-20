@@ -468,6 +468,25 @@ pub struct PaintArtifact {
     volatile_nodes: Option<Vec<u32>>,
     /// Sorted indices of the boxes with text fragments.
     fragment_nodes: Vec<u32>,
+    /// What the line-start trim and the ordinal pass decided, kept (with
+    /// `W3COS_PAINT_RANGE_REBUILD`) so the next frame re-runs them only for
+    /// the boxes its layout splice touched.
+    range_record: Option<std::sync::Arc<RangeRecord>>,
+}
+
+/// Per build, for [`paint_range_rebuild_mode`].
+#[derive(Debug, Default)]
+struct RangeRecord {
+    /// Layout boxes (before paint-only UA boxes).
+    len: usize,
+    /// Per layout box: the line-start trim removed leading white space.
+    trimmed: Vec<bool>,
+    /// No box had a bidi rank or a split positioned-inline owner: the
+    /// ordinals were the identity.
+    ordinals_plain: bool,
+    /// Percentage padding was resolved (trim geometry then depends on
+    /// ancestors' widths): the record is not reused.
+    percent_padding: bool,
 }
 
 impl Default for PaintArtifact {
@@ -502,6 +521,7 @@ impl Default for PaintArtifact {
             touched_gaps: false,
             volatile_nodes: None,
             fragment_nodes: Vec::new(),
+            range_record: None,
         }
     }
 }
@@ -698,6 +718,32 @@ fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
         .get(KEY)
         .map(String::as_str)
         .filter(|owner| !owner.is_empty())
+}
+
+/// [`positioned_inline_fragment_ordinals`] when only `scan` can hold a
+/// bidi rank or a split positioned-inline owner (every other box kept the
+/// inputs of a build that had none): the identity unless one is found.
+/// Returns the ordinals and whether they are the identity.
+fn positioned_inline_fragment_ordinals_ranged(
+    nodes: &[PaintNode],
+    scan: Option<&[(u32, u32)]>,
+    tail: usize,
+) -> (Vec<usize>, bool) {
+    let special = |node: &PaintNode| {
+        bidi_logical_rank(node).is_some() || split_positioned_inline_owner(node).is_some()
+    };
+    let found = match scan {
+        Some(ranges) => ranges
+            .iter()
+            .flat_map(|&(a, b)| a as usize..(b as usize).min(nodes.len()))
+            .chain(tail.min(nodes.len())..nodes.len())
+            .any(|index| special(&nodes[index])),
+        None => nodes.iter().any(special),
+    };
+    if !found {
+        return ((0..nodes.len()).collect(), true);
+    }
+    (positioned_inline_fragment_ordinals(nodes), false)
 }
 
 fn positioned_inline_fragment_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
@@ -1233,6 +1279,47 @@ fn trim_collapsible_inline_whitespace_at_line_start(
     nodes: &mut [PaintNode],
     rect_by_index: &[Option<LayoutRect>],
 ) {
+    trim_line_start_white_space_ranged(nodes, rect_by_index, None, None);
+}
+
+/// [`trim_collapsible_inline_whitespace_at_line_start`], recording per box
+/// whether it trimmed. With `aligned` (this frame's touched boxes and the
+/// previous build's record, for the same boxes), a box whose own and whose
+/// inline ancestors' and line-start container's inputs and geometry the
+/// layout splice did not touch takes the previous decision instead of
+/// re-testing its line-start geometry.
+fn trim_line_start_white_space_ranged(
+    nodes: &mut [PaintNode],
+    rect_by_index: &[Option<LayoutRect>],
+    aligned: Option<(&[bool], &[bool])>,
+    mut record: Option<&mut Vec<bool>>,
+) -> u32 {
+    const COLLAPSIBLE: [char; 5] = [' ', '\t', '\n', '\r', '\u{000c}'];
+    let trim = |node: &mut PaintNode| {
+        let ComponentKind::Text { content } = &mut node.kind else {
+            return false;
+        };
+        let trimmed = content.trim_start_matches(COLLAPSIBLE);
+        if trimmed.len() == content.len() {
+            return false;
+        }
+        let removed = content.len() - trimmed.len();
+        let ends = w3cos_std::inline_text::fragment_ends(content, &node.style);
+        *content = trimmed.to_string();
+        if let Some(ends) = ends {
+            // Anonymous text may contain independently authored DOM or
+            // pseudo-element runs. Rebase their byte boundaries and text
+            // fingerprint when discarding a line-leading separator.
+            let ends = ends
+                .into_iter()
+                .filter(|end| *end > removed)
+                .map(|end| end - removed)
+                .collect::<Vec<_>>();
+            w3cos_std::inline_text::set_fragment_ends(&mut node.style, content, &ends);
+        }
+        true
+    };
+    let mut copied = 0;
     for index in 0..nodes.len() {
         let node = &nodes[index];
         if node.style.display != Display::Inline
@@ -1243,12 +1330,31 @@ fn trim_collapsible_inline_whitespace_at_line_start(
         {
             continue;
         }
-        // Only text that starts with collapsible white space changes: test
-        // that before the line-start geometry.
-        const COLLAPSIBLE: [char; 5] = [' ', '\t', '\n', '\r', '\u{000c}'];
         if !matches!(&node.kind, ComponentKind::Text { content } if content.starts_with(COLLAPSIBLE))
         {
             continue;
+        }
+        if let Some((touched, before)) = aligned
+            && let Some(mut parent) = node.parent
+            && !touched[index]
+        {
+            let mut clean = !touched[parent];
+            while clean && nodes[parent].style.display == Display::Inline {
+                let Some(ancestor) = nodes[parent].parent else {
+                    break;
+                };
+                parent = ancestor;
+                clean = !touched[parent];
+            }
+            if clean {
+                copied += 1;
+                if before[index] && trim(&mut nodes[index]) {
+                    if let Some(record) = record.as_deref_mut() {
+                        record[index] = true;
+                    }
+                }
+                continue;
+            }
         }
         let (Some(mut parent), Some(rect)) =
             (node.parent, rect_by_index.get(index).copied().flatten())
@@ -1275,28 +1381,13 @@ fn trim_collapsible_inline_whitespace_at_line_start(
         if (rect.x - line_start).abs() > 0.01 {
             continue;
         }
-        let node = &mut nodes[index];
-        let ComponentKind::Text { content } = &mut node.kind else {
-            continue;
-        };
-        let trimmed = content.trim_start_matches(COLLAPSIBLE);
-        if trimmed.len() != content.len() {
-            let removed = content.len() - trimmed.len();
-            let ends = w3cos_std::inline_text::fragment_ends(content, &node.style);
-            *content = trimmed.to_string();
-            if let Some(ends) = ends {
-                // Anonymous text may contain independently authored DOM or
-                // pseudo-element runs. Rebase their byte boundaries and text
-                // fingerprint when discarding a line-leading separator.
-                let ends = ends
-                    .into_iter()
-                    .filter(|end| *end > removed)
-                    .map(|end| end - removed)
-                    .collect::<Vec<_>>();
-                w3cos_std::inline_text::set_fragment_ends(&mut node.style, content, &ends);
-            }
+        if trim(&mut nodes[index])
+            && let Some(record) = record.as_deref_mut()
+        {
+            record[index] = true;
         }
     }
+    copied
 }
 
 const TABLE_BACKGROUND_FRAGMENTS: &str = "--w3cos-internal-table-background-fragments";
@@ -3445,11 +3536,88 @@ impl PaintArtifact {
                     .insert("--w3cos-internal-float-line-bands".into(), encoded);
             }
         }
-        trim_collapsible_inline_whitespace_at_line_start(&mut nodes, &rect_by_index);
+        let range_mode = paint_range_rebuild_mode();
+        let source_len = nodes.len();
+        // The boxes this frame's layout splice touched, when the previous
+        // build's record covers the same boxes (see `PAINT_TOUCHED`).
+        let range_touched = (range_mode != 0 && !has_percentage_padding)
+            .then(|| {
+                PAINT_TOUCHED.with(|touched| {
+                    touched
+                        .borrow()
+                        .as_ref()
+                        .filter(|changes| changes.len == source_len)
+                        .map(|changes| (changes.touched_bitmap(), changes.changed.clone()))
+                })
+            })
+            .flatten();
+        let range_before = previous
+            .and_then(|previous| previous.range_record.as_deref())
+            .filter(|record| record.len == source_len && !record.percent_padding);
+        let range_aligned = range_touched.as_ref().zip(range_before);
+        let mut trimmed = (range_mode != 0).then(|| vec![false; source_len]);
+        let verify_nodes = (range_mode == 2 && range_aligned.is_some()).then(|| nodes.clone());
+        let copied = trim_line_start_white_space_ranged(
+            &mut nodes,
+            &rect_by_index,
+            range_aligned
+                .map(|((touched, _), before)| (touched.as_slice(), before.trimmed.as_slice())),
+            trimmed.as_mut(),
+        );
+        if let Some(mut fresh) = verify_nodes {
+            trim_collapsible_inline_whitespace_at_line_start(&mut fresh, &rect_by_index);
+            let same = fresh
+                .iter()
+                .zip(&nodes)
+                .all(|(a, b)| a.kind == b.kind && a.style.as_style() == b.style.as_style());
+            if !same {
+                PAINT_RANGE_STATS.with(|stats| {
+                    let mut value = stats.get();
+                    value.2 += 1;
+                    stats.set(value);
+                });
+                eprintln!("[paint-range-rebuild-verify] trim mismatch ({copied} copied)");
+                nodes = fresh;
+                trimmed = None;
+            }
+        }
         table_passes::run(&mut nodes, &rect_by_index);
         media_controls::append(&mut nodes, &mut rect_by_index);
+        let ordinal_scan = range_aligned
+            .filter(|(_, before)| before.ordinals_plain)
+            .map(|((_, changed), _)| changed.as_slice());
+        let (logical_paint_ordinals, ordinals_plain) =
+            positioned_inline_fragment_ordinals_ranged(&nodes, ordinal_scan, source_len);
+        if range_mode == 2
+            && ordinal_scan.is_some()
+            && logical_paint_ordinals != positioned_inline_fragment_ordinals(&nodes)
+        {
+            PAINT_RANGE_STATS.with(|stats| {
+                let mut value = stats.get();
+                value.2 += 1;
+                stats.set(value);
+            });
+            eprintln!("[paint-range-rebuild-verify] ordinal mismatch");
+        }
+        if range_aligned.is_some() {
+            PAINT_RANGE_STATS.with(|stats| {
+                let mut value = stats.get();
+                value.0 += 1;
+                value.1 += u64::from(copied);
+                stats.set(value);
+            });
+        }
+        let range_record = trimmed.map(|trimmed| {
+            std::sync::Arc::new(RangeRecord {
+                len: source_len,
+                trimmed,
+                ordinals_plain,
+                percent_padding: has_percentage_padding,
+            })
+        });
         let mut artifact = Self {
-            logical_paint_ordinals: positioned_inline_fragment_ordinals(&nodes),
+            logical_paint_ordinals,
+            range_record,
             body_index,
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
@@ -4731,6 +4899,43 @@ pub(crate) fn paint_touched_mode() -> u8 {
             Some("0" | "false") => 0,
             Some("verify") => 2,
             _ => 1,
+        },
+    )
+}
+
+thread_local! {
+    /// (aligned builds, trim decisions copied, verify mismatches).
+    static PAINT_RANGE_STATS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_RANGE_REBUILD_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn paint_range_stats() -> (u64, u64, u64) {
+    PAINT_RANGE_STATS.with(std::cell::Cell::get)
+}
+
+/// `W3COS_PAINT_RANGE_REBUILD=1|verify` (off by default): the reusing
+/// artifact build re-runs the line-start white-space trim and the logical
+/// ordinal scan only for the boxes this frame's layout splice touched,
+/// taking the previous build's decisions for the rest. `verify` also runs
+/// the full passes, reports a difference and uses the full result.
+pub(crate) fn paint_range_rebuild_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_RANGE_REBUILD_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_RANGE_REBUILD").ok().as_deref() {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
         },
     )
 }

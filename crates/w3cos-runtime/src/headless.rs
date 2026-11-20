@@ -1330,6 +1330,85 @@ mod tests {
     }
 
     #[test]
+    fn paint_range_rebuild_matches_full_passes() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PAINT_RANGE_REBUILD_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PAINT_RANGE_REBUILD_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::set_style_property(log, "padding-bottom", "2px");
+            let mut messages = Vec::new();
+            for index in 0..5 {
+                let message = crate::dom::create_element("div");
+                crate::dom::set_style_property(message, "padding", "4px");
+                // Leading white space at a line start is trimmed in paint.
+                let span = crate::dom::create_element("span");
+                crate::dom::set_style_property(span, "color", "red");
+                let inner = crate::dom::create_text_node(&format!("  message {index}"));
+                crate::dom::append_child(span, inner);
+                crate::dom::append_child(message, span);
+                let text = crate::dom::create_text_node(" says hi");
+                crate::dom::append_child(message, text);
+                crate::dom::append_child(log, message);
+                messages.push(message);
+            }
+            crate::dom::append_child(body, log);
+            let streamed = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node(" streamed");
+            crate::dom::append_child(streamed, text);
+            crate::dom::append_child(messages[2], streamed);
+            assert!(crate::incremental_layout::flush());
+            let before = crate::paint_artifact::paint_range_stats();
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut content = String::from(" streamed");
+            for _ in 0..5 {
+                content.push_str(" more words");
+                crate::dom::set_text_content(text, &content);
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = crate::paint_artifact::paint_range_stats();
+            (
+                frames,
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            )
+        };
+        let (verified, (aligned, copied, mismatched)) = run(2);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(
+                aligned > 0,
+                "spliced frames must reuse the previous build's record"
+            );
+            assert!(
+                copied > 0,
+                "untouched boxes must take the previous trim decision"
+            );
+        }
+        assert_eq!(
+            mismatched, 0,
+            "range-scoped passes differ from the full passes"
+        );
+        let (ranged, _) = run(1);
+        let (full, (off_aligned, _, _)) = run(0);
+        assert_eq!(off_aligned, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(ranged == full, "frames from range-scoped passes differ");
+    }
+
+    #[test]
     fn shared_paint_flat_matches_a_fresh_flatten() {
         struct Off;
         impl Drop for Off {
