@@ -2524,6 +2524,10 @@ pub(super) fn replay_paint_splices(
             splice_tree(root, entry, &geometry, sizes);
         }
         lazy.flush(layouts);
+        let changes = changes.map(|mut changes| {
+            changes.generation = crate::incremental_layout::paint_layout_generation();
+            changes
+        });
         LAST_PAINT_CHANGES.with(|slot| *slot.borrow_mut() = changes);
         if let Some(shadow) = shadow {
             let same = shadow.len() == layouts.len()
@@ -2602,6 +2606,8 @@ pub(crate) struct PaintChanges {
     /// Set by the first splice (the tree size before the replay).
     started: bool,
     pub(crate) touched: Vec<bool>,
+    /// The paint layout that replayed these splices.
+    pub(crate) generation: u64,
 }
 
 impl PaintChanges {
@@ -2654,6 +2660,7 @@ thread_local! {
 pub(crate) fn paint_changes_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("W3COS_PAINT_CHANGES_VERIFY").is_ok_and(|v| v == "1"))
+        || crate::paint_artifact::paint_touched_mode() != 0
 }
 
 /// The changes of the last paint replay, once.

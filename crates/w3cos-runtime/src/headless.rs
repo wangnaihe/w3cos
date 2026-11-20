@@ -61,6 +61,8 @@ struct RetainedPaint {
     /// update can reuse the artifact.
     rect_independent: bool,
     artifact: PaintArtifact,
+    /// The paint layout (`paint_layout_generation`) the artifact shows.
+    layout_generation: u64,
 }
 
 thread_local! {
@@ -275,6 +277,28 @@ fn finish_headless_frame(
         sticky_counter_signal: node.sticky_counter_signal,
     });
     let viewport = Some((width as f32, height as f32));
+    // What the layout splice of this frame touched (if it replayed one).
+    #[cfg_attr(not(feature = "skia"), allow(unused_variables))]
+    let changes = crate::incremental_layout::take_paint_changes();
+    let touched_on = crate::paint_artifact::paint_touched_mode() != 0;
+    if touched_on {
+        // Paint-only UA boxes come after every layout box; a set that does
+        // not cover the layout boxes is not used.
+        // Only a set for this frame's paint layout, made on top of the one
+        // the retained artifact shows, describes what changed since it.
+        let now = crate::incremental_layout::paint_layout_generation();
+        let base = RETAINED_PAINT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|retained| retained.layout_generation)
+        });
+        let touched = changes
+            .as_ref()
+            .filter(|changes| changes.generation == now && base.map(|base| base + 1) == Some(now))
+            .map(|changes| changes.touched.clone())
+            .filter(|touched| touched.len() == flat.len());
+        crate::paint_artifact::set_paint_touched(touched);
+    }
     let mut artifact = if crate::paint_artifact::paint_append_reuse_enabled() {
         RETAINED_PAINT.with(|slot| {
             let retained = slot.borrow();
@@ -296,6 +320,9 @@ fn finish_headless_frame(
             viewport,
         )
     };
+    if touched_on {
+        crate::paint_artifact::set_paint_touched(None);
+    }
     artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
     let nodes = artifact
@@ -381,8 +408,6 @@ fn finish_headless_frame(
         height as f32,
     );
     // What the layout splice of this frame touched (if it was one splice).
-    #[cfg_attr(not(feature = "skia"), allow(unused_variables))]
-    let changes = crate::incremental_layout::take_paint_changes();
     #[cfg(feature = "skia")]
     if paint_layer_reuse_enabled() {
         // Diff against the artifact the retained recordings were made from.
@@ -436,6 +461,7 @@ fn finish_headless_frame(
             structure,
             rect_independent,
             artifact,
+            layout_generation: crate::incremental_layout::paint_layout_generation(),
         })
     });
     if let Some(replaced) = replaced {
@@ -469,6 +495,7 @@ fn reuse_retained_paint(
             return Ok(None);
         }
         retained.artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
+        retained.layout_generation = crate::incremental_layout::paint_layout_generation();
         if reuse == crate::incremental_layout::PaintReuse::Insets {
             if !retained.rect_independent {
                 return Ok(None);

@@ -2584,6 +2584,7 @@ pub fn with_paint_layout<R>(
     // A geometry read can set this and never paint. The paint that follows
     // records its own reason.
     note_paint_reuse(PaintReuse::None);
+    PAINT_LAYOUT_GENERATION.with(|generation| generation.set(generation.get() + 1));
     PAINT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let same_viewport = |cache: &PaintCache| {
@@ -2691,6 +2692,16 @@ pub(crate) fn paint_splice_stats() -> (u32, u32) {
 /// layout. `Some(true)`: the cache is current. `Some(false)`: it may be
 /// partly edited and must be rebuilt. `None`: untouched.
 /// Preorder subtree sizes from a flat tree's subtree ends.
+thread_local! {
+    static PAINT_LAYOUT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts paint layouts on this thread: a change set describes the step
+/// from the paint layout before its own to its own.
+pub(crate) fn paint_layout_generation() -> u64 {
+    PAINT_LAYOUT_GENERATION.with(std::cell::Cell::get)
+}
+
 fn flat_subtree_sizes(flat: &[crate::layout::FlatNodeInfo<'_>]) -> Vec<u32> {
     flat.iter()
         .enumerate()

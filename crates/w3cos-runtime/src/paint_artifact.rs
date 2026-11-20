@@ -454,6 +454,9 @@ pub struct PaintArtifact {
     append_record: Option<std::sync::Arc<AppendRecord>>,
     /// Identifies this build for the next frame's `append_record.base`.
     serial: u64,
+    /// During `append_all_reusing` only: the boxes this frame's layout
+    /// splice touched ([`paint_touched_mode`]).
+    touched: Option<Vec<bool>>,
 }
 
 impl Default for PaintArtifact {
@@ -484,6 +487,7 @@ impl Default for PaintArtifact {
             generation: 0,
             append_record: None,
             serial: 0,
+            touched: None,
         }
     }
 }
@@ -3522,6 +3526,16 @@ impl PaintArtifact {
     /// far line up with last frame's, and whose ancestors' output is the
     /// same. A copied node's display items are emitted from its new rect.
     fn append_all_reusing(&mut self, previous: Option<&PaintArtifact>) {
+        if paint_touched_mode() != 0 {
+            self.touched = PAINT_TOUCHED
+                .with(|touched| touched.borrow_mut().take())
+                .filter(|touched| touched.len() == self.nodes.len());
+        }
+        self.append_all_reusing_with(previous);
+        self.touched = None;
+    }
+
+    fn append_all_reusing_with(&mut self, previous: Option<&PaintArtifact>) {
         let len = self.nodes.len();
         let base = previous.and_then(|previous| {
             let record = previous.append_record.as_deref()?;
@@ -3627,6 +3641,22 @@ impl PaintArtifact {
     }
 
     fn inputs_match(&self, index: usize, previous: &PaintArtifact) -> bool {
+        // A box the layout splice did not touch kept its inputs (Blink:
+        // layout marks the objects that need a paint invalidation).
+        if let Some(touched) = self.touched.as_deref()
+            && touched.get(index) == Some(&false)
+        {
+            if paint_touched_mode() == 2 && !self.inputs_match_compared(index, previous) {
+                eprintln!("[paint-touched-verify] mismatch: untouched box {index} changed inputs");
+                PAINT_TOUCHED_MISMATCHES.with(|count| count.set(count.get() + 1));
+                return false;
+            }
+            return true;
+        }
+        self.inputs_match_compared(index, previous)
+    }
+
+    fn inputs_match_compared(&self, index: usize, previous: &PaintArtifact) -> bool {
         let (node, old) = (&self.nodes[index], &previous.nodes[index]);
         node.parent == old.parent
             && node.sticky_counter_signal == old.sticky_counter_signal
@@ -4453,6 +4483,50 @@ fn establishes_stacking_context(node: &PaintNode) -> bool {
 }
 
 /// Indices of `classes` ordered by class, equal classes in index order.
+thread_local! {
+    /// Per box: whether this frame's layout splice touched it (see
+    /// `incremental_layout::PaintChanges`), for the artifact build only.
+    static PAINT_TOUCHED: std::cell::RefCell<Option<Vec<bool>>> =
+        const { std::cell::RefCell::new(None) };
+    static PAINT_TOUCHED_MISMATCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_TOUCHED_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `W3COS_PAINT_TOUCHED=1`: the reusing artifact build trusts the layout
+/// splice's change set and skips the input comparison for boxes it did not
+/// touch. `=verify` also compares and reports (and honours) a difference.
+/// Off by default.
+pub(crate) fn paint_touched_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_TOUCHED_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_TOUCHED").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+/// Install (or clear) the touched set for the next artifact build.
+pub(crate) fn set_paint_touched(touched: Option<Vec<bool>>) {
+    PAINT_TOUCHED.with(|slot| *slot.borrow_mut() = touched);
+}
+
+/// Untouched boxes whose inputs differed (verify mode) on this thread.
+#[allow(dead_code)]
+pub(crate) fn paint_touched_mismatches() -> u32 {
+    PAINT_TOUCHED_MISMATCHES.with(std::cell::Cell::get)
+}
+
 pub(crate) fn stable_order_by_class(classes: &[usize]) -> Vec<usize> {
     let buckets = classes.iter().copied().max().map_or(0, |max| max + 1);
     let mut starts = vec![0usize; buckets + 1];
@@ -4983,6 +5057,91 @@ mod tests {
             .append_unchanged_against(&first)
             .expect("built against first");
         assert!(!unchanged[2] && unchanged[4] && unchanged[6]);
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+    }
+
+    /// `W3COS_PAINT_TOUCHED`: with the splice's set (the edited text, its
+    /// grown ancestors and the moved boxes touched) the build matches a full
+    /// build; a set that misses the edited text is caught by verify.
+    #[test]
+    fn a_touched_set_skips_the_input_compare_and_verify_catches_a_wrong_one() {
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        let block = |overflow: bool, opacity: f32| {
+            let mut style = Style::default();
+            style.display = Display::Block;
+            if overflow {
+                style.overflow_x = Some(Overflow::Hidden);
+                style.overflow_y = Some(Overflow::Hidden);
+            }
+            style.opacity = opacity;
+            style
+        };
+        let node = |kind: ComponentKind, style: &Style, parent: Option<usize>| PaintNode {
+            kind,
+            style: style.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let text = |content: &str| ComponentKind::Text {
+            content: content.into(),
+        };
+        let (plain, clipped, faded) = (block(false, 1.0), block(true, 1.0), block(false, 0.5));
+        let nodes = |first: &str| {
+            vec![
+                node(ComponentKind::Root, &plain, None),
+                node(ComponentKind::Root, &clipped, Some(0)),
+                node(text(first), &plain, Some(1)),
+                node(ComponentKind::Root, &faded, Some(1)),
+                node(text("second"), &plain, Some(3)),
+                node(ComponentKind::Root, &plain, Some(0)),
+                node(text("third"), &plain, Some(5)),
+            ]
+        };
+        let rect = |y: f32, height: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 200.0,
+            height,
+        };
+        let layouts = |grow: f32| {
+            vec![
+                (rect(0.0, 300.0 + grow), 0),
+                (rect(0.0, 100.0 + grow), 1),
+                (rect(0.0, 20.0 + grow), 2),
+                (rect(20.0 + grow, 20.0), 3),
+                (rect(20.0 + grow, 20.0), 4),
+                (rect(100.0 + grow, 50.0), 5),
+                (rect(100.0 + grow, 20.0), 6),
+            ]
+        };
+        let first =
+            PaintArtifact::build_reusing(nodes("first"), &layouts(0.0), 1, None, None, None);
+        let build = |mode: u8, touched: Vec<bool>| {
+            PAINT_TOUCHED_OVERRIDE.with(|flag| flag.set(Some(mode)));
+            set_paint_touched(Some(touched));
+            let next = PaintArtifact::build_reusing(
+                nodes("first, longer"),
+                &layouts(20.0),
+                2,
+                None,
+                None,
+                Some(&first),
+            );
+            set_paint_touched(None);
+            PAINT_TOUCHED_OVERRIDE.with(|flag| flag.set(None));
+            next
+        };
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(false)));
+        let fresh = PaintArtifact::build(nodes("first, longer"), &layouts(20.0), 2);
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        let right = build(1, vec![true; 7]);
+        assert!(right.append_output_eq(&fresh));
+        let before = paint_touched_mismatches();
+        let mut wrong = vec![false; 7];
+        wrong[0] = true;
+        let verified = build(2, wrong);
+        assert!(verified.append_output_eq(&fresh));
+        assert!(paint_touched_mismatches() > before);
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
