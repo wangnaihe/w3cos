@@ -854,8 +854,63 @@ fn union_cull_rect(a: LayoutRect, b: LayoutRect) -> LayoutRect {
 /// by visual rect the same way.
 struct CullIndex<'a> {
     artifact: &'a PaintArtifact,
-    /// Per node: its cull key's extent (built on first use).
-    extents: Option<Vec<Option<LayoutRect>>>,
+    /// Per node its cull key, per key its extent (built on first use).
+    extents: Option<CullExtents>,
+}
+
+/// `CullIndex` output: per node its cull key, per key its extent.
+#[derive(Default)]
+struct CullExtents {
+    key_of: Vec<u32>,
+    key_extent: Vec<Option<LayoutRect>>,
+}
+
+/// Last frame's `CullExtents` and the serial of the artifact they were
+/// built from (`W3COS_CULL_INCREMENTAL`).
+struct CullMemo {
+    serial: u64,
+    extents: CullExtents,
+}
+
+thread_local! {
+    static CULL_MEMO: RefCell<Option<CullMemo>> = const { RefCell::new(None) };
+    static CULL_INCREMENTAL_MISMATCHES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `W3COS_CULL_INCREMENTAL=1`: update last frame's cull extents for the
+/// nodes the artifact did not copy as aligned runs, instead of rebuilding
+/// them for the whole document every frame (Blink keeps cached subsequences'
+/// visual rects the same way). `=verify` also builds in full and compares.
+fn cull_incremental_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = CULL_INCREMENTAL_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_CULL_INCREMENTAL").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static CULL_INCREMENTAL_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+impl Drop for CullIndex<'_> {
+    fn drop(&mut self) {
+        if cull_incremental_mode() != 0 {
+            let memo = self.extents.take().map(|extents| CullMemo {
+                serial: self.artifact.serial(),
+                extents,
+            });
+            CULL_MEMO.with(|slot| *slot.borrow_mut() = memo);
+        }
+    }
 }
 
 impl<'a> CullIndex<'a> {
@@ -866,35 +921,44 @@ impl<'a> CullIndex<'a> {
         }
     }
 
-    fn build(artifact: &PaintArtifact) -> Vec<Option<LayoutRect>> {
-        let nodes = &artifact.nodes;
-        let is_inline = |index: usize| {
-            let node = &nodes[index];
-            matches!(
-                node.style.display,
-                Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::Contents
-            ) || matches!(node.kind, ComponentKind::Text { .. })
-        };
-        // Cull key per node: the nearest non-inline ancestor-or-self.
-        let mut key_of: Vec<usize> = (0..nodes.len()).collect();
-        for index in 0..nodes.len() {
-            let mut key = index;
-            while is_inline(key) {
-                match nodes[key].parent {
-                    Some(parent) if parent < index => {
-                        key = key_of[parent];
-                        break;
-                    }
-                    Some(parent) if parent < nodes.len() => key = parent,
-                    _ => break,
+    #[inline]
+    fn is_inline(nodes: &[crate::paint_artifact::PaintNode], index: usize) -> bool {
+        let node = &nodes[index];
+        matches!(
+            node.style.display,
+            Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::Contents
+        ) || matches!(node.kind, ComponentKind::Text { .. })
+    }
+
+    /// The nearest non-inline ancestor-or-self of `index`, given the keys
+    /// of every node before it.
+    #[inline]
+    fn key_for(nodes: &[crate::paint_artifact::PaintNode], key_of: &[u32], index: usize) -> u32 {
+        let mut key = index;
+        while Self::is_inline(nodes, key) {
+            match nodes[key].parent {
+                Some(parent) if parent < index => {
+                    key = key_of[parent] as usize;
+                    break;
                 }
+                Some(parent) if parent < nodes.len() => key = parent,
+                _ => break,
             }
-            key_of[index] = key;
         }
-        let mut extents: Vec<Option<LayoutRect>> = vec![None; nodes.len()];
+        key as u32
+    }
+
+    fn build(artifact: &PaintArtifact) -> CullExtents {
+        let nodes = &artifact.nodes;
+        // Cull key per node: the nearest non-inline ancestor-or-self.
+        let mut key_of: Vec<u32> = vec![0; nodes.len()];
+        for index in 0..nodes.len() {
+            key_of[index] = Self::key_for(nodes, &key_of, index);
+        }
+        let mut key_extent: Vec<Option<LayoutRect>> = vec![None; nodes.len()];
         let mut add = |index: usize, rect: LayoutRect| {
             if let Some(&key) = key_of.get(index) {
-                let slot = &mut extents[key];
+                let slot = &mut key_extent[key as usize];
                 *slot = Some(slot.map_or(rect, |extent| union_cull_rect(extent, rect)));
             }
         };
@@ -906,19 +970,114 @@ impl<'a> CullIndex<'a> {
         for item in &artifact.display_items {
             add(item.client_index, item.visual_rect);
         }
-        // Every node reads its key's extent.
-        (0..nodes.len())
-            .map(|index| extents[key_of[index]])
-            .collect()
+        CullExtents { key_of, key_extent }
+    }
+
+    /// `build` from last frame's output: nodes in the aligned runs the
+    /// artifact copied keep their rects, items, inputs and ancestors, so
+    /// their keys stand; only keys with a contributor outside the runs (in
+    /// either frame) are rebuilt.
+    fn build_incremental(
+        artifact: &PaintArtifact,
+        memo: CullMemo,
+    ) -> Result<CullExtents, CullMemo> {
+        let nodes = &artifact.nodes;
+        let len = nodes.len();
+        let runs = match artifact.append_runs_since(memo.serial) {
+            Some(runs) if memo.extents.key_of.len() == len => runs,
+            _ => return Err(memo),
+        };
+        let CullExtents {
+            mut key_of,
+            mut key_extent,
+        } = memo.extents;
+        let mut dirty = vec![false; len];
+        let mut gap_start = 0usize;
+        let mut gaps: Vec<(usize, usize)> = Vec::with_capacity(runs.len() + 1);
+        for run in runs {
+            let (start, end) = (run[0] as usize, (run[1] as usize).min(len));
+            if start < gap_start || start > len {
+                return Ok(Self::build(artifact));
+            }
+            if start > gap_start {
+                gaps.push((gap_start, start));
+            }
+            gap_start = end;
+        }
+        if gap_start < len {
+            gaps.push((gap_start, len));
+        }
+        let mut any_dirty = false;
+        for &(start, end) in &gaps {
+            for index in start..end {
+                let old = key_of[index];
+                let key = Self::key_for(nodes, &key_of, index);
+                key_of[index] = key;
+                dirty[old as usize] = true;
+                dirty[key as usize] = true;
+                any_dirty = true;
+            }
+        }
+        if any_dirty {
+            for (key, extent) in key_extent.iter_mut().enumerate() {
+                if dirty[key] {
+                    *extent = None;
+                }
+            }
+            let mut add = |index: usize, rect: LayoutRect| {
+                if let Some(&key) = key_of.get(index)
+                    && dirty[key as usize]
+                {
+                    let slot = &mut key_extent[key as usize];
+                    *slot = Some(slot.map_or(rect, |extent| union_cull_rect(extent, rect)));
+                }
+            };
+            for (index, rect) in artifact.rect_by_index.iter().enumerate() {
+                if let Some(rect) = rect {
+                    add(index, *rect);
+                }
+            }
+            for item in &artifact.display_items {
+                add(item.client_index, item.visual_rect);
+            }
+        }
+        Ok(CullExtents { key_of, key_extent })
+    }
+
+    fn build_for_frame(artifact: &PaintArtifact) -> CullExtents {
+        let mode = cull_incremental_mode();
+        if mode == 0 {
+            return Self::build(artifact);
+        }
+        let memo = CULL_MEMO.with(|memo| memo.borrow_mut().take());
+        let extents = match memo {
+            Some(memo) => {
+                Self::build_incremental(artifact, memo).unwrap_or_else(|_| Self::build(artifact))
+            }
+            None => Self::build(artifact),
+        };
+        if mode == 2 {
+            let full = Self::build(artifact);
+            let lookup = |e: &CullExtents, i: usize| e.key_extent[e.key_of[i] as usize];
+            let bad = (0..artifact.nodes.len())
+                .filter(|&i| lookup(&extents, i) != lookup(&full, i))
+                .count();
+            if bad > 0 {
+                eprintln!("[cull-incremental-verify] mismatch: {bad} nodes' extents differ");
+                CULL_INCREMENTAL_MISMATCHES.with(|count| count.set(count.get() + bad));
+                return full;
+            }
+        }
+        extents
     }
 
     fn extent(&mut self, index: usize) -> Option<LayoutRect> {
         let artifact = self.artifact;
-        self.extents
-            .get_or_insert_with(|| Self::build(artifact))
-            .get(index)
-            .copied()
-            .flatten()
+        let extents = self
+            .extents
+            .get_or_insert_with(|| Self::build_for_frame(artifact));
+        let key = *extents.key_of.get(index)?;
+        extents.key_extent[key as usize]
     }
 
     /// Drop the layer's nodes outside the visible rect expanded by
@@ -8009,6 +8168,93 @@ fn to_skia_color(color: w3cos_std::color::Color, opacity: f32) -> Color {
 
 #[cfg(test)]
 mod tests {
+    /// Cull extents carried over from last frame through the artifact's
+    /// copied runs equal a full build, when a middle block grew and moved
+    /// every block after it.
+    #[test]
+    fn incremental_cull_extents_match_a_full_build() {
+        use super::{CullIndex, CullMemo};
+        use crate::layout::LayoutRect;
+        use crate::paint_artifact::{PaintArtifact, PaintNode};
+        use w3cos_std::component::ComponentKind;
+        use w3cos_std::style::{Display, Style};
+        let mut block = Style::default();
+        block.display = Display::Block;
+        let mut inline = Style::default();
+        inline.display = Display::Inline;
+        let node = |kind: ComponentKind, style: &Style, parent: Option<usize>| PaintNode {
+            kind,
+            style: style.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let blocks = 24;
+        let nodes = || {
+            let mut nodes = vec![node(ComponentKind::Root, &block, None)];
+            for index in 0..blocks {
+                nodes.push(node(ComponentKind::Root, &block, Some(0)));
+                nodes.push(node(ComponentKind::Root, &inline, Some(3 * index + 1)));
+                nodes.push(node(
+                    ComponentKind::Text {
+                        content: format!("block {index}").into(),
+                    },
+                    &inline,
+                    Some(3 * index + 2),
+                ));
+            }
+            nodes
+        };
+        let layouts = |grown: f32| {
+            let rect = |y: f32, width: f32, height: f32| LayoutRect {
+                x: 0.0,
+                y,
+                width,
+                height,
+            };
+            let mut layouts = vec![(rect(0.0, 200.0, 20.0 * blocks as f32 + grown), 0)];
+            for index in 0..blocks {
+                let extra = if index == blocks / 2 { grown } else { 0.0 };
+                let y = 20.0 * index as f32 + if index > blocks / 2 { grown } else { 0.0 };
+                layouts.push((rect(y, 200.0, 20.0 + extra), 3 * index + 1));
+                // The inline overflows its block when it grew.
+                layouts.push((rect(y, 120.0, 18.0 + 2.0 * extra), 3 * index + 2));
+                layouts.push((rect(y, 100.0, 18.0 + 2.0 * extra), 3 * index + 3));
+            }
+            layouts
+        };
+        let first = PaintArtifact::build_reusing(nodes(), &layouts(0.0), 1, None, None, None);
+        let next =
+            PaintArtifact::build_reusing(nodes(), &layouts(30.0), 2, None, None, Some(&first));
+        let runs = next
+            .append_runs_since(first.serial())
+            .expect("built against first");
+        assert!(
+            !runs.is_empty(),
+            "the blocks before the grown one copy as runs"
+        );
+        let memo = CullMemo {
+            serial: first.serial(),
+            extents: CullIndex::build(&first),
+        };
+        let incremental = CullIndex::build_incremental(&next, memo)
+            .ok()
+            .expect("incremental");
+        let full = CullIndex::build(&next);
+        let extent = |e: &super::CullExtents, i: usize| e.key_extent[e.key_of[i] as usize];
+        for index in 0..next.nodes.len() {
+            assert_eq!(
+                extent(&incremental, index),
+                extent(&full, index),
+                "node {index}"
+            );
+        }
+        let grown = 3 * (blocks / 2) + 1;
+        assert!(
+            extent(&full, grown).is_some_and(|e| e.height >= 18.0 + 60.0),
+            "the grown block's extent covers its overflowing inline"
+        );
+    }
+
     #[test]
     #[ignore = "requires the frozen browser color artifact"]
     fn fractional_foreground_blend_matches_frozen_browser_pixels() {
