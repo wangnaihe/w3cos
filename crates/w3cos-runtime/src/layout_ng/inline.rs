@@ -496,28 +496,41 @@ fn basis_free_spacing(s: w3cos_std::style::Spacing) -> bool {
 }
 
 fn zero_edges(style: &Style) -> bool {
-    // A percentage edge needs the containing block's width, which inline
-    // items do not carry; it is not zero, and inline_edges_supported
-    // sends it to legacy.
-    if ![
+    let edges = [
         style.padding.top,
         style.padding.right,
         style.padding.bottom,
         style.padding.left,
         style.margin.left,
         style.margin.right,
-    ]
-    .into_iter()
-    .all(basis_free_spacing)
-    {
-        return false;
-    }
-    let padding = style.padding_lengths();
-    let margin = style.margin_lengths();
-    [padding.top, padding.right, padding.bottom, padding.left]
-        .into_iter()
-        .all(|v| v == 0.0)
-        && [margin.left, margin.right].into_iter().all(|v| v == 0.0)
+    ];
+    // Pixel edges (the common case) resolve on their own: the same
+    // used value `padding_lengths` / `margin_lengths` give each edge,
+    // without resolving the other margins.
+    let pixel_zero = edges.into_iter().try_fold(true, |zero, edge| match edge {
+        w3cos_std::style::Spacing::Px(value) => {
+            Some(zero && w3cos_std::style::used_box_spacing(value) == 0.0)
+        }
+        _ => None,
+    });
+    let edges_zero = match pixel_zero {
+        Some(zero) => zero,
+        None => {
+            // A percentage edge needs the containing block's width, which
+            // inline items do not carry; it is not zero, and
+            // inline_edges_supported sends it to legacy.
+            if !edges.into_iter().all(basis_free_spacing) {
+                return false;
+            }
+            let padding = style.padding_lengths();
+            let margin = style.margin_lengths();
+            [padding.top, padding.right, padding.bottom, padding.left]
+                .into_iter()
+                .all(|v| v == 0.0)
+                && [margin.left, margin.right].into_iter().all(|v| v == 0.0)
+        }
+    };
+    edges_zero
         && style.border_width == 0.0
         && [
             style.border_top_width,
