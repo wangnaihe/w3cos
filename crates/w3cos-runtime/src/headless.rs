@@ -179,11 +179,11 @@ fn render_document_rgba_inner(width: u32, height: u32, force_cpu: bool) -> Resul
         bail!("headless viewport dimensions must be positive");
     }
 
-    crate::incremental_layout::with_paint_layout(
+    crate::incremental_layout::with_paint_layout_flat(
         width as f32,
         height as f32,
-        |root, layout_results| {
-            finish_headless_frame(width, height, force_cpu, root, layout_results)
+        |root, layout_results, known_flat| {
+            finish_headless_frame(width, height, force_cpu, root, layout_results, known_flat)
         },
     )
 }
@@ -194,6 +194,7 @@ fn finish_headless_frame(
     force_cpu: bool,
     root: &w3cos_std::Component,
     layout_results: &layout::LayoutResults,
+    known_flat: Option<&[layout::FlatNodeInfo<'_>]>,
 ) -> Result<HeadlessFrame> {
     if crate::webgl_draw::has_live_contexts() {
         let flat = layout::pre_flatten(root);
@@ -222,7 +223,27 @@ fn finish_headless_frame(
     {
         return Ok(frame);
     }
-    let flat = layout::pre_flatten(root);
+    // A paint splice already flattened this tree (`W3COS_SHARED_PAINT_FLAT`).
+    let flattened;
+    let flat: &[layout::FlatNodeInfo<'_>] = match known_flat {
+        Some(known) => {
+            if crate::incremental_layout::shared_paint_flat_mode() == 2 {
+                let fresh = layout::pre_flatten(root);
+                if !layout::same_flat(known, &fresh) {
+                    SHARED_FLAT_MISMATCHES.with(|count| count.set(count.get() + 1));
+                    eprintln!(
+                        "[shared-paint-flat-verify] mismatch: the splice's flat tree differs"
+                    );
+                }
+            }
+            SHARED_FLAT_USES.with(|count| count.set(count.get() + 1));
+            known
+        }
+        None => {
+            flattened = layout::pre_flatten(root);
+            &flattened
+        }
+    };
     let layout_cache = &layout_results.layout_cache;
     if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
         for (rect, index) in layout_cache {
@@ -475,6 +496,20 @@ fn finish_headless_frame(
         height,
         rgba,
     })
+}
+
+thread_local! {
+    /// (frames painted from a splice's flat tree, verify mismatches).
+    static SHARED_FLAT_USES: Cell<u64> = const { Cell::new(0) };
+    static SHARED_FLAT_MISMATCHES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn shared_flat_stats() -> (u64, u64) {
+    (
+        SHARED_FLAT_USES.with(Cell::get),
+        SHARED_FLAT_MISMATCHES.with(Cell::get),
+    )
 }
 
 fn reuse_retained_paint(
@@ -1291,6 +1326,78 @@ mod tests {
         assert!(
             reused == fresh,
             "frames with a kept paint scroll plan differ"
+        );
+    }
+
+    #[test]
+    fn shared_paint_flat_matches_a_fresh_flatten() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::incremental_layout::SHARED_PAINT_FLAT_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::incremental_layout::SHARED_PAINT_FLAT_OVERRIDE
+                .with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::set_style_property(log, "padding-bottom", "2px");
+            let mut messages = Vec::new();
+            for index in 0..5 {
+                let message = crate::dom::create_element("div");
+                crate::dom::set_style_property(message, "padding", "4px");
+                let paragraph = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("message {index} says hi"));
+                crate::dom::append_child(paragraph, text);
+                crate::dom::append_child(message, paragraph);
+                crate::dom::append_child(log, message);
+                messages.push(message);
+            }
+            crate::dom::append_child(body, log);
+            let streamed = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("streamed");
+            crate::dom::append_child(streamed, text);
+            crate::dom::append_child(messages[2], streamed);
+            assert!(crate::incremental_layout::flush());
+            let before = shared_flat_stats();
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut content = String::from("streamed");
+            for _ in 0..5 {
+                content.push_str(" more words");
+                crate::dom::set_text_content(text, &content);
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = shared_flat_stats();
+            (frames, (after.0 - before.0, after.1 - before.1))
+        };
+        let (verified, (used, mismatched)) = run(2);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(
+                used > 0,
+                "spliced frames must paint from the splice's flat tree"
+            );
+        }
+        assert_eq!(
+            mismatched, 0,
+            "a shared flat tree differs from a fresh flatten"
+        );
+        let (shared, _) = run(1);
+        let (fresh, (off_used, _)) = run(0);
+        assert_eq!(off_used, 0);
+        assert!(verified == fresh, "verify-mode frames differ");
+        assert!(
+            shared == fresh,
+            "frames painted from a shared flat tree differ"
         );
     }
 

@@ -1224,6 +1224,22 @@ pub struct FlatNodeInfo<'a> {
     pub subtree_end: usize,
 }
 
+/// Whether two flat forms describe the same nodes of the same tree (same
+/// addresses, links and ids).
+pub(crate) fn same_flat(a: &[FlatNodeInfo<'_>], b: &[FlatNodeInfo<'_>]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.component.map(std::ptr::from_ref) == y.component.map(std::ptr::from_ref)
+                && x.stable_id == y.stable_id
+                && std::ptr::eq(x.kind, y.kind)
+                && std::ptr::eq(x.style, y.style)
+                && std::ptr::eq(x.on_click, y.on_click)
+                && x.sticky_counter_signal == y.sticky_counter_signal
+                && x.parent == y.parent
+                && x.subtree_end == y.subtree_end
+        })
+}
+
 pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
     thread_local! {
         /// The last two flattened roots (by address) and their node counts:

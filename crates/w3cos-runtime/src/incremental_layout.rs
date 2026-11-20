@@ -2565,6 +2565,48 @@ pub fn with_paint_layout<R>(
     viewport_h: f32,
     use_layout: impl FnOnce(&Component, &crate::layout::LayoutResults) -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
+    with_paint_layout_flat(viewport_w, viewport_h, |component, results, _| {
+        use_layout(component, results)
+    })
+}
+
+/// `W3COS_SHARED_PAINT_FLAT=1|verify`: a paint splice hands the flat tree
+/// it made of the spliced paint tree to the paint that follows, which
+/// would flatten the same tree again; `verify` flattens it anyway and
+/// compares. Off by default.
+pub(crate) fn shared_paint_flat_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = SHARED_PAINT_FLAT_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_SHARED_PAINT_FLAT").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SHARED_PAINT_FLAT_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`with_paint_layout`], also passing the paint tree's flat form when this
+/// paint layout already made it (see [`shared_paint_flat_mode`]).
+pub fn with_paint_layout_flat<R>(
+    viewport_w: f32,
+    viewport_h: f32,
+    use_layout: impl FnOnce(
+        &Component,
+        &crate::layout::LayoutResults,
+        Option<&[crate::layout::FlatNodeInfo<'_>]>,
+    ) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    let mut use_layout = Some(use_layout);
     // Paint after layout (the document lifecycle): a structural change is
     // laid out by the retained flush first, and its splices are replayed on
     // the paint tree below.
@@ -2600,17 +2642,24 @@ pub fn with_paint_layout<R>(
         if reusable {
             let cache = slot.as_mut().unwrap();
             if sync_paint_cache(cache, &dirty, cascade, viewport_w, viewport_h) {
-                return use_layout(&cache.component, &cache.results);
+                let use_layout = use_layout.take().expect("paint layout user");
+                return use_layout(&cache.component, &cache.results, None);
             }
         } else if synced
             && let Some(cache) = slot.as_mut()
             && same_viewport(cache)
             && let Some(point) = cache.journal
+            && let Some(painted) = splice_paint_cache(
+                cache,
+                point,
+                structure,
+                cascade,
+                viewport_w,
+                viewport_h,
+                &mut use_layout,
+            )
         {
-            match splice_paint_cache(cache, point, structure, cascade, viewport_w, viewport_h) {
-                Some(true) => return use_layout(&cache.component, &cache.results),
-                Some(false) | None => {}
-            }
+            return painted;
         }
         *slot = None;
         rebuild_paint_cache(&mut slot, structure, cascade, viewport_w, viewport_h)?;
@@ -2618,7 +2667,8 @@ pub fn with_paint_layout<R>(
         if synced {
             cache.journal = Some(splice::paint_journal_point());
         }
-        use_layout(&cache.component, &cache.results)
+        let use_layout = use_layout.take().expect("paint layout user");
+        use_layout(&cache.component, &cache.results, None)
     })
 }
 
@@ -2718,14 +2768,22 @@ fn flat_subtree_sizes(flat: &[crate::layout::FlatNodeInfo<'_>]) -> Vec<u32> {
         .collect()
 }
 
-fn splice_paint_cache(
+fn splice_paint_cache<R, F>(
     cache: &mut PaintCache,
     point: (u64, usize),
     structure: u64,
     cascade: u64,
     viewport_w: f32,
     viewport_h: f32,
-) -> Option<bool> {
+    use_layout: &mut Option<F>,
+) -> Option<anyhow::Result<R>>
+where
+    F: FnOnce(
+        &Component,
+        &crate::layout::LayoutResults,
+        Option<&[crate::layout::FlatNodeInfo<'_>]>,
+    ) -> anyhow::Result<R>,
+{
     let (applied, count) = splice::replay_paint_splices(
         point,
         &mut cache.component,
@@ -2735,13 +2793,13 @@ fn splice_paint_cache(
     )?;
     if !applied {
         let _ = splice::take_paint_changes();
-        return Some(false);
+        return None;
     }
     if count == 0 {
         let _ = splice::take_paint_changes();
         // The structure moved without a splice (an off-document edit, or
         // a change the flush did not lay out): rebuild.
-        return Some(false);
+        return None;
     }
     let flat = pre_flatten(&cache.component);
     if splice::paint_splice_incremental() {
@@ -2772,7 +2830,12 @@ fn splice_paint_cache(
     cache.results.layout_slots = Some(slots);
     cache.node_ids = flat.iter().map(flat_host_id).collect();
     cache.shift_lists = None;
-    drop(flat);
+    let flat = if shared_paint_flat_mode() != 0 {
+        Some(flat)
+    } else {
+        drop(flat);
+        None
+    };
     // The retained Taffy tree no longer matches the spliced component.
     let mut engine = LayoutEngine::new();
     engine.set_skip_projections(can_skip_projections(&cache.component));
@@ -2787,7 +2850,12 @@ fn splice_paint_cache(
     if splice::paint_splice_verify() {
         verify_paint_splice(cache, count, viewport_w, viewport_h);
     }
-    Some(true)
+    let use_layout = use_layout.take().expect("paint layout user");
+    Some(use_layout(
+        &cache.component,
+        &cache.results,
+        flat.as_deref(),
+    ))
 }
 
 /// [`splice::paint_splice_verify`]: compare the spliced paint tree and
