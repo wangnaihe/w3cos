@@ -4723,21 +4723,41 @@ pub(crate) fn stable_order_by_class(classes: &[usize]) -> Vec<usize> {
 
 /// `items` in paint order (stable), by the paint-order class of each item's
 /// node; a counting sort, since classes are dense ranks.
-pub(crate) fn sort_by_paint_order<T>(
+pub(crate) fn sort_by_paint_order<T: Copy>(
     artifact: &PaintArtifact,
     items: Vec<T>,
     node_index: impl Fn(&T) -> usize,
 ) -> Vec<T> {
     let classes = items
         .iter()
-        .map(|item| artifact.paint_order_class(node_index(item)) as usize)
-        .collect::<Vec<_>>();
-    let order = stable_order_by_class(&classes);
-    let mut slots = items.into_iter().map(Some).collect::<Vec<_>>();
-    order
-        .into_iter()
-        .map(|index| slots[index].take().expect("each index once"))
-        .collect()
+        .map(|item| artifact.paint_order_class(node_index(item)))
+        .collect::<Vec<u32>>();
+    if classes.is_sorted() {
+        return items;
+    }
+    // The order depends only on the class sequence, which a frame that did
+    // not restack repeats; comparing it is far cheaper than sorting again.
+    PAINT_SORT_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.0 != classes {
+            let wide = classes
+                .iter()
+                .map(|&class| class as usize)
+                .collect::<Vec<_>>();
+            memo.1 = stable_order_by_class(&wide)
+                .into_iter()
+                .map(|index| index as u32)
+                .collect();
+            memo.0 = classes;
+        }
+        memo.1.iter().map(|&index| items[index as usize]).collect()
+    })
+}
+
+thread_local! {
+    /// The last class sequence `sort_by_paint_order` sorted, and its order.
+    static PAINT_SORT_MEMO: std::cell::RefCell<(Vec<u32>, Vec<u32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 thread_local! {
