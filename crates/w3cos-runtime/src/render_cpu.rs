@@ -2021,8 +2021,31 @@ fn draw_text_ink_in_box(
     draw_text_line(pixmap, x, y, text, font_size, color, font, style, clip_mask);
 }
 
+fn font_is_ahem(style: &Style) -> bool {
+    style.font_family.as_deref().is_some_and(|families| {
+        families.split(',').any(|family| {
+            family
+                .trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case("ahem")
+        })
+    })
+}
+
 fn single_line_h_align(style: &Style, _box_w: f32, _ink_w: f32) -> TextAlign {
-    if style.display == w3cos_std::style::Display::Inline {
+    // Inline fragments are already placed by layout. Ahem's `width: 100%`
+    // line box is the exception Skia honors, so a pre-wrap run and its
+    // `<br>` reference share one alignment. Other inline text stays put.
+    if style.display == w3cos_std::style::Display::Inline && !font_is_ahem(style) {
+        return TextAlign::Left;
+    }
+    if style.display == w3cos_std::style::Display::Inline
+        && style.width != w3cos_std::style::Dimension::Percent(100.0)
+        && !style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key("--w3cos-internal-float-line-bands"))
+    {
         return TextAlign::Left;
     }
     let text_align = match (style.text_align, style.direction) {
@@ -2116,17 +2139,47 @@ fn draw_text_in_rect(
         let align = text_align_last(style).unwrap_or_else(|| {
             single_line_h_align(style, first_line_content.width, layout.ink_bounds[0].width)
         });
-        draw_text_ink_in_box(
-            pixmap,
-            first_line_content,
-            &lines[0],
-            style.font_size,
-            color,
-            font,
-            style,
-            align,
-            effective_clip,
-        );
+        // An inline run shares the multi-line em-box origin. Shifting by
+        // ink.top pulls Ahem's internal leading above the line box, so a
+        // pre-wrap fragment no longer sits on the same pixels as the
+        // reference's forced-break line.
+        if style.display == w3cos_std::style::Display::Inline && font_is_ahem(style) {
+            let ink = layout.ink_bounds[0];
+            let x = match align {
+                TextAlign::Right => {
+                    first_line_content.x + first_line_content.width - ink.width - ink.left
+                }
+                TextAlign::Center => {
+                    first_line_content.x + (first_line_content.width - ink.width) * 0.5 - ink.left
+                }
+                TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => {
+                    first_line_content.x - ink.left
+                }
+            };
+            draw_text_line(
+                pixmap,
+                x,
+                first_line_content.y,
+                &lines[0],
+                style.font_size,
+                color,
+                font,
+                style,
+                effective_clip,
+            );
+        } else {
+            draw_text_ink_in_box(
+                pixmap,
+                first_line_content,
+                &lines[0],
+                style.font_size,
+                color,
+                font,
+                style,
+                align,
+                effective_clip,
+            );
+        }
         return;
     }
 
