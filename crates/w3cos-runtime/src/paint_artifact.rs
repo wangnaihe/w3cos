@@ -1216,15 +1216,15 @@ thread_local! {
     static STYLE_ADJUST_MEMO_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `W3COS_STYLE_ADJUST_MEMO=1` (default off); `=verify` recomputes each
+/// `W3COS_STYLE_ADJUST_MEMO` (default on; `=0` off); `=verify` recomputes each
 /// reused result and reports a difference.
 fn style_adjust_memo_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_STYLE_ADJUST_MEMO").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }

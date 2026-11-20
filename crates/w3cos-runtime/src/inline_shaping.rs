@@ -279,18 +279,20 @@ thread_local! {
     static SHAPING_INDEX_LAZY_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `W3COS_SHAPING_INDEX_LAZY=1` (default off): instead of indexing every
+/// `W3COS_SHAPING_INDEX_LAZY` (default on; `=0` off): instead of indexing every
 /// node's inline owner each frame, scan only the subtrees of the owners the
 /// recorded layers ask about (preorder: an owner's subtree is the run after
 /// it whose parents are at or after it, plus the paint-only tail).
-/// `=verify` builds both and compares every answer.
+/// `=verify` builds both and compares every answer. Same-session idle
+/// wall A/B (16 rounds, with the style-adjust memo): on-screen message
+/// frame -6.6% (13/16), last message -5.2% (13/16).
 fn shaping_index_lazy_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_SHAPING_INDEX_LAZY").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
