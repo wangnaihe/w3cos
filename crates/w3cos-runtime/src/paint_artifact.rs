@@ -3426,6 +3426,18 @@ impl PaintArtifact {
         .then_some(record.unchanged.as_slice())
     }
 
+    /// Identifies this build (see `append_runs_since`).
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// `append_runs_against` for the build whose `serial` is `base`.
+    pub(crate) fn append_runs_since(&self, base: u64) -> Option<&[[u32; 4]]> {
+        let record = self.append_record.as_deref()?;
+        (base != 0 && record.base == base && record.unchanged.len() == self.nodes.len())
+            .then_some(record.runs.as_slice())
+    }
+
     /// The aligned runs this artifact copied from `previous` (see
     /// `AppendRecord::runs`), when it was built against `previous`.
     pub(crate) fn append_runs_against(&self, previous: &PaintArtifact) -> Option<&[[u32; 4]]> {

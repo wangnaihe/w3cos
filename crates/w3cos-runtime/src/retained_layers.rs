@@ -81,6 +81,11 @@ pub struct RetainedLayerTree {
     translated: Option<Vec<Option<(f32, f32)>>>,
     /// The clip tree's rects when the recordings were made.
     clip_rects: Vec<Option<LayoutRect>>,
+    /// The chunk paint order `layers` were grouped from
+    /// (`W3COS_LAYER_REUSE`).
+    chunk_order: Vec<usize>,
+    /// `serial` of the artifact `layers` were last synced from.
+    artifact_serial: u64,
 }
 
 impl RetainedLayerTree {
@@ -107,7 +112,35 @@ impl RetainedLayerTree {
         overrides: &CompositorOverrides,
         known_changed: bool,
     ) -> LayerPaintAction {
-        let layers = build_layers(artifact);
+        let reuse_mode = layer_reuse_mode();
+        let order = chunk_paint_order(artifact);
+        let mut reused = false;
+        let old_bounds: Vec<LayoutRect> = self.layers.iter().map(|layer| layer.bounds).collect();
+        let runs = artifact.append_runs_since(self.artifact_serial);
+        let layers = if reuse_mode != 0
+            && partition_still_holds(artifact, &order, &self.chunk_order, &self.layers, runs)
+        {
+            // Blink's PaintArtifactCompositor keeps its pending layers when
+            // the chunks group the same way; only bounds and owners refresh.
+            let mut layers = std::mem::take(&mut self.layers);
+            refresh_layers(artifact, &mut layers);
+            reused = true;
+            if reuse_mode == 2 {
+                let full = build_layers_in_order(artifact, &order);
+                if !layers_equal(&layers, &full) {
+                    eprintln!("[layer-reuse] mismatch against the full layer build");
+                    LAYER_REUSE_MISMATCHES.with(|count| count.set(count.get() + 1));
+                    reused = false;
+                    layers = full;
+                }
+            }
+            layers
+        } else {
+            build_layers_in_order(artifact, &order)
+        };
+        if reused {
+            LAYER_REUSE_HITS.with(|count| count.set(count.get() + 1));
+        }
         let content = if known_changed {
             if layer_sync_fast_verify()
                 && content_fingerprint(artifact, &layers) | 1 == self.content_fingerprint
@@ -139,32 +172,38 @@ impl RetainedLayerTree {
         } else {
             Vec::new()
         };
-        let structure_changed = self.layers.len() != layers.len()
-            || self
-                .layers
-                .iter()
-                .zip(&layers)
-                .any(|(old, new)| old.client_indices != new.client_indices);
+        // A reused partition has the same clients per layer by construction.
+        // A reuse that verify rejected took the old layers: rebuild.
+        let structure_changed = if reuse_mode != 0 && self.layers.is_empty() {
+            !reused
+        } else {
+            self.layers.len() != layers.len()
+                || self
+                    .layers
+                    .iter()
+                    .zip(&layers)
+                    .any(|(old, new)| old.client_indices != new.client_indices)
+        };
         let comparable = self.track_partial
             && self.recordings_valid
-            && !self.layers.is_empty()
+            && !old_bounds.is_empty()
             && !structure_changed
             && global == self.global_fingerprint
             && self.clip_rects.len() == clip_rects.len();
         let moves: Option<Vec<LayerMove>> = comparable.then(|| {
             let mut chain = ClipChainMoves::new(artifact, &self.clip_rects, &clip_rects);
-            self.layers
+            old_bounds
                 .iter()
                 .zip(&layers)
                 .zip(self.layer_chunk_hashes.iter().zip(&chunk_hashes))
                 .map(|((old, new), (old_chunks, new_chunks))| {
                     if old_chunks != new_chunks
-                        || old.bounds.width.to_bits() != new.bounds.width.to_bits()
-                        || old.bounds.height.to_bits() != new.bounds.height.to_bits()
+                        || old.width.to_bits() != new.bounds.width.to_bits()
+                        || old.height.to_bits() != new.bounds.height.to_bits()
                     {
                         return LayerMove::Changed;
                     }
-                    let delta = (new.bounds.x - old.bounds.x, new.bounds.y - old.bounds.y);
+                    let delta = (new.bounds.x - old.x, new.bounds.y - old.y);
                     let clips_moved = new
                         .client_indices
                         .iter()
@@ -193,6 +232,8 @@ impl RetainedLayerTree {
         self.global_fingerprint = global;
         self.layer_chunk_hashes = chunk_hashes;
         self.layers = layers;
+        self.chunk_order = order;
+        self.artifact_serial = artifact.serial();
 
         if known_changed
             || !self.recordings_valid
@@ -258,6 +299,36 @@ pub(crate) fn layer_sync_fast_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("W3COS_LAYER_SYNC_FAST").map_or(true, |v| v != "0" && v != "false")
     })
+}
+
+/// `W3COS_LAYER_REUSE=1`: keep last frame's layer partition when every
+/// chunk still groups the same way (same paint order, properties, sticky
+/// owner, viewport attachment and clients); `=verify` also builds the
+/// layers in full and reports a difference. Off by default.
+pub(crate) fn layer_reuse_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = LAYER_REUSE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_LAYER_REUSE").as_deref() {
+        Ok("1") | Ok("true") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAYER_REUSE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static LAYER_REUSE_HITS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static LAYER_REUSE_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn layer_sync_fast_verify() -> bool {
@@ -1389,10 +1460,13 @@ fn moved_by(
 }
 
 pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
-    let mut layers = Vec::new();
-    // Stable: chunks of equal paint order keep their order. Paint-order
-    // classes are dense ranks below the node count, so a counting sort
-    // orders the chunks in linear time.
+    build_layers_in_order(artifact, &chunk_paint_order(artifact))
+}
+
+/// Chunk ids in paint order. Stable: chunks of equal paint order keep their
+/// order. Paint-order classes are dense ranks below the node count, so a
+/// counting sort orders the chunks in linear time.
+fn chunk_paint_order(artifact: &PaintArtifact) -> Vec<usize> {
     let classes = artifact
         .chunks
         .iter()
@@ -1405,8 +1479,12 @@ pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
             artifact.paint_order_class(client_index) as usize
         })
         .collect::<Vec<_>>();
-    let chunk_ids = crate::paint_artifact::stable_order_by_class(&classes);
-    for chunk_id in chunk_ids {
+    crate::paint_artifact::stable_order_by_class(&classes)
+}
+
+fn build_layers_in_order(artifact: &PaintArtifact, chunk_ids: &[usize]) -> Vec<CompositorLayer> {
+    let mut layers = Vec::new();
+    for &chunk_id in chunk_ids {
         let chunk = &artifact.chunks[chunk_id];
         let sticky = artifact
             .display_items
@@ -1464,6 +1542,176 @@ pub fn build_layers(artifact: &PaintArtifact) -> Vec<CompositorLayer> {
         });
     }
     layers
+}
+
+/// Whether `build_layers_in_order(artifact, order)` would group the chunks
+/// exactly as `layers` (built from `previous_order`) are: same order, and
+/// every chunk joins or starts a layer as before with the same clients.
+fn partition_still_holds(
+    artifact: &PaintArtifact,
+    order: &[usize],
+    previous_order: &[usize],
+    layers: &[CompositorLayer],
+    runs: Option<&[[u32; 4]]>,
+) -> bool {
+    if layers.is_empty() || order != previous_order {
+        return false;
+    }
+    // Per chunk: it lies inside a run the build copied from the artifact
+    // `layers` came from, so its items, properties, sticky owners and
+    // viewport attachment are last frame's (runs align every array, chunk
+    // ids included).
+    let mut copied = vec![false; artifact.chunks.len()];
+    if let Some(runs) = runs {
+        let mut run = 0;
+        for (id, chunk) in artifact.chunks.iter().enumerate() {
+            while run < runs.len() && (runs[run][3] as usize) < chunk.end {
+                run += 1;
+            }
+            copied[id] = runs
+                .get(run)
+                .is_some_and(|r| r[2] as usize <= chunk.begin && chunk.end <= r[3] as usize);
+        }
+    }
+    let mut position = 0;
+    let mut previous_layer: Option<&CompositorLayer> = None;
+    let mut previous_chunk_copied = true;
+    let mut previous_first_copied = true;
+    for layer in layers {
+        let count = layer.chunk_ids.len();
+        if count == 0 || order.get(position..position + count) != Some(layer.chunk_ids.as_slice()) {
+            return false;
+        }
+        position += count;
+        let mut offset = 0;
+        let first_copied = copied.get(layer.chunk_ids[0]).copied().unwrap_or(false);
+        for (nth, &chunk_id) in layer.chunk_ids.iter().enumerate() {
+            let Some(chunk) = artifact.chunks.get(chunk_id) else {
+                return false;
+            };
+            let chunk_copied = copied.get(chunk_id).copied().unwrap_or(false);
+            // This chunk, the one before it in paint order and the layer's
+            // first chunk are all unchanged: the join decision and the
+            // clients are last frame's.
+            // A layer's first chunk is also tested against the previous
+            // layer, whose first client decides viewport attachment.
+            if chunk_copied
+                && previous_chunk_copied
+                && first_copied
+                && (nth > 0 || previous_first_copied)
+            {
+                offset += chunk.end - chunk.begin;
+                if offset > layer.client_indices.len() {
+                    return false;
+                }
+                continue;
+            }
+            previous_chunk_copied = chunk_copied;
+            let Some(items) = artifact.display_items.get(chunk.begin..chunk.end) else {
+                return false;
+            };
+            let first_item = artifact.display_items.get(chunk.begin);
+            let sticky = first_item
+                .and_then(|item| artifact.sticky_owner.get(item.client_index).copied())
+                .flatten();
+            // build_layers' same-layer test against a layer whose first
+            // client so far is `first_client`.
+            let joins = |properties: &PaintProperties,
+                         sticky_owner: Option<usize>,
+                         first_client: Option<usize>| {
+                *properties == chunk.properties
+                    && sticky_owner == sticky
+                    && first_client.zip(first_item).is_some_and(|(client, item)| {
+                        artifact.viewport_attached(client)
+                            == artifact.viewport_attached(item.client_index)
+                    })
+            };
+            if nth == 0 {
+                if previous_layer.is_some_and(|previous| {
+                    joins(
+                        &previous.properties,
+                        previous.sticky_owner,
+                        previous.client_indices.first().copied(),
+                    )
+                }) || layer.properties != chunk.properties
+                    || layer.sticky_owner != sticky
+                {
+                    return false;
+                }
+            } else if !joins(
+                &layer.properties,
+                layer.sticky_owner,
+                (offset > 0).then(|| layer.client_indices[0]),
+            ) {
+                return false;
+            }
+            let end = offset + items.len();
+            let Some(clients) = layer.client_indices.get(offset..end) else {
+                return false;
+            };
+            if !clients
+                .iter()
+                .zip(items)
+                .all(|(client, item)| *client == item.client_index)
+            {
+                return false;
+            }
+            offset = end;
+        }
+        if offset != layer.client_indices.len() {
+            return false;
+        }
+        previous_layer = Some(layer);
+        previous_first_copied = first_copied;
+    }
+    position == order.len()
+}
+
+/// Recomputes what a kept partition does not fix: bounds and owners.
+fn refresh_layers(artifact: &PaintArtifact, layers: &mut [CompositorLayer]) {
+    for layer in layers {
+        let mut chunks = layer.chunk_ids.iter().map(|&id| &artifact.chunks[id]);
+        if let Some(first) = chunks.next() {
+            layer.bounds = chunks.fold(first.bounds, |bounds, chunk| {
+                union_rect(bounds, chunk.bounds)
+            });
+        }
+        layer.scroll_host = artifact
+            .properties
+            .scrolls
+            .get(layer.properties.scroll)
+            .and_then(|node| node.host_index);
+        layer.effect_owner =
+            property_owner(artifact, |props| props.effect, layer.properties.effect);
+        layer.transform_owner = property_owner(
+            artifact,
+            |props| props.transform,
+            layer.properties.transform,
+        );
+    }
+}
+
+fn layers_equal(a: &[CompositorLayer], b: &[CompositorLayer]) -> bool {
+    let rect_bits = |r: &LayoutRect| {
+        [
+            r.x.to_bits(),
+            r.y.to_bits(),
+            r.width.to_bits(),
+            r.height.to_bits(),
+        ]
+    };
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.id == b.id
+                && rect_bits(&a.bounds) == rect_bits(&b.bounds)
+                && a.properties == b.properties
+                && a.chunk_ids == b.chunk_ids
+                && a.client_indices == b.client_indices
+                && a.sticky_owner == b.sticky_owner
+                && a.effect_owner == b.effect_owner
+                && a.transform_owner == b.transform_owner
+                && a.scroll_host == b.scroll_host
+        })
 }
 
 fn property_owner(
@@ -1930,6 +2178,36 @@ mod tests {
             .flat_map(|layer| layer.client_indices)
             .collect::<Vec<_>>();
         assert_eq!(painted_clients, vec![0, 2, 3, 1]);
+    }
+
+    #[test]
+    fn a_kept_layer_partition_refreshes_bounds_and_matches_a_full_build() {
+        super::LAYER_REUSE_OVERRIDE.with(|mode| mode.set(Some(2)));
+        let mismatches = || super::LAYER_REUSE_MISMATCHES.with(std::cell::Cell::get);
+        let hits = || super::LAYER_REUSE_HITS.with(std::cell::Cell::get);
+        let (mismatches_before, hits_before) = (mismatches(), hits());
+        let mut tree = RetainedLayerTree::default();
+        let scrolls = HashMap::new();
+        let overrides = CompositorOverrides::default();
+        let first = scroll_tree();
+        tree.sync(&first, &scrolls, &overrides);
+        assert_eq!(hits(), hits_before, "nothing to keep on the first frame");
+        let mut moved = scroll_tree();
+        for chunk in &mut moved.chunks {
+            chunk.bounds.y += 7.0;
+        }
+        tree.sync(&moved, &scrolls, &overrides);
+        assert_eq!(hits(), hits_before + 1);
+        assert!(layers_equal(&tree.layers, &build_layers(&moved)));
+        // A chunk that changes its clients regroups in full.
+        let mut regrouped = scroll_tree();
+        let last = regrouped.display_items.len() - 1;
+        regrouped.display_items[last].client_index += 1;
+        tree.sync(&regrouped, &scrolls, &overrides);
+        assert_eq!(hits(), hits_before + 1);
+        assert!(layers_equal(&tree.layers, &build_layers(&regrouped)));
+        assert_eq!(mismatches(), mismatches_before);
+        super::LAYER_REUSE_OVERRIDE.with(|mode| mode.set(None));
     }
 
     #[test]
