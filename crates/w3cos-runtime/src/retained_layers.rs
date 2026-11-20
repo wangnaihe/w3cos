@@ -612,11 +612,63 @@ pub struct PaintDiff {
 /// px; see [`paint_damage`]).
 pub type ClientDamage = (usize, usize, LayoutRect);
 
+/// A damage entry that is a run of clients which only moved, by one offset
+/// (`W3COS_PAINT_DAMAGE_BLIT`): its position in the damage list, the move
+/// (CSS px) and the union of the clients' old ink.
+pub type MovedSpan = (usize, (f32, f32), LayoutRect);
+
+thread_local! {
+    /// The moved spans of the last bounded damage, with that damage's length.
+    static DAMAGE_MOVES: std::cell::RefCell<Option<(usize, Vec<MovedSpan>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `W3COS_PAINT_DAMAGE_BLIT=1|verify` (needs `W3COS_PAINT_DAMAGE=1`): a run
+/// of clients that only moved by a whole device pixel offset is copied from
+/// the previous frame's pixels instead of composited again (WebKit's
+/// blit-on-scroll); only changed clients, uncovered strips and whatever
+/// overlaps the copied pixels are composited. `verify` also composites the
+/// full frame off-screen and compares.
+pub fn paint_damage_blit_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DAMAGE_BLIT_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_DAMAGE_BLIT").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DAMAGE_SPANS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static PAINT_DAMAGE_BLIT_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The moved spans recorded with a damage list of `len` entries.
+pub fn take_damage_moves(len: usize) -> Option<Vec<MovedSpan>> {
+    DAMAGE_MOVES
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|(recorded, _)| *recorded == len)
+        .map(|(_, moves)| moves)
+}
+
 /// `W3COS_PAINT_DAMAGE_SPANS=0` turns it off: consecutive clients that only
 /// moved, by one offset, share one damage rect covering their old and new
 /// paint (Blink invalidates a subtree that moved as a whole by its visual
 /// rect, not box by box).
 fn paint_damage_spans_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PAINT_DAMAGE_SPANS_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_SPANS").map_or(true, |v| v != "0"))
 }
@@ -770,17 +822,23 @@ fn paint_damage_with<S: InkSource>(
     ink: &mut S,
 ) -> Option<Vec<ClientDamage>> {
     let spans = paint_damage_spans_enabled();
+    let record_moves = paint_damage_blit_mode() != 0;
+    DAMAGE_MOVES.with(|slot| *slot.borrow_mut() = None);
+    let mut moves: Vec<MovedSpan> = Vec::new();
     let mut damage = Vec::new();
     // The open run of moved clients: first, end, offset bits, old ink union.
     let mut span: Option<(usize, usize, (u32, u32), (f32, f32), LayoutRect)> = None;
-    let flush = |span: &mut Option<(usize, usize, (u32, u32), (f32, f32), LayoutRect)>,
-                 damage: &mut Vec<ClientDamage>| {
+    let mut flush = |span: &mut Option<(usize, usize, (u32, u32), (f32, f32), LayoutRect)>,
+                     damage: &mut Vec<ClientDamage>| {
         if let Some((first, end, _, (dx, dy), old)) = span.take() {
             let new = LayoutRect {
                 x: old.x + dx,
                 y: old.y + dy,
                 ..old
             };
+            if record_moves {
+                moves.push((damage.len(), (dx, dy), old));
+            }
             damage.push((first, end, union_rect(old, new)));
         }
     };
@@ -858,6 +916,9 @@ fn paint_damage_with<S: InkSource>(
         }
     }
     flush(&mut span, &mut damage);
+    if record_moves {
+        DAMAGE_MOVES.with(|slot| *slot.borrow_mut() = Some((damage.len(), moves)));
+    }
     Some(damage)
 }
 
@@ -991,7 +1052,10 @@ fn resized_box_damage(
 /// text fragments, grown by a margin for glyph overhang, outlines and
 /// anti-aliasing. `Err`: paint that can reach farther (shadows, filters,
 /// transforms, backdrop effects).
-fn client_ink_bounds(artifact: &PaintArtifact, index: usize) -> Result<Option<LayoutRect>, ()> {
+pub(crate) fn client_ink_bounds(
+    artifact: &PaintArtifact,
+    index: usize,
+) -> Result<Option<LayoutRect>, ()> {
     let Some(node) = artifact.nodes.get(index) else {
         return Ok(None);
     };

@@ -1562,6 +1562,110 @@ mod tests {
         }
     }
 
+    /// Cards below an edited top card move by whole pixels: the blit copies
+    /// them from the previous frame and the result equals a full paint; with
+    /// a gradient behind them the blit must give up and stay correct.
+    #[test]
+    fn damage_blit_matches_a_full_composite() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        // Moved spans need the damage spans and the splice (default on):
+        // pin them so the lib-test modes that turn them off still check it.
+        crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        for gradient in [false, true] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            if gradient {
+                crate::dom::set_style_property(
+                    body,
+                    "background-image",
+                    "linear-gradient(#ffffff, #3366cc)",
+                );
+            }
+            let mut texts = Vec::new();
+            for index in 0..6 {
+                let card = crate::dom::create_element("div");
+                for (name, value) in [("width", "140px"), ("background", "#eeeeff")] {
+                    crate::dom::set_style_property(card, name, value);
+                }
+                let paragraph = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("card {index} says hello"));
+                crate::dom::append_child(paragraph, text);
+                crate::dom::append_child(card, paragraph);
+                crate::dom::append_child(body, card);
+                texts.push(text);
+            }
+            let edits: [(usize, &str); 4] = [
+                (
+                    0,
+                    "card 0 now says a much longer hello that wraps onto more lines",
+                ),
+                (0, "card 0"),
+                (1, "card 1 now says a much longer hello that wraps"),
+                (1, "card 1"),
+            ];
+            let (frames, (blitted, gave_up, differed)) = with_stable_fonts(|| {
+                with_layer_reuse(true, || {
+                    crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                    crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE
+                        .with(|value| value.set(Some(2)));
+                    let before = crate::render_skia::paint_damage_blit_stats();
+                    render_document_rgba(160, 480).expect("first frame");
+                    let mut frames = Vec::new();
+                    for (card, text) in edits {
+                        crate::dom::set_text_content(texts[card], text);
+                        frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
+                    }
+                    let after = crate::render_skia::paint_damage_blit_stats();
+                    (
+                        frames,
+                        (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+                    )
+                })
+            });
+            assert_eq!(differed, 0, "a blitted frame differs from a full composite");
+            if gradient {
+                assert_eq!(blitted, 0, "a blit over a gradient must give up");
+            } else {
+                assert!(
+                    blitted > 0,
+                    "cards moved by an edit above them must be copied"
+                );
+            }
+            let _ = gave_up;
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(Some(0)));
+            for (index, text) in texts.iter().enumerate() {
+                crate::dom::set_text_content(*text, &format!("card {index} says hello"));
+            }
+            for (step, (card, text)) in edits.into_iter().enumerate() {
+                crate::dom::set_text_content(texts[card], text);
+                let fresh = with_layer_reuse(false, || {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(160, 480).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "gradient {gradient} step {step}: a blitted frame differs from a full one"
+                );
+            }
+        }
+    }
+
     #[test]
     fn layer_reuse_keeps_text_overflowing_a_zero_width_block() {
         crate::dom::reset_document();

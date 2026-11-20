@@ -3108,6 +3108,36 @@ fn composite_skia_layers(
         return;
     };
     let surface = skia_safe::IRect::from_wh(size.width, size.height);
+    if crate::retained_layers::paint_damage_blit_mode() != 0
+        && let Some(moves) = crate::retained_layers::take_damage_moves(damage.len())
+        && !moves.is_empty()
+    {
+        match plan_damage_blit(
+            damage,
+            &moves,
+            layers,
+            artifact,
+            scroll_info,
+            overrides,
+            scale_factor,
+            surface,
+        ) {
+            Ok(plan) => {
+                apply_damage_blit(canvas, &plan, surface, &full);
+                return;
+            }
+            Err(reason) => {
+                PAINT_DAMAGE_BLIT_STATS.with(|stats| {
+                    let mut value = stats.get();
+                    value.1 += 1;
+                    stats.set(value);
+                });
+                if paint_damage_verify() || crate::retained_layers::paint_damage_blit_mode() == 2 {
+                    eprintln!("[paint-damage-blit] fallback: {reason}");
+                }
+            }
+        }
+    }
     let mut region = skia_safe::Region::new();
     for rect in &rects {
         if let Some(rect) = skia_safe::IRect::intersect(rect, &surface) {
@@ -3156,6 +3186,448 @@ fn composite_skia_layers(
             clip.height(),
             clip.left,
             clip.top,
+            surface.width(),
+            surface.height(),
+            if differing == 0 {
+                "same".to_string()
+            } else {
+                format!("DIFF {differing} pixels")
+            }
+        );
+    }
+}
+
+thread_local! {
+    /// (frames blitted, blits given up, verify frames that differed).
+    static PAINT_DAMAGE_BLIT_STATS: std::cell::Cell<(u32, u32, u32)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn paint_damage_blit_stats() -> (u32, u32, u32) {
+    PAINT_DAMAGE_BLIT_STATS.with(std::cell::Cell::get)
+}
+
+/// A damage-blit composite: pixel copies from the previous frame, then a
+/// clipped composite of `redraw`.
+struct DamageBlit {
+    /// (source rect in the previous frame, device offset); sources are
+    /// read before any copy is written.
+    copies: Vec<(skia_safe::IRect, (i32, i32))>,
+    redraw: skia_safe::Region,
+}
+
+/// Per client, the device translation of the layer that draws it:
+/// `Some(Err(()))` in a CSS-transformed (or non-translating) layer, `None`
+/// when no layer draws it.
+fn client_device_translations(
+    layers: &[crate::retained_layers::CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+) -> Vec<Option<Result<(f32, f32), ()>>> {
+    let mut out = vec![None; artifact.nodes.len()];
+    for layer in layers {
+        let translation = if !layer_css_transform(layer, artifact, overrides).is_identity() {
+            Err(())
+        } else {
+            let matrix =
+                compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+            if matrix.is_translate() {
+                let (sx, sy) = layer
+                    .client_indices
+                    .first()
+                    .map_or((0.0, 0.0), |&index| artifact.viewport_scroll_for(index));
+                Ok((
+                    matrix.translate_x() - sx * scale_factor,
+                    matrix.translate_y() - sy * scale_factor,
+                ))
+            } else {
+                Err(())
+            }
+        };
+        for &client in &layer.client_indices {
+            if let Some(slot) = out.get_mut(client) {
+                // A client drawn by two layers under different
+                // translations cannot be placed.
+                *slot = match *slot {
+                    None => Some(translation),
+                    Some(Ok(previous)) if translation == Ok(previous) => Some(Ok(previous)),
+                    _ => Some(Err(())),
+                };
+            }
+        }
+    }
+    out
+}
+
+/// `rect` (document CSS px) in device pixels under `translation`, rounded
+/// out and padded a pixel for anti-aliasing (as `damage_device_rects`).
+fn device_rect(rect: LayoutRect, translation: (f32, f32), scale: f32) -> Option<skia_safe::IRect> {
+    let left = rect.x * scale + translation.0;
+    let top = rect.y * scale + translation.1;
+    let right = (rect.x + rect.width) * scale + translation.0;
+    let bottom = (rect.y + rect.height) * scale + translation.1;
+    if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()) {
+        return None;
+    }
+    Some(skia_safe::IRect::from_ltrb(
+        (left.floor() - 1.0) as i32,
+        (top.floor() - 1.0) as i32,
+        (right.ceil() + 1.0) as i32,
+        (bottom.ceil() + 1.0) as i32,
+    ))
+}
+
+fn irect_contains(outer: &skia_safe::IRect, inner: &skia_safe::IRect) -> bool {
+    inner.is_empty()
+        || (outer.left <= inner.left
+            && outer.top <= inner.top
+            && outer.right >= inner.right
+            && outer.bottom >= inner.bottom)
+}
+
+/// Plan copying each moved span's pixels by its device offset. Every pixel
+/// of a copy's destination outside `redraw` then equals the new frame's:
+/// only the span's clients (shifted unchanged) and its ancestors paint
+/// there, and the ancestors paint one solid colour across all sources and
+/// destinations (no image, radius, shadow, filter, opacity, transform or
+/// scrollbar, the copies inside their padding boxes). Anything else that
+/// paints over a source or a destination, the uncovered parts of sources,
+/// the parts of destinations whose source is off the surface, and every
+/// changed client's damage are composited again.
+#[allow(clippy::too_many_arguments)]
+fn plan_damage_blit(
+    damage: &[crate::retained_layers::ClientDamage],
+    moves: &[crate::retained_layers::MovedSpan],
+    layers: &[crate::retained_layers::CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale: f32,
+    surface: skia_safe::IRect,
+) -> Result<DamageBlit, &'static str> {
+    use skia_safe::region::RegionOp;
+    use w3cos_std::style::Overflow;
+    if artifact
+        .canvas_background_style
+        .as_ref()
+        .is_some_and(|style| {
+            style
+                .background_image
+                .as_deref()
+                .is_some_and(|image| image.trim() != "none")
+        })
+    {
+        return Err("canvas background image");
+    }
+    let n = artifact.nodes.len();
+    let translations = client_device_translations(layers, artifact, scroll_info, overrides, scale);
+    let mut in_span = vec![false; n];
+    let mut is_move_entry = vec![false; damage.len()];
+    let mut copies = Vec::with_capacity(moves.len());
+    let mut uncovered = skia_safe::Region::new();
+    let mut sources = skia_safe::Region::new();
+    let mut destinations = skia_safe::Region::new();
+    let mut by_offset: Vec<((i32, i32), skia_safe::Region)> = Vec::new();
+    for &(position, (dx, dy), old) in moves {
+        let &(first, end, _) = damage.get(position).ok_or("move entry out of range")?;
+        *is_move_entry
+            .get_mut(position)
+            .ok_or("move entry out of range")? = true;
+        let mut translation = None;
+        for client in first..end.min(n) {
+            in_span[client] = true;
+            match translations[client] {
+                None => {}
+                Some(Err(())) => return Err("moved client in a transformed layer"),
+                Some(Ok(t)) => match translation {
+                    None => translation = Some(t),
+                    Some(previous) if previous == t => {}
+                    Some(_) => return Err("moved span under two translations"),
+                },
+            }
+        }
+        let Some(translation) = translation else {
+            continue;
+        };
+        let (ddx, ddy) = (dx * scale, dy * scale);
+        if (ddx - ddx.round()).abs() > 1e-3 || (ddy - ddy.round()).abs() > 1e-3 {
+            return Err("fractional device offset");
+        }
+        let delta = (ddx.round() as i32, ddy.round() as i32);
+        let full_source = device_rect(old, translation, scale).ok_or("non-finite rect")?;
+        let full_destination = full_source.with_offset(delta);
+        let Some(source) = skia_safe::IRect::intersect(&full_source, &surface) else {
+            // Nothing of it was on the surface: composite where it lands.
+            if let Some(rect) = skia_safe::IRect::intersect(&full_destination, &surface) {
+                uncovered.op_rect(rect, RegionOp::Union);
+            }
+            continue;
+        };
+        let Some(destination) = skia_safe::IRect::intersect(&source.with_offset(delta), &surface)
+        else {
+            continue;
+        };
+        let source = destination.with_offset((-delta.0, -delta.1));
+        // Destination pixels whose source was off the surface.
+        if let Some(rect) = skia_safe::IRect::intersect(&full_destination, &surface) {
+            let mut missing = skia_safe::Region::from_rect(rect);
+            missing.op_rect(destination, RegionOp::Difference);
+            uncovered.op_region(&missing, RegionOp::Union);
+        }
+        sources.op_rect(source, RegionOp::Union);
+        // Copies by one offset may overlap (a pixel gets the same source
+        // either way); copies by different offsets may not.
+        if by_offset
+            .iter()
+            .any(|(offset, region)| *offset != delta && region.intersects_rect(destination))
+        {
+            return Err("overlapping destinations of different offsets");
+        }
+        match by_offset.iter_mut().find(|(offset, _)| *offset == delta) {
+            Some((_, region)) => {
+                region.op_rect(destination, RegionOp::Union);
+            }
+            None => by_offset.push((delta, skia_safe::Region::from_rect(destination))),
+        }
+        destinations.op_rect(destination, RegionOp::Union);
+        copies.push((source, delta));
+    }
+    if copies.is_empty() {
+        return Err("no copy on the surface");
+    }
+    // Every source is read into a buffer before any copy is written, so a
+    // source may overlap another copy's destination.
+    let mut touched = sources.clone();
+    touched.op_region(&destinations, RegionOp::Union);
+    let bounds = *touched.bounds();
+    // Ancestors of the moved clients outside the spans.
+    let mut ancestor = vec![false; n];
+    for client in 0..n {
+        if !in_span[client] {
+            continue;
+        }
+        let mut parent = artifact.nodes[client].parent;
+        while let Some(index) = parent {
+            if index >= n || in_span[index] || ancestor[index] {
+                break;
+            }
+            ancestor[index] = true;
+            parent = artifact.nodes[index].parent;
+        }
+    }
+    for index in (0..n).filter(|&index| ancestor[index]) {
+        let style = artifact.nodes[index].style.as_style();
+        if style.opacity < 1.0
+            || style
+                .filter
+                .as_deref()
+                .is_some_and(|filter| filter.trim() != "none")
+            || !style.transform.is_identity()
+            || style.backdrop_blur.is_some()
+            || style.box_shadow.is_some()
+            || !style.box_shadows.is_empty()
+            || style
+                .background_image
+                .as_deref()
+                .is_some_and(|image| image.trim() != "none")
+            || style.border_radius != 0.0
+            || [
+                style.border_top_left_radius,
+                style.border_top_right_radius,
+                style.border_bottom_right_radius,
+                style.border_bottom_left_radius,
+            ]
+            .iter()
+            .any(|radius| radius.is_some_and(|radius| radius != 0.0))
+        {
+            return Err("ancestor paint is not one solid colour");
+        }
+        let scrolls = [
+            style.overflow,
+            style.overflow_x.unwrap_or(style.overflow),
+            style.overflow_y.unwrap_or(style.overflow),
+        ]
+        .iter()
+        .any(|overflow| matches!(overflow, Overflow::Scroll | Overflow::Auto));
+        if scrolls {
+            return Err("ancestor scroll container (scrollbars)");
+        }
+        let paints = style.background.a > 0
+            || style.border_width > 0.0
+            || [
+                style.border_top_width,
+                style.border_right_width,
+                style.border_bottom_width,
+                style.border_left_width,
+            ]
+            .iter()
+            .any(|width| width.is_some_and(|width| width > 0.0))
+            || style.clip.is_some()
+            || !matches!(style.overflow, Overflow::Visible);
+        if !paints {
+            continue;
+        }
+        let Some(rect) = artifact.rect_by_index.get(index).copied().flatten() else {
+            return Err("painting ancestor without a box");
+        };
+        let Some(Ok(translation)) = translations[index] else {
+            return Err("painting ancestor not placeable");
+        };
+        let left = style.border_left_width.unwrap_or(style.border_width);
+        let top = style.border_top_width.unwrap_or(style.border_width);
+        let right = style.border_right_width.unwrap_or(style.border_width);
+        let bottom = style.border_bottom_width.unwrap_or(style.border_width);
+        let padding_box = LayoutRect {
+            x: rect.x + left,
+            y: rect.y + top,
+            width: (rect.width - left - right).max(0.0),
+            height: (rect.height - top - bottom).max(0.0),
+        };
+        let padded = device_rect(padding_box, translation, scale).ok_or("non-finite rect")?;
+        // Strictly inside: drop the anti-aliasing pad on each side.
+        let inner = skia_safe::IRect::from_ltrb(
+            padded.left + 2,
+            padded.top + 2,
+            padded.right - 2,
+            padded.bottom - 2,
+        );
+        if !irect_contains(&inner, &bounds) {
+            return Err("copies leave an ancestor's padding box");
+        }
+    }
+    let mut redraw = uncovered;
+    // Uncovered parts of the sources.
+    let mut exposed = sources.clone();
+    exposed.op_region(&destinations, RegionOp::Difference);
+    redraw.op_region(&exposed, RegionOp::Union);
+    // Whatever else paints over a source or destination, where it lands.
+    let mut add_overlaps = |rect: skia_safe::IRect, redraw: &mut skia_safe::Region| {
+        if !touched.intersects_rect(rect) {
+            return;
+        }
+        for (source, delta) in &copies {
+            let destination = source.with_offset(*delta);
+            if let Some(hit) = skia_safe::IRect::intersect(&rect, &destination) {
+                redraw.op_rect(hit, RegionOp::Union);
+            }
+            if let Some(hit) = skia_safe::IRect::intersect(&rect, source) {
+                redraw.op_rect(hit.with_offset(*delta), RegionOp::Union);
+            }
+        }
+    };
+    let mut changed = vec![false; n];
+    for (position, &(first, end, rect)) in damage.iter().enumerate() {
+        if is_move_entry[position] {
+            continue;
+        }
+        let Some(Ok(translation)) = translations.get(first).copied().flatten() else {
+            return Err("changed client not placeable");
+        };
+        for client in first..end.min(n) {
+            changed[client] = true;
+        }
+        let device = device_rect(rect, translation, scale).ok_or("non-finite rect")?;
+        if let Some(device) = skia_safe::IRect::intersect(&device, &surface) {
+            redraw.op_rect(device, RegionOp::Union);
+            add_overlaps(device, &mut redraw);
+        }
+    }
+    for client in 0..n {
+        if in_span[client] || ancestor[client] || changed[client] {
+            continue;
+        }
+        let translation = match translations[client] {
+            None => continue,
+            Some(Err(())) => {
+                // Not placeable: it must not be near the copies at all.
+                return Err("unplaceable client");
+            }
+            Some(Ok(translation)) => translation,
+        };
+        let Ok(ink) = crate::retained_layers::client_ink_bounds(artifact, client) else {
+            return Err("client ink unbounded");
+        };
+        let Some(ink) = ink else {
+            continue;
+        };
+        if let Some(device) = device_rect(ink, translation, scale) {
+            add_overlaps(device, &mut redraw);
+        }
+    }
+    redraw.op_rect(surface, RegionOp::Intersect);
+    let area = skia_safe::region::Iterator::new(&redraw)
+        .map(|rect| rect.width() as i64 * rect.height() as i64)
+        .sum::<i64>();
+    // Mostly redrawn: the copies save nothing.
+    if area * 10 > surface.width() as i64 * surface.height() as i64 * 7 {
+        return Err("most of the frame is redrawn");
+    }
+    Ok(DamageBlit { copies, redraw })
+}
+
+/// Copy, then composite `plan.redraw`; count (and in verify mode compare).
+fn apply_damage_blit(
+    canvas: &Canvas,
+    plan: &DamageBlit,
+    surface: skia_safe::IRect,
+    full: &dyn Fn(&Canvas),
+) {
+    let mut buffers = Vec::with_capacity(plan.copies.len());
+    for (source, _) in &plan.copies {
+        let info = ImageInfo::new(
+            (source.width(), source.height()),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let row = source.width() as usize * 4;
+        let mut pixels = vec![0u8; row * source.height() as usize];
+        if !canvas.read_pixels(&info, &mut pixels, row, (source.left, source.top)) {
+            // Cannot read the previous frame: composite in full.
+            full(canvas);
+            return;
+        }
+        buffers.push((info, row, pixels));
+    }
+    for ((source, delta), (info, row, pixels)) in plan.copies.iter().zip(&buffers) {
+        let _ = canvas.write_pixels(
+            info,
+            pixels,
+            *row,
+            (source.left + delta.0, source.top + delta.1),
+        );
+    }
+    let mut redraw = plan.redraw.clone();
+    redraw.op_rect(surface, skia_safe::region::RegionOp::Intersect);
+    if !redraw.is_empty() {
+        let save = canvas.save();
+        canvas.clip_region(&redraw, skia_safe::ClipOp::Intersect);
+        full(canvas);
+        canvas.restore_to_count(save);
+    }
+    PAINT_DAMAGE_BLIT_STATS.with(|stats| {
+        let mut value = stats.get();
+        value.0 += 1;
+        stats.set(value);
+    });
+    if crate::retained_layers::paint_damage_blit_mode() == 2 || paint_damage_verify() {
+        let differing = verify_damage_composite(canvas, full);
+        if differing > 0 {
+            PAINT_DAMAGE_BLIT_STATS.with(|stats| {
+                let mut value = stats.get();
+                value.2 += 1;
+                stats.set(value);
+            });
+        }
+        let area = skia_safe::region::Iterator::new(&redraw)
+            .map(|rect| rect.width() as i64 * rect.height() as i64)
+            .sum::<i64>();
+        eprintln!(
+            "[paint-damage-blit-verify] {} copies, redraw {area} px of {}x{}: {}",
+            plan.copies.len(),
             surface.width(),
             surface.height(),
             if differing == 0 {
