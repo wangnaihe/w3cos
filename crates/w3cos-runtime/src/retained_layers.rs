@@ -261,6 +261,10 @@ pub(crate) fn layer_sync_fast_enabled() -> bool {
 }
 
 fn layer_sync_fast_verify() -> bool {
+    #[cfg(test)]
+    if LAYER_SYNC_FAST_QUIET.with(std::cell::Cell::get) {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("W3COS_LAYER_SYNC_FAST").is_ok_and(|v| v == "verify"))
 }
@@ -269,6 +273,9 @@ fn layer_sync_fast_verify() -> bool {
 thread_local! {
     pub(crate) static LAYER_SYNC_FAST_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+    /// A test that reports a known change on purpose silences the verify
+    /// note (`=verify` gates treat it as a finding).
+    static LAYER_SYNC_FAST_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 enum LayerMove {
@@ -1836,7 +1843,10 @@ mod tests {
             tree.sync(&artifact, &scrolls, &overrides),
             LayerPaintAction::Replay
         );
+        // The artifact is unchanged on purpose: that is what `=verify` notes.
+        super::LAYER_SYNC_FAST_QUIET.with(|quiet| quiet.set(true));
         let known = tree.sync_known_changed(&artifact, &scrolls, &overrides, true);
+        super::LAYER_SYNC_FAST_QUIET.with(|quiet| quiet.set(false));
         assert_eq!(known, LayerPaintAction::Rebuild);
         note(&mut tree, known);
         // The skipped fingerprint cannot vouch for the recordings.
