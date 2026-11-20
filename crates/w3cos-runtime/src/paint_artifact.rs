@@ -506,16 +506,18 @@ impl Default for PaintArtifact {
 
 const BIDI_LOGICAL_ORDER: &str = "--w3cos-internal-bidi-logical-order";
 
+#[inline(always)]
+fn bidi_logical_rank(node: &PaintNode) -> Option<usize> {
+    node.style
+        .custom_properties
+        .as_ref()
+        .filter(|properties| properties.may_contain(BIDI_LOGICAL_ORDER))
+        .and_then(|properties| properties.get(BIDI_LOGICAL_ORDER))
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 fn logical_paint_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
-    let rank = |index: usize| {
-        nodes[index]
-            .style
-            .custom_properties
-            .as_ref()
-            .filter(|properties| properties.may_contain(BIDI_LOGICAL_ORDER))
-            .and_then(|properties| properties.get(BIDI_LOGICAL_ORDER))
-            .and_then(|value| value.parse::<usize>().ok())
-    };
+    let rank = |index: usize| bidi_logical_rank(&nodes[index]);
     let mut ordinals: Vec<_> = (0..nodes.len()).collect();
     if !(0..nodes.len()).any(|index| rank(index).is_some()) {
         return ordinals;
@@ -682,6 +684,9 @@ impl AppendMemo {
     }
 }
 
+// Inlined: almost every node has no custom properties, so the check is a
+// pointer test at the call site instead of a call per node.
+#[inline(always)]
 fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
     const KEY: &str = "--w3cos-internal-positioned-inline-owner";
     node.style
@@ -695,22 +700,26 @@ fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
 
 fn positioned_inline_fragment_ordinals(nodes: &[PaintNode]) -> Vec<usize> {
     let mut ordinals = logical_paint_ordinals(nodes);
-    let mut groups = std::collections::HashMap::new();
+    // One owner lookup per node; the grouping below only visits the split
+    // fragments it found.
+    let mut split: Vec<(usize, &str)> = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         if let Some(owner) = split_positioned_inline_owner(node) {
-            groups
-                .entry((node.parent, owner))
-                .and_modify(|first: &mut usize| *first = (*first).min(ordinals[index]))
-                .or_insert(ordinals[index]);
+            split.push((index, owner));
         }
     }
-    if groups.is_empty() {
+    if split.is_empty() {
         return ordinals;
     }
-    for (index, node) in nodes.iter().enumerate() {
-        if let Some(owner) = split_positioned_inline_owner(node) {
-            ordinals[index] = groups[&(node.parent, owner)];
-        }
+    let mut groups = std::collections::HashMap::new();
+    for &(index, owner) in &split {
+        groups
+            .entry((nodes[index].parent, owner))
+            .and_modify(|first: &mut usize| *first = (*first).min(ordinals[index]))
+            .or_insert(ordinals[index]);
+    }
+    for &(index, owner) in &split {
+        ordinals[index] = groups[&(nodes[index].parent, owner)];
     }
     ordinals
 }
