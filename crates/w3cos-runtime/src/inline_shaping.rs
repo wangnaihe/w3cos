@@ -13,6 +13,66 @@ struct GlyphSlice {
     glyphs: Vec<GlyphId>,
     positions: Vec<Point>,
     glyph_font_sizes: Vec<f32>,
+    /// Origin-relative geometric ink for the last font this slice painted
+    /// with: the whole slice (clip culling) and each same-size glyph range.
+    /// Pure in (face, size, scale, skew, embolden), the key of the per-glyph
+    /// outline cache, so a fragment kept across frames does not look up
+    /// every glyph's outline again.
+    ink: std::cell::RefCell<Option<SliceInk>>,
+}
+
+#[derive(Clone)]
+struct SliceInk {
+    font: (u32, u32, u32, u32, bool),
+    whole: Option<skia_safe::Rect>,
+    ranges: Vec<Option<skia_safe::Rect>>,
+}
+
+fn ink_font_key(font: &skia_safe::Font) -> (u32, u32, u32, u32, bool) {
+    (
+        font.typeface().unique_id(),
+        font.size().to_bits(),
+        font.scale_x().to_bits(),
+        font.skew_x().to_bits(),
+        font.is_embolden(),
+    )
+}
+
+impl GlyphSlice {
+    fn slice_ink(&self, font: &skia_safe::Font) -> std::cell::Ref<'_, SliceInk> {
+        let key = ink_font_key(font);
+        if self.ink.borrow().as_ref().is_none_or(|ink| ink.font != key) {
+            let mut ranges = Vec::new();
+            skia_text_run::visit_glyph_fonts(
+                font,
+                &self.glyph_font_sizes,
+                self.glyphs.len(),
+                |font, range| {
+                    ranges.push(skia_text_run::geometric_ink_bounds(
+                        font,
+                        &self.glyphs[range.clone()],
+                        &self.positions[range],
+                    ));
+                },
+            );
+            // Same fold as `geometric_ink_bounds_with_sizes`.
+            let mut whole = skia_safe::Rect::default();
+            let mut known = true;
+            for bounds in &ranges {
+                match bounds {
+                    Some(bounds) => whole.join(bounds),
+                    None => known = false,
+                }
+            }
+            let whole = known.then_some(whole);
+            *self.ink.borrow_mut() = Some(SliceInk {
+                font: key,
+                whole,
+                ranges,
+            });
+        }
+        std::cell::Ref::map(self.ink.borrow(), |ink| ink.as_ref().expect("slice ink"))
+    }
 }
 
 struct SourceDecoration {
@@ -178,15 +238,9 @@ impl Fragment {
             let font = skia_text_run::css_font_for_style(&run.face, style.font_size, style);
             let x = rect.x - self.source_x + run.origin_x;
             let baseline = rect.y + self.ascent;
-            let visible = render_skia::glyph_slice_intersects_clip(
-                canvas,
-                &font,
-                &run.glyphs,
-                &run.positions,
-                &run.glyph_font_sizes,
-                x,
-                baseline,
-            );
+            let visible = render_skia::glyph_ink_intersects_clip(canvas, x, baseline, || {
+                run.slice_ink(&font).whole
+            });
             if trace {
                 eprintln!(
                     "W3COS_HEADLESS_GLYPH rect={rect:?} source_x={} origin={} baseline={baseline} face={:?} glyphs={} first={:?} visible={visible} clip={:?}",
@@ -201,17 +255,16 @@ impl Fragment {
             if !visible {
                 continue;
             }
+            let slice_ink = run.slice_ink(&font);
+            let mut range_index = 0;
             skia_text_run::visit_glyph_fonts(
                 &font,
                 &run.glyph_font_sizes,
                 run.glyphs.len(),
                 |font, range| {
-                    let ink = skia_text_run::geometric_ink_bounds(
-                        font,
-                        &run.glyphs[range.clone()],
-                        &run.positions[range.clone()],
-                    )
-                    .map(|bounds| bounds.with_offset((x, baseline)));
+                    let ink = slice_ink.ranges[range_index]
+                        .map(|bounds| bounds.with_offset((x, baseline)));
+                    range_index += 1;
                     render_skia::draw_fractional_text(
                         canvas,
                         style,
@@ -1051,6 +1104,7 @@ fn shape_group(
                 glyphs: Vec::new(),
                 positions: Vec::new(),
                 glyph_font_sizes: Vec::new(),
+                ink: Default::default(),
             })
             .collect::<Vec<_>>();
         for (glyph_index, ((glyph, position), cluster)) in shaped

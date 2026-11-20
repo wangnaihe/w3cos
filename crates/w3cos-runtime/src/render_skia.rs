@@ -6312,6 +6312,25 @@ pub(crate) fn glyph_slice_intersects_clip(
     x: f32,
     baseline: f32,
 ) -> bool {
+    glyph_ink_intersects_clip(canvas, x, baseline, || {
+        crate::skia_text_run::geometric_ink_bounds_with_sizes(
+            font,
+            glyphs,
+            positions,
+            glyph_font_sizes,
+        )
+    })
+}
+
+/// [`glyph_slice_intersects_clip`] with the run's origin-relative geometric
+/// ink supplied by the caller (computed only when the clip test needs it), so
+/// a retained shaped run can reuse the ink it measured on an earlier frame.
+pub(crate) fn glyph_ink_intersects_clip(
+    canvas: &Canvas,
+    x: f32,
+    baseline: f32,
+    ink: impl FnOnce() -> Option<Rect>,
+) -> bool {
     let Some(clip) = canvas.device_clip_bounds() else {
         return false;
     };
@@ -6319,12 +6338,7 @@ pub(crate) fn glyph_slice_intersects_clip(
     if matrix.has_perspective() {
         return true;
     }
-    let Some(ink) = crate::skia_text_run::geometric_ink_bounds_with_sizes(
-        font,
-        glyphs,
-        positions,
-        glyph_font_sizes,
-    ) else {
+    let Some(ink) = ink() else {
         return true;
     };
     if ink.is_empty() {
