@@ -2603,47 +2603,127 @@ pub(super) fn push_subtree_sizes(component: &Component, out: &mut Vec<u32>) -> u
 /// a paint invalidation instead of paint diffing the whole tree).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PaintChanges {
-    /// Set by the first splice (the tree size before the replay).
-    started: bool,
-    pub(crate) touched: Vec<bool>,
+    /// Set by the first splice.
+    pub(crate) started: bool,
+    /// Boxes in the tree after the last splice folded in.
+    pub(crate) len: usize,
+    /// Sorted, merged, disjoint `[start, end)` index ranges of boxes that
+    /// were inserted or are on a splice's path or grew: their inputs or size
+    /// may have changed.
+    pub(crate) changed: Vec<(u32, u32)>,
+    /// Same form: boxes the layout only moved (same inputs, new position).
+    pub(crate) moved: Vec<(u32, u32)>,
     /// The paint layout that replayed these splices.
     pub(crate) generation: u64,
+}
+
+/// Sort and merge `[start, end)` ranges in place (adjacent ones join).
+pub(crate) fn normalize_ranges(ranges: &mut Vec<(u32, u32)>) {
+    ranges.retain(|&(a, b)| a < b);
+    ranges.sort_unstable();
+    let mut out = 0usize;
+    for i in 0..ranges.len() {
+        let (a, b) = ranges[i];
+        if out > 0 && a <= ranges[out - 1].1 {
+            ranges[out - 1].1 = ranges[out - 1].1.max(b);
+        } else {
+            ranges[out] = (a, b);
+            out += 1;
+        }
+    }
+    ranges.truncate(out);
+}
+
+/// Whether `index` lies in one of the sorted disjoint `ranges`.
+pub(crate) fn ranges_contain(ranges: &[(u32, u32)], index: usize) -> bool {
+    let index = index as u32;
+    let at = ranges.partition_point(|&(_, end)| end <= index);
+    ranges.get(at).is_some_and(|&(start, _)| start <= index)
+}
+
+/// The end of the gap starting at `index` (no range covers
+/// `index..returned`); `index` itself when a range covers it.
+pub(crate) fn ranges_gap_end(ranges: &[(u32, u32)], index: usize, len: usize) -> usize {
+    let at = ranges.partition_point(|&(_, end)| end as usize <= index);
+    match ranges.get(at) {
+        Some(&(start, _)) => (start as usize).max(index).min(len),
+        None => len,
+    }
 }
 
 impl PaintChanges {
     /// Fold one splice in; its geometry is in the indices of the tree it
     /// edits (after the splices before it). `None`: sizes do not add up.
+    /// O(ranges) per splice: earlier ranges are remapped, not boxes.
     fn add(&mut self, geometry: &SpliceGeometry, inserted: usize) -> Option<()> {
         if !self.started {
             self.started = true;
-            self.touched = vec![false; geometry.total];
+            self.len = geometry.total;
         }
         let (start, end) = (geometry.region_start, geometry.region_end);
-        if self.touched.len() != geometry.total || end > self.touched.len() || start > end {
+        if self.len != geometry.total || end > self.len || start > end {
             return None;
         }
-        let delta = inserted as isize - (end - start) as isize;
+        let delta = inserted as i64 - (end - start) as i64;
+        let new_len = (self.len as i64 + delta) as usize;
         let map = |old: usize| -> usize {
             if old >= end {
-                (old as isize + delta) as usize
+                (old as i64 + delta) as usize
             } else {
                 old
             }
         };
-        let mut next = Vec::with_capacity((self.touched.len() as isize + delta) as usize);
-        next.extend_from_slice(&self.touched[..start]);
-        next.extend(std::iter::repeat_n(true, inserted));
-        next.extend_from_slice(&self.touched[end..]);
+        // A range's part before the region stays, its part after shifts;
+        // its part inside the region is replaced by the inserted boxes.
+        let remap = |ranges: &mut Vec<(u32, u32)>| {
+            let mut next = Vec::with_capacity(ranges.len() + 2);
+            for &(a, b) in ranges.iter() {
+                let (a, b) = (a as usize, b as usize);
+                if a < start {
+                    next.push((a as u32, b.min(start) as u32));
+                }
+                if b > end {
+                    next.push((map(a.max(end)) as u32, map(b) as u32));
+                }
+            }
+            *ranges = next;
+        };
+        remap(&mut self.changed);
+        remap(&mut self.moved);
+        self.changed.push((start as u32, (start + inserted) as u32));
         for &index in geometry.starts.iter().chain(&geometry.grown) {
-            *next.get_mut(map(index))? = true;
+            let at = map(index);
+            if at >= new_len {
+                return None;
+            }
+            self.changed.push((at as u32, at as u32 + 1));
         }
         for &(from, to) in &geometry.shifted {
-            for old in from..to {
-                *next.get_mut(map(old))? = true;
+            // Parts before and after the replaced region (none inside it).
+            for (a, b) in [(from, to.min(start)), (from.max(end), to)] {
+                if a >= b {
+                    continue;
+                }
+                let (a, b) = (map(a), map(b - 1) + 1);
+                if b > new_len {
+                    return None;
+                }
+                self.moved.push((a as u32, b as u32));
             }
         }
-        self.touched = next;
+        normalize_ranges(&mut self.changed);
+        normalize_ranges(&mut self.moved);
+        self.len = new_len;
         Some(())
+    }
+
+    /// Per box: changed or moved (for verify and dumps only).
+    pub(crate) fn touched_bitmap(&self) -> Vec<bool> {
+        let mut touched = vec![false; self.len];
+        for &(a, b) in self.changed.iter().chain(&self.moved) {
+            touched[a as usize..(b as usize).min(self.len)].fill(true);
+        }
+        touched
     }
 }
 
@@ -3622,6 +3702,55 @@ pub(super) fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two splices folded as ranges mark the same boxes as the per-box
+    /// remap they replace: the first's ranges move with the second's region.
+    #[test]
+    fn paint_changes_ranges_follow_later_splices() {
+        let geometry =
+            |total, region_start, region_end, starts: Vec<usize>, shifted, grown| SpliceGeometry {
+                total,
+                region_start,
+                region_end,
+                starts,
+                shifted,
+                grown,
+            };
+        let mut changes = PaintChanges::default();
+        // 20 boxes: box 5's subtree 5..8 becomes 5 boxes, 8..20 move.
+        changes
+            .add(
+                &geometry(20, 5, 8, vec![0, 4], vec![(8, 20)], vec![0, 4]),
+                5,
+            )
+            .unwrap();
+        assert_eq!(changes.len, 22);
+        assert_eq!(changes.changed, vec![(0, 1), (4, 10)]);
+        assert_eq!(changes.moved, vec![(10, 22)]);
+        // Then 15..17 (moved boxes) is removed: later moved boxes shift up.
+        changes
+            .add(
+                &geometry(22, 15, 17, vec![0, 14], vec![(17, 22)], vec![]),
+                0,
+            )
+            .unwrap();
+        assert_eq!(changes.len, 20);
+        assert_eq!(changes.changed, vec![(0, 1), (4, 10), (14, 15)]);
+        assert_eq!(changes.moved, vec![(10, 20)]);
+        let touched = changes.touched_bitmap();
+        assert_eq!(touched.iter().filter(|t| **t).count(), 1 + 6 + 10);
+        assert!(!touched[1] && !touched[3] && touched[19]);
+        assert_eq!(ranges_gap_end(&changes.changed, 1, 20), 4);
+        assert_eq!(ranges_gap_end(&changes.changed, 4, 20), 4);
+        assert_eq!(ranges_gap_end(&changes.changed, 15, 20), 20);
+        assert!(ranges_contain(&changes.changed, 9) && !ranges_contain(&changes.changed, 10));
+        // A size that does not add up drops the set.
+        assert!(
+            changes
+                .add(&geometry(21, 0, 1, vec![], vec![], vec![]), 1)
+                .is_none()
+        );
+    }
 
     #[test]
     fn region_splice_in_place_matches_a_rebuilt_list() {

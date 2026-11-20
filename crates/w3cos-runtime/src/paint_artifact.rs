@@ -456,7 +456,10 @@ pub struct PaintArtifact {
     serial: u64,
     /// During `append_all_reusing` only: the boxes this frame's layout
     /// splice touched ([`paint_touched_mode`]).
-    touched: Option<Vec<bool>>,
+    touched: Option<crate::incremental_layout::PaintChanges>,
+    /// `touched` is set and no box has column fragments: untouched gaps
+    /// may be jumped in one step.
+    touched_gaps: bool,
 }
 
 impl Default for PaintArtifact {
@@ -488,6 +491,7 @@ impl Default for PaintArtifact {
             append_record: None,
             serial: 0,
             touched: None,
+            touched_gaps: false,
         }
     }
 }
@@ -3449,7 +3453,26 @@ impl PaintArtifact {
             return start;
         }
         let mut end = start;
+        // Boxes in neither touched range kept their rects and inputs: jump
+        // over such a gap at once when its outside parents are the same.
         while end < len {
+            if self.touched_gaps
+                && let Some(touched) = self.touched.as_ref()
+            {
+                let gap =
+                    crate::incremental_layout::ranges_gap_end(&touched.changed, end, len).min(
+                        crate::incremental_layout::ranges_gap_end(&touched.moved, end, len),
+                    );
+                if gap > end + 1 && self.gap_parents_same(start, end, same) {
+                    let verify = paint_touched_mode() == 2;
+                    if !verify || self.gap_matches(start, end, gap, previous, same) {
+                        end = gap;
+                        continue;
+                    }
+                    eprintln!("[paint-touched-verify] mismatch: gap {end}..{gap} differs");
+                    PAINT_TOUCHED_MISMATCHES.with(|count| count.set(count.get() + 1));
+                }
+            }
             let parent_same = self.nodes[end]
                 .parent
                 .is_none_or(|parent| parent >= start || same[parent]);
@@ -3529,12 +3552,19 @@ impl PaintArtifact {
         if paint_touched_mode() != 0 {
             self.touched = PAINT_TOUCHED
                 .with(|touched| touched.borrow_mut().take())
-                .filter(|touched| touched.len() == self.nodes.len());
+                .filter(|touched| touched.len == self.nodes.len());
+            self.touched_gaps = self.touched.is_some()
+                && previous.is_some_and(|previous| {
+                    !self.column_fragments.iter().any(|c| !c.is_empty())
+                        && !previous.column_fragments.iter().any(|c| !c.is_empty())
+                });
         }
         self.append_all_reusing_with(previous);
         self.touched = None;
+        self.touched_gaps = false;
     }
 
+    #[inline(always)]
     fn append_all_reusing_with(&mut self, previous: Option<&PaintArtifact>) {
         let len = self.nodes.len();
         let base = previous.and_then(|previous| {
@@ -3640,11 +3670,13 @@ impl PaintArtifact {
         }));
     }
 
+    #[inline]
     fn inputs_match(&self, index: usize, previous: &PaintArtifact) -> bool {
         // A box the layout splice did not touch kept its inputs (Blink:
         // layout marks the objects that need a paint invalidation).
-        if let Some(touched) = self.touched.as_deref()
-            && touched.get(index) == Some(&false)
+        // Moved boxes kept their inputs too; only `changed` ones compare.
+        if let Some(touched) = self.touched.as_ref()
+            && !crate::incremental_layout::ranges_contain(&touched.changed, index)
         {
             if paint_touched_mode() == 2 && !self.inputs_match_compared(index, previous) {
                 eprintln!("[paint-touched-verify] mismatch: untouched box {index} changed inputs");
@@ -3656,6 +3688,38 @@ impl PaintArtifact {
         self.inputs_match_compared(index, previous)
     }
 
+    /// Every ancestor of `at` before the run `start..` has the same output:
+    /// a box after `at` whose parent precedes the run has one of them.
+    fn gap_parents_same(&self, start: usize, at: usize, same: &[bool]) -> bool {
+        let mut parent = self.nodes[at].parent;
+        while let Some(index) = parent {
+            if index < start && !same[index] {
+                return false;
+            }
+            parent = self.nodes[index].parent;
+        }
+        true
+    }
+
+    /// Verify: the per-box run checks hold over `at..gap`.
+    fn gap_matches(
+        &self,
+        start: usize,
+        at: usize,
+        gap: usize,
+        previous: &PaintArtifact,
+        same: &[bool],
+    ) -> bool {
+        (at..gap).all(|index| {
+            self.nodes[index]
+                .parent
+                .is_none_or(|parent| parent >= start || same[parent])
+                && self.rect_by_index[index] == previous.rect_by_index[index]
+                && self.inputs_match_compared(index, previous)
+        })
+    }
+
+    #[inline(always)]
     fn inputs_match_compared(&self, index: usize, previous: &PaintArtifact) -> bool {
         let (node, old) = (&self.nodes[index], &previous.nodes[index]);
         node.parent == old.parent
@@ -4486,7 +4550,7 @@ fn establishes_stacking_context(node: &PaintNode) -> bool {
 thread_local! {
     /// Per box: whether this frame's layout splice touched it (see
     /// `incremental_layout::PaintChanges`), for the artifact build only.
-    static PAINT_TOUCHED: std::cell::RefCell<Option<Vec<bool>>> =
+    static PAINT_TOUCHED: std::cell::RefCell<Option<crate::incremental_layout::PaintChanges>> =
         const { std::cell::RefCell::new(None) };
     static PAINT_TOUCHED_MISMATCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -4517,7 +4581,7 @@ pub(crate) fn paint_touched_mode() -> u8 {
 }
 
 /// Install (or clear) the touched set for the next artifact build.
-pub(crate) fn set_paint_touched(touched: Option<Vec<bool>>) {
+pub(crate) fn set_paint_touched(touched: Option<crate::incremental_layout::PaintChanges>) {
     PAINT_TOUCHED.with(|slot| *slot.borrow_mut() = touched);
 }
 
@@ -5060,9 +5124,10 @@ mod tests {
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
-    /// `W3COS_PAINT_TOUCHED`: with the splice's set (the edited text, its
-    /// grown ancestors and the moved boxes touched) the build matches a full
-    /// build; a set that misses the edited text is caught by verify.
+    /// `W3COS_PAINT_TOUCHED`: with the splice's ranges (the edited text and
+    /// its grown ancestors changed, the later boxes moved) the build matches
+    /// a full build; ranges that miss the edit and the moves are caught by
+    /// verify.
     #[test]
     fn a_touched_set_skips_the_input_compare_and_verify_catches_a_wrong_one() {
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
@@ -5116,9 +5181,14 @@ mod tests {
         };
         let first =
             PaintArtifact::build_reusing(nodes("first"), &layouts(0.0), 1, None, None, None);
-        let build = |mode: u8, touched: Vec<bool>| {
+        let build = |mode: u8, changed: Vec<(u32, u32)>, moved: Vec<(u32, u32)>| {
             PAINT_TOUCHED_OVERRIDE.with(|flag| flag.set(Some(mode)));
-            set_paint_touched(Some(touched));
+            set_paint_touched(Some(crate::incremental_layout::PaintChanges {
+                len: 7,
+                changed,
+                moved,
+                ..Default::default()
+            }));
             let next = PaintArtifact::build_reusing(
                 nodes("first, longer"),
                 &layouts(20.0),
@@ -5134,12 +5204,11 @@ mod tests {
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(false)));
         let fresh = PaintArtifact::build(nodes("first, longer"), &layouts(20.0), 2);
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
-        let right = build(1, vec![true; 7]);
+        // The edited text and its ancestors changed; the rest moved.
+        let right = build(1, vec![(0, 3)], vec![(3, 7)]);
         assert!(right.append_output_eq(&fresh));
         let before = paint_touched_mismatches();
-        let mut wrong = vec![false; 7];
-        wrong[0] = true;
-        let verified = build(2, wrong);
+        let verified = build(2, vec![(0, 1)], Vec::new());
         assert!(verified.append_output_eq(&fresh));
         assert!(paint_touched_mismatches() > before);
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));

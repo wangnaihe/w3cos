@@ -295,8 +295,8 @@ fn finish_headless_frame(
         let touched = changes
             .as_ref()
             .filter(|changes| changes.generation == now && base.map(|base| base + 1) == Some(now))
-            .map(|changes| changes.touched.clone())
-            .filter(|touched| touched.len() == flat.len());
+            .filter(|changes| changes.len == flat.len())
+            .cloned();
         crate::paint_artifact::set_paint_touched(touched);
     }
     let mut artifact = if crate::paint_artifact::paint_append_reuse_enabled() {
@@ -1400,7 +1400,10 @@ fn clamp_scroll_offset_ng(x: f32, y: f32, extent: &crate::layout::ScrollExtent) 
 /// `W3COS_PAINT_CHANGES_VERIFY=1`: report paint clients the full paint diff
 /// marks dirty or moved that the layout splice's change set does not cover.
 fn paint_changes_verify() -> bool {
-    crate::incremental_layout::paint_changes_wanted()
+    // Only the check itself: `W3COS_PAINT_TOUCHED` also records the changes
+    // but must not pay for this full comparison.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_CHANGES_VERIFY").is_ok_and(|v| v == "1"))
 }
 
 #[cfg(feature = "skia")]
@@ -1415,11 +1418,35 @@ fn verify_paint_changes(
         eprintln!("[paint-changes-verify] no change set");
         return;
     };
-    let touched = &changes.touched;
-    if touched.len() != len {
-        eprintln!("[paint-changes-verify] size {} vs {len}", touched.len());
+    if changes.len != len {
+        eprintln!("[paint-changes-verify] size {} vs {len}", changes.len);
         return;
     }
+    let touched = &changes.touched_bitmap();
+    // What the range consumers assume: a box in neither range kept its
+    // rect and inputs; a box only moved kept its inputs.
+    let same_inputs = |i: usize| {
+        prev.nodes.get(i).is_some_and(|n| {
+            n.kind == cur.nodes[i].kind
+                && n.style == cur.nodes[i].style
+                && n.parent == cur.nodes[i].parent
+        })
+    };
+    let changed_box = |i: usize| crate::incremental_layout::ranges_contain(&changes.changed, i);
+    let untouched_diff = (0..len)
+        .filter(|&i| {
+            !touched[i]
+                && !(same_inputs(i) && prev.rect_by_index.get(i) == cur.rect_by_index.get(i))
+        })
+        .count();
+    let moved_diff = (0..len)
+        .filter(|&i| touched[i] && !changed_box(i) && !same_inputs(i))
+        .count();
+    eprintln!(
+        "[paint-changes-verify] ranges changed {} moved {} untouched-diff {untouched_diff} moved-inputs-diff {moved_diff}",
+        changes.changed.len(),
+        changes.moved.len()
+    );
     let changed: Vec<usize> = (0..len)
         .filter(|&i| {
             diff.dirty.get(i).copied().unwrap_or(true)

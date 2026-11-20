@@ -23,7 +23,9 @@ use crate::layout::{LayoutEngine, pre_flatten};
 
 #[path = "incremental_layout_splice.rs"]
 mod splice;
-pub(crate) use splice::{PaintChanges, paint_changes_wanted, take_paint_changes};
+pub(crate) use splice::{
+    PaintChanges, paint_changes_wanted, ranges_contain, ranges_gap_end, take_paint_changes,
+};
 
 struct WidthMemo {
     structure: u64,
