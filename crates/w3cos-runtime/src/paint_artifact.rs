@@ -636,7 +636,7 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    static ARTIFACT_SPLICE_OVERRIDE: std::cell::Cell<Option<bool>> =
+    pub(crate) static ARTIFACT_SPLICE_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 

@@ -1336,11 +1336,17 @@ mod tests {
             fn drop(&mut self) {
                 crate::paint_artifact::PAINT_RANGE_REBUILD_OVERRIDE.with(|value| value.set(None));
                 crate::incremental_layout::force_paint_splice(None);
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
             }
         }
         let _off = Off;
         let run = |mode: u8| {
             crate::paint_artifact::PAINT_RANGE_REBUILD_OVERRIDE.with(|value| value.set(Some(mode)));
+            // The record is kept across spliced frames only: pin the splice
+            // flags so the lib-test modes that turn them off still check it.
+            crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+            crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
             crate::dom::reset_document();
             crate::jsdom::reset_bridge();
             crate::incremental_layout::invalidate();
