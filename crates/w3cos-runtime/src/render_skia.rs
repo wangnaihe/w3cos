@@ -9172,11 +9172,12 @@ fn paragraph_widths(
     )
 }
 
-/// `W3COS_LAYOUT_WRAP_ESTIMATE=1`: layout's wrapped-height measurement
-/// breaks lines from the paragraph's single shaping like paint does
-/// (`paragraph_widths`), measuring a candidate line on its own only near the
-/// available edge, instead of shaping every growing line prefix. `=verify`
-/// also wraps without it and reports differing lines. Off by default.
+/// On by default (`W3COS_LAYOUT_WRAP_ESTIMATE=0` turns it off): layout's
+/// wrapped-height measurement breaks lines from the paragraph's single
+/// shaping like paint does (`paragraph_widths`), measuring a candidate line
+/// on its own only near the available edge, instead of shaping every
+/// growing line prefix. `=verify` also wraps without it and reports
+/// differing lines.
 pub(crate) fn layout_wrap_estimate_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = LAYOUT_WRAP_ESTIMATE_OVERRIDE.with(std::cell::Cell::get) {
@@ -9185,9 +9186,9 @@ pub(crate) fn layout_wrap_estimate_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_LAYOUT_WRAP_ESTIMATE").ok().as_deref() {
-            Some("1") => 1,
+            Some("0") | Some("false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
