@@ -642,6 +642,93 @@ pub(crate) struct CullSpan {
 
 /// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
 /// inputs and ancestors' output are unchanged since the previous frame.
+/// `W3COS_PAINT_PERSISTENT_NODES` (off by default; design in
+/// ngtools/design-persistent-paint-nodes.md). Step P1, `=probe`: after the
+/// full build, every box the layout splice did not change must have the
+/// same adjusted paint node as last frame; counts and reports the boxes
+/// that do not (the dependency rules the persistent path will need).
+fn persistent_nodes_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_PERSISTENT_NODES").as_deref() {
+            Ok("probe") => 3,
+            _ => 0,
+        },
+    )
+}
+
+thread_local! {
+    /// (frames probed, clean boxes compared, clean boxes that differ).
+    pub(crate) static PERSISTENT_NODES_PROBE: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+fn persistent_nodes_probe(artifact: &PaintArtifact, previous: &PaintArtifact, source_len: usize) {
+    if previous.nodes.len() != artifact.nodes.len() {
+        eprintln!("[paint-persistent-nodes-probe] skip: node count");
+        return;
+    }
+    let Some((changed, moved)) = PAINT_TOUCHED.with(|touched| {
+        touched
+            .borrow()
+            .as_ref()
+            .filter(|changes| changes.len == source_len)
+            .map(|changes| (changes.changed.clone(), changes.moved.clone()))
+    }) else {
+        eprintln!("[paint-persistent-nodes-probe] skip: no layout changes");
+        return;
+    };
+    let in_ranges = |ranges: &[(u32, u32)], index: usize| {
+        ranges
+            .iter()
+            .any(|&(a, b)| index >= a as usize && index < b as usize)
+    };
+    let (mut compared, mut differ) = (0u64, 0u64);
+    let mut shown = 0;
+    for index in 0..artifact.nodes.len() {
+        if index < source_len && in_ranges(&changed, index) {
+            continue;
+        }
+        compared += 1;
+        let (a, b) = (&previous.nodes[index], &artifact.nodes[index]);
+        let kind = a.kind != b.kind;
+        let style = a.style.as_style() != b.style.as_style();
+        let tree = a.parent != b.parent || a.sticky_counter_signal != b.sticky_counter_signal;
+        if kind || style || tree {
+            differ += 1;
+            if shown < 4 {
+                shown += 1;
+                let moved = index < source_len && in_ranges(&moved, index);
+                let props = |node: &PaintNode| {
+                    node.style
+                        .custom_properties
+                        .as_ref()
+                        .map(|p| format!("{p:?}"))
+                        .unwrap_or_default()
+                };
+                eprintln!(
+                    "[paint-persistent-nodes-probe] box {index}/{len} differs: kind {kind} style {style} tree {tree} moved {moved} paint_only {po} kind {k:?}{extra}",
+                    len = artifact.nodes.len(),
+                    po = index >= source_len,
+                    k = std::mem::discriminant(&b.kind),
+                    extra = if style && props(a) != props(b) {
+                        format!(" props {} -> {}", props(a), props(b))
+                    } else {
+                        String::new()
+                    },
+                );
+            }
+        }
+    }
+    PERSISTENT_NODES_PROBE.with(|stats| {
+        let (f, c, d) = stats.get();
+        stats.set((f + 1, c + compared, d + differ));
+    });
+    eprintln!(
+        "[paint-persistent-nodes-probe] frame: {differ} of {compared} unchanged boxes differ (changed {changed:?})"
+    );
+}
+
 /// A fresh, nonzero [`PaintArtifact::serial`] for a new build.
 fn next_artifact_serial() -> u64 {
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -3747,6 +3834,11 @@ impl PaintArtifact {
                 .collect();
         }
 
+        if persistent_nodes_mode() != 0
+            && let Some(previous) = previous
+        {
+            persistent_nodes_probe(&artifact, previous, source_len);
+        }
         if paint_append_reuse_enabled() {
             artifact.append_all_reusing(previous);
             return artifact;
