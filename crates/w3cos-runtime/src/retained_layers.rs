@@ -789,6 +789,37 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DAMAGE_QUIET_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Changed clients `W3COS_PAINT_DAMAGE_QUIET` left out of the damage.
+    pub(crate) static PAINT_DAMAGE_QUIET_SKIPS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// `(prev serial, cur serial, per client)`: the last diff's dirty
+    /// clients that paint nothing in either frame (see
+    /// [`paint_damage_quiet_enabled`]).
+    static QUIET_DIRTY: std::cell::RefCell<Option<(u64, u64, Vec<bool>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `W3COS_PAINT_DAMAGE_QUIET=1`: a client the diff marks changed although it
+/// has no display items in either frame (under `W3COS_PAINT_CULL_RUNS`, a
+/// box the cull band drops that moved) adds no damage: it painted no pixels
+/// and paints none (Blink does not invalidate a box outside the cull rect).
+/// Off by default.
+pub(crate) fn paint_damage_quiet_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PAINT_DAMAGE_QUIET_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_QUIET").is_ok_and(|v| v == "1"))
+}
+
 /// The moved spans recorded with a damage list of `len` entries.
 pub fn take_damage_moves(len: usize) -> Option<Vec<MovedSpan>> {
     DAMAGE_MOVES
@@ -824,6 +855,8 @@ type Ink = Result<Option<LayoutRect>, ()>;
 trait InkSource {
     fn old(&mut self, prev: &PaintArtifact, index: usize) -> Ink;
     fn store(&mut self, index: usize, ink: Ink);
+    /// Drop what is kept for `index` (measured again when next needed).
+    fn forget(&mut self, _index: usize) {}
 }
 
 /// Measure every time, keep nothing.
@@ -849,6 +882,10 @@ impl InkSource for Vec<Option<Ink>> {
     #[inline]
     fn store(&mut self, index: usize, ink: Ink) {
         self[index] = Some(ink);
+    }
+    #[inline]
+    fn forget(&mut self, index: usize) {
+        self[index] = None;
     }
 }
 
@@ -989,6 +1026,18 @@ fn paint_damage_with<S: InkSource>(
 ) -> Option<Vec<ClientDamage>> {
     let mut checked = 0;
     let spans = paint_damage_spans_enabled();
+    // The diff's clients that paint nothing in either frame, when it made
+    // this pair's diff (`W3COS_PAINT_DAMAGE_QUIET`).
+    let quiet = paint_damage_quiet_enabled()
+        .then(|| {
+            QUIET_DIRTY.with(|slot| {
+                slot.borrow_mut()
+                    .take()
+                    .filter(|(a, b, _)| *a == prev.serial() && *b == cur.serial())
+                    .map(|(_, _, quiet)| quiet)
+            })
+        })
+        .flatten();
     let record_moves = paint_damage_blit_mode() != 0;
     DAMAGE_MOVES.with(|slot| *slot.borrow_mut() = None);
     let mut moves: Vec<MovedSpan> = Vec::new();
@@ -1036,6 +1085,17 @@ fn paint_damage_with<S: InkSource>(
             checked = damage.len();
         }
         let dirty = dirty_by_client.get(index).copied().unwrap_or(true);
+        if dirty
+            && quiet
+                .as_ref()
+                .is_some_and(|quiet| quiet.get(index).copied().unwrap_or(false))
+        {
+            // Paints nothing in either frame: no pixels to repaint. Its
+            // kept ink is dropped (measured again when next needed).
+            ink.forget(index);
+            PAINT_DAMAGE_QUIET_SKIPS.with(|count| count.set(count.get() + 1));
+            continue;
+        }
         // A client that only moved (`moved_by`: same style, properties,
         // size and display items relative to its box) paints its old ink
         // shifted by the move.
@@ -1906,6 +1966,16 @@ fn paint_diff_clients_inner(
     for &index in &quiet_dirty {
         dirty[index] = true;
     }
+    if paint_damage_quiet_enabled() {
+        let quiet = (!quiet_dirty.is_empty()).then(|| {
+            let mut quiet = vec![false; n];
+            for &index in &quiet_dirty {
+                quiet[index] = true;
+            }
+            (prev.serial(), cur.serial(), quiet)
+        });
+        QUIET_DIRTY.with(|slot| *slot.borrow_mut() = quiet);
+    }
     if changed.is_empty() {
         return Some(PaintDiff { dirty, moved });
     }
@@ -2007,17 +2077,14 @@ fn paint_diff_clients_inner(
                         })
                     })
             };
-            let descends = |artifact: &PaintArtifact, mut index: usize| {
-                while let Some(parent) = artifact.nodes[index].parent {
-                    if parent == root {
-                        return true;
-                    }
-                    if parent < root {
-                        return false;
-                    }
-                    index = parent;
-                }
-                false
+            // Nodes are in tree order with every parent before its child
+            // (checked above), so `root`'s subtree is the run after it whose
+            // parents are at or after `root`: scanning in order, a node whose
+            // parent is in that run is in it too.
+            let descends = |artifact: &PaintArtifact, index: usize| {
+                artifact.nodes[index]
+                    .parent
+                    .is_some_and(|parent| parent >= root)
             };
             let root_plain = [prev, cur].iter().all(|artifact| {
                 artifact.text_fragments.get(root).is_none_or(Vec::is_empty)

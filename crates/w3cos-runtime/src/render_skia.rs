@@ -3410,7 +3410,10 @@ fn composite_skia_layers(
     };
     let Some(rects) = rects else {
         if paint_damage_verify() {
-            eprintln!("[paint-damage-verify] full: damage not placeable");
+            eprintln!(
+                "[paint-damage-verify] full: damage not placeable ({})",
+                UNPLACEABLE.with(std::cell::Cell::get)
+            );
         }
         full(canvas);
         return;
@@ -3596,6 +3599,77 @@ fn client_device_translations(
     out
 }
 
+/// Per (property tree state, viewport scroll) of the layers, the device
+/// translation a client in that state draws under: where a client the cull
+/// rect dropped from every layer would be drawn (Blink maps a chunk through
+/// its property tree state, not through the layer that happens to hold it).
+/// `Err(())` for a CSS-transformed or non-translating layer, or two layers
+/// of one state under different translations.
+type StateTranslations = Vec<(
+    crate::paint_artifact::PaintProperties,
+    (u32, u32),
+    Result<(f32, f32), ()>,
+)>;
+
+fn state_device_translations(
+    layers: &[crate::retained_layers::CompositorLayer],
+    artifact: &PaintArtifact,
+    scroll_info: &[Option<(f32, f32, LayoutRect)>],
+    overrides: &CompositorOverrides,
+    scale_factor: f32,
+) -> StateTranslations {
+    let mut out: StateTranslations = Vec::new();
+    for layer in layers {
+        let Some(&first) = layer.client_indices.first() else {
+            continue;
+        };
+        let scroll = artifact.viewport_scroll_for(first);
+        let translation = if !layer_css_transform(layer, artifact, overrides).is_identity() {
+            Err(())
+        } else {
+            let matrix =
+                compositor_layer_matrix(layer, artifact, scroll_info, overrides, scale_factor);
+            if matrix.is_translate() {
+                Ok((
+                    matrix.translate_x() - scroll.0 * scale_factor,
+                    matrix.translate_y() - scroll.1 * scale_factor,
+                ))
+            } else {
+                Err(())
+            }
+        };
+        let key = (scroll.0.to_bits(), scroll.1.to_bits());
+        match out
+            .iter_mut()
+            .find(|(properties, bits, _)| *properties == layer.properties && *bits == key)
+        {
+            Some((_, _, slot)) => {
+                if *slot != translation {
+                    *slot = Err(());
+                }
+            }
+            None => out.push((layer.properties, key, translation)),
+        }
+    }
+    out
+}
+
+/// The translation `client` draws under by its property tree state (see
+/// [`state_device_translations`]); `None` when no layer has that state.
+fn state_translation(
+    states: &StateTranslations,
+    artifact: &PaintArtifact,
+    client: usize,
+) -> Option<Result<(f32, f32), ()>> {
+    let properties = artifact.node_properties.get(client)?;
+    let scroll = artifact.viewport_scroll_for(client);
+    let key = (scroll.0.to_bits(), scroll.1.to_bits());
+    states
+        .iter()
+        .find(|(state, bits, _)| state == properties && *bits == key)
+        .map(|&(_, _, translation)| translation)
+}
+
 /// `rect` (document CSS px) in device pixels under `translation`, rounded
 /// out and padded a pixel for anti-aliasing (as `damage_device_rects`).
 /// `W3COS_PAINT_DAMAGE_TRACE=1`: per damaged frame, print each damage
@@ -3684,6 +3758,15 @@ fn plan_damage_blit(
     }
     let n = artifact.nodes.len();
     let translations = client_device_translations(layers, artifact, scroll_info, overrides, scale);
+    let states = state_device_translations(layers, artifact, scroll_info, overrides, scale);
+    // A client no layer draws (the cull rect dropped it) placed by its state.
+    let placed = |client: usize| {
+        translations
+            .get(client)
+            .copied()
+            .flatten()
+            .or_else(|| state_translation(&states, artifact, client))
+    };
     let mut in_span = vec![false; n];
     let mut is_move_entry = vec![false; damage.len()];
     let mut copies = Vec::with_capacity(moves.len());
@@ -3833,7 +3916,7 @@ fn plan_damage_blit(
         let Some(rect) = artifact.rect_by_index.get(index).copied().flatten() else {
             return Err("painting ancestor without a box");
         };
-        let Some(Ok(translation)) = translations[index] else {
+        let Some(Ok(translation)) = placed(index) else {
             return Err("painting ancestor not placeable");
         };
         let left = style.border_left_width.unwrap_or(style.border_width);
@@ -3908,9 +3991,12 @@ fn plan_damage_blit(
         if is_move_entry[position] {
             continue;
         }
-        let Some(Ok(translation)) = translations.get(first).copied().flatten() else {
+        let Some(Ok(translation)) = placed(first) else {
             return Err("changed client not placeable");
         };
+        if (first..end.min(n)).any(|client| placed(client) != Some(Ok(translation))) {
+            return Err("changed span under two translations");
+        }
         for client in first..end.min(n) {
             changed[client] = true;
         }
@@ -4007,6 +4093,89 @@ fn apply_damage_blit(
     surface: skia_safe::IRect,
     full: &dyn Fn(&Canvas),
 ) {
+    if !blit_in_place(canvas, plan, surface) && !blit_buffered(canvas, plan, full) {
+        return;
+    }
+    let mut redraw = plan.redraw.clone();
+    redraw.op_rect(surface, skia_safe::region::RegionOp::Intersect);
+    if !redraw.is_empty() {
+        let save = canvas.save();
+        canvas.clip_region(&redraw, skia_safe::ClipOp::Intersect);
+        full(canvas);
+        canvas.restore_to_count(save);
+    }
+    blit_count(canvas, plan, surface, full);
+}
+
+/// The copies of a plan whose moves are all one vertical offset, done in
+/// the surface's own pixels: the union of the sources, row by row away from
+/// the direction of the move (as `memmove`), so every source row is read
+/// before a copy writes over it. `false`: not such a plan, or no direct
+/// pixel access; nothing was written.
+fn blit_in_place(canvas: &Canvas, plan: &DamageBlit, surface: skia_safe::IRect) -> bool {
+    let Some(&(_, delta)) = plan.copies.first() else {
+        return true;
+    };
+    if delta.0 != 0 || plan.copies.iter().any(|&(_, other)| other != delta) {
+        return false;
+    }
+    let Some(pixmap) = canvas.peek_pixels() else {
+        return false;
+    };
+    let bpp = pixmap.info().bytes_per_pixel();
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let row_bytes = pixmap.row_bytes();
+    let base = pixmap.writable_addr() as *mut u8;
+    if base.is_null() || bpp == 0 || (width, height) != (surface.width(), surface.height()) {
+        return false;
+    }
+    let mut sources = skia_safe::Region::new();
+    for (source, _) in &plan.copies {
+        sources.op_rect(*source, skia_safe::region::RegionOp::Union);
+    }
+    // Rows of each source rect; the plan keeps sources and destinations on
+    // the surface.
+    let mut rows: Vec<(i32, i32, i32)> = Vec::new();
+    for rect in skia_safe::region::Iterator::new(&sources) {
+        let (top, bottom) = (rect.top.max(0), rect.bottom.min(height));
+        let (left, right) = (rect.left.max(0), rect.right.min(width));
+        if left >= right {
+            continue;
+        }
+        for y in top..bottom {
+            let to = y + delta.1;
+            if (0..height).contains(&to) {
+                rows.push((y, left, right));
+            }
+        }
+    }
+    // Moving down: the lowest rows first; moving up: the highest first.
+    if delta.1 > 0 {
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    } else {
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+    for (y, left, right) in rows {
+        let to = y + delta.1;
+        let start = left as usize * bpp;
+        let len = (right - left) as usize * bpp;
+        // SAFETY: both rows lie inside the pixmap the canvas owns for this
+        // call (rows and columns clamped to its size above); `copy` allows
+        // the overlap of a row with itself.
+        unsafe {
+            std::ptr::copy(
+                base.add(y as usize * row_bytes + start),
+                base.add(to as usize * row_bytes + start),
+                len,
+            );
+        }
+    }
+    true
+}
+
+/// The copies of a plan through buffers read before any is written.
+/// `false`: the previous frame could not be read, so it composited in full.
+fn blit_buffered(canvas: &Canvas, plan: &DamageBlit, full: &dyn Fn(&Canvas)) -> bool {
     let mut buffers = Vec::with_capacity(plan.copies.len());
     for (source, _) in &plan.copies {
         let info = ImageInfo::new(
@@ -4020,7 +4189,7 @@ fn apply_damage_blit(
         if !canvas.read_pixels(&info, &mut pixels, row, (source.left, source.top)) {
             // Cannot read the previous frame: composite in full.
             full(canvas);
-            return;
+            return false;
         }
         buffers.push((info, row, pixels));
     }
@@ -4032,14 +4201,16 @@ fn apply_damage_blit(
             (source.left + delta.0, source.top + delta.1),
         );
     }
-    let mut redraw = plan.redraw.clone();
-    redraw.op_rect(surface, skia_safe::region::RegionOp::Intersect);
-    if !redraw.is_empty() {
-        let save = canvas.save();
-        canvas.clip_region(&redraw, skia_safe::ClipOp::Intersect);
-        full(canvas);
-        canvas.restore_to_count(save);
-    }
+    true
+}
+
+/// Count a blit (and in verify mode compare it against a full composite).
+fn blit_count(
+    canvas: &Canvas,
+    plan: &DamageBlit,
+    surface: skia_safe::IRect,
+    full: &dyn Fn(&Canvas),
+) {
     PAINT_DAMAGE_BLIT_STATS.with(|stats| {
         let mut value = stats.get();
         value.0 += 1;
@@ -4054,6 +4225,8 @@ fn apply_damage_blit(
                 stats.set(value);
             });
         }
+        let mut redraw = plan.redraw.clone();
+        redraw.op_rect(surface, skia_safe::region::RegionOp::Intersect);
         let area = skia_safe::region::Iterator::new(&redraw)
             .map(|rect| rect.width() as i64 * rect.height() as i64)
             .sum::<i64>();
@@ -4299,6 +4472,22 @@ impl TileCoverage {
     }
 }
 
+thread_local! {
+    /// Damage entries of clients no layer draws (the cull rect dropped them)
+    /// that `damage_device_rects` placed by their property tree state.
+    pub(crate) static DAMAGE_CULLED_PLACED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+// Why `damage_device_rects` last gave up (`W3COS_PAINT_DAMAGE_VERIFY` prints it).
+thread_local! {
+    static UNPLACEABLE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn note_unplaceable(reason: &'static str) {
+    UNPLACEABLE.with(|cell| cell.set(reason));
+}
+
 /// Device rects holding every damaged client's old and new paint, as placed
 /// by the layer that draws it now (entries are in client order). A span
 /// entry is placed once; every client of it that a layer draws must be
@@ -4320,12 +4509,32 @@ fn damage_device_rects(
     // client are adjacent; a span covers its clients alone.
     let mut first = vec![u32::MAX; artifact.nodes.len()];
     for (position, &(start, end, _)) in damage.iter().enumerate().rev() {
-        for slot in first.get_mut(start..end)? {
+        let Some(slots) = first.get_mut(start..end) else {
+            note_unplaceable("r0");
+            return None;
+        };
+        for slot in slots {
             *slot = position as u32;
         }
     }
     let mut placed: Vec<Option<(u32, u32)>> = vec![None; damage.len()];
     let mut out = Vec::new();
+    if paint_damage_trace() {
+        eprintln!(
+            "[paint-damage-trace]   place: {} clients, {} layers, {} layer clients, {} entries covering {} clients",
+            artifact.nodes.len(),
+            layers.len(),
+            layers
+                .iter()
+                .map(|layer| layer.client_indices.len())
+                .sum::<usize>(),
+            damage.len(),
+            damage
+                .iter()
+                .map(|&(start, end, _)| end - start)
+                .sum::<usize>()
+        );
+    }
     for layer in layers {
         let mut translation = None;
         for &client in &layer.client_indices {
@@ -4339,7 +4548,10 @@ fn damage_device_rects(
                 Some(translation) => translation,
                 None => {
                     if !layer_css_transform(layer, artifact, overrides).is_identity() {
-                        return None;
+                        {
+                            note_unplaceable("r1");
+                            return None;
+                        }
                     }
                     let matrix = compositor_layer_matrix(
                         layer,
@@ -4350,7 +4562,10 @@ fn damage_device_rects(
                     );
                     // Without a CSS transform the layer matrix is a translation.
                     if !matrix.is_translate() {
-                        return None;
+                        {
+                            note_unplaceable("r2");
+                            return None;
+                        }
                     }
                     let (sx, sy) = layer
                         .client_indices
@@ -4387,7 +4602,10 @@ fn damage_device_rects(
                 let bottom = (y + rect.height * scale_factor) + ty;
                 if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite())
                 {
-                    return None;
+                    {
+                        note_unplaceable("r3");
+                        return None;
+                    }
                 }
                 // Padded a pixel for anti-aliasing; a rect off the surface
                 // damages nothing.
@@ -4412,8 +4630,57 @@ fn damage_device_rects(
             }
         }
     }
-    if placed.iter().any(Option::is_none) {
-        return None;
+    // Entries no layer placed: clients the cull rect dropped from this
+    // frame's layers (their old ink, painted last frame, still needs a
+    // repaint), placed by their property tree state.
+    let states = placed
+        .iter()
+        .any(Option::is_none)
+        .then(|| state_device_translations(layers, artifact, scroll_info, overrides, scale_factor));
+    for (position, &(start, end, rect)) in damage.iter().enumerate() {
+        if placed[position].is_some() {
+            continue;
+        }
+        let Some(states) = states.as_ref() else {
+            break;
+        };
+        let translation = state_translation(states, artifact, start);
+        // Every client of a span shares the first one's state.
+        let same_state = artifact
+            .node_properties
+            .get(start..end)
+            .is_some_and(|states| {
+                let attached = artifact.viewport_attached(start);
+                states.iter().all(|state| *state == states[0])
+                    && (start + 1..end).all(|client| artifact.viewport_attached(client) == attached)
+            });
+        if !same_state {
+            note_unplaceable("r5");
+            return None;
+        }
+        let Some(Ok((tx, ty))) = translation else {
+            note_unplaceable("r4");
+            return None;
+        };
+        DAMAGE_CULLED_PLACED.with(|count| count.set(count.get() + 1));
+        let (x, y) = (rect.x * scale_factor, rect.y * scale_factor);
+        let left = x + tx;
+        let top = y + ty;
+        let right = (x + rect.width * scale_factor) + tx;
+        let bottom = (y + rect.height * scale_factor) + ty;
+        if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()) {
+            note_unplaceable("r3");
+            return None;
+        }
+        if right <= -1.0 || bottom <= -1.0 || left >= surface.0 + 1.0 || top >= surface.1 + 1.0 {
+            continue;
+        }
+        out.push(skia_safe::IRect::from_ltrb(
+            (left.floor() - 1.0).max(-1.0) as i32,
+            (top.floor() - 1.0).max(-1.0) as i32,
+            (right.ceil() + 1.0).min(surface.0 + 1.0) as i32,
+            (bottom.ceil() + 1.0).min(surface.1 + 1.0) as i32,
+        ));
     }
     Some(out)
 }

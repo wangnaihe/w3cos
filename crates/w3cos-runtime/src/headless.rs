@@ -2010,6 +2010,131 @@ mod tests {
         }
     }
 
+    /// A long column under the paint cull rect: an edit at the top moves
+    /// every card below it, most of them outside the cull band, where no
+    /// layer draws them. Their damage entries are placed by their property
+    /// tree state, or (`W3COS_PAINT_DAMAGE_QUIET`) left out since they paint
+    /// nothing in either frame; both composite under damage and equal a full
+    /// paint.
+    #[test]
+    fn damage_of_culled_boxes_matches_a_full_composite() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_QUIET_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::PAINT_CULL_RUNS_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(Some(1)));
+        crate::paint_artifact::PAINT_CULL_RUNS_OVERRIDE.with(|value| value.set(Some(1)));
+        crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        for quiet in [false, true] {
+            crate::retained_layers::PAINT_DAMAGE_QUIET_OVERRIDE
+                .with(|value| value.set(Some(quiet)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            // The first card grows (and shrinks back), moving all the others.
+            let first = crate::dom::create_element("div");
+            crate::dom::set_style_property(first, "width", "140px");
+            let words = crate::dom::create_text_node("top");
+            crate::dom::append_child(first, words);
+            crate::dom::append_child(body, first);
+            let mut texts = Vec::new();
+            // 300 cards of 24px: far past the cull band below a 480px view.
+            for index in 0..300 {
+                let card = crate::dom::create_element("div");
+                for (name, value) in [
+                    ("width", "140px"),
+                    ("height", "24px"),
+                    ("background", "#eeeeff"),
+                ] {
+                    crate::dom::set_style_property(card, name, value);
+                }
+                let text = crate::dom::create_text_node(&format!("card {index}"));
+                crate::dom::append_child(card, text);
+                crate::dom::append_child(body, card);
+                texts.push(text);
+            }
+            let edits = [
+                "top now says a much longer hello that wraps onto more lines",
+                "top",
+                "top grows again over two lines",
+            ];
+            let quiet_skips =
+                || crate::retained_layers::PAINT_DAMAGE_QUIET_SKIPS.with(std::cell::Cell::get);
+            let placed = || crate::render_skia::DAMAGE_CULLED_PLACED.with(std::cell::Cell::get);
+            let (frames, (damaged, blit_diff, skipped, culled)) = with_stable_fonts(|| {
+                with_layer_reuse(true, || {
+                    crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                    crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE
+                        .with(|value| value.set(Some(2)));
+                    render_document_rgba(160, 480).expect("first frame");
+                    let before = (
+                        crate::render_skia::paint_damage_stats().0
+                            + crate::render_skia::paint_damage_blit_stats().0,
+                        crate::render_skia::paint_damage_blit_stats().2,
+                        quiet_skips(),
+                        placed(),
+                    );
+                    let mut frames = Vec::new();
+                    for text in edits {
+                        crate::dom::set_text_content(words, text);
+                        frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
+                    }
+                    (
+                        frames,
+                        (
+                            crate::render_skia::paint_damage_stats().0
+                                + crate::render_skia::paint_damage_blit_stats().0
+                                - before.0,
+                            crate::render_skia::paint_damage_blit_stats().2 - before.1,
+                            quiet_skips() - before.2,
+                            placed() - before.3,
+                        ),
+                    )
+                })
+            });
+            assert!(
+                damaged > 0,
+                "quiet {quiet}: no frame composited under damage"
+            );
+            assert_eq!(blit_diff, 0, "quiet {quiet}: a blitted frame differs");
+            if quiet {
+                assert!(skipped > 0, "culled moved cards must be left out");
+            } else {
+                assert_eq!(skipped, 0);
+                assert!(culled > 0, "culled moved cards must be placed by state");
+            }
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(Some(0)));
+            crate::dom::set_text_content(words, "top");
+            for (step, text) in edits.into_iter().enumerate() {
+                crate::dom::set_text_content(words, text);
+                let fresh = with_layer_reuse(false, || {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(160, 480).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "quiet {quiet} step {step}: a damage composite differs from a full one"
+                );
+            }
+            let _ = &texts;
+        }
+    }
+
     /// Cards below an edited top card move by whole pixels: the blit copies
     /// them from the previous frame and the result equals a full paint; with
     /// a gradient behind them the blit must give up and stay correct.
