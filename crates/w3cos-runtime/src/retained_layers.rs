@@ -1903,46 +1903,114 @@ fn paint_diff_clients_inner(
     let quiet = skip_quiet && cur.cull_band.is_some() && prev.cull_band == cur.cull_band;
     let mut quiet_dirty: Vec<usize> = Vec::new();
     let count = sparse_list.as_ref().map_or(n, Vec::len);
-    for at in 0..count {
-        let index = sparse_list.as_ref().map_or(at, |list| list[at]);
-        if quiet
-            && !in_run.get(index).copied().unwrap_or(false)
-            && prev_items[index] == 0
-            && cur_items[index] == 0
-            && prev.column_fragments.get(index).is_none_or(Vec::is_empty)
-            && cur.column_fragments.get(index).is_none_or(Vec::is_empty)
-            && prev.pushed_no_property_nodes(index)
-            && cur.pushed_no_property_nodes(index)
-        {
-            // Paints nothing in either frame (the cull band dropped it, or
-            // it is invisible) and owns no clip or scroll node: no other
-            // client to invalidate (Blink does not visit a box outside the
-            // cull rect). Still marked when it changed, so the frame counts
-            // as changed as before.
-            if !rect_equal(
-                prev.rect_by_index.get(index).copied().flatten(),
-                cur.rect_by_index.get(index).copied().flatten(),
-            ) || !paint_inputs_equal(index, &prev.nodes[index], &cur.nodes[index])
+    // `W3COS_PAINT_DIFF_CULLED_SPANS`: the build's culled spans already hold
+    // the quiet test below (no item, no property node in either frame, same
+    // inputs), so a box in one only compares its rect.
+    let spans_mode = if quiet {
+        paint_diff_culled_spans_mode()
+    } else {
+        0
+    };
+    let spans = (spans_mode != 0)
+        .then(|| cur.culled_spans_against(prev))
+        .flatten()
+        .unwrap_or(&[]);
+    let (mut span_at, mut span_start, mut span_end) = (0usize, usize::MAX, 0usize);
+    let (mut span_boxes, mut span_mismatch) = (0u64, 0u64);
+    // The per-box diff after the span test; a macro so the loop without
+    // spans (the default) stays as tight as before.
+    macro_rules! diff_box {
+        ($index:expr) => {{
+            let index = $index;
+            if quiet
+                && !in_run.get(index).copied().unwrap_or(false)
+                && prev_items[index] == 0
+                && cur_items[index] == 0
+                && prev.column_fragments.get(index).is_none_or(Vec::is_empty)
+                && cur.column_fragments.get(index).is_none_or(Vec::is_empty)
+                && prev.pushed_no_property_nodes(index)
+                && cur.pushed_no_property_nodes(index)
             {
-                quiet_dirty.push(index);
+                // Paints nothing in either frame (the cull band dropped it, or
+                // it is invisible) and owns no clip or scroll node: no other
+                // client to invalidate (Blink does not visit a box outside the
+                // cull rect). Still marked when it changed, so the frame counts
+                // as changed as before.
+                if !rect_equal(
+                    prev.rect_by_index.get(index).copied().flatten(),
+                    cur.rect_by_index.get(index).copied().flatten(),
+                ) || !paint_inputs_equal(index, &prev.nodes[index], &cur.nodes[index])
+                {
+                    quiet_dirty.push(index);
+                }
+                continue;
             }
-            continue;
-        }
-        // The common case, kept out of the (not inlined) visit: a client of
-        // a copied run with equal text pieces.
-        if in_run.get(index).copied().unwrap_or(false)
-            && prev.text_fragments.get(index).is_none_or(Vec::is_empty)
-            && cur.text_fragments.get(index).is_none_or(Vec::is_empty)
-            && get(&prev.vertical_text, index) == get(&cur.vertical_text, index)
-        {
-            if volatile(&cur.nodes[index]) {
-                changed.push((index, true));
+            // The common case, kept out of the (not inlined) visit: a client of
+            // a copied run with equal text pieces.
+            if in_run.get(index).copied().unwrap_or(false)
+                && prev.text_fragments.get(index).is_none_or(Vec::is_empty)
+                && cur.text_fragments.get(index).is_none_or(Vec::is_empty)
+                && get(&prev.vertical_text, index) == get(&cur.vertical_text, index)
+            {
+                if volatile(&cur.nodes[index]) {
+                    changed.push((index, true));
+                }
+                continue;
             }
-            continue;
+            if !visit(index, &mut changed, &mut moved) {
+                return None;
+            }
+        }};
+    }
+    if spans.is_empty() {
+        for at in 0..count {
+            diff_box!(sparse_list.as_ref().map_or(at, |list| list[at]));
         }
-        if !visit(index, &mut changed, &mut moved) {
-            return None;
+    } else {
+        for at in 0..count {
+            let index = sparse_list.as_ref().map_or(at, |list| list[at]);
+            if index >= span_end {
+                span_at += spans[span_at..].partition_point(|span| span.end as usize <= index);
+                (span_start, span_end) =
+                    spans.get(span_at).map_or((usize::MAX, usize::MAX), |span| {
+                        (span.start as usize, span.end as usize)
+                    });
+            }
+            if index >= span_start && !in_run.get(index).copied().unwrap_or(false) {
+                let moved_rect = !rect_equal(
+                    prev.rect_by_index.get(index).copied().flatten(),
+                    cur.rect_by_index.get(index).copied().flatten(),
+                );
+                if spans_mode == 2 {
+                    let full_quiet = prev_items[index] == 0
+                        && cur_items[index] == 0
+                        && prev.column_fragments.get(index).is_none_or(Vec::is_empty)
+                        && cur.column_fragments.get(index).is_none_or(Vec::is_empty)
+                        && prev.pushed_no_property_nodes(index)
+                        && cur.pushed_no_property_nodes(index);
+                    let full_dirty = moved_rect
+                        || !paint_inputs_equal(index, &prev.nodes[index], &cur.nodes[index]);
+                    if !full_quiet || full_dirty != moved_rect {
+                        eprintln!(
+                            "[paint-diff-culled-spans-verify] mismatch: box {index} quiet {full_quiet} dirty {full_dirty}"
+                        );
+                        span_mismatch += 1;
+                    }
+                }
+                if moved_rect {
+                    quiet_dirty.push(index);
+                }
+                span_boxes += 1;
+                continue;
+            }
+            diff_box!(index);
         }
+    }
+    if span_boxes + span_mismatch > 0 {
+        PAINT_DIFF_CULLED_SPANS_STATS.with(|stats| {
+            let (a, b) = stats.get();
+            stats.set((a + span_boxes, b + span_mismatch));
+        });
     }
     if cur
         .nodes
@@ -2167,6 +2235,41 @@ fn paint_diff_clients_inner(
         }
     }
     Some(PaintDiff { dirty, moved })
+}
+
+/// `W3COS_PAINT_DIFF_CULLED_SPANS=1` (with `W3COS_PAINT_CULL_RUNS`): the
+/// paint diff takes a box in the build's culled spans as quiet without
+/// re-testing its display items, property nodes and inputs (the build
+/// established them when it copied the span; Blink does not visit a box
+/// outside the cull rect). `=verify` also runs the full test and compares.
+pub(crate) fn paint_diff_culled_spans_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_DIFF_CULLED_SPANS")
+            .ok()
+            .as_deref()
+        {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DIFF_CULLED_SPANS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// `(boxes taken by span, verify mismatches)`.
+    pub(crate) static PAINT_DIFF_CULLED_SPANS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Per effect node, whether it or an ancestor effect has a filter.

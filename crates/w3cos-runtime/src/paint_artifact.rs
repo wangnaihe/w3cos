@@ -616,7 +616,28 @@ struct AppendRecord {
     /// this build copied as culled runs (or inherited them through aligned
     /// runs): each pushed no property node and no display item, sat under
     /// the root's properties and was not viewport attached or sticky.
-    cull_spans: Vec<(u32, u32)>,
+    cull_spans: Vec<CullSpan>,
+}
+
+/// One culled span of an append record (see `AppendRecord::cull_spans`).
+/// With `W3COS_PAINT_CULL_SUBTREES` it also carries what Blink keeps as a
+/// subtree's visual overflow: the vertical extent of its boxes relative to
+/// its first box, so a span that only moved is culled with one test.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CullSpan {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    /// Lowest box top and highest box bottom, minus the first box's top.
+    top: f32,
+    bottom: f32,
+    /// Visible boxes (those the band culled rather than hid).
+    visible: u32,
+    /// Parents before `start` of boxes in the span; `parent_count` 3: more
+    /// than two (the span is not taken whole).
+    parents: [u32; 2],
+    parent_count: u8,
+    /// The root properties every box sat under when checked.
+    root: PaintProperties,
 }
 
 /// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
@@ -3741,6 +3762,17 @@ impl PaintArtifact {
         .then_some(record.unchanged.as_slice())
     }
 
+    /// The culled spans this build copied or carried over from `previous`
+    /// (sorted, disjoint): their boxes kept their inputs and pushed no
+    /// property node and no display item in either build.
+    pub(crate) fn culled_spans_against(&self, previous: &PaintArtifact) -> Option<&[CullSpan]> {
+        let record = self.append_record.as_deref()?;
+        (record.base != 0
+            && record.base == previous.serial
+            && record.unchanged.len() == self.nodes.len())
+        .then_some(record.cull_spans.as_slice())
+    }
+
     /// Whether this build recorded `index` pushing no property node (and
     /// so no rect-carrying clip or scroll node). `false` without a record.
     #[inline]
@@ -3816,7 +3848,7 @@ impl PaintArtifact {
         memo: &mut AppendMemo,
         marks: &mut Vec<AppendMark>,
         runs: &mut Vec<[u32; 4]>,
-        cull_spans: &mut Vec<(u32, u32)>,
+        cull_spans: &mut Vec<CullSpan>,
     ) -> usize {
         let len = self.nodes.len();
         let mark = self.mark();
@@ -3893,11 +3925,11 @@ impl PaintArtifact {
         // Last frame's culled spans in the run hold again: same indices,
         // same output (and so no item, no property node).
         let old_spans = &record.cull_spans;
-        let mut at = old_spans.partition_point(|&(_, e)| e as usize <= start);
-        while let Some(&(a, b)) = old_spans.get(at)
-            && (a as usize) < end
+        let mut at = old_spans.partition_point(|span| (span.start as usize) < start);
+        while let Some(span) = old_spans.get(at)
+            && span.end as usize <= end
         {
-            push_span(cull_spans, (a as usize).max(start), (b as usize).min(end));
+            cull_spans.push(*span);
             at += 1;
         }
         let range = |a: u32, b: u32| a as usize..b as usize;
@@ -4070,6 +4102,105 @@ impl PaintArtifact {
         (cullable && self.outside_band(node, rect, top, bottom)).then_some(true)
     }
 
+    /// `W3COS_PAINT_CULL_SUBTREES`: last frame's culled span starting at
+    /// `at`, when it may be taken whole: its boxes kept their inputs (a gap
+    /// of the changed ranges), its outside parents have the same output, its
+    /// first box kept its size and inline position, and its extent moved
+    /// with that box lies past the band (with a pixel to spare for rounding).
+    #[allow(clippy::too_many_arguments)]
+    fn whole_culled_span(
+        &self,
+        at: usize,
+        start: usize,
+        previous: &PaintArtifact,
+        record: &AppendRecord,
+        same: &[bool],
+        changed: &[(u32, u32)],
+        root: PaintProperties,
+        top: f32,
+        bottom: f32,
+    ) -> Option<CullSpan> {
+        let spans = &record.cull_spans;
+        let index = spans.partition_point(|span| (span.start as usize) < at);
+        let span = *spans.get(index).filter(|span| span.start as usize == at)?;
+        let end = span.end as usize;
+        if span.parent_count > 2 || span.root != root {
+            return None;
+        }
+        let parents_same = span.parents[..span.parent_count as usize]
+            .iter()
+            .all(|&parent| {
+                let parent = parent as usize;
+                (start..at).contains(&parent) || (parent < start && same[parent])
+            });
+        if !parents_same
+            || crate::incremental_layout::ranges_gap_end(changed, at, self.nodes.len()) < end
+        {
+            return None;
+        }
+        let (Some(rect), Some(old_rect)) = (self.rect_by_index[at], previous.rect_by_index[at])
+        else {
+            return None;
+        };
+        if rect.x != old_rect.x || rect.width != old_rect.width || rect.height != old_rect.height {
+            return None;
+        }
+        let (low, high) = (rect.y + span.top, rect.y + span.bottom);
+        (low > bottom + 1.0 || high < top - 1.0).then_some(span)
+    }
+
+    /// Records boxes `segment..end` of a culled run, checked box by box, as
+    /// one span with its extent, visible count and outside parents.
+    fn close_cull_segment(
+        &self,
+        segment: usize,
+        end: usize,
+        root: PaintProperties,
+        cull_spans: &mut Vec<CullSpan>,
+    ) {
+        // Only the span readers need them; skip the walk otherwise.
+        if segment >= end || !cull_spans_wanted() {
+            return;
+        }
+        let first = self.rect_by_index[segment].map_or(0.0, |rect| rect.y);
+        let mut span = CullSpan {
+            start: segment as u32,
+            end: end as u32,
+            top: f32::INFINITY,
+            bottom: f32::NEG_INFINITY,
+            visible: 0,
+            parents: [0; 2],
+            parent_count: 0,
+            root,
+        };
+        for index in segment..end {
+            let node = &self.nodes[index];
+            if let Some(rect) = self.rect_by_index[index] {
+                span.top = span.top.min(rect.y - first);
+                span.bottom = span.bottom.max(rect.y + rect.height - first);
+            } else {
+                // A box without a rect is never in a run; keep it unusable.
+                span.parent_count = 3;
+            }
+            if node.style.visibility == Visibility::Visible {
+                span.visible += 1;
+            }
+            if let Some(parent) = node.parent
+                && parent < segment
+                && span.parent_count <= 2
+                && !span.parents[..span.parent_count as usize].contains(&(parent as u32))
+            {
+                if span.parent_count == 2 {
+                    span.parent_count = 3;
+                } else {
+                    span.parents[span.parent_count as usize] = parent as u32;
+                    span.parent_count += 1;
+                }
+            }
+        }
+        cull_spans.push(span);
+    }
+
     fn copy_culled_run(
         &mut self,
         start: usize,
@@ -4079,7 +4210,7 @@ impl PaintArtifact {
         unchanged: &mut [bool],
         memo: &mut AppendMemo,
         marks: &mut Vec<AppendMark>,
-        cull_spans: &mut Vec<(u32, u32)>,
+        cull_spans: &mut Vec<CullSpan>,
     ) -> usize {
         let Some((top, bottom)) = self.cull_band else {
             return start;
@@ -4117,14 +4248,47 @@ impl PaintArtifact {
         let spans = &record.cull_spans;
         let (mut span_end, mut gap_end) = (start, start);
         let mut fast_count = 0u64;
+        let subtrees = paint_cull_subtrees_mode();
+        let whole = (subtrees != 0 && paint_touched_mode() == 1 && self.touched_gaps)
+            .then(|| self.touched.as_ref().map(|touched| &touched.changed))
+            .flatten();
+        let spans_before = cull_spans.len();
+        let mut segment = start;
+        let (mut whole_spans, mut whole_boxes, mut whole_mismatch) = (0u64, 0u64, 0u64);
         while end < len {
+            if let Some(changed) = whole
+                && let Some(span) = self.whole_culled_span(
+                    end, start, previous, record, same, changed, root, top, bottom,
+                )
+            {
+                let span_end = span.end as usize;
+                let agrees = subtrees != 2
+                    || (end..span_end).all(|index| {
+                        self.culled_box_check(
+                            index, start, previous, record, same, tail, root, top, bottom,
+                        )
+                        .is_some()
+                    });
+                if agrees {
+                    self.close_cull_segment(segment, end, root, cull_spans);
+                    cull_spans.push(span);
+                    culled += span.visible as u64;
+                    whole_spans += 1;
+                    whole_boxes += (span_end - end) as u64;
+                    end = span_end;
+                    segment = end;
+                    continue;
+                }
+                eprintln!("[paint-cull-subtrees-verify] mismatch: span {end}..{span_end}");
+                whole_mismatch += 1;
+            }
             if let Some(changed) = changed {
                 if end >= span_end {
-                    let at = spans.partition_point(|&(_, e)| e as usize <= end);
+                    let at = spans.partition_point(|span| span.end as usize <= end);
                     span_end = spans
                         .get(at)
-                        .filter(|&&(a, _)| a as usize <= end)
-                        .map_or(end, |&(_, e)| e as usize);
+                        .filter(|span| span.start as usize <= end)
+                        .map_or(end, |span| span.end as usize);
                 }
                 if end >= gap_end {
                     gap_end = crate::incremental_layout::ranges_gap_end(changed, end, len);
@@ -4171,9 +4335,17 @@ impl PaintArtifact {
                 stats.set((a + fast_count, b));
             });
         }
+        if whole_spans + whole_mismatch > 0 {
+            PAINT_CULL_SUBTREE_STATS.with(|stats| {
+                let (a, b, c) = stats.get();
+                stats.set((a + whole_spans, b + whole_boxes, c + whole_mismatch));
+            });
+        }
         if end - start < 8 {
+            cull_spans.truncate(spans_before);
             return start;
         }
+        self.close_cull_segment(segment, end, root, cull_spans);
         let nodes = start..end;
         self.node_properties[nodes.clone()]
             .copy_from_slice(&previous.node_properties[nodes.clone()]);
@@ -4188,7 +4360,6 @@ impl PaintArtifact {
         memo.owns_context[nodes.clone()].copy_from_slice(&old_memo.owns_context[nodes.clone()]);
         memo.stacking[nodes.clone()].copy_from_slice(&old_memo.stacking[nodes.clone()]);
         memo.ancestor_phase[nodes.clone()].copy_from_slice(&old_memo.ancestor_phase[nodes.clone()]);
-        push_span(cull_spans, start, end);
         let (items, chunks) = (mark.items, mark.chunks);
         let stop = record.marks.get(end).copied().unwrap_or(tail);
         if self.paint_order.levels.len() as u32 == old.levels {
@@ -4277,7 +4448,7 @@ impl PaintArtifact {
         let mut same = vec![false; len];
         let mut unchanged = vec![false; len];
         let mut runs = Vec::new();
-        let mut cull_spans: Vec<(u32, u32)> = Vec::new();
+        let mut cull_spans: Vec<CullSpan> = Vec::new();
         let (mut copied, mut appended, mut run_copied) = (0u64, 0u64, 0u64);
         let mut cull_copied = 0u64;
         let splice = artifact_splice_enabled();
@@ -4375,7 +4546,8 @@ impl PaintArtifact {
         });
         if verify {
             eprintln!(
-                "[append-reuse] copied {copied} of {len} ({run_copied} in aligned runs, {cull_copied} in culled runs)"
+                "[append-reuse] copied {copied} of {len} ({run_copied} in aligned runs, {cull_copied} in culled runs; whole culled spans so far {:?})",
+                PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get)
             );
         }
         if let Some(fresh) = fresh
@@ -6189,6 +6361,73 @@ mod tests {
         };
         let first = build(0.0, None, 1);
         let second = build(16.0, Some(&first), 1);
+        // `W3COS_PAINT_CULL_SUBTREES`: the moved span is culled whole by its
+        // kept extent; verify checks every box agrees.
+        for mode in [2, 1] {
+            PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(Some(mode)));
+            let before = PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get);
+            let whole = build(32.0, Some(&second), 1);
+            let after = PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get);
+            PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(None));
+            assert!(after.0 > before.0, "the moved span is taken whole");
+            assert!(after.1 - before.1 >= 30);
+            assert_eq!(
+                after.2, before.2,
+                "a box of a whole span fails the full check"
+            );
+            PAINT_CULL_RUN_GAPS_OVERRIDE.with(|value| value.set(Some(0)));
+            let reference = {
+                set_paint_touched(Some(crate::incremental_layout::PaintChanges {
+                    len: 40,
+                    changed: vec![(0, 2)],
+                    moved: vec![(2, 40)],
+                    ..Default::default()
+                }));
+                PAINT_CULL_BAND.with(|band| band.set(Some((-4000.0, 720.0 + 4000.0))));
+                let artifact = PaintArtifact::build_reusing(
+                    nodes(),
+                    &layouts(32.0),
+                    1,
+                    None,
+                    None,
+                    Some(&second),
+                );
+                PAINT_CULL_BAND.with(|band| band.set(None));
+                set_paint_touched(None);
+                artifact
+            };
+            assert!(whole.append_output_eq(&reference));
+        }
+        // `W3COS_PAINT_DIFF_CULLED_SPANS`: the diff takes the culled span's
+        // boxes as quiet from the build and marks the moved ones, as the
+        // full test does.
+        {
+            use crate::retained_layers::{
+                PAINT_DIFF_CULLED_SPANS_OVERRIDE, PAINT_DIFF_CULLED_SPANS_STATS, paint_diff_clients,
+            };
+            let third = build(32.0, Some(&second), 1);
+            let diff = |mode: u8| {
+                PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(|value| value.set(Some(mode)));
+                let diff = paint_diff_clients(&second, &third).expect("paint diff");
+                PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(|value| value.set(None));
+                (diff.dirty, diff.moved)
+            };
+            let before = PAINT_DIFF_CULLED_SPANS_STATS.with(std::cell::Cell::get);
+            let verified = diff(2);
+            let after = PAINT_DIFF_CULLED_SPANS_STATS.with(std::cell::Cell::get);
+            assert!(
+                after.0 - before.0 >= 30,
+                "the culled boxes are taken by span"
+            );
+            assert_eq!(
+                after.1, before.1,
+                "the span test disagrees with the full one"
+            );
+            let full = diff(0);
+            assert!(verified == full);
+            assert!(diff(1) == full);
+            assert!(full.0[39], "a moved culled box is still marked");
+        }
         let before = PAINT_CULL_RUN_GAPS_STATS.with(std::cell::Cell::get);
         let verified = build(32.0, Some(&second), 2);
         let after = PAINT_CULL_RUN_GAPS_STATS.with(std::cell::Cell::get);
@@ -10214,15 +10453,46 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
 }
 
-/// Appends `[start, end)` to sorted disjoint spans, merging a touching one.
-fn push_span(spans: &mut Vec<(u32, u32)>, start: usize, end: usize) {
-    if start >= end {
-        return;
+/// Whether a reader of the culled spans (`W3COS_PAINT_CULL_RUN_GAPS`,
+/// `W3COS_PAINT_CULL_SUBTREES`, `W3COS_PAINT_DIFF_CULLED_SPANS`) is on, so
+/// `copy_culled_run` records them.
+fn cull_spans_wanted() -> bool {
+    paint_cull_run_gaps_mode() != 0
+        || paint_cull_subtrees_mode() != 0
+        || crate::retained_layers::paint_diff_culled_spans_mode() != 0
+}
+
+/// `W3COS_PAINT_CULL_SUBTREES=1` (with `W3COS_PAINT_CULL_RUNS` and the
+/// layout's touched ranges): a culled span from last frame that lies in a
+/// gap of the changed ranges only moved as a whole, so `copy_culled_run`
+/// culls it with one test of its kept vertical extent against the band and
+/// copies it without visiting its boxes (Blink culls a subtree by its visual
+/// overflow rect). `=verify` also checks every box and counts disagreements.
+pub(crate) fn paint_cull_subtrees_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CULL_SUBTREES_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
     }
-    match spans.last_mut() {
-        Some(last) if last.1 as usize == start => last.1 = end as u32,
-        _ => spans.push((start as u32, end as u32)),
-    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_CULL_SUBTREES").ok().as_deref() {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_CULL_SUBTREES_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// `(spans taken whole, boxes in them, verify mismatches)`.
+    pub(crate) static PAINT_CULL_SUBTREE_STATS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 pub(crate) fn paint_cull_runs_enabled() -> bool {
