@@ -999,6 +999,20 @@ pub(crate) fn paint_damage_until(
     paint_damage_with(prev, cur, diff, &mut MeasureInk, Some(stop))
 }
 
+/// `W3COS_PAINT_DAMAGE_QUIET_RUNS=1` (off by default): `paint_damage_with`
+/// skips a run of quiet clients (dirty, painting nothing in either frame;
+/// see `W3COS_PAINT_DAMAGE_QUIET`) in one tight loop instead of one walk
+/// step each. Same damage, same order: a quiet client adds none.
+fn paint_damage_quiet_runs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("W3COS_PAINT_DAMAGE_QUIET_RUNS").as_deref(),
+            Ok("1" | "true")
+        )
+    })
+}
+
 /// The first client at or after `from` that changed or moved (`len` when
 /// none does). Clients past `diff`'s tables count as changed.
 #[inline(never)]
@@ -1044,6 +1058,7 @@ fn paint_damage_with<S: InkSource>(
             })
         })
         .flatten();
+    let quiet_runs = paint_damage_quiet_runs_enabled();
     let record_moves = paint_damage_blit_mode() != 0;
     DAMAGE_MOVES.with(|slot| *slot.borrow_mut() = None);
     let mut moves: Vec<MovedSpan> = Vec::new();
@@ -1099,7 +1114,19 @@ fn paint_damage_with<S: InkSource>(
             // Paints nothing in either frame: no pixels to repaint. Its
             // kept ink is dropped (measured again when next needed).
             ink.forget(index);
-            PAINT_DAMAGE_QUIET_SKIPS.with(|count| count.set(count.get() + 1));
+            let mut skipped = 1;
+            // `W3COS_PAINT_DAMAGE_QUIET_RUNS`: the quiet clients after it
+            // (the band's culled boxes, in long runs) in one tight loop.
+            if quiet_runs && let Some(quiet) = quiet.as_ref() {
+                while dirty_by_client.get(next).copied() == Some(true)
+                    && quiet.get(next).copied() == Some(true)
+                {
+                    ink.forget(next);
+                    next += 1;
+                    skipped += 1;
+                }
+            }
+            PAINT_DAMAGE_QUIET_SKIPS.with(|count| count.set(count.get() + skipped));
             continue;
         }
         // A client that only moved (`moved_by`: same style, properties,
