@@ -1856,6 +1856,85 @@ mod tests {
     }
 
     #[test]
+    fn paint_feature_skip_matches_the_full_passes() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::append_child(body, log);
+            let first = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("plain");
+            crate::dom::append_child(first, text);
+            crate::dom::append_child(log, first);
+            assert!(crate::incremental_layout::flush());
+            let before = crate::paint_artifact::paint_feature_skip_stats();
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            for step in 0..6 {
+                match step {
+                    // A box with a percentage translate arrives.
+                    1 => {
+                        let moved = crate::dom::create_element("div");
+                        for (name, value) in [
+                            ("width", "40px"),
+                            ("height", "20px"),
+                            ("background", "#3366cc"),
+                            ("transform", "translate(50%, 25%)"),
+                        ] {
+                            crate::dom::set_style_property(moved, name, value);
+                        }
+                        crate::dom::append_child(log, moved);
+                    }
+                    // Then a table.
+                    3 => {
+                        let table = crate::dom::create_element("table");
+                        crate::dom::set_style_property(table, "border-collapse", "collapse");
+                        let row = crate::dom::create_element("tr");
+                        let cell = crate::dom::create_element("td");
+                        crate::dom::set_style_property(cell, "border", "2px solid #000");
+                        let words = crate::dom::create_text_node("cell");
+                        crate::dom::append_child(cell, words);
+                        crate::dom::append_child(row, cell);
+                        crate::dom::append_child(table, row);
+                        crate::dom::append_child(log, table);
+                    }
+                    _ => {
+                        let line = crate::dom::create_element("p");
+                        let words = crate::dom::create_text_node(&format!("line {step}"));
+                        crate::dom::append_child(line, words);
+                        crate::dom::append_child(log, line);
+                    }
+                }
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = crate::paint_artifact::paint_feature_skip_stats();
+            (frames, (after.0 - before.0, after.1 - before.1))
+        };
+        let (verified, (skipped, mismatched)) = run(2);
+        assert!(skipped > 0, "passes for absent features must be skipped");
+        assert_eq!(mismatched, 0, "a skipped pass was needed");
+        let (skip, _) = run(1);
+        let (full, (off_skipped, _)) = run(0);
+        assert_eq!(off_skipped, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(skip == full, "frames with skipped passes differ");
+    }
+
+    #[test]
     fn damage_composite_matches_a_full_composite() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();

@@ -477,6 +477,11 @@ pub struct PaintArtifact {
     /// `W3COS_PAINT_RANGE_REBUILD`) so the next frame re-runs them only for
     /// the boxes its layout splice touched.
     range_record: Option<std::sync::Arc<RangeRecord>>,
+    /// [`FEATURE_TRANSLATE_PERCENT`] and the other rare-feature bits some
+    /// box of `nodes` may carry (a superset), kept with
+    /// `W3COS_PAINT_FEATURE_SKIP` so the next build skips whole-tree passes
+    /// for features no box has.
+    feature_presence: Option<u8>,
 }
 
 /// Per build, for [`paint_range_rebuild_mode`].
@@ -529,6 +534,7 @@ impl Default for PaintArtifact {
             volatile_nodes: None,
             fragment_nodes: Vec::new(),
             range_record: None,
+            feature_presence: None,
         }
     }
 }
@@ -897,6 +903,10 @@ mod table_passes {
     fn verify() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| flag("W3COS_PAINT_TABLE_MEMO_VERIFY"))
+    }
+
+    pub(super) fn is_table_part(display: Display) -> bool {
+        table_part(display)
     }
 
     fn table_part(display: Display) -> bool {
@@ -3336,9 +3346,20 @@ impl PaintArtifact {
         for index in z_items {
             nodes[index].style.position = Position::Relative;
         }
+        let feature_mode = paint_feature_skip_mode();
+        let features = (feature_mode != 0).then(|| feature_presence(&nodes, previous));
+        let has_feature = |bit: u8| features.is_none_or(|features| features & bit != 0);
         let has_percentage_padding = adjust_used_styles(&mut nodes, viewport);
         if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
-            resolve_translate_percent(&mut nodes, layout_cache);
+            run_feature_pass(
+                feature_mode,
+                has_feature(FEATURE_TRANSLATE_PERCENT),
+                &mut nodes,
+                |a, b| same_paint_nodes(a, b),
+                Clone::clone,
+                |nodes| resolve_translate_percent(nodes, layout_cache),
+                "translate-percent",
+            );
         }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
@@ -3588,8 +3609,31 @@ impl PaintArtifact {
                 trimmed = None;
             }
         }
-        table_passes::run(&mut nodes, &rect_by_index);
-        media_controls::append(&mut nodes, &mut rect_by_index);
+        run_feature_pass(
+            feature_mode,
+            has_feature(FEATURE_TABLE),
+            &mut nodes,
+            |a, b| same_paint_nodes(a, b),
+            Clone::clone,
+            |nodes| table_passes::run(nodes, &rect_by_index),
+            "table",
+        );
+        {
+            let mut both = (
+                std::mem::take(&mut nodes),
+                std::mem::take(&mut rect_by_index),
+            );
+            run_feature_pass(
+                feature_mode,
+                has_feature(FEATURE_VIDEO_CONTROLS),
+                &mut both,
+                |a, b| same_paint_nodes(&a.0, &b.0) && a.1 == b.1,
+                Clone::clone,
+                |(nodes, rects)| media_controls::append(nodes, rects),
+                "media-controls",
+            );
+            (nodes, rect_by_index) = both;
+        }
         let ordinal_scan = range_aligned
             .filter(|(_, before)| before.ordinals_plain)
             .map(|((_, changed), _)| changed.as_slice());
@@ -3626,6 +3670,7 @@ impl PaintArtifact {
             cull_band: PAINT_CULL_BAND.with(std::cell::Cell::get),
             logical_paint_ordinals,
             range_record,
+            feature_presence: features,
             body_index,
             rect_by_index,
             node_properties: vec![PaintProperties::default(); nodes.len()],
@@ -5228,6 +5273,132 @@ pub(crate) fn paint_range_rebuild_mode() -> u8 {
             _ => 0,
         },
     )
+}
+
+const FEATURE_TRANSLATE_PERCENT: u8 = 1;
+const FEATURE_VIDEO_CONTROLS: u8 = 2;
+const FEATURE_TABLE: u8 = 4;
+
+/// `W3COS_PAINT_FEATURE_SKIP=1|verify` (off by default): the reusing build
+/// skips its whole-tree passes for percentage translates, media controls
+/// and tables when no box can carry them: the previous build's set plus
+/// the boxes this frame's layout splice touched (every other box kept its
+/// style). `verify` also runs each skipped pass and compares.
+pub(crate) fn paint_feature_skip_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_FEATURE_SKIP_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_FEATURE_SKIP").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_FEATURE_SKIP_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (passes skipped, verify mismatches).
+    static PAINT_FEATURE_SKIP_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn paint_feature_skip_stats() -> (u64, u64) {
+    PAINT_FEATURE_SKIP_STATS.with(std::cell::Cell::get)
+}
+
+/// The rare-feature bits of one box.
+fn node_features(node: &PaintNode) -> u8 {
+    let style = &node.style;
+    let mut bits = 0;
+    if matches!(style.display, Display::Table | Display::InlineTable)
+        || table_passes::is_table_part(style.display)
+    {
+        bits |= FEATURE_TABLE;
+    }
+    if let Some(properties) = style.custom_properties.as_ref() {
+        const TRANSLATE: &str = "--w3cos-internal-translate-percent";
+        const VIDEO: &str = "--w3cos-internal-video-controls";
+        if properties.may_contain(TRANSLATE) && properties.contains_key(TRANSLATE) {
+            bits |= FEATURE_TRANSLATE_PERCENT;
+        }
+        if properties.may_contain(VIDEO) && properties.contains_key(VIDEO) {
+            bits |= FEATURE_VIDEO_CONTROLS;
+        }
+    }
+    bits
+}
+
+/// The features some box of `nodes` may carry: the previous build's set
+/// and this frame's touched boxes when the splice's set covers the same
+/// boxes, else every box.
+fn feature_presence(nodes: &[PaintNode], previous: Option<&PaintArtifact>) -> u8 {
+    let kept = previous.and_then(|previous| previous.feature_presence);
+    let incremental = kept.and_then(|kept| {
+        PAINT_TOUCHED.with(|touched| {
+            let touched = touched.borrow();
+            let changes = touched
+                .as_ref()
+                .filter(|changes| changes.len == nodes.len())?;
+            let mut bits = kept;
+            for &(start, end) in &changes.changed {
+                for node in &nodes[start as usize..(end as usize).min(nodes.len())] {
+                    bits |= node_features(node);
+                }
+            }
+            Some(bits)
+        })
+    });
+    incremental.unwrap_or_else(|| {
+        nodes
+            .iter()
+            .fold(0, |bits, node| bits | node_features(node))
+    })
+}
+
+/// Run `pass` on `nodes` unless `present` says no box needs it; `verify`
+/// runs it on a copy and compares.
+fn run_feature_pass<T>(
+    mode: u8,
+    present: bool,
+    nodes: &mut T,
+    same: impl Fn(&T, &T) -> bool,
+    copy: impl Fn(&T) -> T,
+    pass: impl Fn(&mut T),
+    name: &str,
+) {
+    if mode == 0 || present {
+        pass(nodes);
+        return;
+    }
+    let mut stats = PAINT_FEATURE_SKIP_STATS.with(std::cell::Cell::get);
+    stats.0 += 1;
+    if mode == 2 {
+        let mut fresh = copy(nodes);
+        pass(&mut fresh);
+        if !same(&fresh, nodes) {
+            stats.1 += 1;
+            eprintln!("[paint-feature-skip-verify] {name} pass was needed");
+            *nodes = fresh;
+        }
+    }
+    PAINT_FEATURE_SKIP_STATS.with(|cell| cell.set(stats));
+}
+
+fn same_paint_nodes(a: &[PaintNode], b: &[PaintNode]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.kind == y.kind && x.parent == y.parent && x.style.as_style() == y.style.as_style()
+        })
 }
 
 /// Install (or clear) the touched set for the next artifact build.
