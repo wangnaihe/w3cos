@@ -6987,50 +6987,7 @@ fn draw_text_in_rect_with_line_painter(
     // lines are prefixes of one font run in one direction, so the paragraph
     // shaping and the standalone line shaping read the same face and glyphs.
     let mut estimate = |prepared: &str| -> Option<text_layout::ParagraphWidths> {
-        if style_uses_ahem(style)
-            || style.direction != w3cos_std::style::TextDirection::Ltr
-            || prepared.contains(['\t', '\n', '\r'])
-        {
-            return None;
-        }
-        let (render_text, bidi_boundaries) =
-            text_layout::font_render_text_for_style_with_boundaries(prepared, style);
-        if !bidi_boundaries.is_empty()
-            || render_text.as_ref() != prepared
-            || prepared.chars().any(|character| {
-                matches!(
-                    unicode_bidi::bidi_class(character),
-                    unicode_bidi::BidiClass::R
-                        | unicode_bidi::BidiClass::AL
-                        | unicode_bidi::BidiClass::AN
-                        | unicode_bidi::BidiClass::LRE
-                        | unicode_bidi::BidiClass::RLE
-                        | unicode_bidi::BidiClass::LRO
-                        | unicode_bidi::BidiClass::RLO
-                        | unicode_bidi::BidiClass::PDF
-                        | unicode_bidi::BidiClass::LRI
-                        | unicode_bidi::BidiClass::RLI
-                        | unicode_bidi::BidiClass::FSI
-                        | unicode_bidi::BidiClass::PDI
-                )
-            })
-        {
-            return None;
-        }
-        let runs = css_font_runs_with_boundaries(prepared, typeface, style, &bidi_boundaries);
-        let [run] = runs.as_slice() else {
-            return None;
-        };
-        if run.text.len() != prepared.len() {
-            return None;
-        }
-        let shaped =
-            crate::skia_text_run::shape_visual_run_with_clusters(run.text, &run.typeface, style)?;
-        text_layout::ParagraphWidths::new(
-            &shaped.clusters,
-            prepared.len(),
-            style.font_size + style.letter_spacing.abs() * 2.0 + style.word_spacing.abs() * 2.0,
-        )
+        paragraph_widths(prepared, typeface, style)
     };
     let layout = if tab_context.is_some() {
         std::rc::Rc::new(text_layout::TextPaintLayout {
@@ -9159,6 +9116,100 @@ pub(crate) fn measure_skia_wrapped_text_last_baseline(
     measure_skia_wrapped_text_geometry::<true>(text, width, style).1
 }
 
+/// ShapingLineBreaker: the paragraph shaped once, for line breaking that
+/// measures a candidate line on its own only near the available edge. Only
+/// for text whose lines are prefixes of one font run in one direction, so
+/// the paragraph shaping and the standalone line shaping read the same face
+/// and glyphs.
+fn paragraph_widths(
+    prepared: &str,
+    typeface: &Typeface,
+    style: &Style,
+) -> Option<text_layout::ParagraphWidths> {
+    if style_uses_ahem(style)
+        || style.direction != w3cos_std::style::TextDirection::Ltr
+        || prepared.contains(['\t', '\n', '\r'])
+    {
+        return None;
+    }
+    let (render_text, bidi_boundaries) =
+        text_layout::font_render_text_for_style_with_boundaries(prepared, style);
+    if !bidi_boundaries.is_empty()
+        || render_text.as_ref() != prepared
+        || prepared.chars().any(|character| {
+            matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R
+                    | unicode_bidi::BidiClass::AL
+                    | unicode_bidi::BidiClass::AN
+                    | unicode_bidi::BidiClass::LRE
+                    | unicode_bidi::BidiClass::RLE
+                    | unicode_bidi::BidiClass::LRO
+                    | unicode_bidi::BidiClass::RLO
+                    | unicode_bidi::BidiClass::PDF
+                    | unicode_bidi::BidiClass::LRI
+                    | unicode_bidi::BidiClass::RLI
+                    | unicode_bidi::BidiClass::FSI
+                    | unicode_bidi::BidiClass::PDI
+            )
+        })
+    {
+        return None;
+    }
+    let runs = css_font_runs_with_boundaries(prepared, typeface, style, &bidi_boundaries);
+    let [run] = runs.as_slice() else {
+        return None;
+    };
+    if run.text.len() != prepared.len() {
+        return None;
+    }
+    let shaped =
+        crate::skia_text_run::shape_visual_run_with_clusters(run.text, &run.typeface, style)?;
+    text_layout::ParagraphWidths::new(
+        &shaped.clusters,
+        prepared.len(),
+        style.font_size + style.letter_spacing.abs() * 2.0 + style.word_spacing.abs() * 2.0,
+    )
+}
+
+/// `W3COS_LAYOUT_WRAP_ESTIMATE=1`: layout's wrapped-height measurement
+/// breaks lines from the paragraph's single shaping like paint does
+/// (`paragraph_widths`), measuring a candidate line on its own only near the
+/// available edge, instead of shaping every growing line prefix. `=verify`
+/// also wraps without it and reports differing lines. Off by default.
+pub(crate) fn layout_wrap_estimate_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = LAYOUT_WRAP_ESTIMATE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_LAYOUT_WRAP_ESTIMATE").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAYOUT_WRAP_ESTIMATE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (layout wraps that used the estimate, of those the ones whose lines
+    /// differed from measuring every candidate in verify mode).
+    static LAYOUT_WRAP_ESTIMATE_STATS: std::cell::Cell<(u32, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[allow(dead_code)]
+pub(crate) fn layout_wrap_estimate_stats() -> (u32, u32) {
+    LAYOUT_WRAP_ESTIMATE_STATS.with(std::cell::Cell::get)
+}
+
 fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(
     text: &str,
     width: f32,
@@ -9197,14 +9248,37 @@ fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(
         } else {
             inner_width
         };
-        let lines = text_layout::wrap_text_with_run_width_and_first_line_in(
-            text,
-            continuation_width,
-            first_line_width,
-            style.white_space,
-            crate::line_break::BreakMode::of(style),
-            |line| measure_skia_text_advance(line, primary, style),
-        );
+        let mode = layout_wrap_estimate_mode();
+        let wrap = |estimate: bool| {
+            let mut paragraph = |prepared: &str| paragraph_widths(prepared, primary, style);
+            text_layout::wrap_text_with_run_width_and_first_line_in_estimated(
+                text,
+                continuation_width,
+                first_line_width,
+                style.white_space,
+                crate::line_break::BreakMode::of(style),
+                |line| measure_skia_text_advance(line, primary, style),
+                estimate.then_some(&mut paragraph as &mut dyn FnMut(&str) -> _),
+            )
+        };
+        let lines = wrap(mode != 0);
+        if mode != 0 {
+            let mut stats = LAYOUT_WRAP_ESTIMATE_STATS.with(std::cell::Cell::get);
+            stats.0 += 1;
+            if mode == 2 {
+                let exact = wrap(false);
+                if exact != lines {
+                    stats.1 += 1;
+                    eprintln!(
+                        "[layout-wrap-estimate-verify] DIFF: {} lines vs {} measured for {:?}",
+                        lines.len(),
+                        exact.len(),
+                        text.chars().take(40).collect::<String>()
+                    );
+                }
+            }
+            LAYOUT_WRAP_ESTIMATE_STATS.with(|cell| cell.set(stats));
+        }
         let used_line_count = text_layout::used_text_line_count(text, style, &lines);
         let content_height = if used_line_count == 1 {
             measure_skia_text_intrinsic_size(&lines[0], style).1 - padding.top - padding.bottom
@@ -10569,6 +10643,44 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn layout_wrap_estimate_keeps_every_line() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                LAYOUT_WRAP_ESTIMATE_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        let style = Style {
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let words = "streaming tokens arrive one word at a time and the bubble grows";
+        let mut text = String::new();
+        for round in 0..6 {
+            if round > 0 {
+                text.push(' ');
+            }
+            text.push_str(words);
+            for width in [90.0, 173.5, 260.0] {
+                LAYOUT_WRAP_ESTIMATE_OVERRIDE.with(|value| value.set(Some(0)));
+                let exact = measure_skia_wrapped_text_height(&text, width, &style);
+                LAYOUT_WRAP_ESTIMATE_OVERRIDE.with(|value| value.set(Some(2)));
+                let before = layout_wrap_estimate_stats();
+                let estimated = measure_skia_wrapped_text_height(&text, width, &style);
+                let after = layout_wrap_estimate_stats();
+                assert_eq!(after.0 - before.0, 1, "the estimate must run");
+                assert_eq!(
+                    after.1 - before.1,
+                    0,
+                    "estimated lines differ at width {width}"
+                );
+                assert_eq!(estimated, exact, "height differs at width {width}");
+            }
+        }
+    }
+
     #[test]
     fn multiline_normal_text_includes_each_lines_resolved_fallback_metrics() {
         let style = Style {

@@ -1838,6 +1838,29 @@ pub(crate) fn wrap_text_with_run_width_and_first_line_in(
     mode: crate::line_break::BreakMode,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
+    wrap_text_with_run_width_and_first_line_in_estimated(
+        text,
+        max_width,
+        first_line_width,
+        white_space,
+        mode,
+        run_width,
+        None,
+    )
+}
+
+/// `wrap_text_with_run_width_and_first_line_in` that reads candidate line
+/// widths from the paragraph's single shaping (`estimate`) and measures a
+/// line on its own only near the available edge.
+pub(crate) fn wrap_text_with_run_width_and_first_line_in_estimated(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
+    run_width: impl FnMut(&str) -> f32,
+    estimate: Option<&mut dyn FnMut(&str) -> Option<ParagraphWidths>>,
+) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
     if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
         return text
@@ -1845,13 +1868,21 @@ pub(crate) fn wrap_text_with_run_width_and_first_line_in(
             .map(str::to_string)
             .collect();
     }
-    wrap_greedy_with_run_width(
+    let first_line_width = first_line_width.max(1.0);
+    wrap_greedy_with_line_width_estimated(
         &text,
-        max_width,
-        first_line_width.max(1.0),
+        1,
         white_space == WhiteSpace::PreWrap,
         mode,
+        |index| {
+            if index == 0 {
+                first_line_width
+            } else {
+                max_width
+            }
+        },
         run_width,
+        estimate,
     )
 }
 
