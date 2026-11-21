@@ -2445,6 +2445,38 @@ pub(super) fn clear_paint_journal() {
     });
 }
 
+/// `W3COS_PAINT_JOURNAL_TRIM=1`: after the paint tree replayed every
+/// journaled splice, the journal drops them (a new epoch, so no older
+/// position stays valid). Without it the entries pile up until a size cap
+/// clears the journal and the next paint rebuilds the whole tree (one frame
+/// in ~51 of a text stream). Off by default.
+pub(super) fn paint_journal_trim_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PAINT_JOURNAL_TRIM_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("W3COS_PAINT_JOURNAL_TRIM").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static PAINT_JOURNAL_TRIM_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Drop every journaled splice and start a new epoch; returns the position
+/// matching the flush cache now.
+pub(super) fn trim_paint_journal() -> (u64, usize) {
+    PAINT_JOURNAL.with(|journal| {
+        let mut journal = journal.borrow_mut();
+        journal.epoch += 1;
+        journal.entries.clear();
+        journal.nodes = 0;
+        (journal.epoch, 0)
+    })
+}
+
 /// The journal position matching the flush cache now.
 pub(super) fn paint_journal_point() -> (u64, usize) {
     PAINT_JOURNAL.with(|journal| {

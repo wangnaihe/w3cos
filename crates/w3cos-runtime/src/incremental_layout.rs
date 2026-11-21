@@ -2844,7 +2844,14 @@ where
     cache.engine = engine;
     cache.structure = structure;
     cache.cascade = cascade;
-    cache.journal = Some(splice::paint_journal_point());
+    // The paint tree now matches the journal's end, and it is the journal's
+    // only reader: drop the replayed entries (`W3COS_PAINT_JOURNAL_TRIM`), so
+    // the journal's size caps never force a full paint rebuild.
+    cache.journal = Some(if splice::paint_journal_trim_enabled() {
+        splice::trim_paint_journal()
+    } else {
+        splice::paint_journal_point()
+    });
     note_paint_patch();
     #[cfg(test)]
     PAINT_SPLICES.with(|count| count.set(count.get() + 1));
@@ -3737,6 +3744,57 @@ mod paint_layout_tests {
                 spliced - spliced_before >= 8,
                 "streamed text must splice the paint layout, got {}",
                 spliced - spliced_before
+            );
+        }
+    }
+
+    #[test]
+    fn trimmed_paint_journal_keeps_splicing_past_its_entry_cap() {
+        struct Force;
+        impl Drop for Force {
+            fn drop(&mut self) {
+                splice::FORCE_PAINT_SPLICE.with(|force| force.set(None));
+                splice::PAINT_JOURNAL_TRIM_OVERRIDE.with(|trim| trim.set(None));
+            }
+        }
+        crate::dom::reset_document();
+        invalidate();
+        splice::FORCE_PAINT_SPLICE.with(|force| force.set(Some(true)));
+        splice::PAINT_JOURNAL_TRIM_OVERRIDE.with(|trim| trim.set(Some(true)));
+        let _force = Force;
+        let log = crate::dom::create_element("div");
+        crate::dom::set_style_property(log, "width", "300px");
+        let paragraph = crate::dom::create_element("p");
+        let text = crate::dom::create_text_node("streamed");
+        crate::dom::append_child(paragraph, text);
+        crate::dom::append_child(log, paragraph);
+        let footer = crate::dom::create_element("div");
+        crate::dom::set_style_property(footer, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), log);
+        crate::dom::append_child(crate::dom::body_id(), footer);
+        assert!(flush());
+        let _ = paint_rect(footer);
+        let (spliced_before, mismatches_before) = paint_splice_stats();
+        // More paints, each after one journaled splice, than the journal's
+        // entry cap: untrimmed, the cap clears it and a paint rebuilds.
+        let steps = 300;
+        for step in 0..steps {
+            crate::dom::set_text_content(text, &format!("streamed word {step}"));
+            assert!(flush());
+            let painted = paint_rect(footer);
+            let fresh = fresh_rect(footer);
+            assert!(
+                (painted.y - fresh.y).abs() < 0.05,
+                "step {step}: spliced paint rect {painted:?} diverges from full layout {fresh:?}"
+            );
+        }
+        let (spliced, mismatches) = paint_splice_stats();
+        assert_eq!(mismatches, mismatches_before);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert_eq!(
+                spliced - spliced_before,
+                steps,
+                "every paint spliced, none rebuilt"
             );
         }
     }
