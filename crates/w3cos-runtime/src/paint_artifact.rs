@@ -3693,6 +3693,7 @@ impl PaintArtifact {
 
     /// Whether this build recorded `index` pushing no property node (and
     /// so no rect-carrying clip or scroll node). `false` without a record.
+    #[inline]
     pub(crate) fn pushed_no_property_nodes(&self, index: usize) -> bool {
         let Some(record) = self.append_record.as_deref() else {
             return false;

@@ -4844,6 +4844,35 @@ pub fn is_node_visible(flat: &[FlatNodeInfo<'_>], idx: usize) -> bool {
     true
 }
 
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// `FNV_PRIME` to the 8th power (wrapping): seven zero bytes after the first.
+const FNV_PRIME_POW8: u64 = {
+    let mut power = 1u64;
+    let mut step = 0;
+    while step < 8 {
+        power = power.wrapping_mul(FNV_PRIME);
+        step += 1;
+    }
+    power
+};
+
+/// FNV-1a of `parent`'s id over the little-endian bytes of `child_index`.
+/// An ordinal below 256 has seven zero bytes after the first, and a zero
+/// byte only multiplies: one xor and one multiply by the 8th power.
+#[inline(always)]
+fn child_stable_id(parent: u64, child_index: usize) -> u64 {
+    let ordinal = child_index as u64;
+    if ordinal < 256 {
+        return (parent ^ ordinal).wrapping_mul(FNV_PRIME_POW8);
+    }
+    let mut child_id = parent;
+    for byte in ordinal.to_le_bytes() {
+        child_id ^= byte as u64;
+        child_id = child_id.wrapping_mul(FNV_PRIME);
+    }
+    child_id
+}
+
 fn pre_flatten_recursive<'a>(
     comp: &'a Component,
     parent: Option<usize>,
@@ -4864,12 +4893,12 @@ fn pre_flatten_recursive<'a>(
     for (child_index, child) in comp.children.iter().enumerate() {
         // FNV-1a over the child ordinal gives each persistent tree slot an
         // identity independent from its current flattened array index.
-        let mut child_id = stable_id;
-        for byte in (child_index as u64).to_le_bytes() {
-            child_id ^= byte as u64;
-            child_id = child_id.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        pre_flatten_recursive(child, Some(my_idx), child_id, out);
+        pre_flatten_recursive(
+            child,
+            Some(my_idx),
+            child_stable_id(stable_id, child_index),
+            out,
+        );
     }
     out[my_idx].subtree_end = out.len();
 }
@@ -62853,5 +62882,22 @@ mod tests {
         // Two CI runs of this tree measured 8086µs and 8089µs. 9ms still
         // rejects a real regression and covers that host plus the 8197µs flake.
         assert!(best_us < 9_000, "layout avg {best_us}µs exceeds 9ms budget");
+    }
+}
+
+#[cfg(test)]
+mod child_stable_id_tests {
+    #[test]
+    fn child_stable_id_matches_fnv_over_every_byte() {
+        for parent in [0u64, 0xcbf2_9ce4_8422_2325, u64::MAX, 0x1234_5678_9abc_def0] {
+            for child_index in (0..1024usize).chain([65_535, 65_536, usize::MAX]) {
+                let mut expected = parent;
+                for byte in (child_index as u64).to_le_bytes() {
+                    expected ^= byte as u64;
+                    expected = expected.wrapping_mul(super::FNV_PRIME);
+                }
+                assert_eq!(super::child_stable_id(parent, child_index), expected);
+            }
+        }
     }
 }
