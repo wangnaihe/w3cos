@@ -953,7 +953,11 @@ pub(crate) fn paint_damage_cached(
         let mut slot = slot.borrow_mut();
         let mut cache = slot
             .take()
-            .filter(|cache| cache.serial == prev.serial() && cache.ink.len() == prev.nodes.len())
+            .filter(|cache| {
+                cache.serial != 0
+                    && cache.serial == prev.serial()
+                    && cache.ink.len() == prev.nodes.len()
+            })
             .unwrap_or_else(|| InkCache {
                 serial: prev.serial(),
                 ink: vec![None; prev.nodes.len()],

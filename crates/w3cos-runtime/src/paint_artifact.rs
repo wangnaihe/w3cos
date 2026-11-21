@@ -642,6 +642,12 @@ pub(crate) struct CullSpan {
 
 /// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
 /// inputs and ancestors' output are unchanged since the previous frame.
+/// A fresh, nonzero [`PaintArtifact::serial`] for a new build.
+fn next_artifact_serial() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn paint_append_reuse_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = APPEND_REUSE_OVERRIDE.with(std::cell::Cell::get) {
@@ -3749,6 +3755,9 @@ impl PaintArtifact {
         for index in 0..artifact.nodes.len() {
             artifact.append_node(index, &mut memo);
         }
+        // Every build has its own serial: per-frame caches keyed by it (the
+        // damage ink cache) must not take another build's entries.
+        artifact.serial = next_artifact_serial();
         artifact
     }
 
@@ -4562,10 +4571,10 @@ impl PaintArtifact {
             });
             // The next frame builds in full and records again.
             *self = fresh;
+            self.serial = next_artifact_serial();
             return;
         }
-        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        self.serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.serial = next_artifact_serial();
         let base = base.map_or(0, |(previous, _)| previous.serial);
         self.append_record = Some(std::sync::Arc::new(AppendRecord {
             marks,
@@ -6240,6 +6249,37 @@ mod tests {
         ];
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
         assert!((artifact.nodes[2].style.padding_lengths().right - 48.018).abs() < 0.01);
+    }
+
+    /// Every build gets its own nonzero serial, with or without append
+    /// reuse: caches keyed by it (the damage ink cache) must never take
+    /// another build's entries.
+    #[test]
+    fn every_build_has_its_own_serial() {
+        let mut serials = Vec::new();
+        for reuse in [false, false, true, true] {
+            APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(reuse)));
+            let root = PaintNode {
+                kind: ComponentKind::Root,
+                style: Style::default().into(),
+                parent: None,
+                sticky_counter_signal: None,
+            };
+            let rect = LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            let artifact = PaintArtifact::build([root], &[(rect, 0)], 1);
+            serials.push(artifact.serial());
+        }
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+        assert!(serials.iter().all(|serial| *serial != 0), "{serials:?}");
+        let mut unique = serials.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), serials.len(), "{serials:?}");
     }
 
     /// Root content outside the cull band emits no display items; boxes in
