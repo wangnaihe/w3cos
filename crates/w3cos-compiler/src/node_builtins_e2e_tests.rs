@@ -549,6 +549,101 @@ fn node_fs_matches_node() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// Code-OSS saves (Ctrl+S) through `DiskFileSystemProvider.writeFile`:
+/// `fs.open(path, "w" | "r+")`, `fs.write(fd, u8view, 0, len, null)` with a
+/// Uint8Array view into a larger buffer, `fs.fdatasync`, `fs.close`, and the
+/// `.vsctmp` + `fs.promises.rename` atomic variant.
+const CODE_OSS_SAVE_MAIN: &str = r##"'use strict';
+// Code-OSS DiskFileSystemProvider save path (vs/platform/files/node + base/node/pfs).
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { promisify } = require('util');
+const P = {
+  open: promisify(fs.open), close: promisify(fs.close), fdatasync: promisify(fs.fdatasync),
+  ftruncate: promisify(fs.ftruncate), fstat: promisify(fs.fstat),
+  write: (fd, buffer, offset, length, position) => new Promise((resolve, reject) => {
+    fs.write(fd, buffer, offset, length, position, (err, bytesWritten, buf) => err ? reject(err) : resolve({ bytesWritten, buffer: buf }));
+  }),
+  exists: async (p) => { try { await fs.promises.access(p); return true; } catch { return false; } },
+};
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'w3save-'));
+const file = path.join(tmp, 'hello.txt');
+fs.writeFileSync(file, 'hello world\n');
+const enc = new TextEncoder();
+async function save(target, text, flags) {
+  // VSBuffer content: a Uint8Array view into a larger ArrayBuffer.
+  const backing = new Uint8Array(64);
+  const bytes = enc.encode(text);
+  backing.set(bytes, 7);
+  const content = backing.subarray(7, 7 + bytes.byteLength);
+  const fd = await P.open(target, flags);
+  if (flags === 'r+') await P.ftruncate(fd, 0);
+  const r1 = await P.write(fd, content, 0, content.byteLength, null);
+  await P.fdatasync(fd);
+  await P.close(fd);
+  return [typeof fd, r1.bytesWritten, r1.buffer === content];
+}
+(async () => {
+  const st0 = await fs.promises.lstat(file);
+  console.log('exists', await P.exists(file), st0.isFile(), st0.size, !!(st0.mode & 0o200));
+  console.log('save-w', ...(await save(file, 'Hello\nworld\n', 'w')));
+  console.log('disk-w', JSON.stringify(fs.readFileSync(file, 'utf8')));
+  console.log('save-r+', ...(await save(file, 'short', 'r+')));
+  console.log('disk-r+', JSON.stringify(fs.readFileSync(file, 'utf8')));
+  const tmpFile = file + '.vsctmp';
+  console.log('save-atomic', ...(await save(tmpFile, 'atomic 你好\n', 'w')));
+  await fs.promises.rename(tmpFile, file);
+  console.log('disk-atomic', JSON.stringify(fs.readFileSync(file, 'utf8')), fs.existsSync(tmpFile));
+  const st1 = await fs.promises.stat(file);
+  console.log('stat', st1.size, typeof st1.mtimeMs, typeof st1.ino);
+  // chunked writes at explicit positions (file service streams large files)
+  const fd = await P.open(file, 'w');
+  const chunk = enc.encode('abcdef');
+  console.log('chunks', (await P.write(fd, chunk, 0, 3, 0)).bytesWritten, (await P.write(fd, chunk, 3, 3, 3)).bytesWritten, (await P.write(fd, chunk, 1, 2, null)).bytesWritten);
+  await P.close(fd);
+  console.log('disk-chunks', JSON.stringify(fs.readFileSync(file, 'utf8')));
+  // fs.promises FileHandle path
+  const fh = await fs.promises.open(file, 'w');
+  const wr = await fh.write(enc.encode('xyz'), 0, 3, null);
+  await fh.datasync(); await fh.close();
+  console.log('filehandle', wr.bytesWritten, JSON.stringify(fs.readFileSync(file, 'utf8')));
+  await fs.promises.writeFile(file, enc.encode('final'));
+  console.log('writeFile-u8', JSON.stringify(await fs.promises.readFile(file, 'utf8')));
+  fs.rmSync(tmp, { recursive: true });
+})().catch((e) => console.log('ERR', e && e.code, e && e.message));
+"##;
+
+/// `node main.cjs` output for `CODE_OSS_SAVE_MAIN`.
+const CODE_OSS_SAVE_NODE_OUTPUT: &str = r##"exists true true 12 true
+save-w number 12 true
+disk-w "Hello\nworld\n"
+save-r+ number 5 true
+disk-r+ "short"
+save-atomic number 14 true
+disk-atomic "atomic 你好\n" false
+stat 14 number number
+chunks 3 3 2
+disk-chunks "bccdef"
+filehandle 3 "xyz"
+writeFile-u8 "final"
+"##;
+
+#[test]
+fn code_oss_disk_provider_save_matches_node() {
+    let root = write_fixture(
+        "w3cos_code_oss_save_e2e",
+        &[
+            ("package.json", r#"{"name":"code-oss-save"}"#),
+            ("main.cjs", CODE_OSS_SAVE_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_code_oss_save_e2e");
+    let expected: Vec<&str> = CODE_OSS_SAVE_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
 const CRYPTO_MAIN: &str = r##"'use strict';
 const crypto = require('crypto');
 const nc = require('node:crypto');

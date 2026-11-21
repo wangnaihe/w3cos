@@ -300,6 +300,24 @@ fn stats_value(metadata: &fs::Metadata) -> Value {
     Value::object(props)
 }
 
+/// Node's `fs.read`/`fs.write` with an integer `position` are pread/pwrite:
+/// they use that offset but leave the descriptor's file position unchanged
+/// (`null`/`undefined`/negative use and advance the current position).
+fn at_position<T>(
+    file: &mut File,
+    position: &Value,
+    op: impl FnOnce(&mut File) -> io::Result<T>,
+) -> io::Result<T> {
+    let Some(position) = position.as_number().filter(|p| *p >= 0.0) else {
+        return op(file);
+    };
+    let saved = file.stream_position()?;
+    file.seek(SeekFrom::Start(position as u64))?;
+    let result = op(file);
+    file.seek(SeekFrom::Start(saved))?;
+    result
+}
+
 fn with_file<T>(fd: i64, syscall: &str, f: impl FnOnce(&mut File) -> io::Result<T>) -> T {
     let result = FILES.with(|files| match files.borrow_mut().get_mut(&fd) {
         Some(file) => f(file),
@@ -913,20 +931,19 @@ fn build_host() -> Value {
         let length = arg(&args, 1).to_number().max(0.0) as usize;
         let position = arg(&args, 2);
         let bytes = with_file(fd, "read", |file| {
-            if let Some(position) = position.as_number().filter(|p| *p >= 0.0) {
-                file.seek(SeekFrom::Start(position as u64))?;
-            }
-            let mut buffer = vec![0u8; length];
-            let mut filled = 0;
-            while filled < length {
-                let count = file.read(&mut buffer[filled..])?;
-                if count == 0 {
-                    break;
+            at_position(file, &position, |file| {
+                let mut buffer = vec![0u8; length];
+                let mut filled = 0;
+                while filled < length {
+                    let count = file.read(&mut buffer[filled..])?;
+                    if count == 0 {
+                        break;
+                    }
+                    filled += count;
                 }
-                filled += count;
-            }
-            buffer.truncate(filled);
-            Ok(buffer)
+                buffer.truncate(filled);
+                Ok(buffer)
+            })
         });
         crate::binary::array_buffer_value(bytes)
     });
@@ -939,11 +956,10 @@ fn build_host() -> Value {
             return Value::Number(written as f64);
         }
         let written = with_file(fd, "write", |file| {
-            if let Some(position) = position.as_number().filter(|p| *p >= 0.0) {
-                file.seek(SeekFrom::Start(position as u64))?;
-            }
-            file.write_all(&bytes)?;
-            Ok(bytes.len())
+            at_position(file, &position, |file| {
+                file.write_all(&bytes)?;
+                Ok(bytes.len())
+            })
         });
         Value::Number(written as f64)
     });
