@@ -86,6 +86,24 @@ pub struct RetainedLayerTree {
     chunk_order: Vec<usize>,
     /// `serial` of the artifact `layers` were last synced from.
     artifact_serial: u64,
+    /// Per chunk, what grouping reads (`W3COS_LAYER_PARTITION_KEYS`), from
+    /// the artifact `layers` were last grouped from.
+    partition_keys: Vec<ChunkGroupKey>,
+    /// Every display item's client, from that artifact.
+    partition_clients: Vec<usize>,
+    /// Each chunk's paint-order class in that artifact.
+    partition_classes: Vec<usize>,
+}
+
+/// What `build_layers_in_order` reads from one chunk to decide whether it
+/// joins the current layer: properties, sticky owner, whether its first
+/// client is viewport-attached, and its item count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChunkGroupKey {
+    properties: PaintProperties,
+    sticky: Option<usize>,
+    viewport: bool,
+    items: usize,
 }
 
 impl RetainedLayerTree {
@@ -113,13 +131,69 @@ impl RetainedLayerTree {
         known_changed: bool,
     ) -> LayerPaintAction {
         let reuse_mode = layer_reuse_mode();
-        let order = chunk_paint_order(artifact);
+        let keys_mode = if reuse_mode != 0 {
+            layer_partition_keys_mode()
+        } else {
+            0
+        };
+        let (classes, keys, clients) = if keys_mode != 0 {
+            partition_inputs(artifact)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        // Same classes as last frame give the same stable order: keep it
+        // instead of sorting again.
+        let same_classes = keys_mode != 0
+            && !self.layers.is_empty()
+            && classes == self.partition_classes
+            && self.chunk_order.len() == classes.len();
+        let order = if same_classes {
+            self.chunk_order.clone()
+        } else if keys_mode != 0 {
+            crate::paint_artifact::stable_order_by_class(&classes)
+        } else {
+            chunk_paint_order(artifact)
+        };
         let mut reused = false;
         let old_bounds: Vec<LayoutRect> = self.layers.iter().map(|layer| layer.bounds).collect();
         let runs = artifact.append_runs_since(self.artifact_serial);
-        let layers = if reuse_mode != 0
-            && partition_still_holds(artifact, &order, &self.chunk_order, &self.layers, runs)
-        {
+        let holds = if reuse_mode == 0 {
+            false
+        } else if keys_mode != 0 {
+            // Blink's PaintArtifactCompositor regroups only when the chunks'
+            // grouping inputs changed: compare them flat against the inputs
+            // the kept layers were grouped from, in one pass with no per-layer
+            // walk.
+            let holds = !self.layers.is_empty()
+                && same_classes
+                && keys == self.partition_keys
+                && clients == self.partition_clients;
+            if keys_mode == 2 {
+                let checked =
+                    partition_still_holds(artifact, &order, &self.chunk_order, &self.layers, runs);
+                if holds && !checked {
+                    eprintln!(
+                        "[layer-partition-keys] mismatch: keys hold, the full check does not"
+                    );
+                    LAYER_PARTITION_KEYS_MISMATCHES.with(|count| count.set(count.get() + 1));
+                }
+                holds && checked
+            } else {
+                holds
+            }
+        } else {
+            partition_still_holds(artifact, &order, &self.chunk_order, &self.layers, runs)
+        };
+        if keys_mode != 0 {
+            self.partition_keys = keys;
+            self.partition_clients = clients;
+            self.partition_classes = classes;
+        } else if !self.partition_keys.is_empty() {
+            self.partition_keys.clear();
+            self.partition_clients.clear();
+            self.partition_classes.clear();
+        }
+        let layers = if holds {
             // Blink's PaintArtifactCompositor keeps its pending layers when
             // the chunks group the same way; only bounds and owners refresh.
             let mut layers = std::mem::take(&mut self.layers);
@@ -2034,6 +2108,71 @@ fn chunk_paint_order(artifact: &PaintArtifact) -> Vec<usize> {
     crate::paint_artifact::stable_order_by_class(&classes)
 }
 
+/// In one pass over the chunks: each chunk's paint-order class (what
+/// `chunk_paint_order` sorts by) and grouping key, and every display item's
+/// client.
+fn partition_inputs(artifact: &PaintArtifact) -> (Vec<usize>, Vec<ChunkGroupKey>, Vec<usize>) {
+    let mut classes = Vec::with_capacity(artifact.chunks.len());
+    let mut keys = Vec::with_capacity(artifact.chunks.len());
+    for chunk in &artifact.chunks {
+        let first = artifact
+            .display_items
+            .get(chunk.begin)
+            .map(|item| item.client_index);
+        classes.push(artifact.paint_order_class(first.unwrap_or(usize::MAX)) as usize);
+        keys.push(ChunkGroupKey {
+            properties: chunk.properties,
+            sticky: first
+                .and_then(|client| artifact.sticky_owner.get(client).copied())
+                .flatten(),
+            viewport: first.is_some_and(|client| artifact.viewport_attached(client)),
+            items: chunk.end.saturating_sub(chunk.begin),
+        });
+    }
+    let clients = artifact
+        .display_items
+        .iter()
+        .map(|item| item.client_index)
+        .collect();
+    (classes, keys, clients)
+}
+
+/// `W3COS_LAYER_PARTITION_KEYS=1` (with `W3COS_LAYER_REUSE`): decide that the
+/// kept layers still group the chunks by comparing each chunk's grouping
+/// inputs and every item's client with the ones the layers were grouped
+/// from, instead of walking the layers chunk by chunk. `=verify` also runs
+/// the walk and reports a keys match the walk rejects. Off by default.
+pub(crate) fn layer_partition_keys_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = LAYER_PARTITION_KEYS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_LAYER_PARTITION_KEYS").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAYER_PARTITION_KEYS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    static LAYER_PARTITION_KEYS_MISMATCHES: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[allow(dead_code)]
+pub(crate) fn layer_partition_keys_mismatches() -> u32 {
+    LAYER_PARTITION_KEYS_MISMATCHES.with(std::cell::Cell::get)
+}
+
 fn build_layers_in_order(artifact: &PaintArtifact, chunk_ids: &[usize]) -> Vec<CompositorLayer> {
     let mut layers = Vec::new();
     for &chunk_id in chunk_ids {
@@ -2793,6 +2932,41 @@ mod tests {
         assert_eq!(hits(), hits_before + 1);
         assert!(layers_equal(&tree.layers, &build_layers(&regrouped)));
         assert_eq!(mismatches(), mismatches_before);
+        super::LAYER_REUSE_OVERRIDE.with(|mode| mode.set(None));
+    }
+
+    #[test]
+    fn partition_keys_keep_layers_only_when_grouping_inputs_match() {
+        super::LAYER_REUSE_OVERRIDE.with(|mode| mode.set(Some(2)));
+        super::LAYER_PARTITION_KEYS_OVERRIDE.with(|mode| mode.set(Some(2)));
+        let mismatches = || super::LAYER_REUSE_MISMATCHES.with(std::cell::Cell::get);
+        let key_mismatches = super::layer_partition_keys_mismatches;
+        let hits = || super::LAYER_REUSE_HITS.with(std::cell::Cell::get);
+        let (mismatches_before, key_mismatches_before, hits_before) =
+            (mismatches(), key_mismatches(), hits());
+        let mut tree = RetainedLayerTree::default();
+        let scrolls = HashMap::new();
+        let overrides = CompositorOverrides::default();
+        tree.sync(&scroll_tree(), &scrolls, &overrides);
+        assert_eq!(hits(), hits_before, "nothing to keep on the first frame");
+        let mut moved = scroll_tree();
+        for chunk in &mut moved.chunks {
+            chunk.bounds.y += 3.0;
+        }
+        tree.sync(&moved, &scrolls, &overrides);
+        assert_eq!(hits(), hits_before + 1, "only geometry moved");
+        assert!(layers_equal(&tree.layers, &build_layers(&moved)));
+        let mut regrouped = scroll_tree();
+        let last = regrouped.display_items.len() - 1;
+        regrouped.display_items[last].client_index += 1;
+        tree.sync(&regrouped, &scrolls, &overrides);
+        assert_eq!(hits(), hits_before + 1, "a changed client regroups");
+        assert!(layers_equal(&tree.layers, &build_layers(&regrouped)));
+        tree.sync(&regrouped, &scrolls, &overrides);
+        assert_eq!(hits(), hits_before + 2, "the regrouped inputs are kept");
+        assert_eq!(mismatches(), mismatches_before);
+        assert_eq!(key_mismatches(), key_mismatches_before);
+        super::LAYER_PARTITION_KEYS_OVERRIDE.with(|mode| mode.set(None));
         super::LAYER_REUSE_OVERRIDE.with(|mode| mode.set(None));
     }
 
