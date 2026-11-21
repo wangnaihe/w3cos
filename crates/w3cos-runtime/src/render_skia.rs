@@ -722,7 +722,7 @@ thread_local! {
 }
 
 /// `W3COS_PAINT_DAMAGE=1`: composite only the damaged part of a frame onto
-/// the previous frame's pixels (cc's partial raster). Off by default.
+/// the previous frame's pixels (cc's partial raster). On by default (`=0` turns it off).
 pub(crate) fn paint_damage_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = PAINT_DAMAGE_OVERRIDE.with(std::cell::Cell::get) {
@@ -730,7 +730,9 @@ pub(crate) fn paint_damage_enabled() -> bool {
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        paint_damage_verify() || std::env::var("W3COS_PAINT_DAMAGE").is_ok_and(|value| value == "1")
+        paint_damage_verify()
+            || std::env::var("W3COS_PAINT_DAMAGE")
+                .map_or(true, |value| value != "0" && value != "false")
     })
 }
 
@@ -742,7 +744,7 @@ pub(crate) fn paint_damage_enabled() -> bool {
 /// only within the cull rect / visible tiles). The layer recordings are
 /// marked stale, so the next on-surface change re-records them.
 /// `=verify` renders such frames in full and compares every pixel with the
-/// previous frame. Off by default.
+/// previous frame. On by default (`=0` turns it off).
 pub(crate) fn paint_offscreen_skip_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_OFFSCREEN_SKIP_OVERRIDE.with(std::cell::Cell::get) {
@@ -751,9 +753,9 @@ pub(crate) fn paint_offscreen_skip_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_OFFSCREEN_SKIP").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
@@ -785,7 +787,7 @@ thread_local! {
 /// (`TileCoverage`) passes the share where the composite goes full anyway,
 /// so a mostly damaged frame does not pay for all of its damage.
 /// `=verify` also measures the whole damage of every stopped frame and
-/// checks it is past that share. Off by default.
+/// checks it is past that share. On by default (`=0` turns it off).
 pub(crate) fn paint_damage_early_out_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_DAMAGE_EARLY_OUT_OVERRIDE.with(std::cell::Cell::get) {
@@ -797,9 +799,9 @@ pub(crate) fn paint_damage_early_out_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }

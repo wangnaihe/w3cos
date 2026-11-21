@@ -833,7 +833,7 @@ fn component_rect_independent(component: &w3cos_std::Component) -> bool {
 /// `border-collapse` stay: a collapsed table paints its cells as one group.
 /// A bidi run's boxes share one line box, so the band drops all or none of
 /// them. `=verify` also replays every box and compares what reaches the
-/// layers (every box with display items, in order).
+/// layers (every box with display items, in order). On by default (`=0` turns it off).
 fn skip_culled_paint_nodes_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = SKIP_CULLED_PAINT_NODES_OVERRIDE.with(std::cell::Cell::get) {
@@ -845,9 +845,9 @@ fn skip_culled_paint_nodes_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }

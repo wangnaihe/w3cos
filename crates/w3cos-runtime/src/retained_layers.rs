@@ -716,7 +716,7 @@ thread_local! {
 /// the previous frame's pixels instead of composited again (WebKit's
 /// blit-on-scroll); only changed clients, uncovered strips and whatever
 /// overlaps the copied pixels are composited. `verify` also composites the
-/// full frame off-screen and compares.
+/// full frame off-screen and compares. On by default (`=0` turns it off).
 pub fn paint_damage_blit_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_DAMAGE_BLIT_OVERRIDE.with(std::cell::Cell::get) {
@@ -725,9 +725,9 @@ pub fn paint_damage_blit_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_DAMAGE_BLIT").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
@@ -742,14 +742,16 @@ thread_local! {
 
 /// `W3COS_PAINT_NARROW_ROOTS=1`: a changed text client does not dirty
 /// every descendant of its containing block when those are only plain text
-/// clients (see `paint_diff_clients_with`). Off by default.
+/// clients (see `paint_diff_clients_with`). On by default (`=0` turns it off).
 pub(crate) fn paint_narrow_roots_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = PAINT_NARROW_ROOTS_OVERRIDE.with(std::cell::Cell::get) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("W3COS_PAINT_NARROW_ROOTS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_PAINT_NARROW_ROOTS").map_or(true, |v| v != "0" && v != "false")
+    })
 }
 
 #[cfg(test)]
@@ -766,15 +768,17 @@ thread_local! {
 
 /// `W3COS_PAINT_RESIZE_STRIPS=1`: a resized plain box whose background
 /// image list is only `none` layers (what `background: <color>` sets) takes
-/// the resized-box strips instead of its whole old and new ink. Off by
-/// default.
+/// the resized-box strips instead of its whole old and new ink. On by
+/// default (`=0` turns it off).
 pub(crate) fn resize_strips_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = RESIZE_STRIPS_OVERRIDE.with(std::cell::Cell::get) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("W3COS_PAINT_RESIZE_STRIPS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_PAINT_RESIZE_STRIPS").map_or(true, |v| v != "0" && v != "false")
+    })
 }
 
 thread_local! {
@@ -810,14 +814,16 @@ thread_local! {
 /// has no display items in either frame (under `W3COS_PAINT_CULL_RUNS`, a
 /// box the cull band drops that moved) adds no damage: it painted no pixels
 /// and paints none (Blink does not invalidate a box outside the cull rect).
-/// Off by default.
+/// On by default (`=0` turns it off).
 pub(crate) fn paint_damage_quiet_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = PAINT_DAMAGE_QUIET_OVERRIDE.with(std::cell::Cell::get) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_QUIET").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var("W3COS_PAINT_DAMAGE_QUIET").map_or(true, |v| v != "0" && v != "false")
+    })
 }
 
 /// The moved spans recorded with a damage list of `len` entries.
@@ -899,14 +905,14 @@ thread_local! {
 /// ink is the old one shifted by the move (Blink keeps each fragment's
 /// visual rect the same way), instead of measuring every moved box twice.
 /// `=verify` also measures and compares (within 0.01 px: a shifted rect may
-/// round differently from a measured one).
+/// round differently from a measured one). On by default (`=0` turns it off).
 fn ink_cache_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_DAMAGE_INK_CACHE").as_deref() {
-            Ok("1") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
