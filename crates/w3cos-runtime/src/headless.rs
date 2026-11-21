@@ -65,6 +65,23 @@ struct RetainedPaint {
     layout_generation: u64,
 }
 
+/// For the off-surface skip without `W3COS_PAINT_DAMAGE`: the damage of
+/// `diff` against the retained artifact, or `None` as soon as part of it is
+/// `on_surface` (the frame is not skipped then, so the rest is never
+/// measured).
+#[cfg(feature = "skia")]
+pub(crate) fn offscreen_damage(
+    cur: &PaintArtifact,
+    diff: (&[bool], &[Option<(f32, f32)>]),
+    mut on_surface: impl FnMut(&[crate::retained_layers::ClientDamage]) -> bool,
+) -> Option<Vec<crate::retained_layers::ClientDamage>> {
+    RETAINED_PAINT.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let prev = &slot.as_ref()?.artifact;
+        crate::retained_layers::paint_damage_until(prev, cur, diff, &mut |rects| on_surface(rects))
+    })
+}
+
 thread_local! {
     static CHECKSUM_ONLY: Cell<bool> = const { Cell::new(false) };
     static LAST_FRAME_CHECKSUM: Cell<u64> = const { Cell::new(0) };
@@ -542,6 +559,13 @@ fn finish_headless_frame(
                                 &artifact,
                             );
                         }
+                        // The off-surface skip needs the damage even under a
+                        // full composite: only to see it is all off surface.
+                        // Skip only: the composite stays full, so the damage
+                        // is computed in `replay_frame` only once its first
+                        // client is known to lie off the surface.
+                        let skip_only = !crate::render_skia::paint_damage_enabled()
+                            && crate::render_skia::paint_offscreen_skip_mode() != 0;
                         let damage = crate::render_skia::paint_damage_enabled()
                             .then(|| {
                                 crate::retained_layers::paint_damage(
@@ -554,17 +578,19 @@ fn finish_headless_frame(
                         if damage.is_none() && crate::render_skia::paint_damage_enabled() {
                             crate::render_skia::note_unbounded_damage();
                         }
-                        Some((diff, damage))
+                        Some((diff, damage, skip_only))
                     })
                 })
             })
             .flatten();
-        let (dirty, moved, damage) = dirty.map_or((None, None, None), |(diff, damage)| {
-            (Some(diff.dirty), Some(diff.moved), damage)
-        });
+        let (dirty, moved, damage, lazy) = dirty
+            .map_or((None, None, None, false), |(diff, damage, lazy)| {
+                (Some(diff.dirty), Some(diff.moved), damage, lazy)
+            });
         crate::render_skia::set_pending_paint_invalidation(dirty);
         crate::render_skia::set_pending_paint_moved(moved);
         crate::render_skia::set_pending_paint_damage(damage);
+        crate::render_skia::set_pending_lazy_damage(lazy);
     }
     let rgba = rasterize_prepared_frame(width, height, &nodes, &scroll_info, &artifact, force_cpu)?;
     let rect_independent = component_rect_independent(root);
@@ -1936,6 +1962,106 @@ mod tests {
         }
     }
 
+    /// A paragraph whose text grows by a word per frame: with
+    /// `W3COS_PAINT_NARROW_ROOTS` the unchanged words stay clean, and every
+    /// damage frame (blit off and verified) equals a full paint.
+    #[test]
+    fn narrow_roots_match_a_full_composite() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_NARROW_ROOTS_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        let edits: [&str; 4] = [
+            "the words of this paragraph grow",
+            "the words of this paragraph grow one",
+            "the words of this paragraph grow one by",
+            "the words of this paragraph grow one by one",
+        ];
+        for blit in [0u8, 2] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            let card = crate::dom::create_element("div");
+            for (name, value) in [
+                ("width", "160px"),
+                ("padding", "12px"),
+                ("background", "#eeeeff"),
+            ] {
+                crate::dom::set_style_property(card, name, value);
+            }
+            let paragraph = crate::dom::create_element("p");
+            // Earlier text nodes of the paragraph stay as they are.
+            for word in ["some ", "earlier ", "words "] {
+                crate::dom::append_child(paragraph, crate::dom::create_text_node(word));
+            }
+            let text = crate::dom::create_text_node("the words of this paragraph");
+            crate::dom::append_child(paragraph, text);
+            crate::dom::append_child(card, paragraph);
+            crate::dom::append_child(body, card);
+            let below = crate::dom::create_element("div");
+            crate::dom::set_style_property(below, "background", "#ffeeee");
+            crate::dom::append_child(below, crate::dom::create_text_node("below"));
+            crate::dom::append_child(body, below);
+            let (frames, hits, blit_diffs) = with_stable_fonts(|| {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                crate::retained_layers::PAINT_NARROW_ROOTS_OVERRIDE
+                    .with(|value| value.set(Some(true)));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE
+                    .with(|value| value.set(Some(blit)));
+                let blit_before = crate::render_skia::paint_damage_blit_stats().2;
+                let before = crate::retained_layers::PAINT_NARROW_ROOTS_HITS.with(Cell::get);
+                render_document_rgba(200, 240).expect("first frame");
+                let mut frames = Vec::new();
+                for edit in edits {
+                    crate::dom::set_text_content(text, edit);
+                    frames.push(render_document_rgba(200, 240).expect("edited frame").rgba);
+                }
+                (
+                    frames,
+                    crate::retained_layers::PAINT_NARROW_ROOTS_HITS.with(Cell::get) - before,
+                    crate::render_skia::paint_damage_blit_stats().2 - blit_before,
+                )
+            });
+            assert!(
+                hits > 0,
+                "a grown paragraph must keep its unchanged words clean"
+            );
+            assert_eq!(
+                blit_diffs, 0,
+                "blit {blit}: a blitted frame differs from a full one"
+            );
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::retained_layers::PAINT_NARROW_ROOTS_OVERRIDE
+                .with(|value| value.set(Some(false)));
+            crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(Some(0)));
+            crate::dom::set_text_content(text, "the words of this paragraph");
+            for (step, edit) in edits.into_iter().enumerate() {
+                crate::dom::set_text_content(text, edit);
+                let fresh = with_stable_fonts(|| {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(200, 240).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "blit {blit} step {step}: a narrow-roots frame differs from a full paint"
+                );
+            }
+        }
+    }
+
     #[test]
     fn offscreen_skip_matches_a_full_composite() {
         struct Off;
@@ -1959,7 +2085,8 @@ mod tests {
             (0, "card 0 is edited on the surface"),
             (11, "card 11 once more"),
         ];
-        for mode in [1u8, 2] {
+        // Also without PAINT_DAMAGE: the damage then only serves the check.
+        for (mode, damage) in [(1u8, true), (2, true), (1, false), (2, false)] {
             crate::dom::reset_document();
             crate::jsdom::reset_bridge();
             invalidate_retained_frame();
@@ -1982,7 +2109,7 @@ mod tests {
                 texts.push(text);
             }
             let (frames, (skipped, verified, differed)) = with_stable_fonts(|| {
-                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(damage)));
                 crate::render_skia::PAINT_OFFSCREEN_SKIP_OVERRIDE
                     .with(|value| value.set(Some(mode)));
                 let before = crate::render_skia::paint_offscreen_skip_stats();
@@ -2027,7 +2154,7 @@ mod tests {
                 });
                 assert!(
                     frames[step] == fresh.rgba,
-                    "mode {mode} step {step}: a frame differs from a full paint"
+                    "mode {mode} damage {damage} step {step}: a frame differs from a full paint"
                 );
             }
         }

@@ -708,6 +708,9 @@ thread_local! {
     /// With the pending invalidation: per changed client, a document rect
     /// covering its old and new paint (`retained_layers::paint_damage`).
     static PENDING_PAINT_DAMAGE: RefCell<Option<Vec<crate::retained_layers::ClientDamage>>> = const { RefCell::new(None) };
+    /// Skip only (no `W3COS_PAINT_DAMAGE`): the off-surface check measures
+    /// the pending invalidation's damage lazily (`headless::offscreen_damage`).
+    static PENDING_LAZY_DAMAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// (frames composited under damage, of those the ones that differed from
     /// a full composite in verify mode).
     static PAINT_DAMAGE_STATS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
@@ -731,7 +734,8 @@ pub(crate) fn paint_damage_enabled() -> bool {
     })
 }
 
-/// `W3COS_PAINT_OFFSCREEN_SKIP=1` (with `W3COS_PAINT_DAMAGE=1`): when every
+/// `W3COS_PAINT_OFFSCREEN_SKIP=1` (also without `W3COS_PAINT_DAMAGE`; the
+/// damage is then computed only for this check): when every
 /// damage rect of a frame lies outside the surface, the kept headless
 /// rasterizer skips re-recording, compositing and reading back that frame,
 /// since its pixels equal the previous frame's (Blink paints and rasters
@@ -794,6 +798,10 @@ pub(crate) fn note_unbounded_damage() {
     }
 }
 
+pub(crate) fn set_pending_lazy_damage(lazy: bool) {
+    PENDING_LAZY_DAMAGE.with(|slot| slot.set(lazy));
+}
+
 pub(crate) fn set_pending_paint_damage(damage: Option<Vec<crate::retained_layers::ClientDamage>>) {
     PENDING_PAINT_DAMAGE.with(|slot| *slot.borrow_mut() = damage);
 }
@@ -822,6 +830,7 @@ pub(crate) fn set_track_partial_layers(track: bool) {
 pub(crate) fn set_pending_paint_invalidation(dirty: Option<Vec<bool>>) {
     PENDING_PAINT_MOVED.with(|slot| slot.borrow_mut().take());
     PENDING_PAINT_DAMAGE.with(|slot| slot.borrow_mut().take());
+    PENDING_LAZY_DAMAGE.with(|slot| slot.set(false));
     PENDING_PAINT_INVALIDATION.with(|slot| *slot.borrow_mut() = dirty);
 }
 
@@ -2659,6 +2668,8 @@ fn paint_display_list_with_suppressed_effects(
 pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: ReplayFrame<'_>) {
     let mut retained = frame.retained.take();
     let damage = PENDING_PAINT_DAMAGE.with(|slot| slot.borrow_mut().take());
+    let lazy = PENDING_LAZY_DAMAGE.with(|slot| slot.replace(false));
+    let mut lazy_damage = None;
     PLACED_DAMAGE.with(|slot| slot.borrow_mut().take());
     if frame.artifact.is_none()
         && let Some(cache) = retained.as_mut()
@@ -2726,7 +2737,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 )
             })
             .collect::<Vec<_>>();
-        let key = paint_damage_enabled().then(|| {
+        let key = (paint_damage_enabled() || paint_offscreen_skip_mode() != 0).then(|| {
             composite_key(
                 canvas,
                 frame.scroll_info,
@@ -2738,15 +2749,38 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         if paint_damage_verify() && damage.is_some() && cache.last_composite != key {
             eprintln!("[paint-damage-verify] full: the surface does not hold the last frame");
         }
-        let mut damage = damage
-            .as_deref()
-            .filter(|_| key.is_some() && cache.last_composite == key);
+        let same_surface = key.is_some() && cache.last_composite == key;
         cache.last_composite = key;
         let skip_mode = if OFFSCREEN_SKIP_ALLOWED.with(std::cell::Cell::get) {
             paint_offscreen_skip_mode()
         } else {
             0
         };
+        if skip_mode != 0
+            && same_surface
+            && lazy
+            && let (Some(dirty), Some(moved)) = (invalidation.as_deref(), moved.as_deref())
+        {
+            let size = canvas.base_layer_size();
+            let mut probe = DamageSurfaceProbe::default();
+            let layers = &cache.tree.layers;
+            let on_surface = |list: &[crate::retained_layers::ClientDamage]| {
+                probe.may_reach(
+                    list,
+                    layers,
+                    artifact,
+                    frame.scroll_info,
+                    overrides,
+                    scale_factor,
+                    (size.width as f32, size.height as f32),
+                )
+            };
+            lazy_damage = crate::headless::offscreen_damage(artifact, (dirty, moved), on_surface);
+        }
+        let mut damage = damage
+            .as_deref()
+            .or(lazy_damage.as_deref())
+            .filter(|_| same_surface);
         if skip_mode != 0
             && let Some(list) = damage
         {
@@ -2788,6 +2822,10 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 // Verify: a full composite must reproduce the previous frame.
                 damage = None;
             }
+        }
+        // Without `W3COS_PAINT_DAMAGE` the damage only served the skip check.
+        if !paint_damage_enabled() {
+            damage = None;
         }
         let reusable = matches!(action, LayerPaintAction::Replay)
             && cache.tree.recordings_valid()
@@ -3924,6 +3962,107 @@ fn verify_damage_composite(canvas: &Canvas, full: &dyn Fn(&Canvas)) -> usize {
         .zip(b.chunks_exact(4))
         .filter(|(a, b)| a != b)
         .count()
+}
+
+/// A conservative early answer to "does this damage reach the surface?"
+/// for the off-surface skip, placing each entry like `damage_device_rects`
+/// (whose answer on the whole damage still decides the skip). `true` also
+/// whenever an entry cannot be placed simply.
+#[derive(Default)]
+struct DamageSurfaceProbe {
+    /// Per client, the layer drawing it (`u32::MAX`: none); built once.
+    layer_of: Option<Vec<u32>>,
+    /// Per layer, its device translation (`None`: not a plain translation).
+    translation: Vec<Option<Option<(f32, f32)>>>,
+}
+
+impl DamageSurfaceProbe {
+    #[allow(clippy::too_many_arguments)]
+    fn may_reach(
+        &mut self,
+        damage: &[crate::retained_layers::ClientDamage],
+        layers: &[crate::retained_layers::CompositorLayer],
+        artifact: &PaintArtifact,
+        scroll_info: &[Option<(f32, f32, LayoutRect)>],
+        overrides: &CompositorOverrides,
+        scale_factor: f32,
+        surface: (f32, f32),
+    ) -> bool {
+        let layer_of = self.layer_of.get_or_insert_with(|| {
+            let mut map = vec![u32::MAX; artifact.nodes.len()];
+            for (position, layer) in layers.iter().enumerate() {
+                for &client in &layer.client_indices {
+                    if let Some(slot) = map.get_mut(client) {
+                        *slot = position as u32;
+                    }
+                }
+            }
+            map
+        });
+        if self.translation.len() != layers.len() {
+            self.translation = vec![None; layers.len()];
+        }
+        for &(start, end, rect) in damage {
+            let mut placed = false;
+            for client in start..end {
+                let Some(&layer) = layer_of.get(client) else {
+                    return true;
+                };
+                if layer == u32::MAX {
+                    continue;
+                }
+                let layer_index = layer as usize;
+                let translation = *self.translation[layer_index].get_or_insert_with(|| {
+                    let layer = &layers[layer_index];
+                    if !layer_css_transform(layer, artifact, overrides).is_identity() {
+                        return None;
+                    }
+                    let matrix = compositor_layer_matrix(
+                        layer,
+                        artifact,
+                        scroll_info,
+                        overrides,
+                        scale_factor,
+                    );
+                    if !matrix.is_translate() {
+                        return None;
+                    }
+                    let (sx, sy) = layer
+                        .client_indices
+                        .first()
+                        .map_or((0.0, 0.0), |&index| artifact.viewport_scroll_for(index));
+                    Some((
+                        matrix.translate_x() - sx * scale_factor,
+                        matrix.translate_y() - sy * scale_factor,
+                    ))
+                });
+                let Some((tx, ty)) = translation else {
+                    return true;
+                };
+                placed = true;
+                let (x, y) = (rect.x * scale_factor, rect.y * scale_factor);
+                let left = x + tx;
+                let top = y + ty;
+                let right = (x + rect.width * scale_factor) + tx;
+                let bottom = (y + rect.height * scale_factor) + ty;
+                if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite())
+                {
+                    return true;
+                }
+                if !(right <= -1.0
+                    || bottom <= -1.0
+                    || left >= surface.0 + 1.0
+                    || top >= surface.1 + 1.0)
+                {
+                    return true;
+                }
+            }
+            if !placed {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Device rects holding every damaged client's old and new paint, as placed

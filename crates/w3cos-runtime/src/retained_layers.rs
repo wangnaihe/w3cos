@@ -652,6 +652,30 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// `W3COS_PAINT_NARROW_ROOTS=1`: a changed text client does not dirty
+/// every descendant of its containing block when those are only plain text
+/// clients (see `paint_diff_clients_with`). Off by default.
+pub(crate) fn paint_narrow_roots_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PAINT_NARROW_ROOTS_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_NARROW_ROOTS").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_NARROW_ROOTS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Changed clients whose containing block was not repainted whole.
+    pub(crate) static PAINT_NARROW_ROOTS_HITS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// `W3COS_PAINT_RESIZE_STRIPS=1`: a resized plain box whose background
 /// image list is only `none` layers (what `background: <color>` sets) takes
 /// the resized-box strips instead of its whole old and new ink. Off by
@@ -781,7 +805,7 @@ pub fn paint_damage(
 ) -> Option<Vec<ClientDamage>> {
     let mode = ink_cache_mode();
     if mode == 0 {
-        return paint_damage_with(prev, cur, diff, &mut MeasureInk);
+        return paint_damage_with(prev, cur, (&diff.dirty, &diff.moved), &mut MeasureInk, None);
     }
     INK_CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -810,7 +834,7 @@ pub fn paint_damage(
         }
         // Clients past `prev`'s painted nothing there.
         cache.ink.resize(cur.nodes.len(), Some(Ok(None)));
-        let damage = paint_damage_with(prev, cur, diff, &mut cache.ink);
+        let damage = paint_damage_with(prev, cur, (&diff.dirty, &diff.moved), &mut cache.ink, None);
         // Bounded: every changed client's entry now holds its `cur` ink.
         // Unbounded: the walk stopped part way, so drop the cache.
         if damage.is_some() {
@@ -821,12 +845,29 @@ pub fn paint_damage(
     })
 }
 
+/// `paint_damage` (measured, not cached) that gives up with `None` as soon
+/// as `stop` accepts the rects added since its last call: the off-surface
+/// check needs every rect only when none of them is on the surface.
+pub(crate) fn paint_damage_until(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    diff: (&[bool], &[Option<(f32, f32)>]),
+    stop: &mut dyn FnMut(&[ClientDamage]) -> bool,
+) -> Option<Vec<ClientDamage>> {
+    paint_damage_with(prev, cur, diff, &mut MeasureInk, Some(stop))
+}
+
 /// The first client at or after `from` that changed or moved (`len` when
 /// none does). Clients past `diff`'s tables count as changed.
 #[inline(never)]
-fn next_changed_client(diff: &PaintDiff, from: usize, len: usize) -> usize {
-    let known = len.min(diff.dirty.len()).min(diff.moved.len());
-    let (dirty, moved) = (&diff.dirty[..known], &diff.moved[..known]);
+fn next_changed_client(
+    dirty: &[bool],
+    moved: &[Option<(f32, f32)>],
+    from: usize,
+    len: usize,
+) -> usize {
+    let known = len.min(dirty.len()).min(moved.len());
+    let (dirty, moved) = (&dirty[..known], &moved[..known]);
     let mut index = from;
     while index < known {
         if dirty[index] || moved[index].is_some() {
@@ -843,9 +884,11 @@ fn next_changed_client(diff: &PaintDiff, from: usize, len: usize) -> usize {
 fn paint_damage_with<S: InkSource>(
     prev: &PaintArtifact,
     cur: &PaintArtifact,
-    diff: &PaintDiff,
+    (dirty_by_client, moved_by_client): (&[bool], &[Option<(f32, f32)>]),
     ink: &mut S,
+    mut stop: Option<&mut dyn FnMut(&[ClientDamage]) -> bool>,
 ) -> Option<Vec<ClientDamage>> {
+    let mut checked = 0;
     let spans = paint_damage_spans_enabled();
     let record_moves = paint_damage_blit_mode() != 0;
     DAMAGE_MOVES.with(|slot| *slot.borrow_mut() = None);
@@ -878,19 +921,29 @@ fn paint_damage_with<S: InkSource>(
     let mut next = 0;
     while next < len {
         // Skip the clients that neither changed nor moved in one tight scan.
-        let index = next_changed_client(diff, next, len);
+        let index = next_changed_client(dirty_by_client, moved_by_client, next, len);
         if index >= len {
             break;
         }
         next = index + 1;
-        let dirty = diff.dirty.get(index).copied().unwrap_or(true);
+        // Checked in doubling batches: each check has a fixed cost.
+        if let Some(stop) = stop.as_mut()
+            && damage.len() > checked
+            && damage.len() >= 2 * checked
+        {
+            if stop(&damage[checked..]) {
+                return None;
+            }
+            checked = damage.len();
+        }
+        let dirty = dirty_by_client.get(index).copied().unwrap_or(true);
         // A client that only moved (`moved_by`: same style, properties,
         // size and display items relative to its box) paints its old ink
         // shifted by the move.
         let shift = if dirty {
             None
         } else {
-            diff.moved.get(index).copied().flatten()
+            moved_by_client.get(index).copied().flatten()
         };
         if prev.sticky_owner.get(index).copied().flatten().is_some()
             || cur.sticky_owner.get(index).copied().flatten().is_some()
@@ -941,6 +994,12 @@ fn paint_damage_with<S: InkSource>(
         }
     }
     flush(&mut span, &mut damage);
+    if let Some(stop) = stop
+        && damage.len() > checked
+        && stop(&damage[checked..])
+    {
+        return None;
+    }
     if record_moves {
         DAMAGE_MOVES.with(|slot| *slot.borrow_mut() = Some((damage.len(), moves)));
     }
@@ -1691,6 +1750,108 @@ fn paint_diff_clients_with(
         false
     };
     let table_like = |display: Display| matches!(display, Display::Table | Display::InlineTable);
+    // `W3COS_PAINT_NARROW_ROOTS=1`: a containing block whose descendants
+    // are only text clients that paint nothing across each other is not
+    // repainted whole for one changed text; each descendant was compared on
+    // its own above (Blink invalidates only the objects whose geometry or
+    // style changed).
+    let narrow = paint_narrow_roots_enabled();
+    let mut narrow_memo = w3cos_std::fxhash::FxHashMap::<usize, bool>::default();
+    let mut text_only_block = |root: usize| -> bool {
+        *narrow_memo.entry(root).or_insert_with(|| {
+            let plain_text = |artifact: &PaintArtifact, index: usize| {
+                let node = &artifact.nodes[index];
+                let style = node.style.as_style();
+                let paints_nothing_itself = matches!(
+                    node.kind,
+                    ComponentKind::Column | ComponentKind::Row | ComponentKind::Box
+                ) && !inline_level(style.display)
+                    && style.border_width == 0.0
+                    && [
+                        style.border_top_width,
+                        style.border_right_width,
+                        style.border_bottom_width,
+                        style.border_left_width,
+                    ]
+                    .iter()
+                    .all(|width| width.is_none_or(|width| width == 0.0))
+                    && style.outline_width == 0.0
+                    && style.overflow == w3cos_std::style::Overflow::Visible
+                    && style.clip.is_none()
+                    && style.backdrop_blur.is_none()
+                    && style.transform.is_identity();
+                // A text run's own background paints inside its own
+                // fragments, which it compares on its own.
+                (matches!(node.kind, ComponentKind::Text { .. })
+                    || (paints_nothing_itself && style.background.a == 0))
+                    && style.background_image.as_deref().is_none_or(|value| {
+                        value.split(',').all(|layer| {
+                            let layer = layer.trim();
+                            layer.is_empty() || layer.eq_ignore_ascii_case("none")
+                        })
+                    })
+                    && style.box_shadow.is_none()
+                    && style.box_shadows.is_empty()
+                    && style.opacity >= 1.0
+                    && style.filter.is_none()
+                    // Text-run and font bookkeeping is the client's own;
+                    // anything that paints (or reads) across clients is not.
+                    && style.custom_properties.as_ref().is_none_or(|properties| {
+                        properties.keys().all(|name| {
+                            ![
+                                "background",
+                                "border",
+                                "decoration",
+                                "outline",
+                                "shadow",
+                                "vertical",
+                                "float-line-bands",
+                                "first-line",
+                                "highlight",
+                                "selection",
+                                "resize",
+                                "url",
+                            ]
+                            .iter()
+                            .any(|word| name.contains(word))
+                        })
+                    })
+            };
+            let descends = |artifact: &PaintArtifact, mut index: usize| {
+                while let Some(parent) = artifact.nodes[index].parent {
+                    if parent == root {
+                        return true;
+                    }
+                    if parent < root {
+                        return false;
+                    }
+                    index = parent;
+                }
+                false
+            };
+            let root_plain = [prev, cur].iter().all(|artifact| {
+                artifact.text_fragments.get(root).is_none_or(Vec::is_empty)
+                    && !matches!(artifact.nodes[root].kind, ComponentKind::Text { .. })
+            });
+            let mut any = false;
+            let mut index = root + 1;
+            while root_plain && index < n {
+                let inside = descends(cur, index);
+                if inside != descends(prev, index) {
+                    return false;
+                }
+                if !inside {
+                    break;
+                }
+                if !plain_text(prev, index) || !plain_text(cur, index) {
+                    return false;
+                }
+                any = true;
+                index += 1;
+            }
+            root_plain && any
+        })
+    };
     let mut roots = Vec::new();
     for &(index, moved_only) in &changed {
         if reads_across_clients(prev, index) || reads_across_clients(cur, index) {
@@ -1706,7 +1867,12 @@ fn paint_diff_clients_with(
                 }
                 block = cur.nodes[candidate].parent;
             }
-            roots.push(block.unwrap_or(index));
+            let root = block.unwrap_or(index);
+            if !(narrow && root != index && text_only_block(root)) {
+                roots.push(root);
+            } else {
+                PAINT_NARROW_ROOTS_HITS.with(|count| count.set(count.get() + 1));
+            }
         }
         let mut ancestor = cur.nodes[index].parent;
         while let Some(candidate) = ancestor {
