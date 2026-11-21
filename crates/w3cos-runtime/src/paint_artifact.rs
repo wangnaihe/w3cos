@@ -612,6 +612,11 @@ struct AppendRecord {
     /// Aligned runs copied from `base`: `[node start, node end, display
     /// item start, display item end)`, at the same indices in both.
     runs: Vec<[u32; 4]>,
+    /// `W3COS_PAINT_CULL_RUN_GAPS`: sorted disjoint `[start, end)` boxes
+    /// this build copied as culled runs (or inherited them through aligned
+    /// runs): each pushed no property node and no display item, sat under
+    /// the root's properties and was not viewport attached or sticky.
+    cull_spans: Vec<(u32, u32)>,
 }
 
 /// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
@@ -3811,6 +3816,7 @@ impl PaintArtifact {
         memo: &mut AppendMemo,
         marks: &mut Vec<AppendMark>,
         runs: &mut Vec<[u32; 4]>,
+        cull_spans: &mut Vec<(u32, u32)>,
     ) -> usize {
         let len = self.nodes.len();
         let mark = self.mark();
@@ -3884,6 +3890,16 @@ impl PaintArtifact {
             levels: previous.paint_order.levels.len() as u32,
         });
         runs.push([start as u32, end as u32, old.items, stop.items]);
+        // Last frame's culled spans in the run hold again: same indices,
+        // same output (and so no item, no property node).
+        let old_spans = &record.cull_spans;
+        let mut at = old_spans.partition_point(|&(_, e)| e as usize <= start);
+        while let Some(&(a, b)) = old_spans.get(at)
+            && (a as usize) < end
+        {
+            push_span(cull_spans, (a as usize).max(start), (b as usize).min(end));
+            at += 1;
+        }
         let range = |a: u32, b: u32| a as usize..b as usize;
         self.properties.transforms.extend_from_slice(
             &previous.properties.transforms[range(old.transforms, stop.transforms)],
@@ -3936,6 +3952,124 @@ impl PaintArtifact {
     /// checks and slice copies, without the display items' alignment an
     /// aligned run needs. Returns the run's end (`start` when there is none).
     #[allow(clippy::too_many_arguments)]
+    /// One box of `copy_culled_run`: `None` ends the run, `Some(visible)`
+    /// takes the box (a visible one was culled by the band).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn culled_box_check(
+        &self,
+        end: usize,
+        start: usize,
+        previous: &PaintArtifact,
+        record: &AppendRecord,
+        same: &[bool],
+        tail: AppendMark,
+        root: PaintProperties,
+        top: f32,
+        bottom: f32,
+    ) -> Option<bool> {
+        let at = record.marks[end];
+        let next = record.marks.get(end + 1).copied().unwrap_or(tail);
+        if (next.transforms, next.clips, next.effects, next.scrolls)
+            != (at.transforms, at.clips, at.effects, at.scrolls)
+            || next.items != at.items
+            || next.chunks != at.chunks
+        {
+            return None;
+        }
+        let node = &self.nodes[end];
+        let parent_same = node.parent.is_none_or(|parent| {
+            (start..end).contains(&parent) || (parent < start && same[parent])
+        });
+        if !parent_same
+            || !self.column_fragments.get(end).is_none_or(Vec::is_empty)
+            || !previous.column_fragments.get(end).is_none_or(Vec::is_empty)
+        {
+            return None;
+        }
+        let (Some(rect), Some(old_rect)) = (self.rect_by_index[end], previous.rect_by_index[end])
+        else {
+            return None;
+        };
+        if rect.x != old_rect.x || rect.width != old_rect.width || rect.height != old_rect.height {
+            return None;
+        }
+        if !self.inputs_match(end, previous) {
+            return None;
+        }
+        if node.style.visibility != Visibility::Visible {
+            return Some(false);
+        }
+        let cullable = end != 0
+            && previous.node_properties[end] == root
+            && at.self_scroll as usize == root.scroll
+            && !matches!(node.style.position, Position::Fixed | Position::Sticky)
+            && !previous
+                .viewport_attached_by_index
+                .get(end)
+                .copied()
+                .unwrap_or(true)
+            && previous.sticky_owner.get(end).copied().flatten().is_none();
+        (cullable && self.outside_band(node, rect, top, bottom)).then_some(true)
+    }
+
+    /// `append_display_items`' cull test, on the copied output.
+    #[inline(always)]
+    fn outside_band(&self, node: &PaintNode, rect: LayoutRect, top: f32, bottom: f32) -> bool {
+        let bounds = if node.style.border_collapse && node.style.display == Display::TableCell {
+            let (left, right) = paint_inline_border_widths(&node.style);
+            LayoutRect {
+                x: rect.x - left,
+                width: rect.width + left + right,
+                ..rect
+            }
+        } else {
+            rect
+        };
+        bounds.y + bounds.height < top || bounds.y > bottom
+    }
+
+    /// `W3COS_PAINT_CULL_RUN_GAPS`: `culled_box_check` for a box in last
+    /// frame's culled spans whose inputs the layout did not change. Its
+    /// marks, columns, viewport / sticky attachment and style held when the
+    /// span was copied; what may differ is its parent's output, its geometry
+    /// and the root's properties.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn culled_box_still_culled(
+        &self,
+        end: usize,
+        start: usize,
+        previous: &PaintArtifact,
+        record: &AppendRecord,
+        same: &[bool],
+        root: PaintProperties,
+        top: f32,
+        bottom: f32,
+    ) -> Option<bool> {
+        let node = &self.nodes[end];
+        let parent_same = node.parent.is_none_or(|parent| {
+            (start..end).contains(&parent) || (parent < start && same[parent])
+        });
+        if !parent_same || !self.column_fragments.get(end).is_none_or(Vec::is_empty) {
+            return None;
+        }
+        let (Some(rect), Some(old_rect)) = (self.rect_by_index[end], previous.rect_by_index[end])
+        else {
+            return None;
+        };
+        if rect.x != old_rect.x || rect.width != old_rect.width || rect.height != old_rect.height {
+            return None;
+        }
+        if node.style.visibility != Visibility::Visible {
+            return Some(false);
+        }
+        let cullable = end != 0
+            && previous.node_properties[end] == root
+            && record.marks[end].self_scroll as usize == root.scroll;
+        (cullable && self.outside_band(node, rect, top, bottom)).then_some(true)
+    }
+
     fn copy_culled_run(
         &mut self,
         start: usize,
@@ -3945,6 +4079,7 @@ impl PaintArtifact {
         unchanged: &mut [bool],
         memo: &mut AppendMemo,
         marks: &mut Vec<AppendMark>,
+        cull_spans: &mut Vec<(u32, u32)>,
     ) -> usize {
         let Some((top, bottom)) = self.cull_band else {
             return start;
@@ -3973,70 +4108,68 @@ impl PaintArtifact {
             .copied()
             .unwrap_or_default();
         let (mut end, mut culled) = (start, 0u64);
+        let gaps = paint_cull_run_gaps_mode();
+        // The fast check needs the layout's changed ranges (an untouched box
+        // kept its inputs) and last frame's spans.
+        let changed = (gaps != 0 && paint_touched_mode() == 1)
+            .then(|| self.touched.as_ref().map(|touched| &touched.changed))
+            .flatten();
+        let spans = &record.cull_spans;
+        let (mut span_end, mut gap_end) = (start, start);
+        let mut fast_count = 0u64;
         while end < len {
-            let at = record.marks[end];
-            let next = record.marks.get(end + 1).copied().unwrap_or(tail);
-            if (next.transforms, next.clips, next.effects, next.scrolls)
-                != (at.transforms, at.clips, at.effects, at.scrolls)
-                || next.items != at.items
-                || next.chunks != at.chunks
-            {
-                break;
-            }
-            let node = &self.nodes[end];
-            let parent_same = node.parent.is_none_or(|parent| {
-                (start..end).contains(&parent) || (parent < start && same[parent])
-            });
-            if !parent_same
-                || !self.column_fragments.get(end).is_none_or(Vec::is_empty)
-                || !previous.column_fragments.get(end).is_none_or(Vec::is_empty)
-            {
-                break;
-            }
-            let (Some(rect), Some(old_rect)) =
-                (self.rect_by_index[end], previous.rect_by_index[end])
-            else {
-                break;
-            };
-            if rect.x != old_rect.x
-                || rect.width != old_rect.width
-                || rect.height != old_rect.height
-            {
-                break;
-            }
-            if !self.inputs_match(end, previous) {
-                break;
-            }
-            if node.style.visibility == Visibility::Visible {
-                // `append_display_items`' cull test, on the copied output.
-                let bounds =
-                    if node.style.border_collapse && node.style.display == Display::TableCell {
-                        let (left, right) = paint_inline_border_widths(&node.style);
-                        LayoutRect {
-                            x: rect.x - left,
-                            width: rect.width + left + right,
-                            ..rect
-                        }
-                    } else {
-                        rect
-                    };
-                let outside = bounds.y + bounds.height < top || bounds.y > bottom;
-                let cullable = end != 0
-                    && previous.node_properties[end] == root
-                    && at.self_scroll as usize == root.scroll
-                    && !matches!(node.style.position, Position::Fixed | Position::Sticky)
-                    && !previous
-                        .viewport_attached_by_index
-                        .get(end)
-                        .copied()
-                        .unwrap_or(true)
-                    && previous.sticky_owner.get(end).copied().flatten().is_none();
-                if !outside || !cullable {
-                    break;
+            if let Some(changed) = changed {
+                if end >= span_end {
+                    let at = spans.partition_point(|&(_, e)| e as usize <= end);
+                    span_end = spans
+                        .get(at)
+                        .filter(|&&(a, _)| a as usize <= end)
+                        .map_or(end, |&(_, e)| e as usize);
                 }
-                culled += 1;
+                if end >= gap_end {
+                    gap_end = crate::incremental_layout::ranges_gap_end(changed, end, len);
+                }
+                if end < span_end && end < gap_end {
+                    let fast = self.culled_box_still_culled(
+                        end, start, previous, record, same, root, top, bottom,
+                    );
+                    if gaps == 2 {
+                        let full = self.culled_box_check(
+                            end, start, previous, record, same, tail, root, top, bottom,
+                        );
+                        if fast != full {
+                            eprintln!(
+                                "[paint-cull-run-gaps-verify] mismatch: box {end} fast {fast:?} full {full:?}"
+                            );
+                            PAINT_CULL_RUN_GAPS_STATS.with(|stats| {
+                                let (a, b) = stats.get();
+                                stats.set((a, b + 1));
+                            });
+                        }
+                    }
+                    match fast {
+                        None => break,
+                        Some(counted) => {
+                            culled += counted as u64;
+                            fast_count += 1;
+                            end += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            match self.culled_box_check(end, start, previous, record, same, tail, root, top, bottom)
+            {
+                None => break,
+                Some(counted) => culled += counted as u64,
             }
             end += 1;
+        }
+        if fast_count > 0 {
+            PAINT_CULL_RUN_GAPS_STATS.with(|stats| {
+                let (a, b) = stats.get();
+                stats.set((a + fast_count, b));
+            });
         }
         if end - start < 8 {
             return start;
@@ -4055,6 +4188,7 @@ impl PaintArtifact {
         memo.owns_context[nodes.clone()].copy_from_slice(&old_memo.owns_context[nodes.clone()]);
         memo.stacking[nodes.clone()].copy_from_slice(&old_memo.stacking[nodes.clone()]);
         memo.ancestor_phase[nodes.clone()].copy_from_slice(&old_memo.ancestor_phase[nodes.clone()]);
+        push_span(cull_spans, start, end);
         let (items, chunks) = (mark.items, mark.chunks);
         let stop = record.marks.get(end).copied().unwrap_or(tail);
         if self.paint_order.levels.len() as u32 == old.levels {
@@ -4143,7 +4277,9 @@ impl PaintArtifact {
         let mut same = vec![false; len];
         let mut unchanged = vec![false; len];
         let mut runs = Vec::new();
+        let mut cull_spans: Vec<(u32, u32)> = Vec::new();
         let (mut copied, mut appended, mut run_copied) = (0u64, 0u64, 0u64);
+        let mut cull_copied = 0u64;
         let splice = artifact_splice_enabled();
         let cull_runs = self.cull_band.is_some() && paint_cull_runs_enabled();
         // Volatile boxes, for the sparse paint diff: a copied run takes the
@@ -4165,6 +4301,7 @@ impl PaintArtifact {
                     &mut memo,
                     &mut marks,
                     &mut runs,
+                    &mut cull_spans,
                 );
                 if end > index {
                     if volatile_ok && let Some(old) = previous_volatile {
@@ -4186,6 +4323,7 @@ impl PaintArtifact {
                     &mut unchanged,
                     &mut memo,
                     &mut marks,
+                    &mut cull_spans,
                 );
                 if end > index {
                     if volatile_ok && let Some(old) = previous_volatile {
@@ -4196,6 +4334,7 @@ impl PaintArtifact {
                     PAINT_CULL_RUN_NODES
                         .with(|count| count.set(count.get() + (end - index) as u64));
                     copied += (end - index) as u64;
+                    cull_copied += (end - index) as u64;
                     index = end;
                     continue;
                 }
@@ -4235,7 +4374,9 @@ impl PaintArtifact {
             stats.set((c + copied, a + appended, m));
         });
         if verify {
-            eprintln!("[append-reuse] copied {copied} of {len} ({run_copied} in aligned runs)");
+            eprintln!(
+                "[append-reuse] copied {copied} of {len} ({run_copied} in aligned runs, {cull_copied} in culled runs)"
+            );
         }
         if let Some(fresh) = fresh
             && !self.append_output_eq(&fresh)
@@ -4260,6 +4401,7 @@ impl PaintArtifact {
             base,
             unchanged,
             runs,
+            cull_spans,
         }));
     }
 
@@ -5984,6 +6126,91 @@ mod tests {
         assert_eq!(artifact.culled_in_viewport(1280.0, 720.0), 0);
         assert!(artifact.cull_band_covers(0.0, 720.0, 512.0));
         assert!(!artifact.cull_band_covers(9000.0, 720.0, 0.0));
+    }
+
+    /// `W3COS_PAINT_CULL_RUN_GAPS`: boxes far below the band shift down
+    /// twice; in the second shift they sit in last build's culled spans and
+    /// outside the layout's changed range, so the short check takes them.
+    /// Verify finds it agrees with the full check, and the build equals the
+    /// one without it.
+    #[test]
+    fn culled_run_gaps_take_last_spans_and_match_the_full_check() {
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(Some(1)));
+        PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(Some(1)));
+        PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let mut block = Style::default();
+        block.display = Display::Block;
+        let nodes = || {
+            (0..40)
+                .map(|index| PaintNode {
+                    kind: ComponentKind::Column,
+                    style: block.clone().into(),
+                    parent: (index > 0).then_some(0),
+                    sticky_counter_signal: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let layouts = |grow: f32| {
+            (0..40)
+                .map(|index| {
+                    let (y, height) = match index {
+                        0 => (0.0, 40000.0),
+                        1 => (0.0, 20.0 + grow),
+                        2..8 => (30.0 * index as f32 + grow, 20.0),
+                        _ => (9000.0 + 30.0 * index as f32 + grow, 20.0),
+                    };
+                    let rect = LayoutRect {
+                        x: 0.0,
+                        y,
+                        width: 100.0,
+                        height,
+                    };
+                    (rect, index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let build = |grow: f32, previous: Option<&PaintArtifact>, gaps: u8| {
+            PAINT_CULL_RUN_GAPS_OVERRIDE.with(|mode| mode.set(Some(gaps)));
+            // The first row grew; every box after it only moved.
+            set_paint_touched(Some(crate::incremental_layout::PaintChanges {
+                len: 40,
+                changed: vec![(0, 2)],
+                moved: vec![(2, 40)],
+                ..Default::default()
+            }));
+            PAINT_CULL_BAND.with(|band| band.set(Some((-4000.0, 720.0 + 4000.0))));
+            let artifact =
+                PaintArtifact::build_reusing(nodes(), &layouts(grow), 1, None, None, previous);
+            PAINT_CULL_BAND.with(|band| band.set(None));
+            set_paint_touched(None);
+            artifact
+        };
+        let first = build(0.0, None, 1);
+        let second = build(16.0, Some(&first), 1);
+        let before = PAINT_CULL_RUN_GAPS_STATS.with(std::cell::Cell::get);
+        let verified = build(32.0, Some(&second), 2);
+        let after = PAINT_CULL_RUN_GAPS_STATS.with(std::cell::Cell::get);
+        let fast = build(32.0, Some(&second), 1);
+        let full = build(32.0, Some(&second), 0);
+        PAINT_CULL_RUN_GAPS_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(None));
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(None));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+        assert!(
+            after.0 - before.0 >= 30,
+            "the shifted boxes take the short check"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "the short check disagrees with the full one"
+        );
+        assert!(verified.append_output_eq(&full));
+        assert!(fast.append_output_eq(&full));
+        assert_eq!(fast.display_items.len(), full.display_items.len());
     }
 
     /// Boxes far below the band that shift down with a growing first row
@@ -9952,6 +10179,50 @@ pub(crate) fn paint_cull_runs_mode() -> u8 {
             _ => 1,
         },
     )
+}
+
+/// `W3COS_PAINT_CULL_RUN_GAPS=1`: inside last frame's culled runs, and a
+/// gap of the layout's changed boxes, `copy_culled_run` checks only what
+/// may differ per box this frame (its parent, its geometry against the band)
+/// instead of every input again: the rest held when the run was copied and
+/// the box's inputs did not change since (Blink skips a culled subtree
+/// without visiting it). `=verify` also runs the full check and compares.
+pub(crate) fn paint_cull_run_gaps_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CULL_RUN_GAPS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_CULL_RUN_GAPS").ok().as_deref() {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_CULL_RUN_GAPS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// `(boxes the fast check passed, verify mismatches)`.
+    pub(crate) static PAINT_CULL_RUN_GAPS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Appends `[start, end)` to sorted disjoint spans, merging a touching one.
+fn push_span(spans: &mut Vec<(u32, u32)>, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    match spans.last_mut() {
+        Some(last) if last.1 as usize == start => last.1 = end as u32,
+        _ => spans.push((start as u32, end as u32)),
+    }
 }
 
 pub(crate) fn paint_cull_runs_enabled() -> bool {
