@@ -1766,6 +1766,96 @@ mod tests {
     }
 
     #[test]
+    fn paint_flat_keep_matches_a_fresh_flatten() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::incremental_layout::PAINT_FLAT_KEEP_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::incremental_layout::PAINT_FLAT_KEEP_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            let mut messages = Vec::new();
+            for index in 0..5 {
+                let message = crate::dom::create_element("div");
+                crate::dom::set_style_property(message, "padding", "4px");
+                let paragraph = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("message {index} says hi"));
+                crate::dom::append_child(paragraph, text);
+                crate::dom::append_child(message, paragraph);
+                crate::dom::append_child(log, message);
+                messages.push(message);
+            }
+            crate::dom::append_child(body, log);
+            let streamed = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("streamed");
+            crate::dom::append_child(streamed, text);
+            crate::dom::append_child(messages[2], streamed);
+            assert!(crate::incremental_layout::flush());
+            let before = crate::incremental_layout::paint_flat_keep_stats();
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut content = String::from("streamed");
+            for step in 0..8 {
+                match step % 4 {
+                    // Text edits inside a kept message.
+                    0 | 2 => {
+                        content.push_str(" more words");
+                        crate::dom::set_text_content(text, &content);
+                    }
+                    // A new message at the end (the log's child list grows,
+                    // and at times moves).
+                    1 => {
+                        let message = crate::dom::create_element("div");
+                        let span = crate::dom::create_element("span");
+                        let words = crate::dom::create_text_node(&format!("new {step}"));
+                        crate::dom::append_child(span, words);
+                        crate::dom::append_child(message, span);
+                        crate::dom::append_child(log, message);
+                    }
+                    // A word inside an earlier message.
+                    _ => {
+                        let word = crate::dom::create_element("b");
+                        let words = crate::dom::create_text_node("bold");
+                        crate::dom::append_child(word, words);
+                        crate::dom::append_child(messages[1], word);
+                    }
+                }
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = crate::incremental_layout::paint_flat_keep_stats();
+            (frames, (after.0 - before.0, after.2 - before.2))
+        };
+        let (verified, (patched, mismatched)) = run(2);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(patched > 0, "paint splices must patch the kept flat tree");
+        }
+        assert_eq!(
+            mismatched, 0,
+            "a patched flat tree differs from a fresh flatten"
+        );
+        let (kept, (_, kept_mismatched)) = run(1);
+        assert_eq!(kept_mismatched, 0);
+        let (fresh, (off_patched, _)) = run(0);
+        assert_eq!(off_patched, 0);
+        assert!(verified == fresh, "verify-mode frames differ");
+        assert!(
+            kept == fresh,
+            "frames painted from a patched flat tree differ"
+        );
+    }
+
+    #[test]
     fn damage_composite_matches_a_full_composite() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();

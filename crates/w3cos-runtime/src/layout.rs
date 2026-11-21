@@ -1259,7 +1259,7 @@ pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
         None => count_nodes(root),
     };
     let mut out = Vec::with_capacity(capacity);
-    pre_flatten_recursive(root, None, 0xcbf2_9ce4_8422_2325, &mut out);
+    pre_flatten_recursive(root, None, FLAT_ROOT_STABLE_ID, &mut out);
     if last[0].0 != address {
         last[1] = last[0];
     }
@@ -1337,6 +1337,148 @@ fn pre_flatten_with_ids<'a>(
     });
     for child in &comp.children {
         pre_flatten_with_ids(child, Some(my_idx), ids, out);
+    }
+    out[my_idx].subtree_end = out.len();
+}
+
+/// [`pre_flatten`] of a tree a paint splice just edited, made from the flat
+/// form `old` of the same tree before the splice (Blink keeps its layout
+/// object tree and only reattaches what changed). A child that kept its
+/// slot (address, ordinal and so stable id) and whose whole subtree holds
+/// no box of `changed` (sorted, disjoint preorder `[start, end)` ranges of
+/// the new tree) is copied from `old` with its indices shifted; the rest is
+/// flattened again. The copied entries' own fields are refreshed at each
+/// copied subtree root, so a moved slot (its parent's child list grew)
+/// still points at the live node.
+///
+/// # Safety
+/// `old` must be the flat form of this tree, at its current address, made
+/// right before edits that touched only boxes `changed` names: inserted
+/// boxes, boxes on an edit's path and boxes whose own data changed. Every
+/// other box (and the child list it owns) must be the one `old` points at.
+pub(crate) unsafe fn pre_flatten_patched<'a>(
+    root: &'a Component,
+    old: &[FlatNodeInfo<'_>],
+    changed: &[(u32, u32)],
+) -> Vec<FlatNodeInfo<'a>> {
+    install_font_unit_provider();
+    let mut out = Vec::with_capacity(old.len() + 64);
+    let hint = old
+        .first()
+        .filter(|entry| entry.stable_id == FLAT_ROOT_STABLE_ID)
+        .map(|_| 0);
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        pre_flatten_patch_recursive(
+            root,
+            None,
+            FLAT_ROOT_STABLE_ID,
+            hint,
+            old,
+            changed,
+            &mut out,
+        );
+    }
+    out
+}
+
+const FLAT_ROOT_STABLE_ID: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Whether no range of `changed` meets `[start, end)`.
+fn flat_range_untouched(changed: &[(u32, u32)], start: usize, end: usize) -> bool {
+    let at = changed.partition_point(|&(_, stop)| (stop as usize) <= start);
+    changed
+        .get(at)
+        .is_none_or(|&(first, _)| first as usize >= end)
+}
+
+/// # Safety
+/// See [`pre_flatten_patched`].
+unsafe fn pre_flatten_patch_recursive<'a, 'o>(
+    comp: &'a Component,
+    parent: Option<usize>,
+    stable_id: u64,
+    old_index: Option<usize>,
+    old: &[FlatNodeInfo<'o>],
+    changed: &[(u32, u32)],
+    out: &mut Vec<FlatNodeInfo<'a>>,
+) {
+    let my_idx = out.len();
+    out.push(FlatNodeInfo {
+        component: Some(comp),
+        stable_id,
+        kind: &comp.kind,
+        style: &comp.style,
+        on_click: &comp.on_click,
+        sticky_counter_signal: comp.sticky_counter_signal,
+        parent,
+        subtree_end: my_idx + 1,
+    });
+    // (next old child, end of the old parent's subtree)
+    let mut cursor = old_index.map(|index| (index + 1, old[index].subtree_end));
+    for (child_index, child) in comp.children.iter().enumerate() {
+        let id = child_stable_id(stable_id, child_index);
+        let candidate = cursor.and_then(|(next, end)| (next < end).then_some(next));
+        let Some(slot) = candidate else {
+            pre_flatten_recursive(child, Some(my_idx), id, out);
+            continue;
+        };
+        let entry = &old[slot];
+        let size = entry.subtree_end - slot;
+        let at = out.len();
+        let same_slot = entry.stable_id == id
+            && entry
+                .component
+                .is_some_and(|node| std::ptr::eq(node, child));
+        if !same_slot {
+            // An insertion or removal before this child moved the later
+            // ordinals, and with them every stable id below: walk them.
+            cursor = None;
+            pre_flatten_recursive(child, Some(my_idx), id, out);
+            continue;
+        }
+        cursor = cursor.map(|(_, end)| (entry.subtree_end, end));
+        let same_children = if child.children.is_empty() {
+            size == 1
+        } else {
+            size > 1
+                && old[slot + 1]
+                    .component
+                    .is_some_and(|node| std::ptr::eq(node, child.children.as_ptr()))
+        };
+        if same_children && flat_range_untouched(changed, at, at + size) {
+            let source = &old[slot..slot + size];
+            // SAFETY: by the contract no box of this subtree changed, so
+            // every entry below its root still points into the live tree
+            // under `comp`, which `'a` borrows.
+            let source: &[FlatNodeInfo<'a>] = unsafe { std::mem::transmute(source) };
+            if at == slot {
+                out.extend_from_slice(source);
+            } else {
+                let shift = at.wrapping_sub(slot);
+                out.extend(source.iter().map(|entry| {
+                    let mut entry = entry.clone();
+                    entry.parent = entry.parent.map(|index| index.wrapping_add(shift));
+                    entry.subtree_end = entry.subtree_end.wrapping_add(shift);
+                    entry
+                }));
+            }
+            out[at] = FlatNodeInfo {
+                component: Some(child),
+                stable_id: id,
+                kind: &child.kind,
+                style: &child.style,
+                on_click: &child.on_click,
+                sticky_counter_signal: child.sticky_counter_signal,
+                parent: Some(my_idx),
+                subtree_end: at + size,
+            };
+        } else {
+            // SAFETY: forwarded.
+            unsafe {
+                pre_flatten_patch_recursive(child, Some(my_idx), id, Some(slot), old, changed, out);
+            }
+        }
     }
     out[my_idx].subtree_end = out.len();
 }
@@ -61417,6 +61559,38 @@ mod tests {
     fn large_viewport() {
         let l = compute(&Component::text("Big", s()), 4000.0, 3000.0).unwrap();
         assert!(l[0].0.width > 0.0);
+    }
+
+    #[test]
+    fn pre_flatten_patched_copies_untouched_subtrees() {
+        fn leaf(text: &str) -> Component {
+            Component::text(text, Style::default())
+        }
+        fn group(children: Vec<Component>) -> Component {
+            Component::column(Style::default(), children)
+        }
+        let mut root = group(vec![
+            group(vec![leaf("a"), leaf("b")]),
+            group(vec![leaf("c"), group(vec![leaf("d")])]),
+            group(vec![leaf("e")]),
+        ]);
+        root.children.reserve(8);
+        let old: Vec<FlatNodeInfo<'static>> = {
+            let flat = pre_flatten(&root);
+            // SAFETY: only read below while `root` lives, after edits the
+            // change set names.
+            unsafe { std::mem::transmute(flat) }
+        };
+        // Grow the middle group's inner list and append a top-level group:
+        // preorder 0 root, 1 g0, 2 a, 3 b, 4 g1, 5 c, 6 g, 7 d, 8 f (new),
+        // 9 g2, 10 e, 11 g3 (new), 12 h (new).
+        root.children[1].children[1].children.push(leaf("f"));
+        root.children.push(group(vec![leaf("h")]));
+        let changed = [(0, 1), (4, 5), (6, 9), (11, 13)];
+        let patched = unsafe { pre_flatten_patched(&root, &old, &changed) };
+        let fresh = pre_flatten(&root);
+        assert!(same_flat(&patched, &fresh));
+        drop(old);
     }
 
     #[test]

@@ -2430,6 +2430,11 @@ struct PaintCache {
     /// Preorder subtree sizes of `component`, kept across paint splices
     /// (`splice::paint_splice_incremental`); `None` until known.
     subtree_sizes: Option<Vec<u32>>,
+    /// The flat form of `component` the last paint splice made
+    /// (`W3COS_PAINT_FLAT_KEEP`). Its references point into `component`;
+    /// only the next paint splice reads it, through
+    /// [`crate::layout::pre_flatten_patched`] and its change set.
+    kept_flat: Option<Vec<crate::layout::FlatNodeInfo<'static>>>,
 }
 
 /// Why the next headless paint can keep its artifact and only move rects.
@@ -2575,6 +2580,43 @@ pub fn with_paint_layout<R>(
 /// it made of the spliced paint tree to the paint that follows, which
 /// would flatten the same tree again; `verify` flattens it anyway and
 /// compares. On by default (`=0` turns it off).
+/// `W3COS_PAINT_FLAT_KEEP=1|verify`: a paint splice keeps the flat form of
+/// the paint tree it made, and the next one re-flattens only the subtrees
+/// its change set touched, copying the rest (Blink keeps its layout object
+/// tree across frames). `verify` also flattens the whole tree and compares.
+/// Off by default.
+pub(crate) fn paint_flat_keep_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_FLAT_KEEP_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_FLAT_KEEP").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_FLAT_KEEP_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (patched flattens, full flattens, verify mismatches).
+    static PAINT_FLAT_KEEP_STATS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn paint_flat_keep_stats() -> (u64, u64, u64) {
+    PAINT_FLAT_KEEP_STATS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn shared_paint_flat_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = SHARED_PAINT_FLAT_OVERRIDE.with(std::cell::Cell::get) {
@@ -2802,7 +2844,51 @@ where
         // a change the flush did not lay out): rebuild.
         return None;
     }
-    let flat = pre_flatten(&cache.component);
+    let flat_keep = paint_flat_keep_mode();
+    let kept_flat = cache.kept_flat.take();
+    let flat = match kept_flat {
+        Some(kept) if flat_keep != 0 => {
+            let patched = splice::with_paint_changes(|changes| {
+                let changes =
+                    changes.filter(|changes| changes.generation == paint_layout_generation())?;
+                // SAFETY: `kept` is the flat form the last paint splice made
+                // of `cache.component`, which only paint splices change in
+                // structure (style patches assign in place); this replay's
+                // change set names every box its splices touched.
+                let flat = unsafe {
+                    crate::layout::pre_flatten_patched(&cache.component, &kept, &changes.changed)
+                };
+                (flat.len() == changes.len).then_some(flat)
+            });
+            let mut stats = PAINT_FLAT_KEEP_STATS.with(std::cell::Cell::get);
+            let flat = match patched {
+                Some(flat) => {
+                    stats.0 += 1;
+                    if flat_keep == 2 {
+                        let fresh = pre_flatten(&cache.component);
+                        if crate::layout::same_flat(&flat, &fresh) {
+                            flat
+                        } else {
+                            stats.2 += 1;
+                            eprintln!(
+                                "[paint-flat-keep-verify] mismatch: the patched flat tree differs"
+                            );
+                            fresh
+                        }
+                    } else {
+                        flat
+                    }
+                }
+                None => {
+                    stats.1 += 1;
+                    pre_flatten(&cache.component)
+                }
+            };
+            PAINT_FLAT_KEEP_STATS.with(|cell| cell.set(stats));
+            flat
+        }
+        _ => pre_flatten(&cache.component),
+    };
     if splice::paint_splice_incremental() {
         cache.subtree_sizes = Some(flat_subtree_sizes(&flat));
     }
@@ -2831,7 +2917,19 @@ where
     cache.results.layout_slots = Some(slots);
     cache.node_ids = flat.iter().map(flat_host_id).collect();
     cache.shift_lists = None;
-    let flat = if shared_paint_flat_mode() != 0 {
+    let shared = shared_paint_flat_mode() != 0;
+    let flat = if flat_keep != 0 {
+        // SAFETY (`W3COS_PAINT_FLAT_KEEP`): kept with the tree it points
+        // into; read only by this frame's paint (below, borrowed from the
+        // cache) and the next paint splice of this cache (see the field).
+        cache.kept_flat = Some(unsafe {
+            std::mem::transmute::<
+                Vec<crate::layout::FlatNodeInfo<'_>>,
+                Vec<crate::layout::FlatNodeInfo<'static>>,
+            >(flat)
+        });
+        None
+    } else if shared {
         Some(flat)
     } else {
         drop(flat);
@@ -2859,10 +2957,14 @@ where
         verify_paint_splice(cache, count, viewport_w, viewport_h);
     }
     let use_layout = use_layout.take().expect("paint layout user");
+    let kept = cache
+        .kept_flat
+        .as_deref()
+        .filter(|_| shared && flat_keep != 0);
     Some(use_layout(
         &cache.component,
         &cache.results,
-        flat.as_deref(),
+        flat.as_deref().or(kept),
     ))
 }
 
@@ -2997,6 +3099,7 @@ fn rebuild_paint_cache(
         shift_lists: None,
         journal: None,
         subtree_sizes,
+        kept_flat: None,
     });
     note_paint_rebuild();
     Ok(())
