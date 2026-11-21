@@ -461,6 +461,10 @@ pub struct PaintArtifact {
     append_record: Option<std::sync::Arc<AppendRecord>>,
     /// Identifies this build for the next frame's `append_record.base`.
     serial: u64,
+    /// `W3COS_PAINT_PERSISTENT_NODES`: the boxes whose text the line-start
+    /// trim shortened in this build (sorted), for the next build's clean
+    /// boxes, which take this build's adjusted node.
+    persist_trimmed: Option<std::sync::Arc<Vec<u32>>>,
     /// During `append_all_reusing` only: the boxes this frame's layout
     /// splice touched ([`paint_touched_mode`]).
     touched: Option<crate::incremental_layout::PaintChanges>,
@@ -529,6 +533,7 @@ impl Default for PaintArtifact {
             generation: 0,
             append_record: None,
             serial: 0,
+            persist_trimmed: None,
             touched: None,
             touched_gaps: false,
             volatile_nodes: None,
@@ -651,6 +656,8 @@ fn persistent_nodes_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_PERSISTENT_NODES").as_deref() {
+            Ok("1" | "true") => 1,
+            Ok("verify") => 2,
             Ok("probe") => 3,
             _ => 0,
         },
@@ -661,6 +668,164 @@ thread_local! {
     /// (frames probed, clean boxes compared, clean boxes that differ).
     pub(crate) static PERSISTENT_NODES_PROBE: std::cell::Cell<(u64, u64, u64)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+thread_local! {
+    /// (frames built on the persistent path, clean boxes taken).
+    pub(crate) static PERSISTENT_NODES_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+    pub(crate) static PERSISTENT_NODES_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The persistent path's inputs: last build and its clean boxes (not in
+/// this frame's layout changes; the root and body always rebuild, since
+/// the canvas background reads their unadjusted style).
+struct PersistPlan<'a> {
+    previous: &'a PaintArtifact,
+    clean: Vec<bool>,
+    clean_count: usize,
+    trimmed: std::sync::Arc<Vec<u32>>,
+}
+
+impl PersistPlan<'_> {
+    /// Clean boxes take last build's adjusted style, and its trimmed text.
+    fn prefill(&self, nodes: &mut [PaintNode]) {
+        for (index, (node, clean)) in nodes.iter_mut().zip(&self.clean).enumerate() {
+            if *clean {
+                node.style = self.previous.nodes[index].style.clone();
+            }
+        }
+        for &index in self.trimmed.iter() {
+            let index = index as usize;
+            if self.clean[index] {
+                nodes[index].kind = self.previous.nodes[index].kind.clone();
+            }
+        }
+    }
+}
+
+fn persistent_nodes_plan<'a>(
+    nodes: &[PaintNode],
+    previous: Option<&'a PaintArtifact>,
+    body_index: Option<usize>,
+) -> Option<PersistPlan<'a>> {
+    let previous = previous?;
+    let trimmed = previous.persist_trimmed.clone()?;
+    if previous.nodes.len() != nodes.len() || nodes.is_empty() {
+        return None;
+    }
+    let changed = PAINT_TOUCHED.with(|touched| {
+        touched
+            .borrow()
+            .as_ref()
+            .filter(|changes| changes.len == nodes.len())
+            .map(|changes| changes.changed.clone())
+    })?;
+    let mut clean = vec![true; nodes.len()];
+    for (a, b) in changed {
+        clean[a as usize..(b as usize).min(nodes.len())].fill(false);
+    }
+    // The table passes add to their boxes' properties (not idempotent on
+    // an adjusted node): table subtrees always rebuild.
+    let mut in_table = vec![false; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        let table = matches!(
+            node.style.display,
+            Display::Table
+                | Display::InlineTable
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableRow
+                | Display::TableColumnGroup
+                | Display::TableColumn
+                | Display::TableCell
+                | Display::TableCaption
+        ) || node
+            .parent
+            .is_some_and(|parent| parent < index && in_table[parent]);
+        if table {
+            in_table[index] = true;
+            clean[index] = false;
+        }
+    }
+    clean[0] = false;
+    if let Some(body) = body_index.filter(|body| *body < clean.len()) {
+        clean[body] = false;
+    }
+    let clean_count = clean.iter().filter(|clean| **clean).count();
+    Some(PersistPlan {
+        previous,
+        clean,
+        clean_count,
+        trimmed,
+    })
+}
+
+type AdjustedNodes = (
+    Vec<PaintNode>,
+    Vec<Option<LayoutRect>>,
+    Vec<usize>,
+    Option<std::sync::Arc<RangeRecord>>,
+    Option<u8>,
+    Color,
+    Option<Style>,
+    Option<usize>,
+    Option<LayoutRect>,
+    usize,
+    Option<std::sync::Arc<Vec<u32>>>,
+);
+
+/// `=verify`: the persistent build equals the full one.
+fn persistent_nodes_same(fast: &AdjustedNodes, full: &AdjustedNodes) -> bool {
+    let nodes = fast.0.len() == full.0.len()
+        && fast.0.iter().zip(&full.0).all(|(a, b)| {
+            a.kind == b.kind
+                && a.style.as_style() == b.style.as_style()
+                && a.parent == b.parent
+                && a.sticky_counter_signal == b.sticky_counter_signal
+        });
+    let rest = fast.1 == full.1
+        && fast.2 == full.2
+        && fast.4 == full.4
+        && fast.5 == full.5
+        && fast.6 == full.6
+        && fast.7 == full.7
+        && fast.8 == full.8
+        && fast.9 == full.9
+        && fast.10 == full.10;
+    if !(nodes && rest) {
+        let first = fast
+            .0
+            .iter()
+            .zip(&full.0)
+            .position(|(a, b)| a.kind != b.kind || a.style.as_style() != b.style.as_style());
+        if let Some(first) = first {
+            let (a, b) = (&fast.0[first], &full.0[first]);
+            let fa = format!("{:#?}", a.style.as_style());
+            let fb = format!("{:#?}", b.style.as_style());
+            let diff: Vec<String> = fa
+                .lines()
+                .zip(fb.lines())
+                .filter(|(x, y)| x != y)
+                .take(6)
+                .map(|(x, y)| format!("{} | {}", x.trim(), y.trim()))
+                .collect();
+            eprintln!(
+                "[paint-persistent-nodes-verify] box {first}: kind same {} kind {:?} style diff (fast | full): {diff:?}",
+                a.kind == b.kind,
+                std::mem::discriminant(&b.kind)
+            );
+        }
+        eprintln!(
+            "[paint-persistent-nodes-verify] mismatch: nodes {nodes} rest {rest} first box {first:?} rects {} ordinals {} trimmed {}",
+            fast.1 == full.1,
+            fast.2 == full.2,
+            fast.10 == full.10
+        );
+    }
+    nodes && rest
 }
 
 fn persistent_nodes_probe(artifact: &PaintArtifact, previous: &PaintArtifact, source_len: usize) {
@@ -1415,7 +1580,7 @@ fn trim_collapsible_inline_whitespace_at_line_start(
     nodes: &mut [PaintNode],
     rect_by_index: &[Option<LayoutRect>],
 ) {
-    trim_line_start_white_space_ranged(nodes, rect_by_index, None, None);
+    trim_line_start_white_space_ranged(nodes, rect_by_index, None, None, None);
 }
 
 /// [`trim_collapsible_inline_whitespace_at_line_start`], recording per box
@@ -1429,6 +1594,9 @@ fn trim_line_start_white_space_ranged(
     rect_by_index: &[Option<LayoutRect>],
     aligned: Option<(&[bool], &[bool])>,
     mut record: Option<&mut Vec<bool>>,
+    // Boxes left as they are (`W3COS_PAINT_PERSISTENT_NODES` clean boxes,
+    // which already hold last build's trimmed text).
+    skip: Option<&[bool]>,
 ) -> u32 {
     const COLLAPSIBLE: [char; 5] = [' ', '\t', '\n', '\r', '\u{000c}'];
     let trim = |node: &mut PaintNode| {
@@ -1457,6 +1625,11 @@ fn trim_line_start_white_space_ranged(
     };
     let mut copied = 0;
     for index in 0..nodes.len() {
+        if let Some(skip) = skip
+            && skip[index]
+        {
+            continue;
+        }
         let node = &nodes[index];
         if node.style.display != Display::Inline
             || matches!(
@@ -3447,344 +3620,427 @@ impl PaintArtifact {
         // positioned: such an item paints like a positioned box at that level
         // and forms a stacking context. Paint reads only layout rects, so
         // modelling it as a zero-offset relative box changes ordering alone.
-        let z_items: Vec<usize> = nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| {
-                node.style.z_index != 0
-                    && node.style.position == Position::Static
-                    && node.parent.is_some_and(|parent| {
-                        matches!(
-                            nodes[parent].style.display,
-                            Display::Flex | Display::Grid | Display::InlineFlex
-                        )
+        let persist_mode = persistent_nodes_mode();
+        let persist_on = matches!(persist_mode, 1 | 2);
+        // The persistent path (see `persistent_nodes_plan`): boxes the
+        // layout splice did not change take last build's adjusted node.
+        let plan = persist_on
+            .then(|| persistent_nodes_plan(&nodes, previous, body_index))
+            .flatten();
+        let adjust = |mut nodes: Vec<PaintNode>, plan: Option<&PersistPlan>| {
+            if let Some(plan) = plan {
+                plan.prefill(&mut nodes);
+            }
+            let z_items: Vec<usize> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.style.z_index != 0
+                        && node.style.position == Position::Static
+                        && node.parent.is_some_and(|parent| {
+                            matches!(
+                                nodes[parent].style.display,
+                                Display::Flex | Display::Grid | Display::InlineFlex
+                            )
+                        })
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in z_items {
+                nodes[index].style.position = Position::Relative;
+            }
+            let feature_mode = paint_feature_skip_mode();
+            let features = (feature_mode != 0).then(|| feature_presence(&nodes, previous));
+            let has_feature = |bit: u8| features.is_none_or(|features| features & bit != 0);
+            let has_percentage_padding = adjust_used_styles(&mut nodes, viewport);
+            if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+                run_feature_pass(
+                    feature_mode,
+                    has_feature(FEATURE_TRANSLATE_PERCENT),
+                    &mut nodes,
+                    |a, b| same_paint_nodes(a, b),
+                    Clone::clone,
+                    |nodes| resolve_translate_percent(nodes, layout_cache),
+                    "translate-percent",
+                );
+            }
+            let has_background_image = |style: &Style| {
+                style.background_image.as_deref().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|layer| !layer.trim().eq_ignore_ascii_case("none"))
+                })
+            };
+            let canvas_background_source = nodes
+                .first()
+                .filter(|node| node.style.background.a > 0 || has_background_image(&node.style))
+                .map(|_| 0)
+                .or_else(|| {
+                    body_index.filter(|index| {
+                        *index != 0
+                            && nodes.get(*index).is_some_and(|node| {
+                                node.style.display != Display::None
+                                    && (node.style.background.a > 0
+                                        || has_background_image(&node.style))
+                            })
                     })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in z_items {
-            nodes[index].style.position = Position::Relative;
-        }
-        let feature_mode = paint_feature_skip_mode();
-        let features = (feature_mode != 0).then(|| feature_presence(&nodes, previous));
-        let has_feature = |bit: u8| features.is_none_or(|features| features & bit != 0);
-        let has_percentage_padding = adjust_used_styles(&mut nodes, viewport);
-        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+                })
+                // A display:none document element has no box to paint on the
+                // canvas. Its suppressed body cannot supply a fallback either.
+                .filter(|_| nodes[0].style.display != Display::None);
+            let root_rect = layout_cache
+                .iter()
+                .find_map(|(rect, index)| (*index == 0).then_some(*rect));
+            if has_percentage_padding {
+                let mut rects = vec![None; nodes.len()];
+                for (rect, index) in layout_cache {
+                    if let Some(slot) = rects.get_mut(*index) {
+                        *slot = Some(*rect);
+                    }
+                }
+                let root_basis = viewport
+                    .map_or_else(|| root_rect.map_or(0.0, |rect| rect.width), |size| size.0);
+                let mut child_bases = vec![root_basis; nodes.len()];
+                for index in 0..nodes.len() {
+                    let basis = nodes[index]
+                        .parent
+                        .map_or(root_basis, |parent| child_bases[parent]);
+                    let percent_padding = {
+                        let padding = &nodes[index].style.padding;
+                        [padding.top, padding.right, padding.bottom, padding.left]
+                            .iter()
+                            .any(|edge| {
+                                matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. })
+                            })
+                    };
+                    // Copy a shared style only when an edge resolves.
+                    if percent_padding {
+                        let style = nodes[index].style.make_mut();
+                        for edge in [
+                            &mut style.padding.top,
+                            &mut style.padding.right,
+                            &mut style.padding.bottom,
+                            &mut style.padding.left,
+                        ] {
+                            match *edge {
+                                Spacing::Percent(percent) => {
+                                    *edge = Spacing::Px(basis * percent / 100.0);
+                                }
+                                Spacing::PaddingCalc { percent, px } => {
+                                    *edge = Spacing::Px((basis * percent / 100.0 + px).max(0.0));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    let style = nodes[index].style.as_style();
+                    child_bases[index] =
+                        if matches!(style.display, Display::Inline | Display::Contents) {
+                            basis
+                        } else {
+                            let padding = style.padding_lengths();
+                            let borders = style.border_left_width.unwrap_or(style.border_width)
+                                + style.border_right_width.unwrap_or(style.border_width);
+                            (rects[index].map_or(basis, |rect| rect.width)
+                                - padding.left
+                                - padding.right
+                                - borders)
+                                .max(0.0)
+                        };
+                }
+            }
+            let root_style = &nodes[0].style;
+            let root_borders = (
+                root_style
+                    .border_left_width
+                    .unwrap_or(root_style.border_width),
+                root_style
+                    .border_top_width
+                    .unwrap_or(root_style.border_width),
+                root_style
+                    .border_right_width
+                    .unwrap_or(root_style.border_width),
+                root_style
+                    .border_bottom_width
+                    .unwrap_or(root_style.border_width),
+            );
+            let root_positioning_rect = root_rect.map(|rect| LayoutRect {
+                x: rect.x + root_borders.0,
+                y: rect.y + root_borders.1,
+                width: (rect.width - root_borders.0 - root_borders.2).max(0.0),
+                height: (rect.height - root_borders.1 - root_borders.3).max(0.0),
+            });
+            let canvas_background_style = canvas_background_source.map(|index| {
+                let mut style = nodes[index].style.as_style().clone();
+                style.border_width = 0.0;
+                style.border_top_width = None;
+                style.border_right_width = None;
+                style.border_bottom_width = None;
+                style.border_left_width = None;
+                if style.background_position.as_deref().is_none_or(|position| {
+                    matches!(
+                        position.trim().to_ascii_lowercase().as_str(),
+                        "" | "0% 0%" | "top left" | "left top"
+                    )
+                }) {
+                    let (x, y) = if index == 0 {
+                        // The positioning override already is the root padding box.
+                        (0.0, 0.0)
+                    } else {
+                        // A propagated body background uses the document element's
+                        // padding edge as its canvas positioning origin.
+                        (
+                            root_positioning_rect.map_or(0.0, |rect| rect.x),
+                            root_positioning_rect.map_or(0.0, |rect| rect.y),
+                        )
+                    };
+                    style.background_position = Some(format!("{x}px {y}px"));
+                }
+                style
+            });
+            let canvas_background = canvas_background_source
+                .map(|index| nodes[index].style.background)
+                .filter(|color| color.a > 0)
+                .unwrap_or(Color::WHITE);
+            // CSS paints a propagated body background on the canvas as if it
+            // were specified on the root element. Relative positions need the
+            // root box as their percentage basis; absolute positions have already
+            // been converted to canvas coordinates above.
+            let canvas_background_positioning_rect = canvas_background_source
+                .filter(|index| {
+                    *index == 0
+                        || nodes[*index]
+                            .style
+                            .background_position
+                            .as_deref()
+                            .is_some_and(background_position_uses_relative_basis)
+                })
+                .and(root_positioning_rect);
+            if let Some(index) = canvas_background_source {
+                nodes[index].style.background = Color::TRANSPARENT;
+                nodes[index].style.background_image = None;
+            }
+            let mut rect_by_index = vec![None; nodes.len()];
+            for &(rect, index) in layout_cache {
+                if let Some(slot) = rect_by_index.get_mut(index) {
+                    *slot = Some(rect);
+                }
+            }
+            for node in &mut nodes {
+                if node
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .is_some_and(|properties| {
+                        properties.contains_key("--w3cos-internal-float-line-bands")
+                    })
+                    && let Some(properties) = node.style.make_mut().custom_properties.as_mut()
+                {
+                    properties.remove("--w3cos-internal-float-line-bands");
+                }
+            }
+            if let Some((width, height)) = viewport {
+                let refs: Vec<_> = nodes
+                    .iter()
+                    .map(|node| (&node.kind, node.style.as_style(), node.parent))
+                    .collect();
+                let flows =
+                    crate::layout::resolve_float_text_layouts(&refs, &rect_by_index, width, height);
+                for flow in flows {
+                    let encoded = flow
+                        .bands
+                        .iter()
+                        .map(|band| {
+                            format!(
+                                "{} {} {}",
+                                band.x - flow.content.x,
+                                band.y - flow.content.y,
+                                band.width
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    nodes[flow.text_index]
+                        .style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert("--w3cos-internal-float-line-bands".into(), encoded);
+                }
+            }
+            let range_mode = paint_range_rebuild_mode();
+            let source_len = nodes.len();
+            // The boxes this frame's layout splice touched, when the previous
+            // build's record covers the same boxes (see `PAINT_TOUCHED`).
+            let range_touched = (range_mode != 0 && !has_percentage_padding)
+                .then(|| {
+                    PAINT_TOUCHED.with(|touched| {
+                        touched
+                            .borrow()
+                            .as_ref()
+                            .filter(|changes| changes.len == source_len)
+                            .map(|changes| (changes.touched_bitmap(), changes.changed.clone()))
+                    })
+                })
+                .flatten();
+            let range_before = previous
+                .and_then(|previous| previous.range_record.as_deref())
+                .filter(|record| record.len == source_len && !record.percent_padding);
+            let range_aligned = range_touched.as_ref().zip(range_before);
+            let mut trimmed = (range_mode != 0 || persist_on).then(|| vec![false; source_len]);
+            let verify_nodes = (range_mode == 2 && range_aligned.is_some()).then(|| nodes.clone());
+            let copied = trim_line_start_white_space_ranged(
+                &mut nodes,
+                &rect_by_index,
+                range_aligned
+                    .map(|((touched, _), before)| (touched.as_slice(), before.trimmed.as_slice())),
+                trimmed.as_mut(),
+                plan.map(|plan| plan.clean.as_slice()),
+            );
+            if let Some(mut fresh) = verify_nodes {
+                trim_collapsible_inline_whitespace_at_line_start(&mut fresh, &rect_by_index);
+                let same = fresh
+                    .iter()
+                    .zip(&nodes)
+                    .all(|(a, b)| a.kind == b.kind && a.style.as_style() == b.style.as_style());
+                if !same {
+                    PAINT_RANGE_STATS.with(|stats| {
+                        let mut value = stats.get();
+                        value.2 += 1;
+                        stats.set(value);
+                    });
+                    eprintln!("[paint-range-rebuild-verify] trim mismatch ({copied} copied)");
+                    nodes = fresh;
+                    trimmed = None;
+                }
+            }
             run_feature_pass(
                 feature_mode,
-                has_feature(FEATURE_TRANSLATE_PERCENT),
+                has_feature(FEATURE_TABLE),
                 &mut nodes,
                 |a, b| same_paint_nodes(a, b),
                 Clone::clone,
-                |nodes| resolve_translate_percent(nodes, layout_cache),
-                "translate-percent",
+                |nodes| table_passes::run(nodes, &rect_by_index),
+                "table",
             );
-        }
-        let has_background_image = |style: &Style| {
-            style.background_image.as_deref().is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|layer| !layer.trim().eq_ignore_ascii_case("none"))
-            })
-        };
-        let canvas_background_source = nodes
-            .first()
-            .filter(|node| node.style.background.a > 0 || has_background_image(&node.style))
-            .map(|_| 0)
-            .or_else(|| {
-                body_index.filter(|index| {
-                    *index != 0
-                        && nodes.get(*index).is_some_and(|node| {
-                            node.style.display != Display::None
-                                && (node.style.background.a > 0
-                                    || has_background_image(&node.style))
-                        })
-                })
-            })
-            // A display:none document element has no box to paint on the
-            // canvas. Its suppressed body cannot supply a fallback either.
-            .filter(|_| nodes[0].style.display != Display::None);
-        let root_rect = layout_cache
-            .iter()
-            .find_map(|(rect, index)| (*index == 0).then_some(*rect));
-        if has_percentage_padding {
-            let mut rects = vec![None; nodes.len()];
-            for (rect, index) in layout_cache {
-                if let Some(slot) = rects.get_mut(*index) {
-                    *slot = Some(*rect);
-                }
-            }
-            let root_basis =
-                viewport.map_or_else(|| root_rect.map_or(0.0, |rect| rect.width), |size| size.0);
-            let mut child_bases = vec![root_basis; nodes.len()];
-            for index in 0..nodes.len() {
-                let basis = nodes[index]
-                    .parent
-                    .map_or(root_basis, |parent| child_bases[parent]);
-                let percent_padding = {
-                    let padding = &nodes[index].style.padding;
-                    [padding.top, padding.right, padding.bottom, padding.left]
-                        .iter()
-                        .any(|edge| {
-                            matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. })
-                        })
-                };
-                // Copy a shared style only when an edge resolves.
-                if percent_padding {
-                    let style = nodes[index].style.make_mut();
-                    for edge in [
-                        &mut style.padding.top,
-                        &mut style.padding.right,
-                        &mut style.padding.bottom,
-                        &mut style.padding.left,
-                    ] {
-                        match *edge {
-                            Spacing::Percent(percent) => {
-                                *edge = Spacing::Px(basis * percent / 100.0);
-                            }
-                            Spacing::PaddingCalc { percent, px } => {
-                                *edge = Spacing::Px((basis * percent / 100.0 + px).max(0.0));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                let style = nodes[index].style.as_style();
-                child_bases[index] = if matches!(style.display, Display::Inline | Display::Contents)
-                {
-                    basis
-                } else {
-                    let padding = style.padding_lengths();
-                    let borders = style.border_left_width.unwrap_or(style.border_width)
-                        + style.border_right_width.unwrap_or(style.border_width);
-                    (rects[index].map_or(basis, |rect| rect.width)
-                        - padding.left
-                        - padding.right
-                        - borders)
-                        .max(0.0)
-                };
-            }
-        }
-        let root_style = &nodes[0].style;
-        let root_borders = (
-            root_style
-                .border_left_width
-                .unwrap_or(root_style.border_width),
-            root_style
-                .border_top_width
-                .unwrap_or(root_style.border_width),
-            root_style
-                .border_right_width
-                .unwrap_or(root_style.border_width),
-            root_style
-                .border_bottom_width
-                .unwrap_or(root_style.border_width),
-        );
-        let root_positioning_rect = root_rect.map(|rect| LayoutRect {
-            x: rect.x + root_borders.0,
-            y: rect.y + root_borders.1,
-            width: (rect.width - root_borders.0 - root_borders.2).max(0.0),
-            height: (rect.height - root_borders.1 - root_borders.3).max(0.0),
-        });
-        let canvas_background_style = canvas_background_source.map(|index| {
-            let mut style = nodes[index].style.as_style().clone();
-            style.border_width = 0.0;
-            style.border_top_width = None;
-            style.border_right_width = None;
-            style.border_bottom_width = None;
-            style.border_left_width = None;
-            if style.background_position.as_deref().is_none_or(|position| {
-                matches!(
-                    position.trim().to_ascii_lowercase().as_str(),
-                    "" | "0% 0%" | "top left" | "left top"
-                )
-            }) {
-                let (x, y) = if index == 0 {
-                    // The positioning override already is the root padding box.
-                    (0.0, 0.0)
-                } else {
-                    // A propagated body background uses the document element's
-                    // padding edge as its canvas positioning origin.
-                    (
-                        root_positioning_rect.map_or(0.0, |rect| rect.x),
-                        root_positioning_rect.map_or(0.0, |rect| rect.y),
-                    )
-                };
-                style.background_position = Some(format!("{x}px {y}px"));
-            }
-            style
-        });
-        let canvas_background = canvas_background_source
-            .map(|index| nodes[index].style.background)
-            .filter(|color| color.a > 0)
-            .unwrap_or(Color::WHITE);
-        // CSS paints a propagated body background on the canvas as if it
-        // were specified on the root element. Relative positions need the
-        // root box as their percentage basis; absolute positions have already
-        // been converted to canvas coordinates above.
-        let canvas_background_positioning_rect = canvas_background_source
-            .filter(|index| {
-                *index == 0
-                    || nodes[*index]
-                        .style
-                        .background_position
-                        .as_deref()
-                        .is_some_and(background_position_uses_relative_basis)
-            })
-            .and(root_positioning_rect);
-        if let Some(index) = canvas_background_source {
-            nodes[index].style.background = Color::TRANSPARENT;
-            nodes[index].style.background_image = None;
-        }
-        let mut rect_by_index = vec![None; nodes.len()];
-        for &(rect, index) in layout_cache {
-            if let Some(slot) = rect_by_index.get_mut(index) {
-                *slot = Some(rect);
-            }
-        }
-        for node in &mut nodes {
-            if node
-                .style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|properties| {
-                    properties.contains_key("--w3cos-internal-float-line-bands")
-                })
-                && let Some(properties) = node.style.make_mut().custom_properties.as_mut()
             {
-                properties.remove("--w3cos-internal-float-line-bands");
+                let mut both = (
+                    std::mem::take(&mut nodes),
+                    std::mem::take(&mut rect_by_index),
+                );
+                run_feature_pass(
+                    feature_mode,
+                    has_feature(FEATURE_VIDEO_CONTROLS),
+                    &mut both,
+                    |a, b| same_paint_nodes(&a.0, &b.0) && a.1 == b.1,
+                    Clone::clone,
+                    |(nodes, rects)| media_controls::append(nodes, rects),
+                    "media-controls",
+                );
+                (nodes, rect_by_index) = both;
             }
-        }
-        if let Some((width, height)) = viewport {
-            let refs: Vec<_> = nodes
-                .iter()
-                .map(|node| (&node.kind, node.style.as_style(), node.parent))
-                .collect();
-            let flows =
-                crate::layout::resolve_float_text_layouts(&refs, &rect_by_index, width, height);
-            for flow in flows {
-                let encoded = flow
-                    .bands
-                    .iter()
-                    .map(|band| {
-                        format!(
-                            "{} {} {}",
-                            band.x - flow.content.x,
-                            band.y - flow.content.y,
-                            band.width
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";");
-                nodes[flow.text_index]
-                    .style
-                    .custom_properties
-                    .get_or_insert_with(Default::default)
-                    .insert("--w3cos-internal-float-line-bands".into(), encoded);
-            }
-        }
-        let range_mode = paint_range_rebuild_mode();
-        let source_len = nodes.len();
-        // The boxes this frame's layout splice touched, when the previous
-        // build's record covers the same boxes (see `PAINT_TOUCHED`).
-        let range_touched = (range_mode != 0 && !has_percentage_padding)
-            .then(|| {
-                PAINT_TOUCHED.with(|touched| {
-                    touched
-                        .borrow()
-                        .as_ref()
-                        .filter(|changes| changes.len == source_len)
-                        .map(|changes| (changes.touched_bitmap(), changes.changed.clone()))
-                })
-            })
-            .flatten();
-        let range_before = previous
-            .and_then(|previous| previous.range_record.as_deref())
-            .filter(|record| record.len == source_len && !record.percent_padding);
-        let range_aligned = range_touched.as_ref().zip(range_before);
-        let mut trimmed = (range_mode != 0).then(|| vec![false; source_len]);
-        let verify_nodes = (range_mode == 2 && range_aligned.is_some()).then(|| nodes.clone());
-        let copied = trim_line_start_white_space_ranged(
-            &mut nodes,
-            &rect_by_index,
-            range_aligned
-                .map(|((touched, _), before)| (touched.as_slice(), before.trimmed.as_slice())),
-            trimmed.as_mut(),
-        );
-        if let Some(mut fresh) = verify_nodes {
-            trim_collapsible_inline_whitespace_at_line_start(&mut fresh, &rect_by_index);
-            let same = fresh
-                .iter()
-                .zip(&nodes)
-                .all(|(a, b)| a.kind == b.kind && a.style.as_style() == b.style.as_style());
-            if !same {
+            let ordinal_scan = range_aligned
+                .filter(|(_, before)| before.ordinals_plain)
+                .map(|((_, changed), _)| changed.as_slice());
+            let (logical_paint_ordinals, ordinals_plain) =
+                positioned_inline_fragment_ordinals_ranged(&nodes, ordinal_scan, source_len);
+            if range_mode == 2
+                && ordinal_scan.is_some()
+                && logical_paint_ordinals != positioned_inline_fragment_ordinals(&nodes)
+            {
                 PAINT_RANGE_STATS.with(|stats| {
                     let mut value = stats.get();
                     value.2 += 1;
                     stats.set(value);
                 });
-                eprintln!("[paint-range-rebuild-verify] trim mismatch ({copied} copied)");
-                nodes = fresh;
-                trimmed = None;
+                eprintln!("[paint-range-rebuild-verify] ordinal mismatch");
             }
-        }
-        run_feature_pass(
-            feature_mode,
-            has_feature(FEATURE_TABLE),
-            &mut nodes,
-            |a, b| same_paint_nodes(a, b),
-            Clone::clone,
-            |nodes| table_passes::run(nodes, &rect_by_index),
-            "table",
-        );
-        {
-            let mut both = (
-                std::mem::take(&mut nodes),
-                std::mem::take(&mut rect_by_index),
-            );
-            run_feature_pass(
-                feature_mode,
-                has_feature(FEATURE_VIDEO_CONTROLS),
-                &mut both,
-                |a, b| same_paint_nodes(&a.0, &b.0) && a.1 == b.1,
-                Clone::clone,
-                |(nodes, rects)| media_controls::append(nodes, rects),
-                "media-controls",
-            );
-            (nodes, rect_by_index) = both;
-        }
-        let ordinal_scan = range_aligned
-            .filter(|(_, before)| before.ordinals_plain)
-            .map(|((_, changed), _)| changed.as_slice());
-        let (logical_paint_ordinals, ordinals_plain) =
-            positioned_inline_fragment_ordinals_ranged(&nodes, ordinal_scan, source_len);
-        if range_mode == 2
-            && ordinal_scan.is_some()
-            && logical_paint_ordinals != positioned_inline_fragment_ordinals(&nodes)
-        {
-            PAINT_RANGE_STATS.with(|stats| {
-                let mut value = stats.get();
-                value.2 += 1;
-                stats.set(value);
+            if range_aligned.is_some() {
+                PAINT_RANGE_STATS.with(|stats| {
+                    let mut value = stats.get();
+                    value.0 += 1;
+                    value.1 += u64::from(copied);
+                    stats.set(value);
+                });
+            }
+            let persist_trimmed = persist_on.then(|| {
+                let mut list: Vec<u32> = trimmed
+                    .as_deref()
+                    .map(|bits| {
+                        bits.iter()
+                            .enumerate()
+                            .filter(|(_, trimmed)| **trimmed)
+                            .map(|(index, _)| index as u32)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(plan) = plan {
+                    list.extend(
+                        plan.trimmed
+                            .iter()
+                            .filter(|&&index| plan.clean[index as usize]),
+                    );
+                    list.sort_unstable();
+                }
+                std::sync::Arc::new(list)
             });
-            eprintln!("[paint-range-rebuild-verify] ordinal mismatch");
-        }
-        if range_aligned.is_some() {
-            PAINT_RANGE_STATS.with(|stats| {
-                let mut value = stats.get();
-                value.0 += 1;
-                value.1 += u64::from(copied);
-                stats.set(value);
+            let trimmed = trimmed.filter(|_| range_mode != 0);
+
+            let range_record = trimmed.map(|trimmed| {
+                std::sync::Arc::new(RangeRecord {
+                    len: source_len,
+                    trimmed,
+                    ordinals_plain,
+                    percent_padding: has_percentage_padding,
+                })
+            });
+            (
+                nodes,
+                rect_by_index,
+                logical_paint_ordinals,
+                range_record,
+                features,
+                canvas_background,
+                canvas_background_style,
+                canvas_background_source,
+                canvas_background_positioning_rect,
+                source_len,
+                persist_trimmed,
+            )
+        };
+        let source_nodes = (persist_mode == 2 && plan.is_some()).then(|| nodes.clone());
+        let (
+            nodes,
+            rect_by_index,
+            logical_paint_ordinals,
+            range_record,
+            features,
+            canvas_background,
+            canvas_background_style,
+            canvas_background_source,
+            canvas_background_positioning_rect,
+            source_len,
+            persist_trimmed,
+        ) = {
+            let fast = adjust(nodes, plan.as_ref());
+            match source_nodes {
+                Some(source) => {
+                    let full = adjust(source, None);
+                    if persistent_nodes_same(&fast, &full) {
+                        fast
+                    } else {
+                        PERSISTENT_NODES_MISMATCHES.with(|count| count.set(count.get() + 1));
+                        full
+                    }
+                }
+                None => fast,
+            }
+        };
+        if let Some(plan) = plan.as_ref() {
+            PERSISTENT_NODES_STATS.with(|stats| {
+                let (frames, clean) = stats.get();
+                stats.set((frames + 1, clean + plan.clean_count as u64));
             });
         }
-        let range_record = trimmed.map(|trimmed| {
-            std::sync::Arc::new(RangeRecord {
-                len: source_len,
-                trimmed,
-                ordinals_plain,
-                percent_padding: has_percentage_padding,
-            })
-        });
         let mut artifact = Self {
             cull_band: PAINT_CULL_BAND.with(std::cell::Cell::get),
             logical_paint_ordinals,
@@ -3804,6 +4060,7 @@ impl PaintArtifact {
             canvas_background_source,
             canvas_background_positioning_rect,
             generation,
+            persist_trimmed,
             ..Self::default()
         };
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
@@ -3834,7 +4091,7 @@ impl PaintArtifact {
                 .collect();
         }
 
-        if persistent_nodes_mode() != 0
+        if persistent_nodes_mode() == 3
             && let Some(previous) = previous
         {
             persistent_nodes_probe(&artifact, previous, source_len);
