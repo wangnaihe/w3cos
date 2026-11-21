@@ -10642,7 +10642,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn layout_wrap_estimate_keeps_every_line() {
         struct Off;
@@ -10681,6 +10680,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn multiline_normal_text_includes_each_lines_resolved_fallback_metrics() {
         let style = Style {
