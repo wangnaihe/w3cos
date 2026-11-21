@@ -433,6 +433,12 @@ fn finish_headless_frame(
             sticky_counter_signal: node.sticky_counter_signal,
         }
     });
+    let cull_mode = crate::paint_artifact::paint_cull_rect_mode();
+    if cull_mode != 0 {
+        crate::paint_artifact::PAINT_CULL_BAND.with(|band| {
+            band.set(Some(headless_cull_band(height as f32)));
+        });
+    }
     let mut artifact = if crate::paint_artifact::paint_append_reuse_enabled() {
         RETAINED_PAINT.with(|slot| {
             let retained = slot.borrow();
@@ -463,8 +469,14 @@ fn finish_headless_frame(
             stats.set((k + kept, c + copied, m + mismatched));
         });
     }
+    if cull_mode != 0 {
+        crate::paint_artifact::PAINT_CULL_BAND.with(|band| band.set(None));
+    }
     artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
+    if cull_mode == 2 {
+        verify_paint_cull(&artifact, width, height);
+    }
     let nodes = artifact
         .rect_by_index
         .iter()
@@ -651,6 +663,46 @@ fn shared_flat_stats() -> (u64, u64) {
     )
 }
 
+/// The cull band for this frame: the kept artifact's band while it still
+/// covers the viewport with Blink's "changed enough" distance to spare,
+/// else the viewport expanded by 4000px vertically.
+fn headless_cull_band(height: f32) -> (f32, f32) {
+    use crate::paint_artifact::{PAINT_CULL_CHANGED_ENOUGH, PAINT_CULL_EXPAND};
+    let scroll_y = crate::jsdom::window_scroll_offset().1;
+    let kept = RETAINED_PAINT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|retained| retained.artifact.cull_band)
+    });
+    let fresh = (
+        scroll_y - PAINT_CULL_EXPAND,
+        scroll_y + height + PAINT_CULL_EXPAND,
+    );
+    match kept {
+        Some((top, bottom))
+            if top <= scroll_y - (PAINT_CULL_EXPAND - PAINT_CULL_CHANGED_ENOUGH)
+                && bottom
+                    >= scroll_y + height + (PAINT_CULL_EXPAND - PAINT_CULL_CHANGED_ENOUGH) =>
+        {
+            (top, bottom)
+        }
+        _ => fresh,
+    }
+}
+
+/// `W3COS_PAINT_CULL_RECT=verify`: no box the band dropped may reach the
+/// viewport at the scroll this frame paints with.
+fn verify_paint_cull(artifact: &PaintArtifact, width: u32, height: u32) {
+    let reaching = artifact.culled_in_viewport(width as f32, height as f32);
+    if reaching > 0 {
+        crate::paint_artifact::PAINT_CULL_DIFFS.with(|count| count.set(count.get() + 1));
+        eprintln!(
+            "[paint-cull-verify] DIFF {reaching} culled boxes reach the viewport ({} culled)",
+            artifact.culled_nodes.len()
+        );
+    }
+}
+
 fn reuse_retained_paint(
     structure: u64,
     reuse: crate::incremental_layout::PaintReuse,
@@ -668,7 +720,19 @@ fn reuse_retained_paint(
         if retained.structure != structure || !retained.artifact.text_fragments.is_empty() {
             return Ok(None);
         }
-        retained.artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
+        let scroll = crate::jsdom::window_scroll_offset();
+        // A kept artifact culled for another scroll position may lack boxes
+        // the viewport now shows: rebuild with a band around it.
+        if !retained
+            .artifact
+            .cull_band_covers(scroll.1, height as f32, 0.0)
+        {
+            return Ok(None);
+        }
+        retained.artifact.viewport_scroll = scroll;
+        if crate::paint_artifact::paint_cull_rect_mode() == 2 {
+            verify_paint_cull(&retained.artifact, width, height);
+        }
         retained.layout_generation = crate::incremental_layout::paint_layout_generation();
         if reuse == crate::incremental_layout::PaintReuse::Insets {
             if !retained.rect_independent {

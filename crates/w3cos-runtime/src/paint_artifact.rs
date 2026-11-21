@@ -407,6 +407,11 @@ pub struct PaintArtifact {
     /// Root viewport scroll in CSS pixels; layout and recordings stay in
     /// document coordinates so scrolling can replay retained pictures.
     pub viewport_scroll: (f32, f32),
+    /// Document-space vertical band (top, bottom) outside of which root
+    /// content emits no display items (`W3COS_PAINT_CULL_RECT`).
+    pub(crate) cull_band: Option<(f32, f32)>,
+    /// Boxes the cull band dropped (kept only under `=verify`).
+    pub(crate) culled_nodes: Vec<u32>,
     pub body_index: Option<usize>,
     pub canvas_background: Color,
     pub canvas_background_style: Option<Style>,
@@ -494,6 +499,8 @@ impl Default for PaintArtifact {
         Self {
             nodes: Vec::new(),
             viewport_scroll: (0.0, 0.0),
+            cull_band: None,
+            culled_nodes: Vec::new(),
             body_index: None,
             canvas_background: Color::WHITE,
             canvas_background_style: None,
@@ -3616,6 +3623,7 @@ impl PaintArtifact {
             })
         });
         let mut artifact = Self {
+            cull_band: PAINT_CULL_BAND.with(std::cell::Cell::get),
             logical_paint_ordinals,
             range_record,
             body_index,
@@ -3877,6 +3885,7 @@ impl PaintArtifact {
             let record = previous.append_record.as_deref()?;
             (previous.nodes.len() == len
                 && record.marks.len() == len
+                && previous.cull_band == self.cull_band
                 && previous.body_index == self.body_index
                 && previous.column_fragments.len() == self.column_fragments.len())
             .then_some((previous, record))
@@ -4630,6 +4639,20 @@ impl PaintArtifact {
             .get(index)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        if let Some((top, bottom)) = self.cull_band
+            && fragments.is_empty()
+            && (bounds.y + bounds.height < top || bounds.y > bottom)
+            && self.cullable(index, properties, self_scroll)
+        {
+            // Blink's CullRect: root content outside the viewport expanded
+            // by 4000px is not painted; the band moves only when the scroll
+            // gets near its edge, and a box entering it paints as new.
+            PAINT_CULL_COUNT.with(|count| count.set(count.get() + 1));
+            if paint_cull_rect_mode() == 2 {
+                self.culled_nodes.push(index as u32);
+            }
+            return;
+        }
         let physical_bounds = fragments
             .iter()
             .map(|fragment| fragment.visual_rect)
@@ -4653,6 +4676,57 @@ impl PaintArtifact {
                 z_order: self.z_order[index],
             });
         }
+    }
+
+    /// The cull band may drop this box's items: it paints under the root's
+    /// property nodes (no transform, clip, effect or scroller of its own or
+    /// from an ancestor) and scrolls with the document (not fixed, sticky or
+    /// viewport-attached).
+    fn cullable(
+        &self,
+        index: usize,
+        properties: PaintProperties,
+        self_scroll: PropertyNodeId,
+    ) -> bool {
+        let root = self.node_properties.first().copied().unwrap_or_default();
+        let node = &self.nodes[index];
+        index != 0
+            && properties == root
+            && self_scroll == root.scroll
+            && !matches!(node.style.position, Position::Fixed | Position::Sticky)
+            && !self
+                .viewport_attached_by_index
+                .get(index)
+                .copied()
+                .unwrap_or(true)
+            && self.sticky_owner.get(index).copied().flatten().is_none()
+    }
+
+    /// `=verify`: boxes the cull band dropped whose painted rect (document
+    /// rect minus the viewport scroll, grown by a generous ink outset)
+    /// reaches the viewport `width` x `height`. Must be 0.
+    pub(crate) fn culled_in_viewport(&self, width: f32, height: f32) -> usize {
+        self.culled_nodes
+            .iter()
+            .filter(|&&index| {
+                let index = index as usize;
+                let Some(rect) = self.rect_by_index.get(index).copied().flatten() else {
+                    return false;
+                };
+                let (_, sy) = self.viewport_scroll_for(index);
+                let outset = paint_cull_ink_outset(&self.nodes[index].style);
+                let top = rect.y - sy - outset;
+                let bottom = rect.y + rect.height - sy + outset;
+                bottom > 0.0 && top < height && width > 0.0
+            })
+            .count()
+    }
+
+    /// The band covers the viewport at `scroll_y` with `margin` to spare.
+    pub(crate) fn cull_band_covers(&self, scroll_y: f32, height: f32, margin: f32) -> bool {
+        self.cull_band.is_none_or(|(top, bottom)| {
+            top <= scroll_y - margin && bottom >= scroll_y + height + margin
+        })
     }
 
     /// A node's paint-order key: a prefix of its paint context owner's key
@@ -5465,6 +5539,64 @@ mod tests {
         ];
         let artifact = PaintArtifact::build(nodes, &layouts, 1);
         assert!((artifact.nodes[2].style.padding_lengths().right - 48.018).abs() < 0.01);
+    }
+
+    /// Root content outside the cull band emits no display items; boxes in
+    /// it, and a fixed box anywhere, still paint; none of the dropped boxes
+    /// reaches the viewport.
+    #[test]
+    fn paint_cull_band_drops_only_root_content_outside_it() {
+        PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(Some(2)));
+        PAINT_CULL_BAND.with(|band| band.set(Some((-4000.0, 720.0 + 4000.0))));
+        let mut block = Style::default();
+        block.display = Display::Block;
+        let mut fixed = block.clone();
+        fixed.position = Position::Fixed;
+        let node = |style: &Style, parent: Option<usize>| PaintNode {
+            kind: ComponentKind::Root,
+            style: style.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let nodes = vec![
+            node(&block, None),
+            node(&block, Some(0)),
+            node(&block, Some(0)),
+            node(&fixed, Some(0)),
+        ];
+        let rect = |y: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 100.0,
+            height: 20.0,
+        };
+        let layouts = vec![
+            (
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 20000.0,
+                },
+                0,
+            ),
+            (rect(100.0), 1),
+            (rect(10000.0), 2),
+            (rect(10000.0), 3),
+        ];
+        let artifact = PaintArtifact::build_reusing(nodes, &layouts, 1, None, None, None);
+        PAINT_CULL_BAND.with(|band| band.set(None));
+        PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(None));
+        let clients: Vec<usize> = artifact
+            .display_items
+            .iter()
+            .map(|item| item.client_index)
+            .collect();
+        assert_eq!(clients, vec![0, 1, 3]);
+        assert_eq!(artifact.culled_nodes, vec![2]);
+        assert_eq!(artifact.culled_in_viewport(1280.0, 720.0), 0);
+        assert!(artifact.cull_band_covers(0.0, 720.0, 512.0));
+        assert!(!artifact.cull_band_covers(9000.0, 720.0, 0.0));
     }
 
     /// A frame whose text changed and whose later siblings moved down
@@ -9293,4 +9425,59 @@ mod tests {
         let (_, dirty_clones) = reuse_or_clone_paint_nodes(second, incoming_dirty);
         assert_eq!(dirty_clones, 1);
     }
+}
+
+/// Blink's cull rect expansion (`CullRect::kPixelDistanceToExpand`).
+pub(crate) const PAINT_CULL_EXPAND: f32 = 4000.0;
+/// Blink keeps a cull rect until the new one moved by this much
+/// (`kChangedEnoughMinimumDistance`).
+pub(crate) const PAINT_CULL_CHANGED_ENOUGH: f32 = 512.0;
+
+/// `W3COS_PAINT_CULL_RECT=1`: in headless frames, root content whose rect is
+/// entirely above or below the viewport expanded by 4000px vertically emits
+/// no display items (Blink paints only within the cull rect). `=verify`
+/// also records the dropped boxes and reports any whose painted rect reaches
+/// the viewport when the frame is painted. Off by default.
+pub(crate) fn paint_cull_rect_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CULL_RECT_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_CULL_RECT").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_CULL_RECT_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// The band the next `build_reusing` culls with (set around the build).
+    pub(crate) static PAINT_CULL_BAND: std::cell::Cell<Option<(f32, f32)>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static PAINT_CULL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static PAINT_CULL_DIFFS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Ink a box may paint outside its layout rect: shadows, outline, and a
+/// line of text overflow.
+fn paint_cull_ink_outset(style: &w3cos_std::component::ComponentStyle) -> f32 {
+    let style = style.as_style();
+    let shadow = style
+        .box_shadows
+        .iter()
+        .chain(style.box_shadow.iter())
+        .map(|shadow| {
+            shadow.offset_y.abs() + shadow.blur_radius.abs() * 2.0 + shadow.spread_radius.abs()
+        })
+        .fold(0.0f32, f32::max);
+    shadow + style.outline_width.abs() * 2.0 + style.font_size * 2.0 + 64.0
 }
