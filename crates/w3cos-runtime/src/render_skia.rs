@@ -12654,6 +12654,107 @@ mod tests {
         crate::image_loader::clear_cache();
     }
 
+    /// One default-repeat tile at y=51.19 must not Linear-sample the red
+    /// image row into the white row (margin-collapse-002, page row 71).
+    #[test]
+    fn single_repeat_tile_does_not_bleed_the_neighbouring_image_row() {
+        crate::image_loader::clear_cache();
+        let mut image = image::RgbaImage::from_pixel(100, 80, image::Rgba([255, 255, 255, 255]));
+        for y in 0..20 {
+            for x in 0..100 {
+                image.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install("single-tile-bleed.png", &bytes.into_inner())
+            .unwrap();
+        let mut surface = Surface::new_raster_n32_premul((120, 140)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        draw_background_image(
+            surface.canvas(),
+            LayoutRect {
+                x: 8.0,
+                y: 51.19,
+                width: 100.0,
+                height: 80.0,
+            },
+            LayoutRect {
+                x: 8.0,
+                y: 51.19,
+                width: 100.0,
+                height: 80.0,
+            },
+            0.0,
+            &Style {
+                background_image: Some("url(single-tile-bleed.png)".into()),
+                ..Style::default()
+            },
+            1.0,
+        );
+        let info = ImageInfo::new((120, 140), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 120 * 140 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 120 * 4, (0, 0)));
+        for x in 8..108 {
+            let offset = (71 * 120 + x) * 4;
+            let pixel = &pixels[offset..offset + 4];
+            assert!(
+                pixel[0] > 250 && pixel[1] > 250 && pixel[2] > 250,
+                "row 71 x={x} bled {pixel:?}"
+            );
+        }
+        let red = &pixels[(60 * 120 + 50) * 4..(60 * 120 + 50) * 4 + 4];
+        assert_eq!(red, &[255, 0, 0, 255], "the red band is still painted");
+        crate::image_loader::clear_cache();
+    }
+
+    #[test]
+    fn two_tile_repeat_keeps_fractional_texel_phase() {
+        crate::image_loader::clear_cache();
+        let mut image = image::RgbaImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgba([0, 128, 128, 255]));
+        image.put_pixel(1, 0, image::Rgba([0, 255, 255, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install("two-tile-phase.png", &bytes.into_inner()).unwrap();
+        let mut surface = Surface::new_raster_n32_premul((8, 2)).unwrap();
+        surface.canvas().clear(Color::WHITE);
+        let rect = LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 2.0,
+        };
+        draw_background_image(
+            surface.canvas(),
+            rect,
+            rect,
+            0.0,
+            &Style {
+                background_image: Some("url(two-tile-phase.png)".into()),
+                background_position: Some("0.5px 0".into()),
+                ..Style::default()
+            },
+            1.0,
+        );
+        let info = ImageInfo::new((8, 2), ColorType::RGBA8888, AlphaType::Premul, None);
+        let mut pixels = vec![0_u8; 8 * 2 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
+        let sample = &pixels[4..8];
+        assert!(
+            sample
+                .iter()
+                .zip([0, 191, 191, 255])
+                .all(|(got, want)| got.abs_diff(want) <= 1),
+            "two-tile phase changed {sample:?}"
+        );
+        crate::image_loader::clear_cache();
+    }
+
     #[test]
     fn repeating_one_pixel_background_covers_paint_area_beyond_tile_cap() {
         crate::image_loader::clear_cache();
