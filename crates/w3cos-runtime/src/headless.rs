@@ -477,12 +477,16 @@ fn finish_headless_frame(
     if cull_mode == 2 {
         verify_paint_cull(&artifact, width, height);
     }
+    let skip_culled = culled_paint_nodes(&artifact);
     let nodes = artifact
         .rect_by_index
         .iter()
         .enumerate()
         .filter_map(|(index, rect)| {
             let rect = (*rect)?;
+            if skip_culled.as_ref().is_some_and(|skip| skip[index]) {
+                return None;
+            }
             let node = artifact.nodes.get(index)?;
             Some((index, rect, &node.kind, node.style.as_style()))
         })
@@ -513,6 +517,9 @@ fn finish_headless_frame(
             )
         })
         .collect::<Vec<_>>();
+    if skip_culled.is_some() && skip_culled_paint_nodes_mode() == 2 {
+        verify_skip_culled_paint_nodes(&artifact, &nodes);
+    }
     if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
         for (index, rect, kind, style) in &nodes {
             eprintln!(
@@ -819,6 +826,164 @@ fn component_rect_independent(component: &w3cos_std::Component) -> bool {
     walk(component)
 }
 
+/// `W3COS_PAINT_SKIP_CULLED_NODES=1|verify` (off by default): leave out of
+/// the paint-order sort and the table and bidi replays the boxes the paint
+/// cull band dropped (outside the band, no display items), which no layer
+/// draws (Blink does not walk a box outside the cull rect). Boxes under
+/// `border-collapse` stay: a collapsed table paints its cells as one group.
+/// A bidi run's boxes share one line box, so the band drops all or none of
+/// them. `=verify` also replays every box and compares what reaches the
+/// layers (every box with display items, in order).
+fn skip_culled_paint_nodes_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = SKIP_CULLED_PAINT_NODES_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_SKIP_CULLED_NODES")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SKIP_CULLED_PAINT_NODES_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (boxes left out, verify mismatches) since the thread started.
+    pub(crate) static SKIP_CULLED_PAINT_NODES_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Per box, whether display items of `artifact` name it.
+fn painted_clients(artifact: &PaintArtifact) -> Vec<bool> {
+    let mut painted = vec![false; artifact.nodes.len()];
+    for item in &artifact.display_items {
+        if let Some(slot) = painted.get_mut(item.client_index) {
+            *slot = true;
+        }
+    }
+    painted
+}
+
+/// The boxes [`skip_culled_paint_nodes_mode`] leaves out, when it is on and
+/// the artifact has a cull band.
+fn culled_paint_nodes(artifact: &PaintArtifact) -> Option<Vec<bool>> {
+    if skip_culled_paint_nodes_mode() == 0 {
+        return None;
+    }
+    let (top, bottom) = artifact.cull_band?;
+    let painted = painted_clients(artifact);
+    let mut skipped = 0u64;
+    let skip = artifact
+        .rect_by_index
+        .iter()
+        .enumerate()
+        .map(|(index, rect)| {
+            let skip = rect.is_some_and(|rect| rect.y + rect.height < top || rect.y > bottom)
+                && !painted[index]
+                && artifact
+                    .nodes
+                    .get(index)
+                    .is_some_and(|node| !node.style.border_collapse);
+            skipped += u64::from(skip);
+            skip
+        })
+        .collect();
+    SKIP_CULLED_PAINT_NODES_STATS.with(|stats| {
+        let (count, mismatches) = stats.get();
+        stats.set((count + skipped, mismatches));
+    });
+    Some(skip)
+}
+
+/// Replay every box as without the skip and compare the boxes with display
+/// items (those layers draw), in order, with `kept`.
+fn verify_skip_culled_paint_nodes(
+    artifact: &PaintArtifact,
+    kept: &[(
+        usize,
+        LayoutRect,
+        &w3cos_std::component::ComponentKind,
+        &w3cos_std::style::Style,
+    )],
+) {
+    let all = artifact
+        .rect_by_index
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rect)| {
+            let rect = (*rect)?;
+            let node = artifact.nodes.get(index)?;
+            Some((index, rect, &node.kind, node.style.as_style()))
+        })
+        .collect::<Vec<(usize, LayoutRect, _, _)>>();
+    let all = crate::paint_artifact::sort_by_paint_order(artifact, all, |node| node.0);
+    let table = crate::table_paint::replay(&all, artifact);
+    let all = table
+        .iter()
+        .map(|node| {
+            (
+                node.index,
+                node.rect,
+                node.kind.as_ref(),
+                node.style.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let bidi = crate::bidi_paint::replay(&all, artifact);
+    let painted = painted_clients(artifact);
+    let drawn = |nodes: &mut dyn Iterator<
+        Item = (
+            usize,
+            LayoutRect,
+            &w3cos_std::component::ComponentKind,
+            &w3cos_std::style::Style,
+        ),
+    >| {
+        nodes
+            .filter(|node| painted.get(node.0).copied().unwrap_or(true))
+            .map(|(index, rect, kind, style)| {
+                (
+                    index,
+                    [rect.x, rect.y, rect.width, rect.height].map(f32::to_bits),
+                    kind.clone(),
+                    style.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let full = drawn(&mut bidi.iter().map(|node| {
+        (
+            node.index,
+            node.rect,
+            node.kind.as_ref(),
+            node.style.as_ref(),
+        )
+    }));
+    let skipped = drawn(&mut kept.iter().copied());
+    if full != skipped {
+        eprintln!(
+            "[skip-culled-paint-nodes-verify] mismatch: {} boxes reach the layers, {} without the skip",
+            skipped.len(),
+            full.len()
+        );
+        SKIP_CULLED_PAINT_NODES_STATS.with(|stats| {
+            let (count, mismatches) = stats.get();
+            stats.set((count, mismatches + 1));
+        });
+    }
+}
+
 fn paint_retained_artifact(
     width: u32,
     height: u32,
@@ -827,12 +992,16 @@ fn paint_retained_artifact(
     layout_results: &layout::LayoutResults,
     artifact: &PaintArtifact,
 ) -> Result<HeadlessFrame> {
+    let skip_culled = culled_paint_nodes(&artifact);
     let nodes = artifact
         .rect_by_index
         .iter()
         .enumerate()
         .filter_map(|(index, rect)| {
             let rect = (*rect)?;
+            if skip_culled.as_ref().is_some_and(|skip| skip[index]) {
+                return None;
+            }
             let node = artifact.nodes.get(index)?;
             Some((index, rect, &node.kind, node.style.as_style()))
         })
@@ -862,6 +1031,9 @@ fn paint_retained_artifact(
             )
         })
         .collect::<Vec<_>>();
+    if skip_culled.is_some() && skip_culled_paint_nodes_mode() == 2 {
+        verify_skip_culled_paint_nodes(artifact, &nodes);
+    }
     let scroll_offsets = layout_results
         .scrollable_nodes
         .iter()
@@ -2008,6 +2180,71 @@ mod tests {
                 "step {step}: a damage composite differs from a full one"
             );
         }
+    }
+
+    /// Boxes the cull band dropped are left out of the paint-order sort and
+    /// the table and bidi replays: the frames equal those that replay every
+    /// box, and verify mode finds the boxes reaching the layers the same.
+    #[test]
+    fn skip_culled_paint_nodes_matches_the_full_replay() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                SKIP_CULLED_PAINT_NODES_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(Some(1)));
+        let run = |mode: u8| {
+            SKIP_CULLED_PAINT_NODES_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            let top = crate::dom::create_element("p");
+            let words = crate::dom::create_text_node("top");
+            crate::dom::append_child(top, words);
+            crate::dom::append_child(body, top);
+            // Lines of inline words (bidi runs) and a collapsed table, far
+            // past the band below a 480px view.
+            for index in 0..300 {
+                let line = crate::dom::create_element("p");
+                for word in 0..3 {
+                    let span = crate::dom::create_element("span");
+                    let text = crate::dom::create_text_node(&format!("w{index}.{word} "));
+                    crate::dom::append_child(span, text);
+                    crate::dom::append_child(line, span);
+                }
+                crate::dom::append_child(body, line);
+            }
+            let table = crate::dom::create_element("table");
+            crate::dom::set_style_property(table, "border-collapse", "collapse");
+            let row = crate::dom::create_element("tr");
+            let cell = crate::dom::create_element("td");
+            crate::dom::set_style_property(cell, "border", "2px solid #000");
+            crate::dom::append_child(cell, crate::dom::create_text_node("cell"));
+            crate::dom::append_child(row, cell);
+            crate::dom::append_child(table, row);
+            crate::dom::append_child(body, table);
+            let before = SKIP_CULLED_PAINT_NODES_STATS.with(std::cell::Cell::get);
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            for text in ["top grows over a longer line of words", "top"] {
+                crate::dom::set_text_content(words, text);
+                frames.push(render_document_rgba(160, 480).expect("edited frame").rgba);
+            }
+            let after = SKIP_CULLED_PAINT_NODES_STATS.with(std::cell::Cell::get);
+            (frames, (after.0 - before.0, after.1 - before.1))
+        };
+        let (verified, (skipped, mismatches)) = run(2);
+        assert!(skipped > 0, "boxes outside the band must be left out");
+        assert_eq!(mismatches, 0, "the boxes reaching the layers differ");
+        let (skip, _) = run(1);
+        let (full, (none, _)) = run(0);
+        assert_eq!(none, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(skip == full, "frames without the culled boxes differ");
     }
 
     /// A long column under the paint cull rect: an edit at the top moves
