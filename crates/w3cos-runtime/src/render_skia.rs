@@ -779,6 +779,57 @@ thread_local! {
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
+/// `W3COS_PAINT_DAMAGE_EARLY_OUT=1` (with `W3COS_PAINT_DAMAGE`, without the
+/// blit): the damage is measured in `replay_frame` where the layers place
+/// it, and the walk stops once a lower bound on its on-surface area
+/// (`TileCoverage`) passes the share where the composite goes full anyway,
+/// so a mostly damaged frame does not pay for all of its damage.
+/// `=verify` also measures the whole damage of every stopped frame and
+/// checks it is past that share. Off by default.
+pub(crate) fn paint_damage_early_out_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DAMAGE_EARLY_OUT_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_DAMAGE_EARLY_OUT")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+/// The early-out applies: the blit plans moves, so its damage may stay
+/// useful however much of the frame it covers.
+pub(crate) fn paint_damage_early_out_active() -> bool {
+    paint_damage_early_out_mode() != 0
+        && paint_damage_enabled()
+        && crate::retained_layers::paint_damage_blit_mode() == 0
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DAMAGE_EARLY_OUT_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (frames the early-out stopped, of those the ones whose whole damage
+    /// was not past the share in verify mode).
+    static PAINT_DAMAGE_EARLY_OUT_STATS: std::cell::Cell<(u32, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[allow(dead_code)]
+pub(crate) fn paint_damage_early_out_stats() -> (u32, u32) {
+    PAINT_DAMAGE_EARLY_OUT_STATS.with(std::cell::Cell::get)
+}
+
 #[allow(dead_code)]
 pub(crate) fn paint_offscreen_skip_stats() -> (u32, u32, u32) {
     PAINT_OFFSCREEN_SKIP_STATS.with(std::cell::Cell::get)
@@ -2775,7 +2826,91 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                     (size.width as f32, size.height as f32),
                 )
             };
-            lazy_damage = crate::headless::offscreen_damage(artifact, (dirty, moved), on_surface);
+            lazy_damage = if paint_damage_enabled() {
+                None
+            } else {
+                crate::headless::lazy_damage(artifact, (dirty, moved), false, on_surface)
+            };
+        }
+        if lazy
+            && same_surface
+            && paint_damage_enabled()
+            && let (Some(dirty), Some(moved)) = (invalidation.as_deref(), moved.as_deref())
+        {
+            let size = canvas.base_layer_size();
+            let (width, height) = (size.width, size.height);
+            let mut probe = DamageSurfaceProbe::default();
+            let mut coverage = TileCoverage::new(width as i64, height as i64);
+            let layers = &cache.tree.layers;
+            let mut stopped = false;
+            let stop = |list: &[crate::retained_layers::ClientDamage]| {
+                probe.place(
+                    list,
+                    layers,
+                    artifact,
+                    frame.scroll_info,
+                    overrides,
+                    scale_factor,
+                    &mut |left, top, right, bottom| {
+                        coverage.add(left, top, right, bottom);
+                        coverage.most_of()
+                    },
+                ) == Some(true)
+                    && {
+                        stopped = true;
+                        true
+                    }
+            };
+            lazy_damage = crate::headless::lazy_damage(artifact, (dirty, moved), true, stop);
+            if stopped {
+                let mut stats = PAINT_DAMAGE_EARLY_OUT_STATS.with(std::cell::Cell::get);
+                stats.0 += 1;
+                if paint_damage_early_out_mode() == 2 {
+                    // The whole damage, measured without the cache.
+                    let whole =
+                        crate::headless::lazy_damage(artifact, (dirty, moved), false, |_| false);
+                    let surface = skia_safe::IRect::from_wh(width, height);
+                    let area = whole
+                        .as_deref()
+                        .and_then(|whole| {
+                            damage_device_rects(
+                                whole,
+                                layers,
+                                artifact,
+                                frame.scroll_info,
+                                overrides,
+                                scale_factor,
+                                (width as f32, height as f32),
+                            )
+                        })
+                        .map(|rects| {
+                            let mut region = skia_safe::Region::new();
+                            for rect in &rects {
+                                if let Some(rect) = skia_safe::IRect::intersect(rect, &surface) {
+                                    region.op_rect(rect, skia_safe::region::RegionOp::Union);
+                                }
+                            }
+                            skia_safe::region::Iterator::new(&region)
+                                .map(|rect| rect.width() as i64 * rect.height() as i64)
+                                .sum::<i64>()
+                        });
+                    let past = area.is_none_or(|area| area * 10 > width as i64 * height as i64 * 7);
+                    if past {
+                        eprintln!(
+                            "[damage-early-out-verify] stop same: whole damage {area:?} px of {width}x{height}"
+                        );
+                    } else {
+                        stats.1 += 1;
+                        eprintln!(
+                            "[damage-early-out-verify] stop DIFF: whole damage {area:?} px of {width}x{height} is under the share"
+                        );
+                    }
+                }
+                PAINT_DAMAGE_EARLY_OUT_STATS.with(|cell| cell.set(stats));
+                crate::perf::record_paint_path("damage-early-out");
+            } else if lazy_damage.is_none() {
+                note_unbounded_damage();
+            }
         }
         let mut damage = damage
             .as_deref()
@@ -3964,10 +4099,10 @@ fn verify_damage_composite(canvas: &Canvas, full: &dyn Fn(&Canvas)) -> usize {
         .count()
 }
 
-/// A conservative early answer to "does this damage reach the surface?"
-/// for the off-surface skip, placing each entry like `damage_device_rects`
-/// (whose answer on the whole damage still decides the skip). `true` also
-/// whenever an entry cannot be placed simply.
+/// Places damage entries like `damage_device_rects` (whose answer on the
+/// whole damage still decides), for early answers while the damage is
+/// still being measured: the off-surface skip's "may this reach the
+/// surface?" and the early-out's coverage.
 #[derive(Default)]
 struct DamageSurfaceProbe {
     /// Per client, the layer drawing it (`u32::MAX`: none); built once.
@@ -3977,8 +4112,11 @@ struct DamageSurfaceProbe {
 }
 
 impl DamageSurfaceProbe {
+    /// Calls `visit` with each entry's device rect (left, top, right,
+    /// bottom; unpadded) per layer drawing one of its clients, until it
+    /// returns `true`. `None`: an entry cannot be placed this simply.
     #[allow(clippy::too_many_arguments)]
-    fn may_reach(
+    fn place(
         &mut self,
         damage: &[crate::retained_layers::ClientDamage],
         layers: &[crate::retained_layers::CompositorLayer],
@@ -3986,8 +4124,8 @@ impl DamageSurfaceProbe {
         scroll_info: &[Option<(f32, f32, LayoutRect)>],
         overrides: &CompositorOverrides,
         scale_factor: f32,
-        surface: (f32, f32),
-    ) -> bool {
+        visit: &mut dyn FnMut(f32, f32, f32, f32) -> bool,
+    ) -> Option<bool> {
         let layer_of = self.layer_of.get_or_insert_with(|| {
             let mut map = vec![u32::MAX; artifact.nodes.len()];
             for (position, layer) in layers.iter().enumerate() {
@@ -4005,9 +4143,7 @@ impl DamageSurfaceProbe {
         for &(start, end, rect) in damage {
             let mut placed = false;
             for client in start..end {
-                let Some(&layer) = layer_of.get(client) else {
-                    return true;
-                };
+                let &layer = layer_of.get(client)?;
                 if layer == u32::MAX {
                     continue;
                 }
@@ -4036,9 +4172,7 @@ impl DamageSurfaceProbe {
                         matrix.translate_y() - sy * scale_factor,
                     ))
                 });
-                let Some((tx, ty)) = translation else {
-                    return true;
-                };
+                let (tx, ty) = translation?;
                 placed = true;
                 let (x, y) = (rect.x * scale_factor, rect.y * scale_factor);
                 let left = x + tx;
@@ -4047,21 +4181,121 @@ impl DamageSurfaceProbe {
                 let bottom = (y + rect.height * scale_factor) + ty;
                 if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite())
                 {
-                    return true;
+                    return None;
                 }
-                if !(right <= -1.0
-                    || bottom <= -1.0
-                    || left >= surface.0 + 1.0
-                    || top >= surface.1 + 1.0)
-                {
-                    return true;
+                if visit(left, top, right, bottom) {
+                    return Some(true);
                 }
             }
             if !placed {
-                return true;
+                return None;
             }
         }
-        false
+        Some(false)
+    }
+
+    /// A conservative "does this damage reach the surface?": `true` also
+    /// whenever an entry cannot be placed simply.
+    #[allow(clippy::too_many_arguments)]
+    fn may_reach(
+        &mut self,
+        damage: &[crate::retained_layers::ClientDamage],
+        layers: &[crate::retained_layers::CompositorLayer],
+        artifact: &PaintArtifact,
+        scroll_info: &[Option<(f32, f32, LayoutRect)>],
+        overrides: &CompositorOverrides,
+        scale_factor: f32,
+        surface: (f32, f32),
+    ) -> bool {
+        self.place(
+            damage,
+            layers,
+            artifact,
+            scroll_info,
+            overrides,
+            scale_factor,
+            &mut |left, top, right, bottom| {
+                // Padded a pixel like `damage_device_rects`.
+                !(right <= -1.0
+                    || bottom <= -1.0
+                    || left >= surface.0 + 1.0
+                    || top >= surface.1 + 1.0)
+            },
+        )
+        .is_none_or(|reached| reached)
+    }
+}
+
+/// A lower bound on the area a union of rects covers: the surface split
+/// into a grid, counting only the cells some single rect covers whole.
+struct TileCoverage {
+    width: i64,
+    height: i64,
+    covered: Vec<bool>,
+    area: i64,
+}
+
+impl TileCoverage {
+    const COLUMNS: i64 = 32;
+    const ROWS: i64 = 18;
+
+    fn new(width: i64, height: i64) -> Self {
+        Self {
+            width,
+            height,
+            covered: vec![false; (Self::COLUMNS * Self::ROWS) as usize],
+            area: 0,
+        }
+    }
+
+    fn column_edge(&self, column: i64) -> i64 {
+        column * self.width / Self::COLUMNS
+    }
+
+    fn row_edge(&self, row: i64) -> i64 {
+        row * self.height / Self::ROWS
+    }
+
+    /// Adds a device rect (unpadded); returns the covered area so far.
+    fn add(&mut self, left: f32, top: f32, right: f32, bottom: f32) -> i64 {
+        if self.width <= 0 || self.height <= 0 {
+            return self.area;
+        }
+        let (left, top) = (left.ceil() as i64, top.ceil() as i64);
+        let (right, bottom) = (right.floor() as i64, bottom.floor() as i64);
+        let first_column = (left.max(0) * Self::COLUMNS / self.width).max(0);
+        let first_row = (top.max(0) * Self::ROWS / self.height).max(0);
+        for row in first_row..Self::ROWS {
+            let (row_top, row_bottom) = (self.row_edge(row), self.row_edge(row + 1));
+            if row_bottom > bottom {
+                break;
+            }
+            if row_top < top {
+                continue;
+            }
+            for column in first_column..Self::COLUMNS {
+                let (column_left, column_right) =
+                    (self.column_edge(column), self.column_edge(column + 1));
+                if column_right > right {
+                    break;
+                }
+                if column_left < left {
+                    continue;
+                }
+                let cell = &mut self.covered[(row * Self::COLUMNS + column) as usize];
+                if !*cell {
+                    *cell = true;
+                    self.area += (column_right - column_left) * (row_bottom - row_top);
+                }
+            }
+        }
+        self.area
+    }
+
+    /// Past the share of the frame where a clipped composite saves nothing
+    /// (the check in `composite_skia_layers`).
+    fn most_of(&self) -> bool {
+        self.area * 10 > self.width * self.height * 7
     }
 }
 

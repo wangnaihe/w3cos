@@ -65,20 +65,31 @@ struct RetainedPaint {
     layout_generation: u64,
 }
 
-/// For the off-surface skip without `W3COS_PAINT_DAMAGE`: the damage of
-/// `diff` against the retained artifact, or `None` as soon as part of it is
-/// `on_surface` (the frame is not skipped then, so the rest is never
-/// measured).
+/// The damage of `diff` against the retained artifact, measured in
+/// `replay_frame` where the layers place it, or `None` as soon as `stop`
+/// accepts part of it (the caller then needs none of the rest): for the
+/// off-surface skip without `W3COS_PAINT_DAMAGE` (measured, not cached) and
+/// for the damage early-out (`cached`: through the ink cache).
 #[cfg(feature = "skia")]
-pub(crate) fn offscreen_damage(
+pub(crate) fn lazy_damage(
     cur: &PaintArtifact,
     diff: (&[bool], &[Option<(f32, f32)>]),
-    mut on_surface: impl FnMut(&[crate::retained_layers::ClientDamage]) -> bool,
+    cached: bool,
+    mut stop: impl FnMut(&[crate::retained_layers::ClientDamage]) -> bool,
 ) -> Option<Vec<crate::retained_layers::ClientDamage>> {
     RETAINED_PAINT.with(|slot| {
         let slot = slot.try_borrow().ok()?;
         let prev = &slot.as_ref()?.artifact;
-        crate::retained_layers::paint_damage_until(prev, cur, diff, &mut |rects| on_surface(rects))
+        if cached {
+            crate::retained_layers::paint_damage_cached(
+                prev,
+                cur,
+                diff,
+                Some(&mut |rects| stop(rects)),
+            )
+        } else {
+            crate::retained_layers::paint_damage_until(prev, cur, diff, &mut |rects| stop(rects))
+        }
     })
 }
 
@@ -566,7 +577,10 @@ fn finish_headless_frame(
                         // client is known to lie off the surface.
                         let skip_only = !crate::render_skia::paint_damage_enabled()
                             && crate::render_skia::paint_offscreen_skip_mode() != 0;
-                        let damage = crate::render_skia::paint_damage_enabled()
+                        // The early-out measures the damage where the layers
+                        // place it, stopping once most of the frame is damaged.
+                        let early_out = crate::render_skia::paint_damage_early_out_active();
+                        let damage = (crate::render_skia::paint_damage_enabled() && !early_out)
                             .then(|| {
                                 crate::retained_layers::paint_damage(
                                     &retained.artifact,
@@ -575,10 +589,13 @@ fn finish_headless_frame(
                                 )
                             })
                             .flatten();
-                        if damage.is_none() && crate::render_skia::paint_damage_enabled() {
+                        if damage.is_none()
+                            && crate::render_skia::paint_damage_enabled()
+                            && !early_out
+                        {
                             crate::render_skia::note_unbounded_damage();
                         }
-                        Some((diff, damage, skip_only))
+                        Some((diff, damage, skip_only || early_out))
                     })
                 })
             })
@@ -2155,6 +2172,105 @@ mod tests {
                 assert!(
                     frames[step] == fresh.rgba,
                     "mode {mode} damage {damage} step {step}: a frame differs from a full paint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn damage_early_out_matches_a_full_composite() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+                crate::render_skia::PAINT_DAMAGE_EARLY_OUT_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(Some(0)));
+        crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        // Card 0 growing moves every card below it: most of the frame.
+        let edits: [(usize, Option<&str>, &str); 5] = [
+            (1, None, "card 1 is edited"),
+            (0, Some("160px"), "card 0 grows"),
+            (2, None, "card 2 is edited"),
+            (0, Some("100px"), "card 0 shrinks"),
+            (1, None, "card 1 again"),
+        ];
+        for mode in [1u8, 2] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            let mut cards = Vec::new();
+            let mut texts = Vec::new();
+            for index in 0..6 {
+                let card = crate::dom::create_element("div");
+                for (name, value) in [
+                    ("width", "140px"),
+                    ("height", "100px"),
+                    ("background", "#eeeeff"),
+                ] {
+                    crate::dom::set_style_property(card, name, value);
+                }
+                let paragraph = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("card {index} says hello"));
+                crate::dom::append_child(paragraph, text);
+                crate::dom::append_child(card, paragraph);
+                crate::dom::append_child(body, card);
+                cards.push(card);
+                texts.push(text);
+            }
+            let (frames, (stopped, differed)) = with_stable_fonts(|| {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                crate::render_skia::PAINT_DAMAGE_EARLY_OUT_OVERRIDE
+                    .with(|value| value.set(Some(mode)));
+                let before = crate::render_skia::paint_damage_early_out_stats();
+                render_document_rgba(160, 240).expect("first frame");
+                let mut frames = Vec::new();
+                for (card, height, text) in edits {
+                    if let Some(height) = height {
+                        crate::dom::set_style_property(cards[card], "height", height);
+                    }
+                    crate::dom::set_text_content(texts[card], text);
+                    frames.push(render_document_rgba(160, 240).expect("edited frame").rgba);
+                }
+                let after = crate::render_skia::paint_damage_early_out_stats();
+                (frames, (after.0 - before.0, after.1 - before.1))
+            });
+            assert_eq!(
+                differed, 0,
+                "a stopped frame's damage was not most of the frame"
+            );
+            assert!(
+                stopped >= 2,
+                "growing card 0 must stop the walk, stopped {stopped}"
+            );
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::render_skia::PAINT_DAMAGE_EARLY_OUT_OVERRIDE.with(|value| value.set(Some(0)));
+            crate::dom::set_style_property(cards[0], "height", "100px");
+            for (index, text) in texts.iter().enumerate() {
+                crate::dom::set_text_content(*text, &format!("card {index} says hello"));
+            }
+            for (step, (card, height, text)) in edits.into_iter().enumerate() {
+                if let Some(height) = height {
+                    crate::dom::set_style_property(cards[card], "height", height);
+                }
+                crate::dom::set_text_content(texts[card], text);
+                let fresh = with_stable_fonts(|| {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(160, 240).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "mode {mode} step {step}: an early-out frame differs from a full paint"
                 );
             }
         }

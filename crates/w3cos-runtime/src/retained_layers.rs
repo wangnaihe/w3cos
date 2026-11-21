@@ -803,9 +803,20 @@ pub fn paint_damage(
     cur: &PaintArtifact,
     diff: &PaintDiff,
 ) -> Option<Vec<ClientDamage>> {
+    paint_damage_cached(prev, cur, (&diff.dirty, &diff.moved), None)
+}
+
+/// `paint_damage` (through the ink cache when it is on) that gives up with
+/// `None` as soon as `stop` accepts the rects added since its last call.
+pub(crate) fn paint_damage_cached(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    diff: (&[bool], &[Option<(f32, f32)>]),
+    mut stop: Option<&mut dyn FnMut(&[ClientDamage]) -> bool>,
+) -> Option<Vec<ClientDamage>> {
     let mode = ink_cache_mode();
     if mode == 0 {
-        return paint_damage_with(prev, cur, (&diff.dirty, &diff.moved), &mut MeasureInk, None);
+        return paint_damage_with(prev, cur, diff, &mut MeasureInk, stop.take());
     }
     INK_CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -834,7 +845,7 @@ pub fn paint_damage(
         }
         // Clients past `prev`'s painted nothing there.
         cache.ink.resize(cur.nodes.len(), Some(Ok(None)));
-        let damage = paint_damage_with(prev, cur, (&diff.dirty, &diff.moved), &mut cache.ink, None);
+        let damage = paint_damage_with(prev, cur, diff, &mut cache.ink, stop.take());
         // Bounded: every changed client's entry now holds its `cur` ink.
         // Unbounded: the walk stopped part way, so drop the cache.
         if damage.is_some() {
