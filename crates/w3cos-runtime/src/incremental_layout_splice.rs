@@ -2449,14 +2449,16 @@ pub(super) fn clear_paint_journal() {
 /// journaled splice, the journal drops them (a new epoch, so no older
 /// position stays valid). Without it the entries pile up until a size cap
 /// clears the journal and the next paint rebuilds the whole tree (one frame
-/// in ~51 of a text stream). Off by default.
+/// in ~51 of a text stream). On by default (`=0` turns it off).
 pub(super) fn paint_journal_trim_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = PAINT_JOURNAL_TRIM_OVERRIDE.with(std::cell::Cell::get) {
         return enabled;
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("W3COS_PAINT_JOURNAL_TRIM").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        !std::env::var("W3COS_PAINT_JOURNAL_TRIM").is_ok_and(|v| v == "0" || v == "false")
+    })
 }
 
 #[cfg(test)]

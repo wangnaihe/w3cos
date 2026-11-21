@@ -2574,7 +2574,7 @@ pub fn with_paint_layout<R>(
 /// `W3COS_SHARED_PAINT_FLAT=1|verify`: a paint splice hands the flat tree
 /// it made of the spliced paint tree to the paint that follows, which
 /// would flatten the same tree again; `verify` flattens it anyway and
-/// compares. Off by default.
+/// compares. On by default (`=0` turns it off).
 pub(crate) fn shared_paint_flat_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = SHARED_PAINT_FLAT_OVERRIDE.with(std::cell::Cell::get) {
@@ -2583,9 +2583,9 @@ pub(crate) fn shared_paint_flat_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_SHARED_PAINT_FLAT").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }

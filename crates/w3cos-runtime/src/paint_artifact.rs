@@ -9746,7 +9746,8 @@ pub(crate) const PAINT_CULL_CHANGED_ENOUGH: f32 = 512.0;
 /// entirely above or below the viewport expanded by 4000px vertically emits
 /// no display items (Blink paints only within the cull rect). `=verify`
 /// also records the dropped boxes and reports any whose painted rect reaches
-/// the viewport when the frame is painted. Off by default.
+/// the viewport when the frame is painted. On by default (`=0` turns it
+/// off).
 pub(crate) fn paint_cull_rect_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_CULL_RECT_OVERRIDE.with(std::cell::Cell::get) {
@@ -9755,9 +9756,9 @@ pub(crate) fn paint_cull_rect_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_CULL_RECT").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
@@ -9765,8 +9766,8 @@ pub(crate) fn paint_cull_rect_mode() -> u8 {
 /// `W3COS_PAINT_CULL_RUNS=1` (with `W3COS_PAINT_CULL_RECT`): append reuse
 /// copies runs of boxes the cull band drops in both frames as slices, and
 /// the paint diff skips boxes that paint nothing in either frame
-/// (`=verify` also runs the diff without the skip and compares). Off by
-/// default.
+/// (`=verify` also runs the diff without the skip and compares). On by
+/// default (`=0` turns it off).
 pub(crate) fn paint_cull_runs_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_CULL_RUNS_OVERRIDE.with(std::cell::Cell::get) {
@@ -9775,9 +9776,9 @@ pub(crate) fn paint_cull_runs_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_CULL_RUNS").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
