@@ -2584,7 +2584,7 @@ pub fn with_paint_layout<R>(
 /// the paint tree it made, and the next one re-flattens only the subtrees
 /// its change set touched, copying the rest (Blink keeps its layout object
 /// tree across frames). `verify` also flattens the whole tree and compares.
-/// Off by default.
+/// On by default (`=0` turns it off).
 pub(crate) fn paint_flat_keep_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_FLAT_KEEP_OVERRIDE.with(std::cell::Cell::get) {
@@ -2593,9 +2593,9 @@ pub(crate) fn paint_flat_keep_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_FLAT_KEEP").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }

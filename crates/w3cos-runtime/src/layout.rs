@@ -21324,7 +21324,7 @@ fn scroll_containers_with_slots(
 /// `W3COS_PAINT_SCROLL_PLAN=1|verify`: a paint splice keeps the scroll
 /// plan of the paint tree it edits when the boxes its change set names
 /// kept their parent and scroll inputs (every other box did by the set's
-/// contract); `verify` also builds the plan and compares. Off by default.
+/// contract); `verify` also builds the plan and compares. On by default (`=0` turns it off).
 pub(crate) fn paint_scroll_plan_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_SCROLL_PLAN_OVERRIDE.with(std::cell::Cell::get) {
@@ -21333,9 +21333,9 @@ pub(crate) fn paint_scroll_plan_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_SCROLL_PLAN").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }

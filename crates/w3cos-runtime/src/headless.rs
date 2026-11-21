@@ -119,7 +119,7 @@ thread_local! {
 /// touched (the `PAINT_TOUCHED` rule: an untouched box keeps its inputs, its
 /// kind among them) already holds this frame's kind, so the paint node takes
 /// it as it is instead of copying the text again. `verify` compares each such
-/// kind and copies on a difference. Off by default.
+/// kind and copies on a difference. On by default (`=0` turns it off).
 fn paint_kind_keep_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_KIND_KEEP_OVERRIDE.with(Cell::get) {
@@ -128,9 +128,9 @@ fn paint_kind_keep_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_KIND_KEEP").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
