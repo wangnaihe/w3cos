@@ -258,10 +258,18 @@ impl RetainedLayerTree {
                     .zip(&layers)
                     .any(|(old, new)| old.client_indices != new.client_indices)
         };
+        // Under the paint cull band, boxes crossing the band's edge change
+        // some layers' clients every few frames: compare layer by layer
+        // (a layer whose clients changed re-records) instead of treating
+        // the whole tree as changed, as cc re-rasters only changed layers.
+        let per_layer_clients = structure_changed
+            && crate::paint_artifact::paint_cull_rect_mode() != 0
+            && self.layers.len() == layers.len()
+            && !(reuse_mode != 0 && self.layers.is_empty());
         let comparable = self.track_partial
             && self.recordings_valid
             && !old_bounds.is_empty()
-            && !structure_changed
+            && (!structure_changed || per_layer_clients)
             && global == self.global_fingerprint
             && self.clip_rects.len() == clip_rects.len();
         let moves: Option<Vec<LayerMove>> = comparable.then(|| {
@@ -270,7 +278,13 @@ impl RetainedLayerTree {
                 .iter()
                 .zip(&layers)
                 .zip(self.layer_chunk_hashes.iter().zip(&chunk_hashes))
-                .map(|((old, new), (old_chunks, new_chunks))| {
+                .enumerate()
+                .map(|(layer_index, ((old, new), (old_chunks, new_chunks)))| {
+                    if per_layer_clients
+                        && self.layers[layer_index].client_indices != new.client_indices
+                    {
+                        return LayerMove::Changed;
+                    }
                     if old_chunks != new_chunks
                         || old.width.to_bits() != new.bounds.width.to_bits()
                         || old.height.to_bits() != new.bounds.height.to_bits()
@@ -2968,6 +2982,64 @@ mod tests {
         assert_eq!(key_mismatches(), key_mismatches_before);
         super::LAYER_PARTITION_KEYS_OVERRIDE.with(|mode| mode.set(None));
         super::LAYER_REUSE_OVERRIDE.with(|mode| mode.set(None));
+    }
+
+    #[test]
+    fn cull_band_client_changes_re_record_only_the_changed_layer() {
+        let tree_with_root_row = |band: Option<(f32, f32)>| {
+            let mut nodes: Vec<PaintNode> = scroll_tree().nodes;
+            for _ in 0..2 {
+                nodes.push(PaintNode {
+                    kind: ComponentKind::Column,
+                    style: Style::default().into(),
+                    parent: Some(0),
+                    sticky_counter_signal: None,
+                });
+            }
+            crate::paint_artifact::PAINT_CULL_BAND.with(|cell| cell.set(band));
+            let artifact = PaintArtifact::build_reusing(
+                nodes,
+                &[
+                    (rect(0.0), 0),
+                    (rect(0.0), 1),
+                    (rect(80.0), 2),
+                    (rect(200.0), 3),
+                    (rect(10000.0), 4),
+                ],
+                1,
+                None,
+                None,
+                None,
+            );
+            crate::paint_artifact::PAINT_CULL_BAND.with(|cell| cell.set(None));
+            artifact
+        };
+        crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let mut tree = RetainedLayerTree::default();
+        tree.set_track_partial(true);
+        let scrolls = HashMap::new();
+        let overrides = CompositorOverrides::default();
+        let full = tree_with_root_row(None);
+        tree.sync(&full, &scrolls, &overrides);
+        tree.note_rebuild();
+        // The cull band drops the far root row's item; its node stays and
+        // the layer count holds.
+        let culled = tree_with_root_row(Some((-4000.0, 4720.0)));
+        assert!(culled.display_items.len() < full.display_items.len());
+        tree.sync(&culled, &scrolls, &overrides);
+        crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(None));
+        assert!(layers_equal(&tree.layers, &build_layers(&culled)));
+        let partial = tree.partial_layers().expect("compared layer by layer");
+        let before = build_layers(&full);
+        let changed: Vec<bool> = before
+            .iter()
+            .zip(&tree.layers)
+            .map(|(old, new)| old.client_indices != new.client_indices)
+            .collect();
+        assert_eq!(changed.iter().filter(|c| **c).count(), 1, "{changed:?}");
+        for (same, changed) in partial.iter().zip(&changed) {
+            assert_eq!(*same, !changed, "partial {partial:?}");
+        }
     }
 
     #[test]
