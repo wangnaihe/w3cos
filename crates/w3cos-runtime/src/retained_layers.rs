@@ -1214,7 +1214,7 @@ fn resized_box_damage(
             .any(|word| name.contains(word))
     };
     // `background: <color>` leaves a `none` image layer: it paints no image
-    // (`W3COS_PAINT_RESIZE_STRIPS=1`; off by default it counts as one).
+    // (`W3COS_PAINT_RESIZE_STRIPS`; with it off, `=0`, it counts as one).
     let no_image = style.background_image.as_deref().is_none_or(|value| {
         resize_strips_enabled()
             && value.split(',').all(|layer| {

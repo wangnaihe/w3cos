@@ -826,7 +826,7 @@ fn component_rect_independent(component: &w3cos_std::Component) -> bool {
     walk(component)
 }
 
-/// `W3COS_PAINT_SKIP_CULLED_NODES=1|verify` (off by default): leave out of
+/// `W3COS_PAINT_SKIP_CULLED_NODES` (`=verify` checks it): leave out of
 /// the paint-order sort and the table and bidi replays the boxes the paint
 /// cull band dropped (outside the band, no display items), which no layer
 /// draws (Blink does not walk a box outside the cull rect). Boxes under
