@@ -280,8 +280,17 @@ pub fn reuse_or_clone_paint_nodes<'a>(
 /// (CSS Transforms 1, 13.1). The DOM keeps the percentages in
 /// `--w3cos-internal-translate-percent` (LayoutNG only) as `"x,y"`; add them
 /// to the pixel translation once the box is laid out.
-fn resolve_translate_percent(nodes: &mut [PaintNode], layout_cache: &[(LayoutRect, usize)]) {
+fn resolve_translate_percent(
+    nodes: &mut [PaintNode],
+    layout_cache: &[(LayoutRect, usize)],
+    // Boxes that already hold last build's resolved translate
+    // (`W3COS_PAINT_PERSISTENT_NODES` clean boxes).
+    skip: Option<&[bool]>,
+) {
     for (rect, index) in layout_cache {
+        if skip.is_some_and(|skip| skip.get(*index).copied().unwrap_or(false)) {
+            continue;
+        }
         let Some(node) = nodes.get_mut(*index) else {
             continue;
         };
@@ -465,6 +474,9 @@ pub struct PaintArtifact {
     /// trim shortened in this build (sorted), for the next build's clean
     /// boxes, which take this build's adjusted node.
     persist_trimmed: Option<std::sync::Arc<Vec<u32>>>,
+    /// That build found percentage padding (its clean boxes' used padding
+    /// depends on their containing blocks: no persistent path from it).
+    persist_percent_padding: bool,
     /// During `append_all_reusing` only: the boxes this frame's layout
     /// splice touched ([`paint_touched_mode`]).
     touched: Option<crate::incremental_layout::PaintChanges>,
@@ -534,6 +546,7 @@ impl Default for PaintArtifact {
             append_record: None,
             serial: 0,
             persist_trimmed: None,
+            persist_percent_padding: false,
             touched: None,
             touched_gaps: false,
             volatile_nodes: None,
@@ -712,7 +725,7 @@ fn persistent_nodes_plan<'a>(
 ) -> Option<PersistPlan<'a>> {
     let previous = previous?;
     let trimmed = previous.persist_trimmed.clone()?;
-    if previous.nodes.len() != nodes.len() || nodes.is_empty() {
+    if previous.persist_percent_padding || previous.nodes.len() != nodes.len() || nodes.is_empty() {
         return None;
     }
     let changed = PAINT_TOUCHED.with(|touched| {
@@ -775,6 +788,7 @@ type AdjustedNodes = (
     Option<LayoutRect>,
     usize,
     Option<std::sync::Arc<Vec<u32>>>,
+    bool,
 );
 
 /// `=verify`: the persistent build equals the full one.
@@ -794,7 +808,8 @@ fn persistent_nodes_same(fast: &AdjustedNodes, full: &AdjustedNodes) -> bool {
         && fast.7 == full.7
         && fast.8 == full.8
         && fast.9 == full.9
-        && fast.10 == full.10;
+        && fast.10 == full.10
+        && fast.11 == full.11;
     if !(nodes && rest) {
         let first = fast
             .0
@@ -1474,11 +1489,22 @@ fn suppress_hidden_empty_cell_paint(nodes: &mut [PaintNode]) {
 /// padding needs a percentage basis. They read the style alone (and the
 /// viewport), so with `W3COS_STYLE_ADJUST_MEMO` a node whose shared style
 /// is the allocation seen at its index last frame reuses that result.
-fn adjust_used_styles(nodes: &mut [PaintNode], viewport: Option<(f32, f32)>) -> bool {
+fn adjust_used_styles(
+    nodes: &mut [PaintNode],
+    viewport: Option<(f32, f32)>,
+    // Boxes that already hold last build's used style
+    // (`W3COS_PAINT_PERSISTENT_NODES` clean boxes; none had percentage
+    // padding).
+    skip: Option<&[bool]>,
+) -> bool {
     let mode = style_adjust_memo_mode();
+    let skipped = |index: usize| skip.is_some_and(|skip| skip[index]);
     if mode == 0 {
         let mut has_percentage_padding = false;
-        for node in nodes.iter_mut() {
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if skipped(index) {
+                continue;
+            }
             has_percentage_padding |= adjust_used_style(node, viewport);
         }
         return has_percentage_padding;
@@ -1491,7 +1517,10 @@ fn adjust_used_styles(nodes: &mut [PaintNode], viewport: Option<(f32, f32)>) -> 
         }
         memo.entries.resize_with(nodes.len(), || None);
         let mut has_percentage_padding = false;
-        for (node, entry) in nodes.iter_mut().zip(memo.entries.iter_mut()) {
+        for (index, (node, entry)) in nodes.iter_mut().zip(memo.entries.iter_mut()).enumerate() {
+            if skipped(index) {
+                continue;
+            }
             if let Some(known) = entry
                 && known.source.ptr_eq(&node.style)
             {
@@ -3631,11 +3660,15 @@ impl PaintArtifact {
             if let Some(plan) = plan {
                 plan.prefill(&mut nodes);
             }
+            // Clean boxes the per-box passes leave as they are.
+            let skip = plan.map(|plan| plan.clean.as_slice());
+            let skipped = |index: usize| skip.is_some_and(|skip| skip[index]);
             let z_items: Vec<usize> = nodes
                 .iter()
                 .enumerate()
-                .filter(|(_, node)| {
-                    node.style.z_index != 0
+                .filter(|(index, node)| {
+                    !skipped(*index)
+                        && node.style.z_index != 0
                         && node.style.position == Position::Static
                         && node.parent.is_some_and(|parent| {
                             matches!(
@@ -3652,7 +3685,7 @@ impl PaintArtifact {
             let feature_mode = paint_feature_skip_mode();
             let features = (feature_mode != 0).then(|| feature_presence(&nodes, previous));
             let has_feature = |bit: u8| features.is_none_or(|features| features & bit != 0);
-            let has_percentage_padding = adjust_used_styles(&mut nodes, viewport);
+            let has_percentage_padding = adjust_used_styles(&mut nodes, viewport, skip);
             if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
                 run_feature_pass(
                     feature_mode,
@@ -3660,7 +3693,7 @@ impl PaintArtifact {
                     &mut nodes,
                     |a, b| same_paint_nodes(a, b),
                     Clone::clone,
-                    |nodes| resolve_translate_percent(nodes, layout_cache),
+                    |nodes| resolve_translate_percent(nodes, layout_cache, skip),
                     "translate-percent",
                 );
             }
@@ -3826,7 +3859,10 @@ impl PaintArtifact {
                     *slot = Some(rect);
                 }
             }
-            for node in &mut nodes {
+            for (index, node) in nodes.iter_mut().enumerate() {
+                if skipped(index) {
+                    continue;
+                }
                 if node
                     .style
                     .custom_properties
@@ -4005,6 +4041,7 @@ impl PaintArtifact {
                 canvas_background_positioning_rect,
                 source_len,
                 persist_trimmed,
+                has_percentage_padding,
             )
         };
         let source_nodes = (persist_mode == 2 && plan.is_some()).then(|| nodes.clone());
@@ -4020,12 +4057,21 @@ impl PaintArtifact {
             canvas_background_positioning_rect,
             source_len,
             persist_trimmed,
+            has_percentage_padding,
         ) = {
             let fast = adjust(nodes, plan.as_ref());
             match source_nodes {
                 Some(source) => {
                     let full = adjust(source, None);
                     if persistent_nodes_same(&fast, &full) {
+                        // Coverage line for the WPT check (verify only).
+                        if let Some(plan) = plan.as_ref() {
+                            eprintln!(
+                                "[paint-persistent-nodes-verify] same clean {} of {}",
+                                plan.clean_count,
+                                fast.0.len()
+                            );
+                        }
                         fast
                     } else {
                         PERSISTENT_NODES_MISMATCHES.with(|count| count.set(count.get() + 1));
@@ -4061,6 +4107,7 @@ impl PaintArtifact {
             canvas_background_positioning_rect,
             generation,
             persist_trimmed,
+            persist_percent_padding: has_percentage_padding,
             ..Self::default()
         };
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
@@ -9559,7 +9606,11 @@ mod tests {
             width,
             height,
         };
-        resolve_translate_percent(&mut nodes, &[(rect(60.0, 20.0), 0), (rect(8.0, 8.0), 1)]);
+        resolve_translate_percent(
+            &mut nodes,
+            &[(rect(60.0, 20.0), 0), (rect(8.0, 8.0), 1)],
+            None,
+        );
         assert_eq!(nodes[0].style.transform.translate_x, 4.0 - 30.0);
         assert_eq!(nodes[0].style.transform.translate_y, 2.0);
         assert!(nodes[1].style.transform.is_identity());
