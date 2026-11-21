@@ -1497,6 +1497,67 @@ fn paint_diff_clients_with(
     runs: Option<&[[u32; 4]]>,
     sparse: bool,
 ) -> Option<PaintDiff> {
+    let quiet = crate::paint_artifact::paint_cull_runs_mode();
+    let diff = paint_diff_clients_inner(prev, cur, runs, sparse, quiet != 0);
+    if quiet == 2 && cur.cull_band.is_some() {
+        let full = paint_diff_clients_inner(prev, cur, runs, sparse, false);
+        if !quiet_diffs_equal(prev, cur, &diff, &full) {
+            eprintln!("[paint-cull-runs-verify] diff mismatch against the unskipped diff");
+            PAINT_CULL_RUNS_MISMATCHES.with(|count| count.set(count.get() + 1));
+            return full;
+        }
+    }
+    diff
+}
+
+/// The two diffs agree on every client that paints in either frame.
+fn quiet_diffs_equal(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    a: &Option<PaintDiff>,
+    b: &Option<PaintDiff>,
+) -> bool {
+    let (a, b) = match (a, b) {
+        (Some(a), Some(b)) => (a, b),
+        (None, None) => return true,
+        // The unskipped diff gave up (too many changed clients, or a
+        // changed client under a filter); the skipped clients paint nothing.
+        (Some(_), None) => {
+            eprintln!("[paint-cull-runs-verify] the unskipped diff gave up");
+            return true;
+        }
+        (None, Some(_)) => return false,
+    };
+    let n = cur.nodes.len();
+    let mut paints = vec![false; n];
+    for item in prev.display_items.iter().chain(&cur.display_items) {
+        if let Some(slot) = paints.get_mut(item.client_index) {
+            *slot = true;
+        }
+    }
+    a.dirty.len() == b.dirty.len()
+        && a.moved.len() == b.moved.len()
+        && (0..n.min(a.dirty.len())).all(|i| {
+            !paints[i]
+                || (a.dirty[i] == b.dirty[i]
+                    && a.moved[i].map(|m| (m.0.to_bits(), m.1.to_bits()))
+                        == b.moved[i].map(|m| (m.0.to_bits(), m.1.to_bits())))
+        })
+        && prev.nodes.len() == n
+}
+
+thread_local! {
+    pub(crate) static PAINT_CULL_RUNS_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn paint_diff_clients_inner(
+    prev: &PaintArtifact,
+    cur: &PaintArtifact,
+    runs: Option<&[[u32; 4]]>,
+    sparse: bool,
+    skip_quiet: bool,
+) -> Option<PaintDiff> {
     use w3cos_std::component::ComponentKind;
     use w3cos_std::style::Display;
     let n = cur.nodes.len();
@@ -1771,9 +1832,36 @@ fn paint_diff_clients_with(
         }
         _ => None,
     };
+    // `W3COS_PAINT_CULL_RUNS`: skip clients that paint nothing in both
+    // frames under the same cull band.
+    let quiet = skip_quiet && cur.cull_band.is_some() && prev.cull_band == cur.cull_band;
+    let mut quiet_dirty: Vec<usize> = Vec::new();
     let count = sparse_list.as_ref().map_or(n, Vec::len);
     for at in 0..count {
         let index = sparse_list.as_ref().map_or(at, |list| list[at]);
+        if quiet
+            && !in_run.get(index).copied().unwrap_or(false)
+            && prev_items[index] == 0
+            && cur_items[index] == 0
+            && prev.column_fragments.get(index).is_none_or(Vec::is_empty)
+            && cur.column_fragments.get(index).is_none_or(Vec::is_empty)
+            && prev.pushed_no_property_nodes(index)
+            && cur.pushed_no_property_nodes(index)
+        {
+            // Paints nothing in either frame (the cull band dropped it, or
+            // it is invisible) and owns no clip or scroll node: no other
+            // client to invalidate (Blink does not visit a box outside the
+            // cull rect). Still marked when it changed, so the frame counts
+            // as changed as before.
+            if !rect_equal(
+                prev.rect_by_index.get(index).copied().flatten(),
+                cur.rect_by_index.get(index).copied().flatten(),
+            ) || !paint_inputs_equal(index, &prev.nodes[index], &cur.nodes[index])
+            {
+                quiet_dirty.push(index);
+            }
+            continue;
+        }
         // The common case, kept out of the (not inlined) visit: a client of
         // a copied run with equal text pieces.
         if in_run.get(index).copied().unwrap_or(false)
@@ -1815,6 +1903,9 @@ fn paint_diff_clients_with(
         }
     }
     let mut dirty = vec![false; n];
+    for &index in &quiet_dirty {
+        dirty[index] = true;
+    }
     if changed.is_empty() {
         return Some(PaintDiff { dirty, moved });
     }

@@ -3691,6 +3691,28 @@ impl PaintArtifact {
         .then_some(record.unchanged.as_slice())
     }
 
+    /// Whether this build recorded `index` pushing no property node (and
+    /// so no rect-carrying clip or scroll node). `false` without a record.
+    pub(crate) fn pushed_no_property_nodes(&self, index: usize) -> bool {
+        let Some(record) = self.append_record.as_deref() else {
+            return false;
+        };
+        let (Some(at), next) = (record.marks.get(index), record.marks.get(index + 1)) else {
+            return false;
+        };
+        let next = next.map_or(
+            (
+                self.properties.transforms.len() as u32,
+                self.properties.clips.len() as u32,
+                self.properties.effects.len() as u32,
+                self.properties.scrolls.len() as u32,
+            ),
+            |next| (next.transforms, next.clips, next.effects, next.scrolls),
+        );
+        record.marks.len() == self.nodes.len()
+            && next == (at.transforms, at.clips, at.effects, at.scrolls)
+    }
+
     /// Identifies this build (see `append_runs_since`).
     pub(crate) fn serial(&self) -> u64 {
         self.serial
@@ -3858,6 +3880,175 @@ impl PaintArtifact {
         end
     }
 
+    /// `W3COS_PAINT_CULL_RUNS`: copies the previous build's output for the
+    /// run of boxes from `start` that the cull band dropped last frame and
+    /// drops again: each pushed no property node and no display item last
+    /// frame, kept its inputs, size and inline position (only its block
+    /// position may differ: everything below a growing message shifts), and
+    /// its new rect is still outside the band. Blink does not walk a box
+    /// outside the cull rect at all; here the per-box work shrinks to these
+    /// checks and slice copies, without the display items' alignment an
+    /// aligned run needs. Returns the run's end (`start` when there is none).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_culled_run(
+        &mut self,
+        start: usize,
+        previous: &PaintArtifact,
+        record: &AppendRecord,
+        same: &mut [bool],
+        unchanged: &mut [bool],
+        memo: &mut AppendMemo,
+        marks: &mut Vec<AppendMark>,
+    ) -> usize {
+        let Some((top, bottom)) = self.cull_band else {
+            return start;
+        };
+        let len = self.nodes.len();
+        let mark = self.mark();
+        let old = record.marks[start];
+        if (mark.transforms, mark.clips, mark.effects, mark.scrolls)
+            != (old.transforms, old.clips, old.effects, old.scrolls)
+        {
+            return start;
+        }
+        let tail = AppendMark {
+            transforms: previous.properties.transforms.len() as u32,
+            clips: previous.properties.clips.len() as u32,
+            effects: previous.properties.effects.len() as u32,
+            scrolls: previous.properties.scrolls.len() as u32,
+            self_scroll: 0,
+            items: previous.display_items.len() as u32,
+            chunks: previous.chunks.len() as u32,
+            levels: previous.paint_order.levels.len() as u32,
+        };
+        let root = previous
+            .node_properties
+            .first()
+            .copied()
+            .unwrap_or_default();
+        let (mut end, mut culled) = (start, 0u64);
+        while end < len {
+            let at = record.marks[end];
+            let next = record.marks.get(end + 1).copied().unwrap_or(tail);
+            if (next.transforms, next.clips, next.effects, next.scrolls)
+                != (at.transforms, at.clips, at.effects, at.scrolls)
+                || next.items != at.items
+                || next.chunks != at.chunks
+            {
+                break;
+            }
+            let node = &self.nodes[end];
+            let parent_same = node.parent.is_none_or(|parent| {
+                (start..end).contains(&parent) || (parent < start && same[parent])
+            });
+            if !parent_same
+                || !self.column_fragments.get(end).is_none_or(Vec::is_empty)
+                || !previous.column_fragments.get(end).is_none_or(Vec::is_empty)
+            {
+                break;
+            }
+            let (Some(rect), Some(old_rect)) =
+                (self.rect_by_index[end], previous.rect_by_index[end])
+            else {
+                break;
+            };
+            if rect.x != old_rect.x
+                || rect.width != old_rect.width
+                || rect.height != old_rect.height
+            {
+                break;
+            }
+            if !self.inputs_match(end, previous) {
+                break;
+            }
+            if node.style.visibility == Visibility::Visible {
+                // `append_display_items`' cull test, on the copied output.
+                let bounds =
+                    if node.style.border_collapse && node.style.display == Display::TableCell {
+                        let (left, right) = paint_inline_border_widths(&node.style);
+                        LayoutRect {
+                            x: rect.x - left,
+                            width: rect.width + left + right,
+                            ..rect
+                        }
+                    } else {
+                        rect
+                    };
+                let outside = bounds.y + bounds.height < top || bounds.y > bottom;
+                let cullable = end != 0
+                    && previous.node_properties[end] == root
+                    && at.self_scroll as usize == root.scroll
+                    && !matches!(node.style.position, Position::Fixed | Position::Sticky)
+                    && !previous
+                        .viewport_attached_by_index
+                        .get(end)
+                        .copied()
+                        .unwrap_or(true)
+                    && previous.sticky_owner.get(end).copied().flatten().is_none();
+                if !outside || !cullable {
+                    break;
+                }
+                culled += 1;
+            }
+            end += 1;
+        }
+        if end - start < 8 {
+            return start;
+        }
+        let nodes = start..end;
+        self.node_properties[nodes.clone()]
+            .copy_from_slice(&previous.node_properties[nodes.clone()]);
+        self.self_clip[nodes.clone()].copy_from_slice(&previous.self_clip[nodes.clone()]);
+        self.z_order[nodes.clone()].copy_from_slice(&previous.z_order[nodes.clone()]);
+        self.viewport_attached_by_index[nodes.clone()]
+            .copy_from_slice(&previous.viewport_attached_by_index[nodes.clone()]);
+        self.sticky_owner[nodes.clone()].copy_from_slice(&previous.sticky_owner[nodes.clone()]);
+        let old_memo = &record.memo;
+        memo.fixed_owner[nodes.clone()].copy_from_slice(&old_memo.fixed_owner[nodes.clone()]);
+        memo.context_owner[nodes.clone()].copy_from_slice(&old_memo.context_owner[nodes.clone()]);
+        memo.owns_context[nodes.clone()].copy_from_slice(&old_memo.owns_context[nodes.clone()]);
+        memo.stacking[nodes.clone()].copy_from_slice(&old_memo.stacking[nodes.clone()]);
+        memo.ancestor_phase[nodes.clone()].copy_from_slice(&old_memo.ancestor_phase[nodes.clone()]);
+        let (items, chunks) = (mark.items, mark.chunks);
+        let stop = record.marks.get(end).copied().unwrap_or(tail);
+        if self.paint_order.levels.len() as u32 == old.levels {
+            // Levels line up with last frame's: the keys copy as slices.
+            self.paint_order.levels.extend_from_slice(
+                &previous.paint_order.levels[old.levels as usize..stop.levels as usize],
+            );
+            self.paint_order.spans[nodes.clone()]
+                .copy_from_slice(&previous.paint_order.spans[nodes.clone()]);
+            marks.extend(record.marks[nodes.clone()].iter().map(|at| AppendMark {
+                items,
+                chunks,
+                ..*at
+            }));
+        } else {
+            for index in nodes.clone() {
+                let levels = self.paint_order.levels.len() as u32;
+                self.paint_order
+                    .set(index, None, previous.paint_order.key(index));
+                marks.push(AppendMark {
+                    items,
+                    chunks,
+                    levels,
+                    ..record.marks[index]
+                });
+            }
+        }
+        if paint_cull_rect_mode() == 2 {
+            for index in nodes.clone() {
+                if self.nodes[index].style.visibility == Visibility::Visible {
+                    self.culled_nodes.push(index as u32);
+                }
+            }
+        }
+        PAINT_CULL_COUNT.with(|count| count.set(count.get() + culled));
+        same[nodes.clone()].fill(true);
+        unchanged[nodes].fill(true);
+        end
+    }
+
     /// `append_node` for every node, copying the previous build's output for
     /// a node whose own inputs equal last frame's, whose property trees so
     /// far line up with last frame's, and whose ancestors' output is the
@@ -3908,6 +4099,7 @@ impl PaintArtifact {
         let mut runs = Vec::new();
         let (mut copied, mut appended, mut run_copied) = (0u64, 0u64, 0u64);
         let splice = artifact_splice_enabled();
+        let cull_runs = self.cull_band.is_some() && paint_cull_runs_enabled();
         // Volatile boxes, for the sparse paint diff: a copied run takes the
         // previous build's entries in its range (same inputs, same answer).
         let record_volatile = crate::retained_layers::paint_diff_sparse_mode() != 0;
@@ -3935,6 +4127,29 @@ impl PaintArtifact {
                         volatile.extend_from_slice(&old[a..b]);
                     }
                     run_copied += (end - index) as u64;
+                    index = end;
+                    continue;
+                }
+            }
+            if cull_runs && let Some((previous, record)) = base {
+                let end = self.copy_culled_run(
+                    index,
+                    previous,
+                    record,
+                    &mut same,
+                    &mut unchanged,
+                    &mut memo,
+                    &mut marks,
+                );
+                if end > index {
+                    if volatile_ok && let Some(old) = previous_volatile {
+                        let a = old.partition_point(|&i| (i as usize) < index);
+                        let b = old.partition_point(|&i| (i as usize) < end);
+                        volatile.extend_from_slice(&old[a..b]);
+                    }
+                    PAINT_CULL_RUN_NODES
+                        .with(|count| count.set(count.get() + (end - index) as u64));
+                    copied += (end - index) as u64;
                     index = end;
                     continue;
                 }
@@ -5597,6 +5812,99 @@ mod tests {
         assert_eq!(artifact.culled_in_viewport(1280.0, 720.0), 0);
         assert!(artifact.cull_band_covers(0.0, 720.0, 512.0));
         assert!(!artifact.cull_band_covers(9000.0, 720.0, 0.0));
+    }
+
+    /// Boxes far below the band that shift down with a growing first row
+    /// are copied as a culled run and match a build without the run copy.
+    #[test]
+    fn culled_run_copies_shifted_boxes_and_matches_a_per_box_build() {
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(Some(2)));
+        let mut block = Style::default();
+        block.display = Display::Block;
+        let nodes = || {
+            (0..40)
+                .map(|index| PaintNode {
+                    kind: ComponentKind::Column,
+                    style: block.clone().into(),
+                    parent: (index > 0).then_some(0),
+                    sticky_counter_signal: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let layouts = |grow: f32| {
+            let mut layouts = vec![(
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40000.0,
+                },
+                0,
+            )];
+            layouts.push((
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 20.0 + grow,
+                },
+                1,
+            ));
+            for index in 2..40 {
+                let y = if index < 8 {
+                    30.0 * index as f32
+                } else {
+                    9000.0 + 30.0 * index as f32
+                };
+                layouts.push((
+                    LayoutRect {
+                        x: 0.0,
+                        y: y + grow,
+                        width: 100.0,
+                        height: 20.0,
+                    },
+                    index,
+                ));
+            }
+            layouts
+        };
+        let build = |grow: f32, previous: Option<&PaintArtifact>| {
+            PAINT_CULL_BAND.with(|band| band.set(Some((-4000.0, 720.0 + 4000.0))));
+            let artifact =
+                PaintArtifact::build_reusing(nodes(), &layouts(grow), 1, None, None, previous);
+            PAINT_CULL_BAND.with(|band| band.set(None));
+            artifact
+        };
+        PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let first = build(0.0, None);
+        let before = PAINT_CULL_RUN_NODES.with(std::cell::Cell::get);
+        let culled_before = PAINT_CULL_COUNT.with(std::cell::Cell::get);
+        let runs = build(16.0, Some(&first));
+        let copied = PAINT_CULL_RUN_NODES.with(std::cell::Cell::get) - before;
+        let culled_runs = PAINT_CULL_COUNT.with(std::cell::Cell::get) - culled_before;
+        PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(Some(0)));
+        let culled_before = PAINT_CULL_COUNT.with(std::cell::Cell::get);
+        let per_box = build(16.0, Some(&first));
+        let culled_per_box = PAINT_CULL_COUNT.with(std::cell::Cell::get) - culled_before;
+        PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(None));
+        ARTIFACT_SPLICE_OVERRIDE.with(|flag| flag.set(None));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
+        assert_eq!(copied, 32, "boxes 8..40 lie below the band in both frames");
+        assert!(runs.append_output_eq(&per_box));
+        assert_eq!(runs.culled_nodes, per_box.culled_nodes);
+        assert_eq!(culled_runs, culled_per_box);
+        assert_eq!(
+            runs.append_record
+                .as_ref()
+                .map(|record| record.marks.clone()),
+            per_box
+                .append_record
+                .as_ref()
+                .map(|record| record.marks.clone())
+        );
     }
 
     /// A frame whose text changed and whose later siblings moved down
@@ -9453,6 +9761,36 @@ pub(crate) fn paint_cull_rect_mode() -> u8 {
     )
 }
 
+/// `W3COS_PAINT_CULL_RUNS=1` (with `W3COS_PAINT_CULL_RECT`): append reuse
+/// copies runs of boxes the cull band drops in both frames as slices, and
+/// the paint diff skips boxes that paint nothing in either frame
+/// (`=verify` also runs the diff without the skip and compares). Off by
+/// default.
+pub(crate) fn paint_cull_runs_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CULL_RUNS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_CULL_RUNS").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+pub(crate) fn paint_cull_runs_enabled() -> bool {
+    paint_cull_runs_mode() != 0
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_CULL_RUNS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static PAINT_CULL_RECT_OVERRIDE: std::cell::Cell<Option<u8>> =
@@ -9464,6 +9802,8 @@ thread_local! {
     pub(crate) static PAINT_CULL_BAND: std::cell::Cell<Option<(f32, f32)>> =
         const { std::cell::Cell::new(None) };
     pub(crate) static PAINT_CULL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Boxes `copy_culled_run` copied.
+    pub(crate) static PAINT_CULL_RUN_NODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(crate) static PAINT_CULL_DIFFS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
