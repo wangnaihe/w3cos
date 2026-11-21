@@ -67,6 +67,11 @@ pub struct RetainedLayerTree {
     /// Fingerprint of everything a layer recording reads that is not owned
     /// by one paint client (layer list, property trees, self clips).
     global_fingerprint: u64,
+    /// `W3COS_LAYER_SELF_CLIP_EQ`: the artifact's per-node self clips when
+    /// the recordings were made (compared, not hashed, each frame); and in
+    /// its verify mode the fingerprint that does hash them.
+    self_clip: Vec<crate::paint_artifact::PropertyNodeId>,
+    global_with_self_clip: u64,
     layer_chunk_hashes: Vec<u64>,
     /// Compute `partial` on sync (off unless a backend keeps recordings
     /// across content changes).
@@ -228,13 +233,29 @@ impl RetainedLayerTree {
             content_fingerprint(artifact, &layers) | 1
         };
         let compositor = compositor_fingerprint(artifact, &layers, scroll_offsets, overrides);
+        let self_clip_mode = layer_self_clip_eq_mode();
         let (global, chunk_hashes) = if self.track_partial {
             (
-                global_fingerprint(artifact, &layers),
+                global_fingerprint(artifact, &layers, self_clip_mode == 0),
                 layer_chunk_hashes(artifact, &layers),
             )
         } else {
             (0, Vec::new())
+        };
+        let global_with_self_clip = (self.track_partial && self_clip_mode == 2)
+            .then(|| global_fingerprint(artifact, &layers, true))
+            .unwrap_or(0);
+        // The global inputs equal the recordings' (with the self clips
+        // compared directly when they are not hashed).
+        let global_same = |tree: &Self| {
+            let same = global == tree.global_fingerprint
+                && (self_clip_mode == 0 || artifact.self_clip == tree.self_clip);
+            if self_clip_mode == 2 && same != (global_with_self_clip == tree.global_with_self_clip)
+            {
+                eprintln!("[layer-self-clip-eq-verify] mismatch: compared {same}");
+                LAYER_SELF_CLIP_EQ_MISMATCHES.with(|count| count.set(count.get() + 1));
+            }
+            same
         };
         let clip_rects: Vec<Option<LayoutRect>> = if self.track_partial {
             artifact
@@ -270,7 +291,7 @@ impl RetainedLayerTree {
             && self.recordings_valid
             && !old_bounds.is_empty()
             && (!structure_changed || per_layer_clients)
-            && global == self.global_fingerprint
+            && global_same(self)
             && self.clip_rects.len() == clip_rects.len();
         let moves: Option<Vec<LayerMove>> = comparable.then(|| {
             let mut chain = ClipChainMoves::new(artifact, &self.clip_rects, &clip_rects);
@@ -318,6 +339,10 @@ impl RetainedLayerTree {
         });
         self.clip_rects = clip_rects;
         self.global_fingerprint = global;
+        if self.track_partial && self_clip_mode != 0 {
+            self.self_clip.clone_from(&artifact.self_clip);
+            self.global_with_self_clip = global_with_self_clip;
+        }
         self.layer_chunk_hashes = chunk_hashes;
         self.layers = layers;
         self.chunk_order = order;
@@ -608,9 +633,33 @@ fn rects_equal(a: LayoutRect, b: LayoutRect) -> bool {
         && a.height.to_bits() == b.height.to_bits()
 }
 
+thread_local! {
+    static LAYER_SELF_CLIP_EQ_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `W3COS_LAYER_SELF_CLIP_EQ=1` (off by default): the layer tree keeps the
+/// artifact's per-node self clips and compares them with the next frame's
+/// instead of hashing all of them (one per box) into the global
+/// fingerprint every frame. `=verify` also hashes them and reports when
+/// the two decisions differ.
+fn layer_self_clip_eq_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_LAYER_SELF_CLIP_EQ").as_deref() {
+            Ok("1" | "true") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
 /// Everything a layer recording reads that no single paint client or layer
 /// owns: the layer list, the property trees and self clips.
-fn global_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> u64 {
+fn global_fingerprint(
+    artifact: &PaintArtifact,
+    layers: &[CompositorLayer],
+    with_self_clip: bool,
+) -> u64 {
     use std::fmt::Write as _;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     layers.len().hash(&mut hasher);
@@ -625,7 +674,9 @@ fn global_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> u
         layer.scroll_host.hash(&mut hasher);
     }
     artifact.nodes.len().hash(&mut hasher);
-    artifact.self_clip.hash(&mut hasher);
+    if with_self_clip {
+        artifact.self_clip.hash(&mut hasher);
+    }
     // Property nodes carry floats without `Hash`; their `Debug` form is
     // exact (shortest round-trip) and these trees are small.
     let mut text = String::new();
