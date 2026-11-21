@@ -731,6 +731,55 @@ pub(crate) fn paint_damage_enabled() -> bool {
     })
 }
 
+/// `W3COS_PAINT_OFFSCREEN_SKIP=1` (with `W3COS_PAINT_DAMAGE=1`): when every
+/// damage rect of a frame lies outside the surface, the kept headless
+/// rasterizer skips re-recording, compositing and reading back that frame,
+/// since its pixels equal the previous frame's (Blink paints and rasters
+/// only within the cull rect / visible tiles). The layer recordings are
+/// marked stale, so the next on-surface change re-records them.
+/// `=verify` renders such frames in full and compares every pixel with the
+/// previous frame. Off by default.
+pub(crate) fn paint_offscreen_skip_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_OFFSCREEN_SKIP_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_OFFSCREEN_SKIP").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_OFFSCREEN_SKIP_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Set by the kept headless rasterizer around its `replay_frame`: the
+    /// canvas keeps the previous frame's pixels and the read-back buffer.
+    static OFFSCREEN_SKIP_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `replay_frame` found only off-surface damage: 1 skipped, 2 verify.
+    static OFFSCREEN_FRAME: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// The device rects `replay_frame` placed for this frame's damage list
+    /// (its address and length), for the composite to reuse.
+    static PLACED_DAMAGE: RefCell<Option<(usize, usize, Option<Vec<skia_safe::IRect>>)>> =
+        const { RefCell::new(None) };
+    /// (frames skipped, frames verified, verified frames that differed).
+    static PAINT_OFFSCREEN_SKIP_STATS: std::cell::Cell<(u32, u32, u32)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[allow(dead_code)]
+pub(crate) fn paint_offscreen_skip_stats() -> (u32, u32, u32) {
+    PAINT_OFFSCREEN_SKIP_STATS.with(std::cell::Cell::get)
+}
+
 /// `W3COS_PAINT_DAMAGE_VERIFY=1`: also composite every damaged frame in
 /// full off-screen and compare every pixel.
 fn paint_damage_verify() -> bool {
@@ -1752,6 +1801,11 @@ impl SkiaRasterizer {
     ) -> Option<&[u8]> {
         self.ensure_surface(width, height)?;
         let surface = self.surface.as_mut()?;
+        let expected = width as usize * height as usize * 4;
+        // The surface and `rgba` hold the previous frame only after a read
+        // of this size.
+        OFFSCREEN_SKIP_ALLOWED.with(|allowed| allowed.set(self.rgba.len() == expected));
+        OFFSCREEN_FRAME.with(|slot| slot.set(0));
         replay_frame(
             surface.canvas(),
             &self.typeface,
@@ -1768,7 +1822,12 @@ impl SkiaRasterizer {
                 scale_factor,
             },
         );
-        let expected = width as usize * height as usize * 4;
+        OFFSCREEN_SKIP_ALLOWED.with(|allowed| allowed.set(false));
+        let offscreen = OFFSCREEN_FRAME.with(|slot| slot.replace(0));
+        if offscreen == 1 {
+            return Some(self.rgba.as_slice());
+        }
+        let previous = (offscreen == 2).then(|| self.rgba.clone());
         self.rgba.resize(expected, 0);
         let info = ImageInfo::new(
             (width as i32, height as i32),
@@ -1776,9 +1835,29 @@ impl SkiaRasterizer {
             AlphaType::Premul,
             None,
         );
-        surface
-            .read_pixels(&info, &mut self.rgba, width as usize * 4, (0, 0))
-            .then_some(self.rgba.as_slice())
+        let read = surface.read_pixels(&info, &mut self.rgba, width as usize * 4, (0, 0));
+        if let Some(previous) = previous {
+            let differing = previous
+                .chunks_exact(4)
+                .zip(self.rgba.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            PAINT_OFFSCREEN_SKIP_STATS.with(|stats| {
+                let mut value = stats.get();
+                value.1 += 1;
+                value.2 += u32::from(differing > 0);
+                stats.set(value);
+            });
+            eprintln!(
+                "[paint-offscreen-skip-verify] off-surface damage: {}",
+                if differing == 0 {
+                    "same".to_string()
+                } else {
+                    format!("DIFF {differing} pixels")
+                }
+            );
+        }
+        read.then_some(self.rgba.as_slice())
     }
 
     fn ensure_surface(&mut self, width: u32, height: u32) -> Option<()> {
@@ -2580,6 +2659,7 @@ fn paint_display_list_with_suppressed_effects(
 pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: ReplayFrame<'_>) {
     let mut retained = frame.retained.take();
     let damage = PENDING_PAINT_DAMAGE.with(|slot| slot.borrow_mut().take());
+    PLACED_DAMAGE.with(|slot| slot.borrow_mut().take());
     if frame.artifact.is_none()
         && let Some(cache) = retained.as_mut()
     {
@@ -2658,10 +2738,57 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
         if paint_damage_verify() && damage.is_some() && cache.last_composite != key {
             eprintln!("[paint-damage-verify] full: the surface does not hold the last frame");
         }
-        let damage = damage
+        let mut damage = damage
             .as_deref()
             .filter(|_| key.is_some() && cache.last_composite == key);
         cache.last_composite = key;
+        let skip_mode = if OFFSCREEN_SKIP_ALLOWED.with(std::cell::Cell::get) {
+            paint_offscreen_skip_mode()
+        } else {
+            0
+        };
+        if skip_mode != 0
+            && let Some(list) = damage
+        {
+            let size = canvas.base_layer_size();
+            let surface = skia_safe::IRect::from_wh(size.width, size.height);
+            let rects = damage_device_rects(
+                list,
+                &cache.tree.layers,
+                artifact,
+                frame.scroll_info,
+                overrides,
+                scale_factor,
+                (size.width as f32, size.height as f32),
+            );
+            let offscreen = rects.as_ref().is_some_and(|rects| {
+                rects
+                    .iter()
+                    .all(|rect| skia_safe::IRect::intersect(rect, &surface).is_none())
+            });
+            if !offscreen {
+                // The composite below places the same damage on the same
+                // layers.
+                PLACED_DAMAGE.with(|slot| {
+                    *slot.borrow_mut() = Some((list.as_ptr() as usize, list.len(), rects))
+                });
+            } else {
+                OFFSCREEN_FRAME.with(|slot| slot.set(skip_mode));
+                if skip_mode == 1 {
+                    crate::retained_layers::take_damage_moves(list.len());
+                    cache.tree.invalidate_recordings();
+                    PAINT_OFFSCREEN_SKIP_STATS.with(|stats| {
+                        let mut value = stats.get();
+                        value.0 += 1;
+                        stats.set(value);
+                    });
+                    crate::perf::record_paint_path("offscreen-skip");
+                    return;
+                }
+                // Verify: a full composite must reproduce the previous frame.
+                damage = None;
+            }
+        }
         let reusable = matches!(action, LayerPaintAction::Replay)
             && cache.tree.recordings_valid()
             && cache.pictures.len() == cache.tree.layers.len()
@@ -3092,15 +3219,23 @@ fn composite_skia_layers(
         return;
     };
     let size = canvas.base_layer_size();
-    let Some(rects) = damage_device_rects(
-        damage,
-        layers,
-        artifact,
-        scroll_info,
-        overrides,
-        scale_factor,
-        (size.width as f32, size.height as f32),
-    ) else {
+    let placed = PLACED_DAMAGE
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|(at, len, _)| *at == damage.as_ptr() as usize && *len == damage.len())
+        .map(|(_, _, rects)| rects);
+    let rects = match placed {
+        Some(rects) => rects,
+        None => damage_device_rects(
+            damage,
+            layers,
+            artifact,
+            scroll_info,
+            overrides,
+            scale_factor,
+            (size.width as f32, size.height as f32),
+        ),
+    };
+    let Some(rects) = rects else {
         if paint_damage_verify() {
             eprintln!("[paint-damage-verify] full: damage not placeable");
         }
@@ -3108,6 +3243,32 @@ fn composite_skia_layers(
         return;
     };
     let surface = skia_safe::IRect::from_wh(size.width, size.height);
+    if paint_damage_trace() {
+        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let frame = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut region = skia_safe::Region::new();
+        for rect in &rects {
+            if let Some(rect) = skia_safe::IRect::intersect(rect, &surface) {
+                region.op_rect(rect, skia_safe::region::RegionOp::Union);
+            }
+        }
+        eprintln!(
+            "[paint-damage-trace] frame {frame}: {} entries, union {} px of {}",
+            damage.len(),
+            region_area(&region),
+            surface.width() as i64 * surface.height() as i64
+        );
+        for (position, &(first, end, rect)) in damage.iter().enumerate().take(60) {
+            eprintln!(
+                "[paint-damage-trace]   entry {position}: clients {first}..{end} {} css rect {:.0},{:.0} {:.0}x{:.0}",
+                trace_kind(artifact, first),
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height
+            );
+        }
+    }
     if crate::retained_layers::paint_damage_blit_mode() != 0
         && let Some(moves) = crate::retained_layers::take_damage_moves(damage.len())
         && !moves.is_empty()
@@ -3264,6 +3425,32 @@ fn client_device_translations(
 
 /// `rect` (document CSS px) in device pixels under `translation`, rounded
 /// out and padded a pixel for anti-aliasing (as `damage_device_rects`).
+/// `W3COS_PAINT_DAMAGE_TRACE=1`: per damaged frame, print each damage
+/// entry (clients, kind, device area) and, for a blit plan, what makes up
+/// its redraw (diagnostics only).
+pub(crate) fn paint_damage_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_DAMAGE_TRACE").is_ok_and(|v| v == "1"))
+}
+
+fn region_area(region: &skia_safe::Region) -> i64 {
+    skia_safe::region::Iterator::new(region)
+        .map(|rect| rect.width() as i64 * rect.height() as i64)
+        .sum()
+}
+
+fn trace_kind(artifact: &PaintArtifact, index: usize) -> String {
+    use w3cos_std::component::ComponentKind;
+    match artifact.nodes.get(index).map(|node| &node.kind) {
+        None => "-".to_string(),
+        Some(ComponentKind::Text { content }) => format!("Text({})", content.len()),
+        Some(kind) => {
+            let name = format!("{kind:?}");
+            name.chars().take(24).collect()
+        }
+    }
+}
+
 fn device_rect(rect: LayoutRect, translation: (f32, f32), scale: f32) -> Option<skia_safe::IRect> {
     let left = rect.x * scale + translation.0;
     let top = rect.y * scale + translation.1;
@@ -3498,11 +3685,36 @@ fn plan_damage_blit(
             return Err("copies leave an ancestor's padding box");
         }
     }
+    let trace = paint_damage_trace();
+    if trace {
+        eprintln!(
+            "[paint-damage-trace]   blit: {} copies {:?}; uncovered {} px",
+            copies.len(),
+            copies
+                .iter()
+                .map(|(source, delta)| (
+                    source.left,
+                    source.top,
+                    source.width(),
+                    source.height(),
+                    *delta
+                ))
+                .collect::<Vec<_>>(),
+            region_area(&uncovered)
+        );
+    }
     let mut redraw = uncovered;
     // Uncovered parts of the sources.
     let mut exposed = sources.clone();
     exposed.op_region(&destinations, RegionOp::Difference);
     redraw.op_region(&exposed, RegionOp::Union);
+    if trace {
+        eprintln!(
+            "[paint-damage-trace]   exposed {} px, redraw so far {} px",
+            region_area(&exposed),
+            region_area(&redraw)
+        );
+    }
     // Whatever else paints over a source or destination, where it lands.
     let mut add_overlaps = |rect: skia_safe::IRect, redraw: &mut skia_safe::Region| {
         if !touched.intersects_rect(rect) {
@@ -3531,10 +3743,23 @@ fn plan_damage_blit(
         }
         let device = device_rect(rect, translation, scale).ok_or("non-finite rect")?;
         if let Some(device) = skia_safe::IRect::intersect(&device, &surface) {
+            let before = if trace { region_area(&redraw) } else { 0 };
             redraw.op_rect(device, RegionOp::Union);
+            let own = if trace { region_area(&redraw) } else { 0 };
             add_overlaps(device, &mut redraw);
+            if trace {
+                eprintln!(
+                    "[paint-damage-trace]   changed entry {position} clients {first}..{end} {}: rect {}x{} adds {} px, its overlaps with copies add {} px",
+                    trace_kind(artifact, first),
+                    device.width(),
+                    device.height(),
+                    own - before,
+                    region_area(&redraw) - own
+                );
+            }
         }
     }
+    let mut others: Vec<(i64, usize, skia_safe::IRect)> = Vec::new();
     for client in 0..n {
         if in_span[client] || ancestor[client] || changed[client] {
             continue;
@@ -3554,10 +3779,44 @@ fn plan_damage_blit(
             continue;
         };
         if let Some(device) = device_rect(ink, translation, scale) {
+            let before = if trace { region_area(&redraw) } else { 0 };
             add_overlaps(device, &mut redraw);
+            if trace {
+                let added = region_area(&redraw) - before;
+                if added > 0 {
+                    others.push((added, client, device));
+                }
+            }
         }
     }
+    if trace {
+        others.sort_by(|a, b| b.0.cmp(&a.0));
+        eprintln!(
+            "[paint-damage-trace]   other clients' ink over the copies: {} clients add {} px; top {:?}",
+            others.len(),
+            others.iter().map(|o| o.0).sum::<i64>(),
+            others
+                .iter()
+                .take(6)
+                .map(|(added, client, device)| (
+                    *added,
+                    *client,
+                    trace_kind(artifact, *client),
+                    device.left,
+                    device.top,
+                    device.width(),
+                    device.height()
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
     redraw.op_rect(surface, RegionOp::Intersect);
+    if trace {
+        eprintln!(
+            "[paint-damage-trace]   redraw total {} px",
+            region_area(&redraw)
+        );
+    }
     let area = skia_safe::region::Iterator::new(&redraw)
         .map(|rect| rect.width() as i64 * rect.height() as i64)
         .sum::<i64>();

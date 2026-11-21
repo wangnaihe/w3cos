@@ -1838,6 +1838,201 @@ mod tests {
         }
     }
 
+    /// Edits to cards below the surface skip the frame (its pixels equal
+    /// the previous frame's); an on-surface edit after them re-records and
+    /// every frame equals a full paint. Verify mode composites the skipped
+    /// frames in full and compares them with the previous frame.
+    /// A card with a background color grows as its text does: with
+    /// `W3COS_PAINT_RESIZE_STRIPS` its `none` image layer no longer blocks
+    /// the resized-box strips, and every damage frame equals a full paint.
+    #[test]
+    fn resize_strips_match_a_full_composite() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::RESIZE_STRIPS_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        let edits: [&str; 4] = [
+            "card 0 says hello and keeps on talking",
+            "card 0 says hello and keeps on talking until it wraps onto more lines",
+            "card 0 says hello and keeps on talking until it wraps onto more lines again and again",
+            "card 0",
+        ];
+        for blit in [0u8, 2] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            let card = crate::dom::create_element("div");
+            for (name, value) in [
+                ("width", "140px"),
+                ("padding", "12px"),
+                ("background", "#eeeeff"),
+            ] {
+                crate::dom::set_style_property(card, name, value);
+            }
+            let paragraph = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("card 0 says hello");
+            crate::dom::append_child(paragraph, text);
+            crate::dom::append_child(card, paragraph);
+            crate::dom::append_child(body, card);
+            // A card below moves by whole pixels as the first one grows.
+            let below = crate::dom::create_element("div");
+            for (name, value) in [("width", "140px"), ("background", "#ffeeee")] {
+                crate::dom::set_style_property(below, name, value);
+            }
+            let below_text = crate::dom::create_text_node("the card below");
+            crate::dom::append_child(below, below_text);
+            crate::dom::append_child(body, below);
+            let (frames, hits, blit_diffs) = with_stable_fonts(|| {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                crate::retained_layers::RESIZE_STRIPS_OVERRIDE.with(|value| value.set(Some(true)));
+                crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE
+                    .with(|value| value.set(Some(blit)));
+                let blit_before = crate::render_skia::paint_damage_blit_stats().2;
+                let before = crate::retained_layers::RESIZE_STRIPS_NONE_IMAGES.with(Cell::get);
+                render_document_rgba(180, 240).expect("first frame");
+                let mut frames = Vec::new();
+                for edit in edits {
+                    crate::dom::set_text_content(text, edit);
+                    frames.push(render_document_rgba(180, 240).expect("edited frame").rgba);
+                }
+                (
+                    frames,
+                    crate::retained_layers::RESIZE_STRIPS_NONE_IMAGES.with(Cell::get) - before,
+                    crate::render_skia::paint_damage_blit_stats().2 - blit_before,
+                )
+            });
+            assert!(
+                hits > 0,
+                "the card's none image layer must pass the strips check"
+            );
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::retained_layers::RESIZE_STRIPS_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::retained_layers::PAINT_DAMAGE_BLIT_OVERRIDE.with(|value| value.set(Some(0)));
+            crate::dom::set_text_content(text, "card 0 says hello");
+            for (step, edit) in edits.into_iter().enumerate() {
+                crate::dom::set_text_content(text, edit);
+                let fresh = with_stable_fonts(|| {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(180, 240).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "blit {blit} step {step}: a strips damage frame differs from a full paint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_skip_matches_a_full_composite() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(None));
+                crate::render_skia::PAINT_OFFSCREEN_SKIP_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        crate::retained_layers::PAINT_DAMAGE_SPANS_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::paint_artifact::ARTIFACT_SPLICE_OVERRIDE.with(|value| value.set(Some(true)));
+        crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        let edits: [(usize, &str); 5] = [
+            (10, "card 10 is edited far below the surface"),
+            (11, "card 11 too"),
+            (10, "card 10 again"),
+            (0, "card 0 is edited on the surface"),
+            (11, "card 11 once more"),
+        ];
+        for mode in [1u8, 2] {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            invalidate_retained_frame();
+            let body = crate::dom::body_id();
+            let mut texts = Vec::new();
+            for index in 0..12 {
+                let card = crate::dom::create_element("div");
+                for (name, value) in [
+                    ("width", "140px"),
+                    ("height", "100px"),
+                    ("background", "#eeeeff"),
+                ] {
+                    crate::dom::set_style_property(card, name, value);
+                }
+                let paragraph = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("card {index} says hello"));
+                crate::dom::append_child(paragraph, text);
+                crate::dom::append_child(card, paragraph);
+                crate::dom::append_child(body, card);
+                texts.push(text);
+            }
+            let (frames, (skipped, verified, differed)) = with_stable_fonts(|| {
+                crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(true)));
+                crate::render_skia::PAINT_OFFSCREEN_SKIP_OVERRIDE
+                    .with(|value| value.set(Some(mode)));
+                let before = crate::render_skia::paint_offscreen_skip_stats();
+                render_document_rgba(160, 240).expect("first frame");
+                let mut frames = Vec::new();
+                for (card, text) in edits {
+                    crate::dom::set_text_content(texts[card], text);
+                    frames.push(render_document_rgba(160, 240).expect("edited frame").rgba);
+                }
+                let after = crate::render_skia::paint_offscreen_skip_stats();
+                (
+                    frames,
+                    (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+                )
+            });
+            assert_eq!(
+                differed, 0,
+                "an off-surface frame differs from the previous one"
+            );
+            if mode == 1 {
+                assert!(
+                    skipped >= 3,
+                    "off-surface edits must skip, skipped {skipped}"
+                );
+            } else {
+                assert!(
+                    verified >= 3,
+                    "off-surface edits must verify, verified {verified}"
+                );
+            }
+            crate::render_skia::PAINT_DAMAGE_OVERRIDE.with(|value| value.set(Some(false)));
+            crate::render_skia::PAINT_OFFSCREEN_SKIP_OVERRIDE.with(|value| value.set(Some(0)));
+            for (index, text) in texts.iter().enumerate() {
+                crate::dom::set_text_content(*text, &format!("card {index} says hello"));
+            }
+            for (step, (card, text)) in edits.into_iter().enumerate() {
+                crate::dom::set_text_content(texts[card], text);
+                let fresh = with_stable_fonts(|| {
+                    crate::incremental_layout::invalidate();
+                    invalidate_retained_frame();
+                    render_document_rgba(160, 240).expect("fresh frame")
+                });
+                assert!(
+                    frames[step] == fresh.rgba,
+                    "mode {mode} step {step}: a frame differs from a full paint"
+                );
+            }
+        }
+    }
+
     #[test]
     fn layer_reuse_keeps_text_overflowing_a_zero_width_block() {
         crate::dom::reset_document();

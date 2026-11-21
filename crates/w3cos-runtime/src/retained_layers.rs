@@ -652,6 +652,31 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// `W3COS_PAINT_RESIZE_STRIPS=1`: a resized plain box whose background
+/// image list is only `none` layers (what `background: <color>` sets) takes
+/// the resized-box strips instead of its whole old and new ink. Off by
+/// default.
+pub(crate) fn resize_strips_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RESIZE_STRIPS_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_RESIZE_STRIPS").is_ok_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// Resized-box checks that passed a `none`-only image list.
+    pub(crate) static RESIZE_STRIPS_NONE_IMAGES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RESIZE_STRIPS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The moved spans recorded with a damage list of `len` entries.
 pub fn take_damage_moves(len: usize) -> Option<Vec<MovedSpan>> {
     DAMAGE_MOVES
@@ -964,6 +989,18 @@ fn resized_box_damage(
             .iter()
             .any(|word| name.contains(word))
     };
+    // `background: <color>` leaves a `none` image layer: it paints no image
+    // (`W3COS_PAINT_RESIZE_STRIPS=1`; off by default it counts as one).
+    let no_image = style.background_image.as_deref().is_none_or(|value| {
+        resize_strips_enabled()
+            && value.split(',').all(|layer| {
+                let layer = layer.trim();
+                layer.is_empty() || layer.eq_ignore_ascii_case("none")
+            })
+    });
+    if style.background_image.is_some() && no_image {
+        RESIZE_STRIPS_NONE_IMAGES.with(|count| count.set(count.get() + 1));
+    }
     let plain = plain_kind
         && a.kind == b.kind
         && a.style == b.style
@@ -989,7 +1026,7 @@ fn resized_box_damage(
         ]
         .iter()
         .all(|radius| radius.is_none_or(|radius| radius == 0.0))
-        && style.background_image.is_none()
+        && no_image
         && style
             .custom_properties
             .as_ref()
@@ -1007,6 +1044,79 @@ fn resized_box_damage(
         && old.x.to_bits() == new.x.to_bits()
         && old.y.to_bits() == new.y.to_bits();
     if !plain {
+        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })
+        {
+            let checks = [
+                ("plain kind", plain_kind),
+                ("same kind", a.kind == b.kind),
+                ("same style", a.style == b.style),
+                ("same parent", a.parent == b.parent),
+                ("visible", style.visibility == Visibility::Visible),
+                (
+                    "block display",
+                    !matches!(
+                        style.display,
+                        Display::Inline
+                            | Display::InlineBlock
+                            | Display::InlineFlex
+                            | Display::Contents
+                            | Display::ListItem
+                    ),
+                ),
+                (
+                    "overflow visible",
+                    style.overflow == Overflow::Visible
+                        && visible(style.overflow_x)
+                        && visible(style.overflow_y),
+                ),
+                ("no radius", style.border_radius == 0.0),
+                ("no image", no_image),
+                (
+                    "no painted custom property",
+                    style.custom_properties.as_ref().is_none_or(|properties| {
+                        !properties.keys().any(|name| painted_by_name(name))
+                    }),
+                ),
+                (
+                    "same clip",
+                    prev.self_clip.get(index) == cur.self_clip.get(index),
+                ),
+                ("same z", prev.z_order.get(index) == cur.z_order.get(index)),
+                (
+                    "same paint order",
+                    prev.paint_order.get(index) == cur.paint_order.get(index),
+                ),
+                (
+                    "no own fragments",
+                    [prev, cur].iter().all(|artifact| {
+                        artifact.text_fragments.get(index).is_none_or(Vec::is_empty)
+                            && artifact
+                                .column_fragments
+                                .get(index)
+                                .is_none_or(|f| f.len() <= 1)
+                    }),
+                ),
+            ];
+            let failed: Vec<&str> = checks
+                .iter()
+                .filter(|(_, ok)| !ok)
+                .map(|(name, _)| *name)
+                .collect();
+            let names: Vec<String> = style
+                .custom_properties
+                .as_ref()
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .take(8)
+                        .map(|name| name.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "[paint-damage-trace]   resized box {index} not plain: failed {failed:?}; rect {old:?} -> {new:?}; custom properties {names:?}"
+            );
+        }
         return None;
     }
     let border = [
