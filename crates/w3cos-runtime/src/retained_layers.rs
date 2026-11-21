@@ -1727,7 +1727,19 @@ fn paint_diff_clients_inner(
     let url_maps = std::cell::RefCell::new(w3cos_std::fxhash::FxHashMap::<usize, bool>::default());
     // Siblings usually share their parent's map: check the last one first.
     let last_url_map = std::cell::Cell::new((usize::MAX, false));
+    let memo = paint_property_memo_mode();
     let has_url = |properties: &w3cos_std::style::CustomProperties| {
+        let scan = |map: &w3cos_std::style::CustomPropertyMap| {
+            map.values().any(|value| value.contains("url("))
+        };
+        if memo != 0 {
+            let found = properties.memo_flag(PROPERTY_MEMO_URL, scan);
+            if memo == 2 && found != scan(properties) {
+                eprintln!("[paint-property-memo-verify] mismatch: url");
+                PAINT_PROPERTY_MEMO_MISMATCHES.with(|count| count.set(count.get() + 1));
+            }
+            return found;
+        }
         let key = properties.identity();
         let (last_key, last_found) = last_url_map.get();
         if last_key == key {
@@ -2131,6 +2143,15 @@ fn paint_diff_clients_inner(
                     // Text-run and font bookkeeping is the client's own;
                     // anything that paints (or reads) across clients is not.
                     && style.custom_properties.as_ref().is_none_or(|properties| {
+                        if memo != 0 {
+                            let own = properties.memo_flag(PROPERTY_MEMO_CLIENT_ONLY, client_only_names);
+                            if memo == 2 && own != client_only_names(properties) {
+                                eprintln!("[paint-property-memo-verify] mismatch: client-only names");
+                                PAINT_PROPERTY_MEMO_MISMATCHES
+                                    .with(|count| count.set(count.get() + 1));
+                            }
+                            return own;
+                        }
                         properties.keys().all(|name| {
                             ![
                                 "background",
@@ -2270,6 +2291,64 @@ thread_local! {
     /// `(boxes taken by span, verify mismatches)`.
     pub(crate) static PAINT_DIFF_CULLED_SPANS_STATS: std::cell::Cell<(u64, u64)> =
         const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Whether a custom property map holds only text-run and font bookkeeping:
+/// no name that paints (or reads) across clients.
+fn client_only_names(map: &w3cos_std::style::CustomPropertyMap) -> bool {
+    map.keys().all(|name| {
+        ![
+            "background",
+            "border",
+            "decoration",
+            "outline",
+            "shadow",
+            "vertical",
+            "float-line-bands",
+            "first-line",
+            "highlight",
+            "selection",
+            "resize",
+            "url",
+        ]
+        .iter()
+        .any(|word| name.contains(word))
+    })
+}
+
+/// `CustomProperties::memo_flag` slots owned by the paint diff.
+const PROPERTY_MEMO_CLIENT_ONLY: u32 = 0;
+const PROPERTY_MEMO_URL: u32 = 1;
+
+/// `W3COS_PAINT_PROPERTY_MEMO=1`: the paint diff's two per-box questions
+/// about a box's custom properties (does a value hold `url(`, does a name
+/// paint across clients) are answered once per shared map and kept on it
+/// until it changes, instead of scanning every box's map each frame (Blink
+/// keeps such bits on ComputedStyle). `=verify` also scans and compares.
+pub(crate) fn paint_property_memo_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_PROPERTY_MEMO_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_PROPERTY_MEMO").ok().as_deref() {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_PROPERTY_MEMO_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static PAINT_PROPERTY_MEMO_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Per effect node, whether it or an ancestor effect has a filter.

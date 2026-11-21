@@ -121,6 +121,9 @@ struct CustomPropertyData {
     map: CustomPropertyMap,
     /// 0: not computed; otherwise `FILTER_READY` | the keys' bits.
     filter: std::sync::atomic::AtomicU64,
+    /// Per-map answers of `memo_flag`: two bits per slot (known, value),
+    /// reset by every mutation like `filter`.
+    flags: std::sync::atomic::AtomicU8,
 }
 
 const FILTER_READY: u64 = 1 << 63;
@@ -131,6 +134,9 @@ impl Clone for CustomPropertyData {
             map: self.map.clone(),
             filter: std::sync::atomic::AtomicU64::new(
                 self.filter.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            flags: std::sync::atomic::AtomicU8::new(
+                self.flags.load(std::sync::atomic::Ordering::Relaxed),
             ),
         }
     }
@@ -202,7 +208,28 @@ impl CustomProperties {
     fn map_mut(&mut self) -> &mut CustomPropertyMap {
         let data = std::sync::Arc::make_mut(&mut self.0);
         *data.filter.get_mut() = 0;
+        *data.flags.get_mut() = 0;
         &mut data.map
+    }
+
+    /// A predicate over the whole map, computed once per shared map and
+    /// kept until it changes: callers that ask the same question of every
+    /// box sharing a map (Blink caches such bits on ComputedStyle) pay for
+    /// it once. `slot` (0..4) names the question; each caller owns one.
+    #[inline]
+    pub fn memo_flag(&self, slot: u32, compute: impl FnOnce(&CustomPropertyMap) -> bool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        debug_assert!(slot < 4);
+        let known = 1u8 << (2 * slot);
+        let flags = self.0.flags.load(Relaxed);
+        if flags & known != 0 {
+            return flags & (known << 1) != 0;
+        }
+        let value = compute(&self.0.map);
+        self.0
+            .flags
+            .fetch_or(known | if value { known << 1 } else { 0 }, Relaxed);
+        value
     }
 
     /// `HashMap::contains_key` behind the key filter: an absent key, the
@@ -284,6 +311,7 @@ impl From<CustomPropertyMap> for CustomProperties {
         Self(std::sync::Arc::new(CustomPropertyData {
             map,
             filter: Default::default(),
+            flags: Default::default(),
         }))
     }
 }
@@ -1849,6 +1877,30 @@ mod tests {
             assert_eq!(props.contains_key(key), map.contains_key(key), "{key}");
             assert_eq!(props.get(key), map.get(key), "{key}");
         }
+    }
+
+    #[test]
+    fn memo_flags_follow_every_mutation() {
+        let has_url = |props: &CustomProperties| {
+            props.memo_flag(1, |map| map.values().any(|value| value.contains("url(")))
+        };
+        let mut props = CustomProperties::new();
+        assert!(!has_url(&props));
+        props.insert("--bg".into(), "url(a.png)".into());
+        assert!(has_url(&props));
+        // A shared map keeps its answer; the unshared copy recomputes it.
+        let shared = props.clone();
+        props.remove("--bg");
+        assert!(has_url(&shared));
+        assert!(!has_url(&props));
+        (*props).insert("--through-deref-mut".into(), "url(b)".into());
+        assert!(has_url(&props));
+        props.retain(|_, value| !value.contains("url("));
+        assert!(!has_url(&props));
+        // Slots are independent.
+        props.insert("--x".into(), "1".into());
+        assert!(props.memo_flag(0, |map| map.contains_key("--x")));
+        assert!(!has_url(&props));
     }
 
     #[test]
