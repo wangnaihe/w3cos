@@ -1498,6 +1498,9 @@ struct CullIndex<'a> {
     artifact: &'a PaintArtifact,
     /// Per node its cull key, per key its extent (built on first use).
     extents: Option<CullExtents>,
+    /// `W3COS_PAINT_CULL_FRAME_EXTENTS`: per key the extent of this frame's
+    /// boxes only (see `frame_extents`), when built.
+    frame: Option<w3cos_std::fxhash::FxHashMap<u32, LayoutRect>>,
 }
 
 /// `CullIndex` output: per node its cull key, per key its extent.
@@ -1546,6 +1549,36 @@ thread_local! {
     static CULL_INCREMENTAL_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
 }
 
+/// `W3COS_PAINT_CULL_FRAME_EXTENTS=1` (off by default): the record cull
+/// builds its per-key extents from the boxes this frame replays and the
+/// display items (`CullIndex::frame_extents`) rather than every box of the
+/// document; with `W3COS_PAINT_SKIP_CULLED_NODES` the far boxes the band
+/// dropped are not visited each frame. `=verify` also builds the full
+/// extents and compares every lookup.
+fn cull_frame_extents_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = CULL_FRAME_EXTENTS_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_CULL_FRAME_EXTENTS").as_deref() {
+            Ok("1" | "true") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static CULL_FRAME_EXTENTS_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static CULL_FRAME_EXTENTS_MISMATCHES: Cell<usize> = const { Cell::new(0) };
+}
+
 impl Drop for CullIndex<'_> {
     fn drop(&mut self) {
         if cull_incremental_mode() != 0 {
@@ -1563,7 +1596,50 @@ impl<'a> CullIndex<'a> {
         Self {
             artifact,
             extents: None,
+            frame: None,
         }
+    }
+
+    /// The nearest non-inline ancestor-or-self of `index` (as `key_for`,
+    /// walking parents instead of reading earlier keys).
+    #[inline]
+    fn key_walk(nodes: &[crate::paint_artifact::PaintNode], index: usize) -> u32 {
+        let mut key = index;
+        while Self::is_inline(nodes, key) {
+            match nodes[key].parent {
+                Some(parent) if parent < nodes.len() => key = parent,
+                _ => break,
+            }
+        }
+        key as u32
+    }
+
+    /// `W3COS_PAINT_CULL_FRAME_EXTENTS`: the per-key extents from the boxes
+    /// this frame replays (`frame_nodes`) and every display item, instead of
+    /// every box of the document. A box the paint cull band dropped is not
+    /// replayed and has no display items: it lies past the band and so past
+    /// the record cull distance, and Blink does not visit it either.
+    fn frame_extents(&mut self, frame_nodes: &[(usize, LayoutRect, &ComponentKind, &Style)]) {
+        let artifact = self.artifact;
+        let nodes = &artifact.nodes;
+        let mut map = w3cos_std::fxhash::FxHashMap::<u32, LayoutRect>::default();
+        map.reserve(frame_nodes.len());
+        let mut add = |index: usize, rect: LayoutRect| {
+            if index < nodes.len() {
+                map.entry(Self::key_walk(nodes, index))
+                    .and_modify(|extent| *extent = union_cull_rect(*extent, rect))
+                    .or_insert(rect);
+            }
+        };
+        for &(index, _, _, _) in frame_nodes {
+            if let Some(Some(rect)) = artifact.rect_by_index.get(index) {
+                add(index, *rect);
+            }
+        }
+        for item in &artifact.display_items {
+            add(item.client_index, item.visual_rect);
+        }
+        self.frame = Some(map);
     }
 
     #[inline]
@@ -1718,6 +1794,27 @@ impl<'a> CullIndex<'a> {
 
     fn extent(&mut self, index: usize) -> Option<LayoutRect> {
         let artifact = self.artifact;
+        if let Some(frame) = &self.frame {
+            let fast = (index < artifact.nodes.len())
+                .then(|| frame.get(&Self::key_walk(&artifact.nodes, index)).copied())
+                .flatten();
+            if cull_frame_extents_mode() == 2 {
+                let extents = self
+                    .extents
+                    .get_or_insert_with(|| Self::build_for_frame(artifact));
+                let full = extents
+                    .key_of
+                    .get(index)
+                    .and_then(|&key| extents.key_extent[key as usize]);
+                if full != fast {
+                    eprintln!(
+                        "[cull-frame-extents-verify] mismatch: node {index} frame {fast:?} full {full:?}"
+                    );
+                    CULL_FRAME_EXTENTS_MISMATCHES.with(|count| count.set(count.get() + 1));
+                }
+            }
+            return fast;
+        }
         let extents = self
             .extents
             .get_or_insert_with(|| Self::build_for_frame(artifact));
@@ -3143,7 +3240,13 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
             }
         }
         let mut cull_rects = Vec::with_capacity(cache.tree.layers.len());
-        let mut culling = cull_layers.then(|| CullIndex::new(artifact));
+        let mut culling = cull_layers.then(|| {
+            let mut index = CullIndex::new(artifact);
+            if cull_frame_extents_mode() != 0 {
+                index.frame_extents(frame.nodes);
+            }
+            index
+        });
         let mut offsets = Vec::with_capacity(cache.tree.layers.len());
         for (layer_index, layer) in cache.tree.layers.iter().enumerate() {
             offsets.push(if keep[layer_index] {
@@ -10358,6 +10461,34 @@ mod tests {
             extent(&full, grown).is_some_and(|e| e.height >= 18.0 + 60.0),
             "the grown block's extent covers its overflowing inline"
         );
+        // Frame extents over every box agree with the full build, and the
+        // walked key with the indexed one.
+        let frame_nodes: Vec<(usize, LayoutRect, &ComponentKind, &Style)> = next
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                (
+                    index,
+                    next.rect_by_index[index].unwrap_or(LayoutRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.0,
+                        height: 0.0,
+                    }),
+                    &node.kind,
+                    &*node.style,
+                )
+            })
+            .collect();
+        let mut index = CullIndex::new(&next);
+        index.frame_extents(&frame_nodes);
+        let frame = index.frame.take().expect("frame extents");
+        for node in 0..next.nodes.len() {
+            let key = CullIndex::key_walk(&next.nodes, node);
+            assert_eq!(key, full.key_of[node], "key of node {node}");
+            assert_eq!(frame.get(&key).copied(), extent(&full, node), "node {node}");
+        }
     }
 
     #[test]
