@@ -87,11 +87,9 @@ fn authored_line_styles_full(text: &str, style: &Style, lines: &[String]) -> Opt
             .filter_map(|(owner, owner_start, owner_end)| {
                 let local_start = (*owner_start).max(start);
                 let local_end = (*owner_end).min(end);
-                (local_start < local_end).then_some((
-                    *owner,
-                    local_start - start,
-                    local_end - start,
-                ))
+                // Lazily: an owner range ending before this line would
+                // underflow.
+                (local_start < local_end).then(|| (*owner, local_start - start, local_end - start))
             })
             .collect::<Vec<_>>();
         if lines.len() == 1
@@ -2221,6 +2219,23 @@ pub fn clear_paint_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_line_styles_skip_owner_ranges_that_end_before_the_line() {
+        // An owner range that ends before a later line must be dropped
+        // for that line rather than underflow its line-local offsets.
+        let text = "aaa bbb";
+        let mut style = Style::default();
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut style, text, &[(7, 0, 3)]);
+        let lines = vec!["aaa".to_string(), "bbb".to_string()];
+        let styles = authored_line_styles_full(text, &style, &lines).expect("two line styles");
+        assert_eq!(styles.len(), 2);
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges("aaa", &styles[0]),
+            vec![(7, 0, 3)]
+        );
+        assert!(w3cos_std::inline_text::cssom_owner_ranges("bbb", &styles[1]).is_empty());
+    }
 
     #[test]
     fn authored_line_styles_one_line_early_out_matches_full_path() {
