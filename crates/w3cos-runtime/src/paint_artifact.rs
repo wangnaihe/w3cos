@@ -6352,6 +6352,9 @@ mod tests {
         PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(Some(1)));
         PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(Some(1)));
         PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(Some(1)));
+        // Subtree culling stays off outside its own loop below (whatever
+        // `W3COS_PAINT_CULL_SUBTREES` is), so the short checks are counted.
+        PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(Some(0)));
         let mut block = Style::default();
         block.display = Display::Block;
         let nodes = || {
@@ -6408,7 +6411,7 @@ mod tests {
             let before = PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get);
             let whole = build(32.0, Some(&second), 1);
             let after = PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get);
-            PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(None));
+            PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(Some(0)));
             assert!(after.0 > before.0, "the moved span is taken whole");
             assert!(after.1 - before.1 >= 30);
             assert_eq!(
@@ -6474,6 +6477,7 @@ mod tests {
         let fast = build(32.0, Some(&second), 1);
         let full = build(32.0, Some(&second), 0);
         PAINT_CULL_RUN_GAPS_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(None));
         PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(None));
         PAINT_CULL_RUNS_OVERRIDE.with(|mode| mode.set(None));
         PAINT_CULL_RECT_OVERRIDE.with(|mode| mode.set(None));
