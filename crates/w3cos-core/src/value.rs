@@ -4779,6 +4779,10 @@ impl From<&str> for Value {
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
+        if value.len() >= LONG_STRING_HEAP_BYTES {
+            // Already owned: keep the buffer, free it with the last value.
+            return Value::from_js_string(JsString::heap_owned(value));
+        }
         Value::from_js_string(JsString::from(value))
     }
 }
@@ -4953,8 +4957,22 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
     let mut owned = String::with_capacity(total);
     owned.push_str(left_text);
     owned.push_str(right_text);
+    if total >= LONG_STRING_HEAP_BYTES {
+        // Page-interned strings live until the page resets, which a
+        // long-running app never does. A `s += chunk` loop would keep every
+        // intermediate result, O(n^2) bytes for an n-byte string. A long
+        // result is a refcounted heap string instead: freed when the last
+        // value holding it is dropped.
+        return Value::from_js_string(JsString::heap_owned(owned));
+    }
     Value::from_js_string(JsString::intern(&owned))
 }
+
+/// Concatenation results and owned `String` values (file contents, decoded
+/// buffers, JSON text) at least this long are heap (`Rc`) strings rather
+/// than page-interned ones: interned strings are never freed before a page
+/// reset. See [`concat_js_values`] and `From<String> for Value`.
+pub(crate) const LONG_STRING_HEAP_BYTES: usize = 1024;
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
@@ -7015,6 +7033,50 @@ mod tests {
             _ => panic!("long page string clone must stay Imm, not Rc"),
         }
         assert_eq!(s.to_js_string(), raw);
+    }
+
+    #[test]
+    fn long_concatenation_results_do_not_accumulate_in_the_page_intern_table() {
+        let chunk = Value::string(&"c".repeat(100));
+        let before = crate::page_arena::allocated_bytes();
+        let mut text = Value::string("");
+        for _ in 0..200 {
+            text = text.js_add(&chunk);
+        }
+        assert_eq!(text.to_js_string().len(), 20_000);
+        assert!(text.is_string());
+        // Short prefixes are still interned; long intermediates are not.
+        let after = crate::page_arena::allocated_bytes();
+        let retained = after - before;
+        assert!(
+            retained < 2 * LONG_STRING_HEAP_BYTES * LONG_STRING_HEAP_BYTES / 100,
+            "{retained} bytes interned building one 20000-byte string"
+        );
+        // The heap result behaves like any other string value.
+        let suffix = text.js_add(&Value::string("!"));
+        assert_eq!(suffix.to_js_string().len(), 20_001);
+        assert!(text.strict_eq(&Value::string(&"c".repeat(20_000))));
+    }
+
+    #[test]
+    fn long_owned_strings_are_freed_with_their_values() {
+        let before = crate::page_arena::allocated_bytes();
+        for index in 0..50 {
+            // Like file contents read as UTF-8: distinct, long, short-lived.
+            let text = Value::from(format!("{index:04}{}", "f".repeat(4000)));
+            assert_eq!(text.to_js_string().len(), 4004);
+            assert!(text.is_string());
+        }
+        let retained = crate::page_arena::allocated_bytes() - before;
+        assert!(
+            retained < 4000,
+            "{retained} bytes interned for 50 dropped 4 KB strings"
+        );
+        let short = Value::from("short".to_string());
+        assert!(
+            short.as_immediate().is_some(),
+            "short strings stay interned"
+        );
     }
 
     #[test]
