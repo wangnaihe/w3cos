@@ -23119,9 +23119,9 @@ fn js_clear_timer(id: u32) {
 /// Entry counts of the binding side tables keyed by DOM node (`W3COS_MEM_STATS`).
 /// A table that keeps growing while `dom.live_nodes` is flat retains
 /// entries for removed nodes.
-pub fn binding_table_stats() -> Vec<(&'static str, usize)> {
-    fn len<T>(table: &'static std::thread::LocalKey<RefCell<T>>, f: fn(&T) -> usize) -> usize {
-        table.with(|table| table.try_borrow().map(|table| f(&table)).unwrap_or(0))
+pub fn binding_table_stats() -> Vec<(&'static str, u64)> {
+    fn len<T>(table: &'static std::thread::LocalKey<RefCell<T>>, f: fn(&T) -> usize) -> u64 {
+        table.with(|table| table.try_borrow().map(|table| f(&table) as u64).unwrap_or(0))
     }
     vec![
         ("element_values", len(&ELEMENT_VALUES, |t| t.len())),
