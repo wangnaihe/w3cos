@@ -63,6 +63,11 @@ struct RetainedPaint {
     artifact: PaintArtifact,
     /// The paint layout (`paint_layout_generation`) the artifact shows.
     layout_generation: u64,
+    /// `W3COS_PAINT_QUIET_FRAME`: the artifact's diff against itself (dirty,
+    /// moved), kept while the artifact, its rects and its scroll stay as
+    /// they are, so a run of quiet frames diffs once.
+    #[cfg_attr(not(feature = "skia"), allow(dead_code))]
+    quiet_diff: Option<(Vec<bool>, Vec<Option<(f32, f32)>>)>,
 }
 
 /// The damage of `diff` against the retained artifact, measured in
@@ -828,6 +833,7 @@ fn finish_headless_frame(
             rect_independent,
             artifact,
             layout_generation: crate::incremental_layout::paint_layout_generation(),
+            quiet_diff: None,
         })
     });
     if let Some(replaced) = replaced {
@@ -948,6 +954,9 @@ fn reuse_retained_paint(
             return Ok(None);
         }
         let scroll_same = retained.artifact.viewport_scroll == scroll;
+        if !scroll_same || reuse != crate::incremental_layout::PaintReuse::Scroll {
+            retained.quiet_diff = None;
+        }
         retained.artifact.viewport_scroll = scroll;
         if crate::paint_artifact::paint_cull_rect_mode() == 2 {
             verify_paint_cull(&retained.artifact, width, height);
@@ -976,7 +985,7 @@ fn reuse_retained_paint(
             && reuse == crate::incremental_layout::PaintReuse::Scroll
             && scroll_same
             && !force_cpu
-            && quiet_frame_invalidation(&retained.artifact);
+            && quiet_frame_invalidation(&retained.artifact, &mut retained.quiet_diff, quiet_mode);
         #[cfg(not(feature = "skia"))]
         let _ = scroll_same;
         let frame = paint_retained_artifact(
@@ -1082,7 +1091,11 @@ pub fn quiet_frame_stats() -> (u64, u64) {
 /// against itself. False (nothing set) when the kept recordings may not be
 /// current or the damage cannot be bounded.
 #[cfg(feature = "skia")]
-fn quiet_frame_invalidation(artifact: &PaintArtifact) -> bool {
+fn quiet_frame_invalidation(
+    artifact: &PaintArtifact,
+    kept: &mut Option<(Vec<bool>, Vec<Option<(f32, f32)>>)>,
+    mode: u8,
+) -> bool {
     if !paint_layer_reuse_enabled()
         || !HEADLESS_SKIA_CURRENT.with(Cell::get)
         || HEADLESS_SKIA_FONTS.with(Cell::get)
@@ -1090,8 +1103,39 @@ fn quiet_frame_invalidation(artifact: &PaintArtifact) -> bool {
     {
         return false;
     }
-    let Some(diff) = crate::retained_layers::paint_diff_clients(artifact, artifact) else {
-        return false;
+    // The diff of an unchanged artifact against itself depends only on the
+    // artifact, so a run of quiet frames reuses the first one's.
+    let diff = match kept.as_ref() {
+        Some((dirty, moved)) => {
+            let diff = crate::retained_layers::PaintDiff {
+                dirty: dirty.clone(),
+                moved: moved.clone(),
+            };
+            if mode == 2 {
+                let fresh = crate::retained_layers::paint_diff_clients(artifact, artifact);
+                if fresh
+                    .as_ref()
+                    .is_none_or(|fresh| fresh.dirty != diff.dirty || fresh.moved != diff.moved)
+                {
+                    eprintln!("[paint-quiet-frame-verify] mismatch: kept self-diff differs");
+                    QUIET_FRAME_STATS.with(|stats| {
+                        let mut value = stats.get();
+                        value.1 += 1;
+                        stats.set(value);
+                    });
+                    *kept = None;
+                    return false;
+                }
+            }
+            diff
+        }
+        None => {
+            let Some(diff) = crate::retained_layers::paint_diff_clients(artifact, artifact) else {
+                return false;
+            };
+            *kept = Some((diff.dirty.clone(), diff.moved.clone()));
+            diff
+        }
     };
     let skip_only = !crate::render_skia::paint_damage_enabled()
         && crate::render_skia::paint_offscreen_skip_mode() != 0;
