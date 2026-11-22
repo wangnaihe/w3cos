@@ -996,6 +996,9 @@ fn reuse_retained_paint(
             layout_results,
             &retained.artifact,
         )?;
+        // A sync that did not run must not carry the hint to a later frame.
+        #[cfg(feature = "skia")]
+        crate::retained_layers::set_quiet_content(0);
         #[cfg(feature = "skia")]
         if quiet {
             let skipped = crate::render_skia::paint_offscreen_skip_stats();
@@ -1008,6 +1011,7 @@ fn reuse_retained_paint(
                 // A frame painted without the diff re-records every layer
                 // and composites in full.
                 crate::render_skia::set_pending_paint_invalidation(None);
+                crate::retained_layers::set_quiet_content(0);
                 let full = paint_retained_artifact(
                     width,
                     height,
@@ -1150,6 +1154,7 @@ fn quiet_frame_invalidation(
     crate::render_skia::set_pending_paint_moved(Some(diff.moved));
     crate::render_skia::set_pending_paint_damage(damage);
     crate::render_skia::set_pending_lazy_damage(skip_only || early_out);
+    crate::retained_layers::set_quiet_content(mode);
     true
 }
 
@@ -2940,7 +2945,13 @@ mod tests {
             let after = super::quiet_frame_stats();
             (frames, (after.0 - before.0, after.1 - before.1))
         };
+        let content_before = crate::retained_layers::quiet_content_mismatches();
         let (verified, (quiet, mismatched)) = run(2);
+        assert_eq!(
+            crate::retained_layers::quiet_content_mismatches(),
+            content_before,
+            "a quiet frame's kept content fingerprint is stale"
+        );
         assert!(
             quiet > 0,
             "frames without a change must take the quiet path"

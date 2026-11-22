@@ -220,7 +220,19 @@ impl RetainedLayerTree {
         if reused {
             LAYER_REUSE_HITS.with(|count| count.set(count.get() + 1));
         }
-        let content = if known_changed {
+        let quiet = QUIET_CONTENT.with(|slot| slot.replace(0));
+        let content = if quiet != 0 && !known_changed && self.content_fingerprint != 0 {
+            // `W3COS_PAINT_QUIET_FRAME`: the artifact is the one the kept
+            // fingerprint was taken of, so its content is unchanged.
+            if quiet == 2 && content_fingerprint(artifact, &layers) | 1 != self.content_fingerprint
+            {
+                eprintln!("[paint-quiet-frame-verify] mismatch: content fingerprint changed");
+                QUIET_CONTENT_MISMATCHES.with(|count| count.set(count.get() + 1));
+                content_fingerprint(artifact, &layers) | 1
+            } else {
+                self.content_fingerprint
+            }
+        } else if known_changed {
             if layer_sync_fast_verify()
                 && content_fingerprint(artifact, &layers) | 1 == self.content_fingerprint
                 && self.recordings_valid
@@ -435,6 +447,25 @@ pub(crate) fn layer_reuse_mode() -> u8 {
 thread_local! {
     pub(crate) static LAYER_REUSE_OVERRIDE: std::cell::Cell<Option<u8>> =
         const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Set by a quiet frame (`W3COS_PAINT_QUIET_FRAME` mode) for the next
+    /// layer sync: the artifact is unchanged since the last sync.
+    static QUIET_CONTENT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    pub(crate) static QUIET_CONTENT_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The next layer sync sees the artifact the last one synced (`mode` 1),
+/// or compares that against a fresh fingerprint (`mode` 2).
+pub(crate) fn set_quiet_content(mode: u8) {
+    QUIET_CONTENT.with(|slot| slot.set(mode));
+}
+
+/// Quiet-frame content fingerprint mismatches under verify.
+pub fn quiet_content_mismatches() -> u64 {
+    QUIET_CONTENT_MISMATCHES.with(std::cell::Cell::get)
 }
 
 thread_local! {
