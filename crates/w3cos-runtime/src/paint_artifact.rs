@@ -11075,7 +11075,7 @@ pub(crate) fn paint_cull_runs_mode() -> u8 {
     )
 }
 
-/// `W3COS_PAINT_CULL_RUN_GAPS=1`: inside last frame's culled runs, and a
+/// `W3COS_PAINT_CULL_RUN_GAPS` (on by default, `=0` turns it off): inside last frame's culled runs, and a
 /// gap of the layout's changed boxes, `copy_culled_run` checks only what
 /// may differ per box this frame (its parent, its geometry against the band)
 /// instead of every input again: the rest held when the run was copied and
@@ -11089,9 +11089,9 @@ pub(crate) fn paint_cull_run_gaps_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_CULL_RUN_GAPS").ok().as_deref() {
-            Some("1" | "true") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
@@ -11117,7 +11117,7 @@ fn cull_spans_wanted() -> bool {
         || crate::retained_layers::paint_diff_culled_spans_mode() != 0
 }
 
-/// `W3COS_PAINT_CULL_SUBTREES=1` (with `W3COS_PAINT_CULL_RUNS` and the
+/// `W3COS_PAINT_CULL_SUBTREES` (on by default, `=0` turns it off; with `W3COS_PAINT_CULL_RUNS` and the
 /// layout's touched ranges): a culled span from last frame that lies in a
 /// gap of the changed ranges only moved as a whole, so `copy_culled_run`
 /// culls it with one test of its kept vertical extent against the band and
@@ -11131,9 +11131,9 @@ pub(crate) fn paint_cull_subtrees_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_CULL_SUBTREES").ok().as_deref() {
-            Some("1" | "true") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }

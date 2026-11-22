@@ -637,7 +637,7 @@ thread_local! {
     static LAYER_SELF_CLIP_EQ_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `W3COS_LAYER_SELF_CLIP_EQ=1` (off by default): the layer tree keeps the
+/// `W3COS_LAYER_SELF_CLIP_EQ` (on by default, `=0` turns it off): the layer tree keeps the
 /// artifact's per-node self clips and compares them with the next frame's
 /// instead of hashing all of them (one per box) into the global
 /// fingerprint every frame. `=verify` also hashes them and reports when
@@ -646,9 +646,9 @@ fn layer_self_clip_eq_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_LAYER_SELF_CLIP_EQ").as_deref() {
-            Ok("1" | "true") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
@@ -1054,16 +1054,16 @@ pub(crate) fn paint_damage_until(
     paint_damage_with(prev, cur, diff, &mut MeasureInk, Some(stop))
 }
 
-/// `W3COS_PAINT_DAMAGE_QUIET_RUNS=1` (off by default): `paint_damage_with`
+/// `W3COS_PAINT_DAMAGE_QUIET_RUNS` (on by default, `=0` turns it off): `paint_damage_with`
 /// skips a run of quiet clients (dirty, painting nothing in either frame;
 /// see `W3COS_PAINT_DAMAGE_QUIET`) in one tight loop instead of one walk
 /// step each. Same damage, same order: a quiet client adds none.
 fn paint_damage_quiet_runs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("W3COS_PAINT_DAMAGE_QUIET_RUNS").as_deref(),
-            Ok("1" | "true")
+            Ok("0" | "false")
         )
     })
 }
@@ -2340,7 +2340,7 @@ fn paint_diff_clients_inner(
     Some(PaintDiff { dirty, moved })
 }
 
-/// `W3COS_PAINT_DIFF_CULLED_SPANS=1` (with `W3COS_PAINT_CULL_RUNS`): the
+/// `W3COS_PAINT_DIFF_CULLED_SPANS` (on by default, `=0` turns it off; with `W3COS_PAINT_CULL_RUNS`): the
 /// paint diff takes a box in the build's culled spans as quiet without
 /// re-testing its display items, property nodes and inputs (the build
 /// established them when it copied the span; Blink does not visit a box
@@ -2356,9 +2356,9 @@ pub(crate) fn paint_diff_culled_spans_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1" | "true") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
@@ -2402,7 +2402,7 @@ fn client_only_names(map: &w3cos_std::style::CustomPropertyMap) -> bool {
 const PROPERTY_MEMO_CLIENT_ONLY: u32 = 0;
 const PROPERTY_MEMO_URL: u32 = 1;
 
-/// `W3COS_PAINT_PROPERTY_MEMO=1`: the paint diff's two per-box questions
+/// `W3COS_PAINT_PROPERTY_MEMO` (on by default, `=0` turns it off): the paint diff's two per-box questions
 /// about a box's custom properties (does a value hold `url(`, does a name
 /// paint across clients) are answered once per shared map and kept on it
 /// until it changes, instead of scanning every box's map each frame (Blink
@@ -2415,9 +2415,9 @@ pub(crate) fn paint_property_memo_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_PROPERTY_MEMO").ok().as_deref() {
-            Some("1" | "true") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }

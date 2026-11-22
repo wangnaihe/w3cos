@@ -1549,7 +1549,7 @@ thread_local! {
     static CULL_INCREMENTAL_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
 }
 
-/// `W3COS_PAINT_CULL_FRAME_EXTENTS=1` (off by default): the record cull
+/// `W3COS_PAINT_CULL_FRAME_EXTENTS` (on by default, `=0` turns it off): the record cull
 /// builds its per-key extents from the boxes this frame replays and the
 /// display items (`CullIndex::frame_extents`) rather than every box of the
 /// document; with `W3COS_PAINT_SKIP_CULLED_NODES` the far boxes the band
@@ -1563,9 +1563,9 @@ fn cull_frame_extents_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_CULL_FRAME_EXTENTS").as_deref() {
-            Ok("1" | "true") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
