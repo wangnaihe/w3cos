@@ -758,23 +758,38 @@ fn persistent_nodes_plan<'a>(
     body_index: Option<usize>,
     viewport: Option<(f32, f32)>,
 ) -> Option<PersistPlan<'a>> {
-    let previous = previous?;
-    let trimmed = previous.persist_trimmed.clone()?;
+    // `=verify` says why a build takes the full path (coverage checks).
+    let full = |why: &str| {
+        if persistent_nodes_mode() == 2 || persist_inplace_mode() == 2 {
+            eprintln!("[paint-persistent-nodes-verify] full: {why}");
+        }
+        None
+    };
+    let Some(previous) = previous else {
+        return full("no previous build");
+    };
+    let Some(trimmed) = previous.persist_trimmed.clone() else {
+        return full("previous build not persistent");
+    };
     // Used styles depend on the viewport (fixed backgrounds).
-    if previous.persist_viewport != viewport
-        || previous.persist_percent_padding
-        || previous.nodes.len() != nodes.len()
-        || nodes.is_empty()
-    {
-        return None;
+    if previous.persist_viewport != viewport {
+        return full("viewport");
     }
-    let changed = PAINT_TOUCHED.with(|touched| {
+    if previous.persist_percent_padding {
+        return full("percentage padding");
+    }
+    if previous.nodes.len() != nodes.len() || nodes.is_empty() {
+        return full("box count");
+    }
+    let Some(changed) = PAINT_TOUCHED.with(|touched| {
         touched
             .borrow()
             .as_ref()
             .filter(|changes| changes.len == nodes.len())
             .map(|changes| changes.changed.clone())
-    })?;
+    }) else {
+        return full("no touched set");
+    };
     let mut clean = vec![true; nodes.len()];
     for (a, b) in changed {
         clean[a as usize..(b as usize).min(nodes.len())].fill(false);
