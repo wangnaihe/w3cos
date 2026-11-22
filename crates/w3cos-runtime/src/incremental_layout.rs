@@ -2329,6 +2329,36 @@ fn assign_style_here(component: &mut Component, id: u32, style: &w3cos_std::styl
     }
 }
 
+/// Inline boxes and atomic inlines are items of their containing block's
+/// inline formatting context (Blink `NGInlineNode`). Their used style and
+/// position come from collecting that context, done when the paint tree is
+/// built, so a layout edit on one rebuilds instead of patching in place.
+fn inline_level_item(style: &w3cos_std::style::Style) -> bool {
+    matches!(
+        style.display,
+        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable
+    )
+}
+
+/// Replaced content: the builder adjusts its box (atomic-inline flex
+/// factors, used size) from the parent's formatting context.
+fn component_is_replaced(component: &Component, id: u32) -> bool {
+    if host_id(component) == Some(id) {
+        return matches!(
+            component.kind,
+            ComponentKind::Image { .. }
+                | ComponentKind::Canvas { .. }
+                | ComponentKind::TextInput { .. }
+                | ComponentKind::Button { .. }
+                | ComponentKind::SvgDocument { .. }
+        );
+    }
+    component
+        .children
+        .iter()
+        .any(|child| component_is_replaced(child, id))
+}
+
 fn style_patch_is_safe(style: &w3cos_std::style::Style) -> bool {
     !matches!(style.height, Dimension::Percent(_))
         && style.float == Float::None
@@ -3141,7 +3171,10 @@ fn sync_paint_cache(
             // `NeedsCollectInlines` on a layout-affecting inline style
             // change; the items here are collected when the paint tree is
             // built, so such an edit rebuilds it.
-            if old != &style && (old.display == Display::Inline || style.display == Display::Inline)
+            if old != &style
+                && (inline_level_item(old)
+                    || inline_level_item(&style)
+                    || component_is_replaced(&cache.component, id.as_u32()))
             {
                 return false;
             }

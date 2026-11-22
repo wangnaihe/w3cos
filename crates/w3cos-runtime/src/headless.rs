@@ -1530,6 +1530,74 @@ mod tests {
         crate::jsdom::reset_bridge();
     }
 
+    /// The last element of each page gets an inline padding edit that is
+    /// undone; the restored frame must equal a cold build. Cases from WPT
+    /// pages whose restored frame differed: an atomic inline image in an
+    /// anonymous inline formatting context, a percent-height canvas in a
+    /// table cell, and a block after floats and inline-blocks.
+    #[test]
+    fn padding_edit_undone_on_replaced_and_float_neighbours_matches_cold_build() {
+        use w3cos_core::Value;
+        fn build(html: &str) -> u32 {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::jsdom::set_viewport(300.0, 200.0);
+            let document = crate::jsdom::document_value();
+            document
+                .get_property("body")
+                .set_property("innerHTML", Value::string(html));
+            let target = document.call_method("getElementById", vec![Value::string("t")]);
+            crate::jsdom::node_id_of(&target).expect("target element")
+        }
+        let differing = |a: &HeadlessFrame, b: &HeadlessFrame| {
+            a.rgba
+                .chunks(4)
+                .zip(b.rgba.chunks(4))
+                .filter(|(x, y)| x != y)
+                .count()
+        };
+        let cases = [
+            (
+                "image",
+                "<div style='font: 40px/1 monospace'>X<span style='font-size:60px'>X</span><span>X</span><img id=t width=60 height=60 style='background:green'></div>",
+            ),
+            (
+                "canvas",
+                "<div style='display:table-cell;height:100px;line-height:0'><canvas id=t width=200 height=200 style='background:green;max-height:100%'></canvas></div>",
+            ),
+            (
+                "floats",
+                "<div style='border:1px solid green;font:20px/24px monospace;width:230px'><div style='float:left;clear:left;width:50px;height:50px;background:cyan'></div><div style='float:left;clear:left;width:50px;height:50px;background:cyan'></div><div style='display:inline-block;width:80px;height:80px;background:lime'></div><div style='display:inline-block;margin-left:-20px;vertical-align:top'>bc<br>def</div><div id=t style='margin-left:50px'>mno</div></div>",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, html) in cases {
+            build(html);
+            let cold = render_document_rgba(300, 200).unwrap();
+            let span = build(html);
+            let first = render_document_rgba(300, 200).unwrap();
+            assert_eq!(
+                differing(&first, &cold),
+                0,
+                "{name}: two cold builds must agree"
+            );
+            let style = crate::jsdom::element_value(span).get_property("style");
+            style.set_property("paddingBottom", Value::string("3px"));
+            let _ = render_document_rgba(300, 200).unwrap();
+            style.call_method("removeProperty", vec![Value::string("padding-bottom")]);
+            let restored = render_document_rgba(300, 200).unwrap();
+            let count = differing(&restored, &cold);
+            if count != 0 {
+                failures.push(format!("{name}: {count} pixels"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "restored frames differ from a cold build: {failures:?}"
+        );
+        crate::jsdom::reset_bridge();
+    }
+
     #[test]
     fn window_scroll_keeps_fixed_descendants_in_the_viewport() {
         crate::dom::reset_document();
