@@ -1572,6 +1572,15 @@ pub(super) fn try_splice(
     viewport_w: f32,
     viewport_h: f32,
 ) -> bool {
+    // The retained tree was laid out by the legacy engine (LayoutNG
+    // refused it as a whole); a subtree solve would run LayoutNG on the
+    // part it accepts and publish different geometry than a full layout.
+    if cache.engine.ng_fell_back() {
+        if debug_enabled() {
+            eprintln!("[splice] refused: full tree is on the legacy engine");
+        }
+        return false;
+    }
     if !cache.splice_owners_ok
         || cache.viewport_w_bits != viewport_w.to_bits()
         || cache.viewport_h_bits != viewport_h.to_bits()
@@ -3534,6 +3543,9 @@ pub(super) fn style_subtree_may_apply(
 ) -> bool {
     subtree_relayout_enabled()
         && cache.splice_ok
+        // A subtree solve on a tree the legacy engine laid out as a whole
+        // would mix engines (see `try_splice`).
+        && !cache.engine.ng_fell_back()
         && cache.skip_projections
         && cache.viewport_w_bits == viewport_w.to_bits()
         && cache.viewport_h_bits == viewport_h.to_bits()
@@ -4750,6 +4762,65 @@ mod tests {
         crate::dom::class_list_remove(items[1], "pad");
         assert!(crate::incremental_layout::flush());
         assert_matches_full("padding off");
+        crate::stylesheet::clear_rules();
+    }
+
+    /// css/css-tables/min-max-size-table-content-box-ref.html: removing and
+    /// re-inserting the only child of a max-width grid item (an
+    /// inline-block, blockified) with a layout flush in between must lay
+    /// it out as a full layout does.
+    #[test]
+    fn grid_item_child_remove_reinsert_matches_full() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".table",
+            &[
+                ("box-sizing", "content-box"),
+                ("border", "3px solid black"),
+                ("padding", "5px"),
+                ("display", "inline-block"),
+            ],
+        );
+        crate::stylesheet::register_rule(".td", &[("padding", "1px")]);
+        crate::stylesheet::register_rule(".big", &[("width", "75px"), ("height", "75px")]);
+        crate::stylesheet::register_rule(
+            ".grid",
+            &[("display", "grid"), ("width", "75px"), ("height", "75px")],
+        );
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let body = crate::dom::body_id();
+        style(body, &[("margin", "0px"), ("font", "16px/0 monospace")]);
+        let class = |tag: &str, name: &str| {
+            let node = crate::dom::create_element(tag);
+            crate::dom::class_list_add(node, name);
+            node
+        };
+        for _ in 0..2 {
+            let table = class("div", "table");
+            let td = class("div", "td");
+            crate::dom::append_child(td, class("div", "big"));
+            crate::dom::append_child(table, td);
+            crate::dom::append_child(body, table);
+            crate::dom::append_child(body, crate::dom::create_element("br"));
+            crate::dom::append_child(body, crate::dom::create_text_node("\n"));
+        }
+        let grid = class("div", "grid");
+        let table = class("div", "table");
+        style(table, &[("max-width", "50px")]);
+        let td = class("div", "td");
+        crate::dom::append_child(table, td);
+        crate::dom::append_child(grid, table);
+        crate::dom::append_child(body, grid);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid item initial");
+        crate::dom::remove_child(table, td);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid item child removed");
+        crate::dom::append_child(table, td);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid item child re-inserted");
         crate::stylesheet::clear_rules();
     }
 

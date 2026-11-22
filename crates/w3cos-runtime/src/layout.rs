@@ -5072,6 +5072,9 @@ fn index_taffy_nodes(tree: &TaffyTree<usize>, root: taffy::NodeId) -> Vec<taffy:
 }
 
 pub struct LayoutEngine {
+    /// The last `compute` under `Mode::On` fell back to the legacy engine
+    /// for the whole tree (`layout_ng::layout_tree_with_text` refused it).
+    ng_fallback: bool,
     tree: TaffyTree<usize>,
     root_node: Option<taffy::NodeId>,
     /// Taffy node for each component preorder index (`get_node_context`).
@@ -5128,6 +5131,7 @@ impl LayoutEngine {
             tree,
             root_node: None,
             node_index: Vec::new(),
+            ng_fallback: false,
             tree_valid: false,
             skip_projections: false,
             measure_text: true,
@@ -5184,6 +5188,13 @@ impl LayoutEngine {
         Ok(())
     }
 
+    /// The last [`Self::compute`] ran the legacy engine because LayoutNG
+    /// refused the tree under `Mode::On`. A subtree of that tree may be one
+    /// LayoutNG accepts, so relaying it out alone would mix engines.
+    pub fn ng_fell_back(&self) -> bool {
+        self.ng_fallback
+    }
+
     pub fn compute(
         &mut self,
         root: &Component,
@@ -5191,6 +5202,7 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> Result<LayoutResults> {
+        self.ng_fallback = false;
         match crate::layout_ng::mode() {
             crate::layout_ng::Mode::Off => self.compute_legacy(root, flat, viewport_w, viewport_h),
             crate::layout_ng::Mode::On => {
@@ -5218,7 +5230,10 @@ impl LayoutEngine {
                             layout_slots: Some(slots),
                         })
                     }
-                    None => self.compute_legacy(root, flat, viewport_w, viewport_h),
+                    None => {
+                        self.ng_fallback = true;
+                        self.compute_legacy(root, flat, viewport_w, viewport_h)
+                    }
                 }
             }
             crate::layout_ng::Mode::Verify => {
