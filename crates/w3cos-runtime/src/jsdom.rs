@@ -123,6 +123,9 @@ struct StyleCache {
     /// Built on first use. `None` keeps the thread-local initializer const.
     ids: Option<HashMap<String, u32>>,
     values: Option<HashMap<(u32, u32), String>>,
+    /// Nodes that may hold entries in `values` (a superset), so dropping
+    /// one node's block skips nodes that never had one.
+    nodes: Option<std::collections::HashSet<u32>>,
 }
 
 impl StyleCache {
@@ -146,6 +149,7 @@ impl StyleCache {
     }
 
     fn insert_value(&mut self, node: u32, property: &str, value: String) {
+        self.nodes.get_or_insert_with(Default::default).insert(node);
         let id = self.prop_id(property);
         self.values().insert((node, id), value);
     }
@@ -190,6 +194,22 @@ impl StyleCache {
         pairs
     }
 
+    /// Drop every declaration of `node`: one probe per known property
+    /// name, not a scan of every node's entries.
+    fn remove_node(&mut self, node: u32) -> bool {
+        if !self.nodes.as_mut().is_some_and(|nodes| nodes.remove(&node)) {
+            return false;
+        }
+        let count = self.names.len() as u32;
+        let mut any = false;
+        if let Some(values) = self.values.as_mut() {
+            for id in 0..count {
+                any |= values.remove(&(node, id)).is_some();
+            }
+        }
+        any
+    }
+
     fn retain_other_nodes(&mut self, node: u32) {
         if let Some(values) = self.values.as_mut() {
             values.retain(|(id, _), _| *id != node);
@@ -198,6 +218,7 @@ impl StyleCache {
 
     fn clear_entries(&mut self) {
         self.values = None;
+        self.nodes = None;
     }
 }
 
@@ -560,6 +581,7 @@ thread_local! {
             names: Vec::new(),
             ids: None,
             values: None,
+            nodes: None,
         })
     };
     /// CSSStyleDeclaration object identity → element node. The AOT style
@@ -5409,7 +5431,7 @@ pub(crate) fn apply_html_attribute(node: u32, name: &str, value: &str) {
     match name {
         "style" => {
             dom::set_attribute(node, name, value);
-            parse_css_text(node, value);
+            replace_inline_style(node, value);
         }
         _ => dom::set_attribute(node, name, value),
     }
@@ -5430,7 +5452,7 @@ pub(crate) fn apply_html_attribute_ns(
         // `setAttribute(...)` instead updates the first qualified-name match.
         dom::set_attribute_ns_parts(node, None, qualified_name, prefix, local_name, value);
         if qualified_name == "style" {
-            parse_css_text(node, value);
+            replace_inline_style(node, value);
         }
     } else {
         dom::set_attribute_ns_parts(node, namespace, qualified_name, prefix, local_name, value);
@@ -14299,6 +14321,27 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
     value
 }
 
+/// Setting the `style` attribute (or `cssText`) replaces the element's
+/// whole inline declaration block (CSSOM "update style attribute for";
+/// Blink Element::StyleAttributeChanged reparses into a fresh
+/// MutableCSSPropertyValueSet and invalidates the inline style).
+fn replace_inline_style(node: u32, css: &str) {
+    clear_inline_style(node);
+    parse_css_text(node, css);
+}
+
+/// Removing the `style` attribute empties the inline block
+/// (Blink: StyleAttributeChanged with a null value).
+pub(crate) fn clear_inline_style(node: u32) {
+    let had_cached = STYLE_CACHE.with(|cache| cache.borrow_mut().remove_node(node));
+    dom::reset_inline_style(node, had_cached);
+}
+
+/// The inline block serialized as the CSSOM-synced `style` attribute value.
+pub(crate) fn inline_style_attribute_text(node: u32) -> String {
+    style_css_text(node).trim_end().to_string()
+}
+
 fn parse_css_text(node: u32, css: &str) {
     for decl in css.split(';') {
         let decl = decl.trim();
@@ -14334,6 +14377,7 @@ fn style_value(node: u32) -> Value {
                     let prop = camel_to_kebab(&arg(&args, 0).to_js_string());
                     let value = arg(&args, 1).to_js_string();
                     style_apply(node, &prop, &value);
+                    dom::note_inline_style_mutated(node);
                     Value::Undefined
                 }),
                 "getPropertyValue" => func(move |_, args| {
@@ -14344,6 +14388,7 @@ fn style_value(node: u32) -> Value {
                     let prop = camel_to_kebab(&arg(&args, 0).to_js_string());
                     let old = style_read(node, &prop);
                     style_apply(node, &prop, "");
+                    dom::note_inline_style_mutated(node);
                     Value::string(&old)
                 }),
                 "cssText" => Value::string(&style_css_text(node)),
@@ -14372,10 +14417,11 @@ fn style_value(node: u32) -> Value {
         .set(move |_target, key, value, _receiver| {
             if bridge_realm_is_current(generation) {
                 if key == "cssText" {
-                    parse_css_text(node, &value.to_js_string());
+                    replace_inline_style(node, &value.to_js_string());
                 } else {
                     style_apply(node, &camel_to_kebab(key), &value.to_js_string());
                 }
+                dom::note_inline_style_mutated(node);
             }
             true
         })
@@ -34391,6 +34437,81 @@ try {
                 .border_width
         });
         assert_eq!(border_width, 2.0);
+    }
+
+    /// CSSOM "update style attribute for" / Blink StyleAttributeChanged:
+    /// the attribute replaces the whole inline block, removing it empties
+    /// the block, and CSSOM writes show up in the attribute.
+    #[test]
+    fn style_attribute_replaces_and_removes_the_inline_block() {
+        setup();
+        let div = create_in_body("div");
+        let node = node_id_of(&div).expect("element has a DOM node");
+        let padding_bottom = || {
+            dom::with_document(|document| {
+                Element::new(NodeId::from_u32(node))
+                    .style(document)
+                    .to_style()
+                    .padding
+                    .bottom
+            })
+        };
+        let set = |css: &str| {
+            div.call_method(
+                "setAttribute",
+                vec![Value::string("style"), Value::string(css)],
+            );
+        };
+        let style = div.get_property("style");
+        set("width: 10px");
+        style.set_property("paddingBottom", Value::string("3px"));
+        assert_eq!(style.get_property("paddingBottom"), Value::string("3px"));
+        // Re-setting the attribute drops the CSSOM-only declaration.
+        set("width: 10px");
+        assert_eq!(
+            style.get_property("cssText").to_js_string().trim(),
+            "width: 10px;"
+        );
+        assert_eq!(style.get_property("width"), Value::string("10px"));
+        assert_eq!(padding_bottom(), w3cos_std::style::Spacing::Px(0.0));
+        // The author's string reads back unchanged.
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("style")]),
+            Value::string("width: 10px")
+        );
+        // A CSSOM write reserializes the attribute.
+        style.set_property("paddingBottom", Value::string("3px"));
+        let text = div
+            .call_method("getAttribute", vec![Value::string("style")])
+            .to_js_string();
+        assert!(
+            text.contains("padding-bottom: 3px") && text.contains("width: 10px"),
+            "{text}"
+        );
+        // removeAttribute empties the block.
+        div.call_method("removeAttribute", vec![Value::string("style")]);
+        assert_eq!(style.get_property("cssText").to_js_string().trim(), "");
+        let fresh = create_in_body("div").get_property("style");
+        assert_eq!(style.get_property("width"), fresh.get_property("width"));
+        assert_eq!(
+            style.get_property("paddingBottom"),
+            fresh.get_property("paddingBottom")
+        );
+        assert_eq!(padding_bottom(), w3cos_std::style::Spacing::Px(0.0));
+        assert_eq!(
+            div.call_method("hasAttribute", vec![Value::string("style")]),
+            Value::Bool(false)
+        );
+        // cssText replaces the block as well.
+        set("width: 10px; padding-bottom: 3px");
+        style.set_property("cssText", Value::string("height: 5px"));
+        assert_eq!(
+            style.get_property("cssText").to_js_string().trim(),
+            "height: 5px;"
+        );
+        assert_eq!(style.get_property("width"), fresh.get_property("width"));
+        assert_eq!(style.get_property("height"), Value::string("5px"));
+        assert_eq!(padding_bottom(), w3cos_std::style::Spacing::Px(0.0));
     }
 
     #[test]

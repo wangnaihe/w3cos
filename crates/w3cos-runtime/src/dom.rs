@@ -346,7 +346,58 @@ pub(crate) fn set_attribute_ns_parts(
     }
 }
 
+thread_local! {
+    /// Elements whose inline style changed through CSSOM since their `style`
+    /// attribute was last written (Blink keeps the attribute lazily in sync:
+    /// `SetInlineStyleChanged` marks it invalid, `SynchronizeStyleAttribute`
+    /// reserializes it on the next read).
+    static STALE_STYLE_ATTRIBUTE: RefCell<std::collections::HashSet<u32, w3cos_std::fxhash::FxBuildHasher>> =
+        RefCell::new(Default::default());
+}
+
+/// A CSSOM write (`el.style.x = ...`, `setProperty`, `removeProperty`,
+/// `cssText`) changed the inline block: the `style` attribute is
+/// reserialized when next read.
+pub(crate) fn note_inline_style_mutated(node: u32) {
+    STALE_STYLE_ATTRIBUTE.with(|stale| stale.borrow_mut().insert(node));
+}
+
+/// Empty the element's inline declaration block (the typed style) and
+/// invalidate it like any inline style edit.
+/// `had_cached`: the bridge cache held declarations for it (every inline
+/// write through the bridge lands there as well).
+pub(crate) fn reset_inline_style(node: u32, had_cached: bool) {
+    STALE_STYLE_ATTRIBUTE.with(|stale| stale.borrow_mut().remove(&node));
+    with_document_mut(|doc| {
+        let id = NodeId::from_u32(node);
+        if !had_cached && doc.get_style(id).inline_declarations.is_empty() {
+            return;
+        }
+        // An inherited name, so the inherited-property epoch moves too.
+        *doc.get_style_mut_for_property(id, "color") =
+            w3cos_dom::css_style::CSSStyleDeclaration::new();
+        doc.mark_inline_style_dirty(id);
+    });
+    mark_dom_dirty();
+}
+
+/// Write the CSSOM-serialized inline block back to a stale `style`
+/// attribute before it is read.
+fn synchronize_style_attribute(node: u32, name: &str) {
+    if !name.eq_ignore_ascii_case("style")
+        || !STALE_STYLE_ATTRIBUTE.with(|stale| stale.borrow_mut().remove(&node))
+    {
+        return;
+    }
+    let text = crate::jsdom::inline_style_attribute_text(node);
+    with_document_mut(|doc| {
+        let el = w3cos_dom::Element::new(NodeId::from_u32(node));
+        el.set_attribute(doc, "style", &text);
+    });
+}
+
 pub fn get_attribute(node: u32, name: &str) -> Option<String> {
+    synchronize_style_attribute(node, name);
     with_document(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.get_attribute(doc, name).map(|s| s.to_string())
@@ -845,6 +896,9 @@ pub fn remove_attribute(node: u32, name: &str) {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.remove_attribute(doc, name);
     });
+    if name.eq_ignore_ascii_case("style") && node_type(node) == 1 {
+        crate::jsdom::clear_inline_style(node);
+    }
     mark_dom_dirty();
     if old_value.is_some() {
         crate::observers_web::notify_attribute(node, name, old_value.as_deref());
@@ -875,6 +929,9 @@ pub fn remove_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str)
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.remove_attribute_ns(doc, namespace, local_name)
     });
+    if removed && namespace.is_none() && local_name == "style" && node_type(node) == 1 {
+        crate::jsdom::clear_inline_style(node);
+    }
     if removed {
         mark_dom_dirty();
         crate::observers_web::notify_attribute_ns(node, local_name, namespace, previous.as_deref());
@@ -882,6 +939,7 @@ pub fn remove_attribute_ns(node: u32, namespace: Option<&str>, local_name: &str)
 }
 
 pub fn has_attribute(node: u32, name: &str) -> bool {
+    synchronize_style_attribute(node, name);
     with_document(|doc| {
         let el = w3cos_dom::Element::new(NodeId::from_u32(node));
         el.get_attribute(doc, name).is_some()
