@@ -422,15 +422,16 @@ fn reuse_frames_check(url: &str, width: u32, height: u32, first: &HeadlessFrame,
     }
     let (mut frames, mut diffs) = (0usize, 0usize);
     let before = w3cos_runtime::headless::persistent_paint_stats();
-    let mut draw = |restored: bool| match w3cos_runtime::headless::render_document_rgba(width, height) {
-        Ok(frame) => {
-            frames += 1;
-            if restored && frame.rgba != first.rgba {
-                diffs += 1;
+    let mut draw =
+        |restored: bool| match w3cos_runtime::headless::render_document_rgba(width, height) {
+            Ok(frame) => {
+                frames += 1;
+                if restored && frame.rgba != first.rgba {
+                    diffs += 1;
+                }
             }
-        }
-        Err(error) => eprintln!("[wpt-reuse-frames] {url} render failed: {error}"),
-    };
+            Err(error) => eprintln!("[wpt-reuse-frames] {url} render failed: {error}"),
+        };
     for step in 0..steps {
         if step % 2 == 0 {
             let Some(node) = text else { continue };
@@ -441,7 +442,9 @@ fn reuse_frames_check(url: &str, width: u32, height: u32, first: &HeadlessFrame,
             draw(true);
         } else {
             let Some(node) = element else { continue };
-            let Some(parent) = dom::parent_node(node) else { continue };
+            let Some(parent) = dom::parent_node(node) else {
+                continue;
+            };
             let next = dom::next_sibling(node);
             dom::remove_child(parent, node);
             draw(false);
