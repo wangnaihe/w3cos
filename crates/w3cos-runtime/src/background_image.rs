@@ -233,6 +233,14 @@ fn raster_background_layers_with_overrides(
                 index,
                 "repeat",
             ));
+            // Default `repeat` still paints one tile when the image fills the
+            // box. That tile keeps a fractional origin and Linear filtering
+            // samples the neighbouring image row (margin-collapse-002, row
+            // y=71). Snap an axis that has only one tile position. Multi-tile
+            // repeat/round/space keeps its phase; `repeat_shader_tile` is
+            // untouched.
+            let single_x = single_tile_axis(geometry.tiles.iter().map(|tile| tile.x));
+            let single_y = single_tile_axis(geometry.tiles.iter().map(|tile| tile.y));
             Some(RasterBackgroundLayer {
                 layer_index: index,
                 source,
@@ -240,8 +248,8 @@ fn raster_background_layers_with_overrides(
                 tiles: geometry.tiles,
                 repeat_shader_tile: geometry.repeat_shader_tile,
                 snap_raster_axes: (
-                    matches!(repeat_x, Repeat::NoRepeat),
-                    matches!(repeat_y, Repeat::NoRepeat),
+                    matches!(repeat_x, Repeat::NoRepeat) || single_x,
+                    matches!(repeat_y, Repeat::NoRepeat) || single_y,
                 ),
                 blend_mode: layer_blend_mode(style, index),
             })
@@ -1328,6 +1336,39 @@ fn style_ex_size(style: &Style) -> f32 {
     style.font_size * if ahem { 0.8 } else { 0.5 }
 }
 
+/// One distinct finite position. Empty and multi-position axes are not
+/// a single tile.
+fn single_tile_axis(positions: impl Iterator<Item = f32>) -> bool {
+    let mut first = None;
+    for position in positions {
+        if !position.is_finite() {
+            return false;
+        }
+        match first {
+            None => first = Some(position),
+            Some(start) if start.to_bits() != position.to_bits() => return false,
+            _ => {}
+        }
+    }
+    first.is_some()
+}
+
+/// Device-pixel edges for a non-repeating or single-tile raster axis.
+/// Same rounding as `render_skia::draw_decoded_image`.
+pub(crate) fn snap_raster_destination(mut rect: LayoutRect, snap_axes: (bool, bool)) -> LayoutRect {
+    if snap_axes.0 {
+        let right = (rect.x + rect.width).round();
+        rect.x = rect.x.round();
+        rect.width = right - rect.x;
+    }
+    if snap_axes.1 {
+        let bottom = (rect.y + rect.height).round();
+        rect.y = rect.y.round();
+        rect.height = bottom - rect.y;
+    }
+    rect
+}
+
 fn axis_tiles(
     area_start: f32,
     area_length: f32,
@@ -1916,5 +1957,54 @@ mod tests {
         );
         assert_eq!(layers[0].geometry.tiles[0].x, 20.0);
         assert_eq!(layers[0].geometry.tiles[0].y, 40.0);
+    }
+
+    /// margin-collapse-002: a 100×80 image in a 100×80 box, default `repeat`,
+    /// still one tile. Its origin is the fractional border box.
+    #[test]
+    fn single_repeat_tile_snaps_and_two_tiles_keep_their_phase() {
+        crate::image_loader::clear_cache();
+        install_image("margin-collapse-tile.png", 100, 80);
+        let origin_y = 51.19;
+        let rect = LayoutRect {
+            x: 8.0,
+            y: origin_y,
+            width: 100.0,
+            height: 80.0,
+        };
+        let style = Style {
+            background_image: Some("url(margin-collapse-tile.png)".into()),
+            ..Style::default()
+        };
+        let layers = raster_background_layers(&style, rect);
+        let tile = layers[0].tiles[0];
+        assert_eq!(layers[0].tiles.len(), 1);
+        assert!((tile.y - origin_y).abs() < 1e-4, "measured y {}", tile.y);
+        assert_eq!((tile.x, tile.width, tile.height), (8.0, 100.0, 80.0));
+        assert_eq!(layers[0].snap_raster_axes, (true, true));
+        assert!(layers[0].repeat_shader_tile.is_none());
+        let snapped = snap_raster_destination(tile, layers[0].snap_raster_axes);
+        assert_eq!(
+            (snapped.x, snapped.y, snapped.width, snapped.height),
+            (8.0, 51.0, 100.0, 80.0)
+        );
+
+        install_image("two-tile-repeat.png", 50, 80);
+        let repeated = raster_background_layers(
+            &Style {
+                background_image: Some("url(two-tile-repeat.png)".into()),
+                ..Style::default()
+            },
+            rect,
+        );
+        let xs = repeated[0]
+            .tiles
+            .iter()
+            .map(|tile| tile.x.to_bits())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(xs.len(), 2, "two horizontal tiles {:?}", repeated[0].tiles);
+        assert_eq!(repeated[0].snap_raster_axes.0, false);
+        assert_eq!(repeated[0].snap_raster_axes.1, true);
+        crate::image_loader::clear_cache();
     }
 }
