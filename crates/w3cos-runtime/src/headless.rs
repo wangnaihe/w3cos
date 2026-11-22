@@ -2614,6 +2614,97 @@ mod tests {
     }
 
     #[test]
+    fn persist_dirty_scan_matches_the_full_scan() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PERSIST_DIRTY_SCAN_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PERSIST_DIRTY_SCAN_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::append_child(body, log);
+            // A flex row whose static items carry z-index (painted like
+            // positioned boxes), and inline text with line-leading spaces.
+            let row = crate::dom::create_element("div");
+            crate::dom::set_style_property(row, "display", "flex");
+            for (index, color) in ["#cc3333", "#33cc33"].iter().enumerate() {
+                let item = crate::dom::create_element("div");
+                for (name, value) in [
+                    ("width", "30px"),
+                    ("height", "20px"),
+                    ("background", color),
+                    ("margin-left", if index == 1 { "-10px" } else { "0px" }),
+                    ("z-index", if index == 0 { "2" } else { "1" }),
+                ] {
+                    crate::dom::set_style_property(item, name, value);
+                }
+                crate::dom::append_child(row, item);
+            }
+            crate::dom::append_child(log, row);
+            let mut texts = Vec::new();
+            for index in 0..3 {
+                let message = crate::dom::create_element("p");
+                let span = crate::dom::create_element("span");
+                let words = crate::dom::create_text_node(&format!("  message {index} words"));
+                crate::dom::append_child(span, words);
+                crate::dom::append_child(message, span);
+                crate::dom::append_child(log, message);
+                texts.push(words);
+            }
+            assert!(crate::incremental_layout::flush());
+            let before = crate::paint_artifact::persist_dirty_scan_stats();
+            let persistent_before = persistent_paint_stats().0;
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            for step in 0..6 {
+                match step % 3 {
+                    0 => crate::dom::set_text_content(
+                        texts[2],
+                        &format!("  message 2 words and {step} more words that wrap"),
+                    ),
+                    1 => crate::dom::set_text_content(texts[0], &format!(" first {step}")),
+                    _ => {
+                        let line = crate::dom::create_element("p");
+                        let words = crate::dom::create_text_node(&format!("   line {step}"));
+                        crate::dom::append_child(line, words);
+                        crate::dom::append_child(log, line);
+                    }
+                }
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = crate::paint_artifact::persist_dirty_scan_stats();
+            let persistent = persistent_paint_stats().0 - persistent_before;
+            (frames, (after.0 - before.0, after.1 - before.1), persistent)
+        };
+        let (verified, (walked, mismatched), persistent) = run(2);
+        // The dirty list exists only on the persistent path
+        // (`W3COS_PAINT_PERSISTENT_NODES`, on in the gate's verify mode).
+        if persistent > 0 {
+            assert!(walked > 0, "persistent builds must walk the dirty list");
+        }
+        assert_eq!(
+            mismatched, 0,
+            "the dirty list walk differs from the full scan"
+        );
+        let (walk, _, _) = run(1);
+        let (full, (off_walked, _), _) = run(0);
+        assert_eq!(off_walked, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(walk == full, "frames from the dirty list walk differ");
+    }
+
+    #[test]
     fn damage_composite_matches_a_full_composite() {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();

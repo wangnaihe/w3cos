@@ -734,6 +734,92 @@ struct PersistPlan<'a> {
     /// `W3COS_PAINT_PERSIST_REMAP`: where each box was in the previous
     /// build when the splices inserted or removed boxes (`None`: same index).
     moved_from: Option<Vec<u32>>,
+    /// `W3COS_PAINT_PERSIST_DIRTY_SCAN`: the boxes that are not clean, in
+    /// order, so the per-box passes visit only them.
+    dirty: Option<Vec<u32>>,
+}
+
+/// `W3COS_PAINT_PERSIST_DIRTY_SCAN=1|verify` (off by default; with the
+/// persistent path on): the per-box passes of the reusing build that skip
+/// clean boxes walk the list of boxes that are not clean instead of every
+/// box (Blink: paint invalidation visits only the objects layout marked).
+/// `verify` also runs each pass over every box, skipping clean ones, and
+/// compares.
+fn persist_dirty_scan_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PERSIST_DIRTY_SCAN_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_PERSIST_DIRTY_SCAN")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PERSIST_DIRTY_SCAN_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (builds that walked the dirty list, verify mismatches).
+    static PERSIST_DIRTY_SCAN_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn persist_dirty_scan_stats() -> (u64, u64) {
+    PERSIST_DIRTY_SCAN_STATS.with(std::cell::Cell::get)
+}
+
+fn persist_dirty_scan_mismatch(what: &str) {
+    PERSIST_DIRTY_SCAN_STATS.with(|stats| {
+        let (builds, mismatches) = stats.get();
+        stats.set((builds, mismatches + 1));
+    });
+    eprintln!("[paint-persist-dirty-scan-verify] mismatch: {what}");
+}
+
+/// The boxes a per-box pass visits: every box not in `skip`, or the dirty
+/// list (the same boxes, in the same order) when there is one.
+enum BoxScan<'a> {
+    All(std::ops::Range<usize>, Option<&'a [bool]>),
+    Dirty(std::slice::Iter<'a, u32>),
+}
+
+impl<'a> BoxScan<'a> {
+    fn new(len: usize, skip: Option<&'a [bool]>, dirty: Option<&'a [u32]>) -> Self {
+        match dirty {
+            Some(dirty) => BoxScan::Dirty(dirty.iter()),
+            None => BoxScan::All(0..len, skip),
+        }
+    }
+}
+
+impl Iterator for BoxScan<'_> {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            BoxScan::All(range, skip) => {
+                for index in range.by_ref() {
+                    if !skip.is_some_and(|skip| skip[index]) {
+                        return Some(index);
+                    }
+                }
+                None
+            }
+            BoxScan::Dirty(iter) => iter.next().map(|&index| index as usize),
+        }
+    }
 }
 
 /// `W3COS_PAINT_PERSIST_REMAP=1` (with the persistent path on; off by
@@ -902,13 +988,24 @@ fn persistent_nodes_plan<'a>(
     if let Some(body) = body_index.filter(|body| *body < clean.len()) {
         clean[body] = false;
     }
-    let clean_count = clean.iter().filter(|clean| **clean).count();
+    let (clean_count, dirty) = if persist_dirty_scan_mode() != 0 {
+        let dirty: Vec<u32> = clean
+            .iter()
+            .enumerate()
+            .filter(|(_, clean)| !**clean)
+            .map(|(index, _)| index as u32)
+            .collect();
+        (clean.len() - dirty.len(), Some(dirty))
+    } else {
+        (clean.iter().filter(|clean| **clean).count(), None)
+    };
     Some(PersistPlan {
         previous,
         clean,
         clean_count,
         trimmed,
         moved_from,
+        dirty,
     })
 }
 
@@ -1632,16 +1729,14 @@ fn adjust_used_styles(
     // (`W3COS_PAINT_PERSISTENT_NODES` clean boxes; none had percentage
     // padding).
     skip: Option<&[bool]>,
+    // The boxes not in `skip`, in order (`W3COS_PAINT_PERSIST_DIRTY_SCAN`).
+    dirty: Option<&[u32]>,
 ) -> bool {
     let mode = style_adjust_memo_mode();
-    let skipped = |index: usize| skip.is_some_and(|skip| skip[index]);
     if mode == 0 {
         let mut has_percentage_padding = false;
-        for (index, node) in nodes.iter_mut().enumerate() {
-            if skipped(index) {
-                continue;
-            }
-            has_percentage_padding |= adjust_used_style(node, viewport);
+        for index in BoxScan::new(nodes.len(), skip, dirty) {
+            has_percentage_padding |= adjust_used_style(&mut nodes[index], viewport);
         }
         return has_percentage_padding;
     }
@@ -1653,10 +1748,9 @@ fn adjust_used_styles(
         }
         memo.entries.resize_with(nodes.len(), || None);
         let mut has_percentage_padding = false;
-        for (index, (node, entry)) in nodes.iter_mut().zip(memo.entries.iter_mut()).enumerate() {
-            if skipped(index) {
-                continue;
-            }
+        for index in BoxScan::new(nodes.len(), skip, dirty) {
+            let node = &mut nodes[index];
+            let entry = &mut memo.entries[index];
             if let Some(known) = entry
                 && known.source.ptr_eq(&node.style)
             {
@@ -1745,7 +1839,7 @@ fn trim_collapsible_inline_whitespace_at_line_start(
     nodes: &mut [PaintNode],
     rect_by_index: &[Option<LayoutRect>],
 ) {
-    trim_line_start_white_space_ranged(nodes, rect_by_index, None, None, None);
+    trim_line_start_white_space_ranged(nodes, rect_by_index, None, None, None, None);
 }
 
 /// [`trim_collapsible_inline_whitespace_at_line_start`], recording per box
@@ -1762,6 +1856,8 @@ fn trim_line_start_white_space_ranged(
     // Boxes left as they are (`W3COS_PAINT_PERSISTENT_NODES` clean boxes,
     // which already hold last build's trimmed text).
     skip: Option<&[bool]>,
+    // The boxes not in `skip`, in order (`W3COS_PAINT_PERSIST_DIRTY_SCAN`).
+    dirty: Option<&[u32]>,
 ) -> u32 {
     const COLLAPSIBLE: [char; 5] = [' ', '\t', '\n', '\r', '\u{000c}'];
     let trim = |node: &mut PaintNode| {
@@ -1789,12 +1885,7 @@ fn trim_line_start_white_space_ranged(
         true
     };
     let mut copied = 0;
-    for index in 0..nodes.len() {
-        if let Some(skip) = skip
-            && skip[index]
-        {
-            continue;
-        }
+    for index in BoxScan::new(nodes.len(), skip, dirty) {
         let node = &nodes[index];
         if node.style.display != Display::Inline
             || matches!(
@@ -3861,29 +3952,64 @@ impl PaintArtifact {
             // Clean boxes the per-box passes leave as they are.
             let skip = plan.map(|plan| plan.clean.as_slice());
             let skipped = |index: usize| skip.is_some_and(|skip| skip[index]);
-            let z_items: Vec<usize> = nodes
-                .iter()
-                .enumerate()
-                .filter(|(index, node)| {
-                    !skipped(*index)
-                        && node.style.z_index != 0
-                        && node.style.position == Position::Static
-                        && node.parent.is_some_and(|parent| {
-                            matches!(
-                                nodes[parent].style.display,
-                                Display::Flex | Display::Grid | Display::InlineFlex
-                            )
-                        })
-                })
-                .map(|(index, _)| index)
+            // `W3COS_PAINT_PERSIST_DIRTY_SCAN`: the passes below visit only
+            // the boxes that are not clean.
+            let dirty = plan.and_then(|plan| plan.dirty.as_deref());
+            let dirty_verify = dirty.is_some() && persist_dirty_scan_mode() == 2;
+            if let Some(dirty) = dirty {
+                if dirty_verify {
+                    // Coverage line for the multi-frame checks (verify only).
+                    eprintln!(
+                        "[paint-persist-dirty-scan-verify] walked {} of {}",
+                        dirty.len(),
+                        nodes.len()
+                    );
+                }
+                PERSIST_DIRTY_SCAN_STATS.with(|stats| {
+                    let (builds, mismatches) = stats.get();
+                    stats.set((builds + 1, mismatches));
+                });
+            }
+            let z_item = |index: usize, nodes: &[PaintNode]| {
+                let node = &nodes[index];
+                node.style.z_index != 0
+                    && node.style.position == Position::Static
+                    && node.parent.is_some_and(|parent| {
+                        matches!(
+                            nodes[parent].style.display,
+                            Display::Flex | Display::Grid | Display::InlineFlex
+                        )
+                    })
+            };
+            let z_items: Vec<usize> = BoxScan::new(nodes.len(), skip, dirty)
+                .filter(|&index| z_item(index, &nodes))
                 .collect();
+            if dirty_verify {
+                let full: Vec<usize> = (0..nodes.len())
+                    .filter(|&index| !skipped(index) && z_item(index, &nodes))
+                    .collect();
+                if full != z_items {
+                    persist_dirty_scan_mismatch("z items");
+                }
+            }
             for index in z_items {
                 nodes[index].style.position = Position::Relative;
             }
             let feature_mode = paint_feature_skip_mode();
             let features = (feature_mode != 0).then(|| feature_presence(&nodes, previous));
             let has_feature = |bit: u8| features.is_none_or(|features| features & bit != 0);
-            let has_percentage_padding = adjust_used_styles(&mut nodes, viewport, skip);
+            let full_adjusted = dirty_verify.then(|| {
+                let mut full = nodes.clone();
+                let percent = adjust_used_styles(&mut full, viewport, skip, None);
+                (full, percent)
+            });
+            let has_percentage_padding = adjust_used_styles(&mut nodes, viewport, skip, dirty);
+            if let Some((full, percent)) = full_adjusted
+                && (percent != has_percentage_padding || !same_paint_nodes(&full, &nodes))
+            {
+                persist_dirty_scan_mismatch("used styles");
+                nodes = full;
+            }
             if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
                 run_feature_pass(
                     feature_mode,
@@ -4057,10 +4183,22 @@ impl PaintArtifact {
                     *slot = Some(rect);
                 }
             }
-            for (index, node) in nodes.iter_mut().enumerate() {
-                if skipped(index) {
-                    continue;
-                }
+            let float_bands_full =
+                dirty_verify.then(|| {
+                    (0..nodes.len())
+                        .filter(|&index| !skipped(index))
+                        .filter(|&index| {
+                            nodes[index].style.custom_properties.as_ref().is_some_and(
+                                |properties| {
+                                    properties.contains_key("--w3cos-internal-float-line-bands")
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+            let mut float_bands_seen = Vec::new();
+            for index in BoxScan::new(nodes.len(), skip, dirty) {
+                let node = &mut nodes[index];
                 if node
                     .style
                     .custom_properties
@@ -4068,10 +4206,17 @@ impl PaintArtifact {
                     .is_some_and(|properties| {
                         properties.contains_key("--w3cos-internal-float-line-bands")
                     })
-                    && let Some(properties) = node.style.make_mut().custom_properties.as_mut()
                 {
-                    properties.remove("--w3cos-internal-float-line-bands");
+                    if float_bands_full.is_some() {
+                        float_bands_seen.push(index);
+                    }
+                    if let Some(properties) = node.style.make_mut().custom_properties.as_mut() {
+                        properties.remove("--w3cos-internal-float-line-bands");
+                    }
                 }
+            }
+            if float_bands_full.is_some_and(|full| full != float_bands_seen) {
+                persist_dirty_scan_mismatch("float line bands");
             }
             if let Some((width, height)) = viewport {
                 let refs: Vec<_> = nodes
@@ -4122,14 +4267,38 @@ impl PaintArtifact {
             let range_aligned = range_touched.as_ref().zip(range_before);
             let mut trimmed = (range_mode != 0 || persist_on).then(|| vec![false; source_len]);
             let verify_nodes = (range_mode == 2 && range_aligned.is_some()).then(|| nodes.clone());
+            let trim_aligned = range_aligned
+                .map(|((touched, _), before)| (touched.as_slice(), before.trimmed.as_slice()));
+            let trim_full = dirty_verify.then(|| {
+                let mut full = nodes.clone();
+                let mut full_trimmed = trimmed.clone();
+                let copied = trim_line_start_white_space_ranged(
+                    &mut full,
+                    &rect_by_index,
+                    trim_aligned,
+                    full_trimmed.as_mut(),
+                    skip,
+                    None,
+                );
+                (full, full_trimmed, copied)
+            });
             let copied = trim_line_start_white_space_ranged(
                 &mut nodes,
                 &rect_by_index,
-                range_aligned
-                    .map(|((touched, _), before)| (touched.as_slice(), before.trimmed.as_slice())),
+                trim_aligned,
                 trimmed.as_mut(),
-                plan.map(|plan| plan.clean.as_slice()),
+                skip,
+                dirty,
             );
+            if let Some((full, full_trimmed, full_copied)) = trim_full
+                && (full_copied != copied
+                    || full_trimmed != trimmed
+                    || !same_paint_nodes(&full, &nodes))
+            {
+                persist_dirty_scan_mismatch("line-start trim");
+                nodes = full;
+                trimmed = full_trimmed;
+            }
             if let Some(mut fresh) = verify_nodes {
                 trim_collapsible_inline_whitespace_at_line_start(&mut fresh, &rect_by_index);
                 let same = fresh
@@ -4197,14 +4366,30 @@ impl PaintArtifact {
                 });
             }
             let persist_trimmed = persist_on.then(|| {
+                let all = |bits: &[bool]| -> Vec<u32> {
+                    bits.iter()
+                        .enumerate()
+                        .filter(|(_, trimmed)| **trimmed)
+                        .map(|(index, _)| index as u32)
+                        .collect()
+                };
+                // Only boxes the trim visited can be marked.
                 let mut list: Vec<u32> = trimmed
                     .as_deref()
-                    .map(|bits| {
-                        bits.iter()
-                            .enumerate()
-                            .filter(|(_, trimmed)| **trimmed)
-                            .map(|(index, _)| index as u32)
-                            .collect()
+                    .map(|bits| match dirty {
+                        Some(dirty) => {
+                            let list: Vec<u32> = dirty
+                                .iter()
+                                .copied()
+                                .filter(|&index| bits[index as usize])
+                                .collect();
+                            if dirty_verify && list != all(bits) {
+                                persist_dirty_scan_mismatch("trimmed list");
+                                return all(bits);
+                            }
+                            list
+                        }
+                        None => all(bits),
                     })
                     .unwrap_or_default();
                 if let Some(plan) = plan {
