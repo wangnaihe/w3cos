@@ -68,6 +68,58 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Retained incremental-layout state (`W3COS_MEM_STATS`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutCacheStats {
+    /// Whether a persistent component + layout tree is cached.
+    pub cached: bool,
+    /// Nodes of the cached component tree.
+    pub component_nodes: usize,
+    /// Node ids mapped into the cached layout tree.
+    pub layout_nodes: usize,
+    pub width_memos: usize,
+    /// Rect snapshots held by the width memos.
+    pub memo_rects: usize,
+    pub client_rect_nodes: usize,
+}
+
+fn component_nodes(component: &Component) -> usize {
+    let mut count = 0;
+    let mut stack = vec![component];
+    while let Some(node) = stack.pop() {
+        count += 1;
+        stack.extend(node.children.iter());
+    }
+    count
+}
+
+/// Walks the cached trees once. Diagnostics only.
+pub fn layout_cache_stats() -> LayoutCacheStats {
+    let mut stats = CACHE.with(|cache| {
+        let Ok(cache) = cache.try_borrow() else {
+            return LayoutCacheStats::default();
+        };
+        let Some(cache) = cache.as_ref() else {
+            return LayoutCacheStats::default();
+        };
+        LayoutCacheStats {
+            cached: true,
+            component_nodes: component_nodes(&cache.component),
+            layout_nodes: cache.node_ids.len(),
+            width_memos: cache.width_memos.len(),
+            memo_rects: cache
+                .width_memos
+                .iter()
+                .map(|memo| memo.rects.len() + memo.client_rects.len())
+                .sum(),
+            client_rect_nodes: 0,
+        }
+    });
+    stats.client_rect_nodes =
+        CLIENT_RECTS.with(|rects| rects.try_borrow().map(|rects| rects.len()).unwrap_or(0));
+    stats
+}
+
 pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
     CLIENT_RECTS.with(|rects| rects.borrow().get(&node).cloned())
 }

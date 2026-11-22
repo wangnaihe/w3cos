@@ -337,6 +337,49 @@ thread_local! {
     static RESIZABLE_VIEW_WARNING_EMITTED: RefCell<bool> = const { RefCell::new(false) };
 }
 
+/// ArrayBuffer / typed-array backing-store accounting, see [`buffer_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferStats {
+    /// Distinct live backing stores (ArrayBuffers, and typed arrays' buffers).
+    pub live_buffers: usize,
+    /// Their byte lengths.
+    pub bytes: usize,
+    /// Their reserved capacity.
+    pub capacity_bytes: usize,
+    /// Typed-array / DataView registry entries (dead ones until the next sweep).
+    pub view_entries: usize,
+}
+
+/// Walks the buffer and view registries once. Diagnostics only
+/// (`W3COS_MEM_STATS`); nothing on the allocation path changes.
+pub fn buffer_stats() -> BufferStats {
+    let mut seen = std::collections::HashSet::new();
+    let mut stats = BufferStats::default();
+    let mut add = |bytes: &Rc<RefCell<Vec<u8>>>, stats: &mut BufferStats| {
+        if seen.insert(Rc::as_ptr(bytes) as usize) {
+            let bytes = bytes.borrow();
+            stats.live_buffers += 1;
+            stats.bytes += bytes.len();
+            stats.capacity_bytes += bytes.capacity();
+        }
+    };
+    BUFFERS.with(|buffers| {
+        for weak in buffers.borrow().values() {
+            if let Some(bytes) = weak.upgrade() {
+                add(&bytes, &mut stats);
+            }
+        }
+    });
+    VIEWS.with(|views| {
+        let views = views.borrow();
+        stats.view_entries = views.len();
+        for view in views.iter() {
+            add(&view.bytes, &mut stats);
+        }
+    });
+    stats
+}
+
 fn buffer_state(value: &Value) -> Option<Rc<RefCell<Vec<u8>>>> {
     let Some(object) = value.as_object() else {
         return None;
@@ -1960,6 +2003,21 @@ pub fn data_view_class() -> Value {
 mod tests {
     use super::*;
     use crate::PanicValue;
+
+    #[test]
+    fn buffer_stats_count_shared_storage_once() {
+        let before = buffer_stats();
+        let buffer = crate::class::construct(&array_buffer_class(), vec![Value::Number(4096.0)]);
+        let first = crate::class::construct(&typed_array_class("Uint8Array"), vec![buffer.clone()]);
+        let second =
+            crate::class::construct(&typed_array_class("Uint32Array"), vec![buffer.clone()]);
+        let stats = buffer_stats();
+        assert_eq!(stats.live_buffers, before.live_buffers + 1);
+        assert_eq!(stats.bytes, before.bytes + 4096);
+        assert!(stats.capacity_bytes >= stats.bytes);
+        assert!(stats.view_entries >= before.view_entries + 2);
+        drop((first, second));
+    }
 
     #[test]
     fn typed_arrays_and_data_view_share_array_buffer_storage() {

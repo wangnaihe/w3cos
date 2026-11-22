@@ -23116,7 +23116,33 @@ fn js_clear_timer(id: u32) {
 /// ChannelServer flushes pending requests this way before their 1s
 /// "Unknown channel" timeout). Timers created or rescheduled by a callback are
 /// due no earlier than `now` and wait for the next tick.
+/// Entry counts of the binding side tables keyed by DOM node (`W3COS_MEM_STATS`).
+/// A table that keeps growing while `dom.live_nodes` is flat retains
+/// entries for removed nodes.
+pub fn binding_table_stats() -> Vec<(&'static str, u64)> {
+    fn len<T>(table: &'static std::thread::LocalKey<RefCell<T>>, f: fn(&T) -> usize) -> u64 {
+        table.with(|table| {
+            table
+                .try_borrow()
+                .map(|table| f(&table) as u64)
+                .unwrap_or(0)
+        })
+    }
+    vec![
+        ("element_values", len(&ELEMENT_VALUES, |t| t.len())),
+        ("element_props", len(&ELEMENT_PROPS, |t| t.len())),
+        ("known_expands", len(&KNOWN_EXPANDS, |t| t.len())),
+        ("attribute_values", len(&ATTRIBUTE_VALUES, |t| t.len())),
+        ("style_object_nodes", len(&STYLE_OBJECT_NODES, |t| t.len())),
+        ("listeners", len(&LISTENERS, |t| t.items.len())),
+        ("timers", len(&JS_TIMERS, |t| t.len())),
+        ("raf_queue", len(&RAF_QUEUE, |t| t.len())),
+        ("microtasks", len(&MICROTASKS, |t| t.len())),
+    ]
+}
+
 pub fn tick_timers() -> usize {
+    crate::mem_stats::maybe_dump();
     let now = Instant::now();
     let mut ran = 0;
     let mut ran_idle = false;

@@ -1062,3 +1062,29 @@ mod tests {
         }
     }
 }
+
+/// Adds every installed-face blob held by this module's caches to `tally`
+/// (`W3COS_MEM_STATS`). Uses `try_lock` so a diagnostic never blocks.
+pub(super) fn tally_font_memory(tally: &mut super::FontTally) {
+    if let Some(cache) = CACHE.get()
+        && let Ok(cache) = cache.try_lock()
+    {
+        for font in cache.values().flatten() {
+            tally.add(&font.data);
+        }
+    }
+    if let Some(faces) = FACES.get()
+        && let Ok(faces) = faces.try_lock()
+    {
+        for font in faces.values() {
+            tally.add(&font.data);
+        }
+    }
+    if let Some(cache) = FALLBACK_CACHE.get()
+        && let Ok(cache) = cache.try_lock()
+    {
+        for font in cache.values().flatten() {
+            tally.add(&font.data);
+        }
+    }
+}
