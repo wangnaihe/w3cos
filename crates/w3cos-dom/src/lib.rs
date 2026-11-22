@@ -4349,6 +4349,47 @@ mod tests {
     }
 
     #[test]
+    fn shared_style_intern_drops_styles_no_node_references() {
+        crate::stylesheet::clear_rules();
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let parent_style = doc.computed_style_shared(parent.id, None);
+
+        // A style that stays referenced must survive every prune and keep
+        // being shared.
+        let kept_el = doc.create_element("div");
+        kept_el
+            .style_mut(&mut doc)
+            .set_property("height", "123456px");
+        parent.append_child(&mut doc, kept_el);
+        let kept = doc.computed_style_shared(kept_el.id, Some(&parent_style));
+
+        // An animation-like stream of distinct styles that are dropped right
+        // away (each frame's height differs).
+        let el = doc.create_element("div");
+        parent.append_child(&mut doc, el);
+        for frame in 0..5000 {
+            el.style_mut(&mut doc)
+                .set_property("height", &format!("{frame}px"));
+            let style = doc.computed_style_shared(el.id, Some(&parent_style));
+            assert_eq!(style.height, w3cos_std::style::Dimension::Px(frame as f32));
+        }
+        assert!(
+            doc.shared_style_intern_len() <= 2 * super::document::SHARED_STYLE_INTERN_MIN_PRUNE,
+            "intern kept {} entries for 2 live styles",
+            doc.shared_style_intern_len()
+        );
+
+        let twin = doc.create_element("div");
+        twin.style_mut(&mut doc).set_property("height", "123456px");
+        parent.append_child(&mut doc, twin);
+        let twin_style = doc.computed_style_shared(twin.id, Some(&parent_style));
+        assert!(std::sync::Arc::ptr_eq(&kept, &twin_style));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn data_attributes_do_not_prevent_safe_matched_property_sharing() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".cell", &[("height", "4px")]);
