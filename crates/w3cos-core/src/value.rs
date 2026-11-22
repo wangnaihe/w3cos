@@ -1709,6 +1709,12 @@ pub struct FunctionData {
     /// `Object.defineProperty(fn, key, { get, set })` accessors (rare: boxed
     /// so ordinary functions pay one pointer).
     accessors: RefCell<Option<Box<HashMap<String, (Value, Value)>>>>,
+    /// The own `prototype` slot holds a placeholder until first read: most
+    /// functions (methods, callbacks, arrows compiled as ordinary
+    /// functions) never touch it, and an eager object per function was the
+    /// largest object-allocation site of a Code-OSS boot. The key itself is
+    /// inserted eagerly, so own-key order and `hasOwnProperty` are unchanged.
+    prototype_pending: Cell<bool>,
     allocation: HeapAllocation,
 }
 
@@ -1782,7 +1788,8 @@ impl FunctionData {
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
         // constructing instances.
-        props.insert(JsString::intern("prototype"), Value::function_prototype());
+        // The object itself is created on first read (`prototype_pending`).
+        props.insert(JsString::intern("prototype"), Value::Undefined);
         let allocation = HeapAllocation::new(
             HeapKind::Function,
             function_heap_bytes(&props, captures_ref),
@@ -1791,7 +1798,21 @@ impl FunctionData {
             body,
             props: RefCell::new(props),
             accessors: RefCell::new(None),
+            prototype_pending: Cell::new(true),
             allocation,
+        }
+    }
+
+    /// Replace the placeholder `prototype` with the fresh object an eager
+    /// construction would have made (same shape: an empty ordinary object
+    /// inheriting `Object.prototype`, no `constructor`).
+    #[cold]
+    #[inline(never)]
+    fn materialize_prototype(&self) {
+        self.prototype_pending.set(false);
+        let prototype = Value::function_prototype();
+        if let Some(slot) = self.props.borrow_mut().get_mut("prototype") {
+            *slot = prototype;
         }
     }
 
@@ -1848,6 +1869,9 @@ impl FunctionData {
     }
 
     pub fn get_property(&self, key: &str) -> Value {
+        if key == "prototype" && self.prototype_pending.get() {
+            self.materialize_prototype();
+        }
         if let Some(value) = self.props.borrow().get(key).cloned() {
             return value;
         }
@@ -1915,6 +1939,9 @@ impl FunctionData {
     }
 
     pub fn set_property(&self, key: &str, value: Value) {
+        if key == "prototype" {
+            self.prototype_pending.set(false);
+        }
         let mut props = self.props.borrow_mut();
         props.insert(JsString::intern(key), value);
         self.allocation
@@ -1922,6 +1949,9 @@ impl FunctionData {
     }
 
     pub fn delete_property(&self, key: &str) {
+        if key == "prototype" {
+            self.prototype_pending.set(false);
+        }
         let mut props = self.props.borrow_mut();
         props.remove(key);
         self.allocation
@@ -7339,6 +7369,70 @@ mod tests {
             !js.props_is_compact(),
             "a delete moves FunctionData props to dictionary mode"
         );
+        crate::page_arena::reset();
+    }
+
+    #[test]
+    fn function_prototype_object_is_created_on_first_read_with_eager_semantics() {
+        crate::page_arena::reset();
+        // Never-read prototypes allocate no object.
+        let objects = crate::page_arena::live_objects();
+        let unread: Vec<Value> = (0..64)
+            .map(|_| Value::function(|_, _| Value::Undefined))
+            .collect();
+        assert_eq!(crate::page_arena::live_objects(), objects);
+        for func in &unread {
+            let js = func.as_function().expect("function");
+            assert!(js.has_own_property("prototype"));
+            assert_eq!(js.keys(), vec!["prototype".to_string()]);
+        }
+
+        // Own-key order is the eager order even when other keys come first.
+        let func = Value::function(|_, _| Value::Undefined);
+        let js = func.as_function().expect("function");
+        js.set_property("extra", Value::Number(1.0));
+        assert_eq!(
+            js.keys(),
+            vec!["prototype".to_string(), "extra".to_string()]
+        );
+
+        // First read creates one stable ordinary object.
+        let prototype = func.get_property("prototype");
+        assert!(prototype.is_object());
+        assert!(prototype.strict_eq(&func.get_property("prototype")));
+        assert!(
+            prototype
+                .as_object()
+                .expect("object")
+                .borrow()
+                .prototype
+                .is_none()
+                == crate::builtins::object_prototype_ref_if_built().is_none()
+        );
+        assert_eq!(
+            js.keys(),
+            vec!["prototype".to_string(), "extra".to_string()]
+        );
+        assert_eq!(crate::page_arena::live_objects(), objects + 1);
+
+        // Writes and deletes before any read win over the lazy object.
+        let replaced = Value::function(|_, _| Value::Undefined);
+        let custom = Value::object(HashMap::new());
+        replaced.set_property("prototype", custom.clone());
+        assert!(replaced.get_property("prototype").strict_eq(&custom));
+        let deleted = Value::function(|_, _| Value::Undefined);
+        let deleted_js = deleted.as_function().expect("function");
+        deleted_js.delete_property("prototype");
+        assert!(!deleted_js.has_own_property("prototype"));
+        assert!(deleted_js.get_property("prototype").is_undefined());
+        let accessor = Value::function(|_, _| Value::Undefined);
+        let accessor_js = accessor.as_function().expect("function");
+        accessor_js.define_accessor(
+            "prototype",
+            Some(Value::function(|_, _| Value::Number(4.0))),
+            None,
+        );
+        assert!(accessor_js.get_property("prototype").is_undefined());
         crate::page_arena::reset();
     }
 
