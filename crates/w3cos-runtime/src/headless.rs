@@ -1598,6 +1598,146 @@ mod tests {
         crate::jsdom::reset_bridge();
     }
 
+    /// The multi-frame WPT check's order on
+    /// css/css-inline/initial-letter/initial-letter-float-002-ref: a text
+    /// edit and its undo, the last element removed and reinserted, then a
+    /// padding edit on that block (beside floats and inline-blocks) and its
+    /// undo. Each restored frame must equal a cold build.
+    #[test]
+    fn float_neighbour_block_edits_in_check_order_match_cold_build() {
+        use w3cos_core::Value;
+        const CSS: &str = r#"
+    .sample {
+        border: solid 1px green;
+        font-family: Ahem;
+        font-size: 20px;
+        line-height: 24px;
+        width: 230px;
+    }
+
+    .float {
+        background: cyan;
+        clear: left;
+        float: left;
+        height: 50px;
+        width: 50px;
+    }
+
+    .fake-initial-letter {
+        background: lime;
+        display: inline-block;
+        height: 80px;
+        margin-top: 2px;
+        width: 80px;
+    }
+
+    .surrounding {
+        display: inline-block;
+        margin-left: -20px;
+        vertical-align: top;
+    }
+
+    .surrounding2 {
+        display: block;
+        margin-left: 50px;
+        margin-top: 0px;
+    }
+"#;
+        const BODY: &str = r#"
+<div class="sample"><div class="float"></div><div class="float"></div>
+<div class="fake-initial-letter"></div>
+<div class="surrounding">bc<br>def<br>ghi<br>jkl<br></div>
+<div class="surrounding2">mno</div>
+</div>
+"#;
+        fn build() -> u32 {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::jsdom::set_viewport(800.0, 600.0);
+            let document = crate::jsdom::document_value();
+            let sheet = document.call_method("createElement", vec![Value::string("style")]);
+            sheet.set_property("textContent", Value::string(CSS));
+            document
+                .get_property("head")
+                .call_method("appendChild", vec![sheet]);
+            document
+                .get_property("body")
+                .set_property("innerHTML", Value::string(BODY));
+            let target =
+                document.call_method("querySelector", vec![Value::string(".surrounding2")]);
+            crate::jsdom::node_id_of(&target).expect("target element")
+        }
+        let differing = |a: &HeadlessFrame, b: &HeadlessFrame| {
+            a.rgba
+                .chunks(4)
+                .zip(b.rgba.chunks(4))
+                .filter(|(x, y)| x != y)
+                .count()
+        };
+        // The page's Ahem web font, registered from the fixed-width fixture.
+        let owner = u64::MAX - 513;
+        struct ClearOwner(u64);
+        impl Drop for ClearOwner {
+            fn drop(&mut self) {
+                crate::font_face::FontRegistry::global().clear_owner(self.0);
+            }
+        }
+        let _clear = ClearOwner(owner);
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                owner,
+                crate::font_face::FontFace {
+                    family: "Ahem".into(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("layout_ng/testdata/Ahem.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register Ahem");
+        build();
+        let cold = render_document_rgba(800, 600).unwrap();
+        let target = build();
+        let first = render_document_rgba(800, 600).unwrap();
+        assert_eq!(differing(&first, &cold), 0, "two cold builds must agree");
+        let text = crate::dom::children(target)[0];
+        let mut failures = Vec::new();
+        for round in 0..2 {
+            crate::dom::set_text_content(text, "mno x");
+            let _ = render_document_rgba(800, 600).unwrap();
+            crate::dom::set_text_content(text, "mno");
+            let count = differing(&render_document_rgba(800, 600).unwrap(), &cold);
+            if count != 0 {
+                failures.push(format!("round {round} text: {count} pixels"));
+            }
+            let parent = crate::dom::parent_node(target).unwrap();
+            let next = crate::dom::next_sibling(target);
+            crate::dom::remove_child(parent, target);
+            let _ = render_document_rgba(800, 600).unwrap();
+            match next {
+                Some(next) => crate::dom::insert_before(parent, target, next),
+                None => crate::dom::append_child(parent, target),
+            }
+            let count = differing(&render_document_rgba(800, 600).unwrap(), &cold);
+            if count != 0 {
+                failures.push(format!("round {round} reinsert: {count} pixels"));
+            }
+            let style = crate::jsdom::element_value(target).get_property("style");
+            style.set_property("paddingBottom", Value::string("3px"));
+            let _ = render_document_rgba(800, 600).unwrap();
+            style.call_method("removeProperty", vec![Value::string("padding-bottom")]);
+            let count = differing(&render_document_rgba(800, 600).unwrap(), &cold);
+            if count != 0 {
+                failures.push(format!("round {round} padding: {count} pixels"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "restored frames differ from a cold build: {failures:?}"
+        );
+        crate::jsdom::reset_bridge();
+    }
+
     #[test]
     fn window_scroll_keeps_fixed_descendants_in_the_viewport() {
         crate::dom::reset_document();
