@@ -3219,7 +3219,7 @@ impl Document {
         let mut component = self.node_to_component(id, &mut ancestors, inherited.as_ref());
         wrap_inline_runs_between_block_boxes(&mut component);
         normalize_single_inline_text_indent(&mut component);
-        reorder_explicit_bidi_inline_rows(&mut component);
+        reorder_bidi_for_lowering(&mut component);
         split_padded_inline_text_fragments(&mut component);
         split_collapsible_space_after_nonbreaking_run(&mut component);
         component
@@ -16089,7 +16089,94 @@ mod text_indent_lowering_tests {
     }
 }
 
+/// `W3COS_BIDI_FAST=1` (off by default): like Blink's
+/// `NGInlineNode::IsBidiEnabled`, a lowered tree with no rtl direction, no
+/// unicode-bidi other than normal, no bidi control, strong rtl or Arabic
+/// number character, no regional indicator and no bidi font-run marker
+/// skips the bidi pass that runs before each box's children are visited
+/// (its logical-run coalesce works on a clone of the box); the pass after
+/// them (coalesce, empty inline boxes) still runs. `=verify` also runs the
+/// full pass and compares the trees.
+fn bidi_fast_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_BIDI_FAST").as_deref() {
+        Ok("1" | "true") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether anything in `component` can make the bidi pass act.
+fn subtree_needs_bidi(component: &w3cos_std::Component) -> bool {
+    use w3cos_std::style::{TextDirection, UnicodeBidi};
+    let mut stack = vec![component];
+    while let Some(node) = stack.pop() {
+        let style = &node.style;
+        if style.direction == TextDirection::Rtl
+            || style.unicode_bidi != UnicodeBidi::Normal
+            || style.custom_properties.as_ref().is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-bidi-font-runs")
+            })
+        {
+            return true;
+        }
+        if let w3cos_std::ComponentKind::Text { content } = &node.kind
+            && !content.is_ascii()
+            && content.chars().any(|character| {
+                is_bidi_control(character)
+                    || is_regional_indicator(character)
+                    || matches!(
+                        unicode_bidi::bidi_class(character),
+                        unicode_bidi::BidiClass::R
+                            | unicode_bidi::BidiClass::AL
+                            | unicode_bidi::BidiClass::AN
+                    )
+            })
+        {
+            return true;
+        }
+        stack.extend(node.children.iter());
+    }
+    false
+}
+
+thread_local! {
+    static BIDI_FAST_STATS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn reorder_bidi_for_lowering(component: &mut w3cos_std::Component) {
+    let mode = bidi_fast_mode();
+    if mode == 0 || subtree_needs_bidi(component) {
+        reorder_explicit_bidi_inline_rows(component);
+        return;
+    }
+    let full = (mode == 2).then(|| {
+        let mut full = component.clone();
+        reorder_explicit_bidi_inline_rows(&mut full);
+        full
+    });
+    reorder_bidi_rows(component, false);
+    if let Some(full) = full {
+        let same = format!("{full:?}") == format!("{component:?}");
+        BIDI_FAST_STATS.with(|stats| {
+            let (checked, bad) = stats.get();
+            let (checked, bad) = (checked + 1, bad + u64::from(!same));
+            stats.set((checked, bad));
+            if !same || checked.is_power_of_two() {
+                eprintln!("[bidi-fast-verify] checked {checked} mismatched {bad}");
+            }
+        });
+        if !same {
+            *component = full;
+        }
+    }
+}
+
 fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
+    reorder_bidi_rows(component, true);
+}
+
+fn reorder_bidi_rows(component: &mut w3cos_std::Component, bidi: bool) {
     use w3cos_std::style::{Display, Float, Position, TextDirection, UnicodeBidi};
     if component.style.direction == TextDirection::Rtl
         && component.style.unicode_bidi == UnicodeBidi::Normal
@@ -16238,10 +16325,10 @@ fn reorder_explicit_bidi_inline_rows(component: &mut w3cos_std::Component) {
         mark_bidi_visual_order(&mut component.style);
         return;
     }
-    let reordered = reorder_explicit_bidi_children(component);
+    let reordered = bidi && reorder_explicit_bidi_children(component);
     if !reordered {
         for child in &mut component.children {
-            reorder_explicit_bidi_inline_rows(child);
+            reorder_bidi_rows(child, bidi);
         }
     }
     coalesce_passive_inline_text_children(component);
