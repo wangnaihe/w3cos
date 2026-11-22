@@ -5298,6 +5298,34 @@ mod tests {
         crate::stylesheet::clear_rules();
     }
 
+    /// css/CSS2/linebox/iframe-in-block-in-inline-ref.html: a restyle of an
+    /// iframe host must keep its replaced box (inline-block, 300x150
+    /// fallback), not patch in its computed inline/auto style.
+    #[test]
+    fn iframe_restyle_keeps_replaced_box() {
+        crate::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let body = crate::dom::body_id();
+        let div = crate::dom::create_element("div");
+        let frame = crate::dom::create_element("iframe");
+        crate::dom::append_child(div, frame);
+        crate::dom::append_child(body, div);
+        let after = crate::dom::create_element("div");
+        crate::dom::append_child(after, crate::dom::create_text_node("after"));
+        crate::dom::append_child(body, after);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("initial");
+        style(frame, &[("border-width", "3px")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("iframe border");
+        style(frame, &[("color", "red")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("iframe color");
+        crate::stylesheet::clear_rules();
+    }
+
     /// css/css-tables/min-max-size-table-content-box-ref.html: removing and
     /// re-inserting the only child of a max-width grid item (an
     /// inline-block, blockified) with a layout flush in between must lay

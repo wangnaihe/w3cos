@@ -996,6 +996,14 @@ fn patch_and_compute(
         .then(|| located_style(key, &cache.component, dirty[0].as_u32()).cloned())
         .flatten();
     for id in dirty {
+        // An iframe/object host's box style is not its computed style: the
+        // DOM lowering makes it a replaced inline-block with the 300x150
+        // fallback size (`--w3cos-internal-replaced-element`). Patching the
+        // computed style in would lay it out as a plain inline box; lower
+        // the document again, as Blink rebuilds a LayoutIFrame's style.
+        if located_style(key, &cache.component, id.as_u32()).is_some_and(is_replaced_host) {
+            return false;
+        }
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         if !style_patch_is_safe(&style) {
             return false;
@@ -2746,6 +2754,13 @@ fn shares_inline_or_float_context(component: &Component, id: u32) -> bool {
         .children
         .iter()
         .any(|child| shares_inline_or_float_context(child, id))
+}
+
+fn is_replaced_host(style: &w3cos_std::style::Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key("--w3cos-internal-replaced-element"))
 }
 
 fn style_patch_is_safe(style: &w3cos_std::style::Style) -> bool {
