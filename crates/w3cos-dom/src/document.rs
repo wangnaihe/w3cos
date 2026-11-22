@@ -568,6 +568,10 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
 /// ComputedStyle>): the per-node cache and layout walk share one allocation.
 pub type SharedStyle = std::sync::Arc<w3cos_std::style::Style>;
 
+/// Smallest shared-style intern size that triggers dropping entries no
+/// node references any more.
+pub(crate) const SHARED_STYLE_INTERN_MIN_PRUNE: usize = 256;
+
 /// Set on the document element's component in quirks mode (BackCompat).
 pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
 /// Set on the document element itself.
@@ -738,6 +742,8 @@ pub struct Document {
     shared_style_intern_inserts: Cell<usize>,
     /// Distinct custom-property maps seen by [`Self::intern_shared_style`].
     custom_properties_intern: RefCell<Vec<w3cos_std::style::CustomProperties>>,
+    /// Intern length at which unreferenced entries are dropped.
+    shared_style_intern_prune_at: Cell<usize>,
 }
 
 #[path = "document/component_patch.rs"]
@@ -889,6 +895,15 @@ impl Document {
         if let Some(existing) = intern.iter().find(|s| s.as_ref() == style.as_ref()) {
             return existing.clone();
         }
+        if intern.len() >= self.shared_style_intern_prune_at.get() {
+            // Entries only the table still references can never be shared
+            // again by an existing node; keeping them grows the table (and
+            // this linear scan) with every distinct style the page ever
+            // produced. Doubling the threshold keeps pruning amortized O(1).
+            intern.retain(|s| std::sync::Arc::strong_count(s) > 1);
+            self.shared_style_intern_prune_at
+                .set((intern.len() * 2).max(SHARED_STYLE_INTERN_MIN_PRUNE));
+        }
         intern.push(style.clone());
         self.shared_style_intern_inserts
             .set(self.shared_style_intern_inserts.get() + 1);
@@ -918,6 +933,11 @@ impl Document {
             None if maps.len() < MAX_MAPS => maps.push(props.clone()),
             None => {}
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_style_intern_len(&self) -> usize {
+        self.shared_style_intern.borrow().len()
     }
 
     fn component_style_shared(
@@ -1048,6 +1068,7 @@ impl Document {
             shared_style_intern: RefCell::new(Vec::new()),
             shared_style_intern_inserts: Cell::new(0),
             custom_properties_intern: RefCell::new(Vec::new()),
+            shared_style_intern_prune_at: Cell::new(SHARED_STYLE_INTERN_MIN_PRUNE),
         };
 
         let root_id = doc.alloc_node(DomNode {
