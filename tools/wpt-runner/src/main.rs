@@ -635,6 +635,13 @@ fn spawn_worker(
     let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("WPT worker stderr reader panicked"))??;
+    // `W3COS_WPT_FORWARD_STDERR=1` (off by default): pass every worker's stderr
+    // through, so `=verify` and multi-frame lines from passing cases are kept.
+    if std::env::var_os("W3COS_WPT_FORWARD_STDERR").is_some_and(|value| value == "1") {
+        use std::io::Write;
+        let mut out = std::io::stderr().lock();
+        let _ = out.write_all(&stderr);
+    }
     if timed_out {
         let tail = String::from_utf8_lossy(&stderr)
             .chars()

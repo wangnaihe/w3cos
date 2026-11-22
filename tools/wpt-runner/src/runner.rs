@@ -378,9 +378,10 @@ fn load_and_render(
 }
 
 /// `W3COS_WPT_REUSE_FRAMES=N` (off by default): after the captured frame,
-/// make N small edits (alternately a text edit and a remove/reinsert of an
-/// element), each drawn once edited and once undone, so incremental paint
-/// paths (with their `=verify` modes) see frames after the first. The undone
+/// make N small edits (in turn a text edit, a remove/reinsert of an element,
+/// and an inline padding edit on it), each drawn once edited and once undone,
+/// so incremental layout and paint paths (with their `=verify` modes) see
+/// frames after the first. The undone
 /// frame must equal the captured one. The reported frame stays the first.
 fn reuse_frame_steps() -> Option<usize> {
     static STEPS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -390,6 +391,11 @@ fn reuse_frame_steps() -> Option<usize> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|steps| *steps > 0)
     })
+}
+
+thread_local! {
+    static DIFF_KIND: std::cell::Cell<char> = const { std::cell::Cell::new('?') };
+    static FLUSH_KIND: std::cell::Cell<&'static str> = const { std::cell::Cell::new("none") };
 }
 
 fn reuse_frames_check(url: &str, width: u32, height: u32, first: &HeadlessFrame, steps: usize) {
@@ -421,19 +427,75 @@ fn reuse_frames_check(url: &str, width: u32, height: u32, first: &HeadlessFrame,
         stack.extend(children);
     }
     let (mut frames, mut diffs) = (0usize, 0usize);
+    // Which edit kinds (t text, r remove/reinsert, s style) restored to a
+    // different frame.
+    let mut diff_kinds = String::new();
     let before = w3cos_runtime::headless::persistent_paint_stats();
-    let mut draw =
-        |restored: bool| match w3cos_runtime::headless::render_document_rgba(width, height) {
-            Ok(frame) => {
-                frames += 1;
-                if restored && frame.rgba != first.rgba {
-                    diffs += 1;
-                }
+    // `W3COS_WPT_REUSE_FLUSH=1`: run the script-side layout flush (what an
+    // offsetHeight read does) before each draw, so the incremental flush
+    // paths (`W3COS_STYLE_LOCAL`, splices) and their verify modes run too.
+    let script_flush = std::env::var("W3COS_WPT_REUSE_FLUSH").is_ok_and(|value| value == "1");
+    if script_flush {
+        let _ = w3cos_runtime::incremental_layout::flush();
+    }
+    let mut draw = |restored: bool| match {
+        if script_flush {
+            let _ = w3cos_runtime::incremental_layout::flush();
+            if !restored {
+                FLUSH_KIND.with(|kind| {
+                    kind.set(w3cos_runtime::incremental_layout::last_flush_stats().kind)
+                });
             }
-            Err(error) => eprintln!("[wpt-reuse-frames] {url} render failed: {error}"),
-        };
+        }
+        w3cos_runtime::headless::render_document_rgba(width, height)
+    } {
+        Ok(frame) => {
+            frames += 1;
+            if restored && frame.rgba != first.rgba {
+                if let Some(dir) = std::env::var_os("W3COS_WPT_REUSE_DUMP") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let save = |name: String, rgba: &[u8]| {
+                        if let Some(image) =
+                            image::RgbaImage::from_raw(width, height, rgba.to_vec())
+                        {
+                            let _ = image.save(dir.join(name));
+                        }
+                    };
+                    save("first.png".into(), &first.rgba);
+                    save(format!("restored-{frames}.png"), &frame.rgba);
+                }
+                diffs += 1;
+                diff_kinds.push(DIFF_KIND.with(std::cell::Cell::get));
+            }
+        }
+        Err(error) => eprintln!("[wpt-reuse-frames] {url} render failed: {error}"),
+    };
+    // Flush kinds of the style edits (`W3COS_STYLE_LOCAL` coverage).
+    let mut style_kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
     for step in 0..steps {
-        if step % 2 == 0 {
+        DIFF_KIND.with(|kind| kind.set(['t', 'r', 's'][step % 3]));
+        if step % 3 == 2 {
+            // A geometry style edit on the last element, then undone.
+            let Some(node) = element else { continue };
+            // Undo through a snapshot of the declaration block, so the
+            // restored frame does not depend on CSSOM serialization.
+            let id = w3cos_dom::NodeId::from_u32(node);
+            let saved = dom::with_document(|doc| doc.get_style(id).clone());
+            dom::set_style_property(node, "padding-bottom", "3px");
+            draw(false);
+            let kind = if script_flush {
+                FLUSH_KIND.with(std::cell::Cell::get)
+            } else {
+                w3cos_runtime::incremental_layout::last_flush_stats().kind
+            };
+            *style_kinds.entry(kind).or_default() += 1;
+            dom::with_document_mut(|doc| {
+                *doc.get_style_mut_for_property(id, "padding-bottom") = saved
+            });
+            dom::invalidate_animated_style(node);
+            draw(true);
+        } else if step % 3 == 0 {
             let Some(node) = text else { continue };
             let original = dom::get_text_content(node).unwrap_or_default();
             dom::set_text_content(node, &format!("{original} x"));
@@ -457,7 +519,7 @@ fn reuse_frames_check(url: &str, width: u32, height: u32, first: &HeadlessFrame,
     }
     let after = w3cos_runtime::headless::persistent_paint_stats();
     eprintln!(
-        "[wpt-reuse-frames] {url} frames {frames} restore-diff {diffs} persistent {} clean {} mismatch {}",
+        "[wpt-reuse-frames] {url} frames {frames} restore-diff {diffs} persistent {} clean {} mismatch {} style-kinds {style_kinds:?} diff-kinds [{diff_kinds}]",
         after.0 - before.0,
         after.1 - before.1,
         after.2 - before.2
