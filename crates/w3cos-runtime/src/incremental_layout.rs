@@ -57,6 +57,10 @@ struct RetainedTree {
     /// moving the tree does not reassert unique access over the nodes the
     /// flat view borrows.
     root: std::ptr::NonNull<Component>,
+    /// `W3COS_PREORDER_SIZES`: the node count of each box's subtree, by
+    /// preorder index (as [`crate::layout::count_nodes`] counts). Dropped by
+    /// any edit but an in-place restyle; a child-list splice updates it.
+    preorder: Option<Vec<u32>>,
 }
 
 impl RetainedTree {
@@ -64,6 +68,7 @@ impl RetainedTree {
         Self {
             flat: None,
             root: std::ptr::NonNull::from(Box::leak(Box::new(component))),
+            preorder: None,
         }
     }
 
@@ -94,6 +99,20 @@ impl RetainedTree {
 }
 
 impl RetainedTree {
+    /// Take the preorder subtree sizes (computed when missing). Whoever
+    /// takes them hands them back with [`Self::put_preorder`] only while
+    /// they still describe the tree.
+    fn take_preorder(&mut self) -> Vec<u32> {
+        match self.preorder.take() {
+            Some(sizes) => sizes,
+            None => preorder_sizes_of(self),
+        }
+    }
+
+    fn put_preorder(&mut self, sizes: Vec<u32>) {
+        self.preorder = Some(sizes);
+    }
+
     /// Run `edit` on the box at `path` (child positions from the root),
     /// keeping the flat view. `edit` may change the box's own fields but
     /// not its children. The walk reaches the box through raw pointers and
@@ -120,7 +139,18 @@ impl RetainedTree {
             Some(indices)
         });
         let Some(indices) = indices else {
-            return component_at_mut(self, path).map(edit).is_some();
+            // An in-place restyle keeps the preorder sizes (only the child
+            // lists decide them).
+            let preorder = self.preorder.take();
+            let kept = component_at_mut(self, path).map(|node| {
+                let children = (node.children.as_ptr(), node.children.len());
+                edit(node);
+                children == (node.children.as_ptr(), node.children.len())
+            });
+            if kept == Some(true) {
+                self.preorder = preorder;
+            }
+            return kept.is_some();
         };
         let mut nodes = Vec::with_capacity(indices.len());
         let mut node = self.root.as_ptr();
@@ -139,6 +169,7 @@ impl RetainedTree {
             if children != ((*node).children.as_ptr(), (*node).children.len()) {
                 // (Not an in-place restyle: flatten again.)
                 self.flat = None;
+                self.preorder = None;
                 return true;
             }
             let flat = &mut self.flat.as_mut().expect("flat view").1;
@@ -156,6 +187,37 @@ impl RetainedTree {
     }
 }
 
+/// The node count of each box's subtree, by preorder index.
+pub(super) fn preorder_sizes_of(root: &Component) -> Vec<u32> {
+    fn walk(component: &Component, sizes: &mut Vec<u32>) -> u32 {
+        let at = sizes.len();
+        sizes.push(0);
+        let mut size = 1;
+        for child in &component.children {
+            size += walk(child, sizes);
+        }
+        sizes[at] = size;
+        size
+    }
+    let mut sizes = Vec::new();
+    walk(root, &mut sizes);
+    sizes
+}
+
+/// `W3COS_PREORDER_SIZES=1` (off by default): the structural splice reads
+/// subtree node counts from preorder sizes kept with the retained tree and
+/// updated by each child-list splice, instead of counting the whole tree on
+/// every splice (Blink keeps such counts on the layout tree rather than
+/// walking it). `=verify` also counts and reports a difference.
+pub(super) fn preorder_sizes_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_PREORDER_SIZES").as_deref() {
+        Ok("1" | "true") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
 impl std::ops::Deref for RetainedTree {
     type Target = Component;
     fn deref(&self) -> &Component {
@@ -167,6 +229,7 @@ impl std::ops::Deref for RetainedTree {
 impl std::ops::DerefMut for RetainedTree {
     fn deref_mut(&mut self) -> &mut Component {
         self.flat = None;
+        self.preorder = None;
         // SAFETY: the flat view (the only other borrow) was just dropped.
         unsafe { self.root.as_mut() }
     }

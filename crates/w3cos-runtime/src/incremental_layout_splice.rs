@@ -1659,6 +1659,28 @@ pub(super) fn try_splice(
         }
         return false;
     }
+    if super::preorder_sizes_mode() == 0 {
+        return try_splice_with(cache, dirty, viewport_w, viewport_h, &mut None);
+    }
+    // `W3COS_PREORDER_SIZES`: hold the retained tree's preorder sizes across
+    // the splice (its solve swaps subtrees in and out, which would drop
+    // them). A refused splice leaves the tree as it was; a child-list
+    // commit updates them; any other commit drops them.
+    let mut preorder = Some(cache.component.take_preorder());
+    let spliced = try_splice_with(cache, dirty, viewport_w, viewport_h, &mut preorder);
+    if let Some(sizes) = preorder {
+        cache.component.put_preorder(sizes);
+    }
+    spliced
+}
+
+fn try_splice_with(
+    cache: &mut Cache,
+    dirty: &[NodeId],
+    viewport_w: f32,
+    viewport_h: f32,
+    preorder: &mut Option<Vec<u32>>,
+) -> bool {
     if !cache.splice_owners_ok
         || cache.viewport_w_bits != viewport_w.to_bits()
         || cache.viewport_h_bits != viewport_h.to_bits()
@@ -2158,7 +2180,15 @@ pub(super) fn try_splice(
         {
             let shift = RebaseShift { dx, dy, dh, levels };
             rebase_pending_client_rects(
-                cache, &plan.path, *keep, *removed, raw, first, len, &shift,
+                cache,
+                &plan.path,
+                *keep,
+                *removed,
+                raw,
+                first,
+                len,
+                &shift,
+                preorder.as_deref(),
             );
             // Owner totals are recounted when a later splice edits the map.
             cache.owner_counts = None;
@@ -2283,8 +2313,12 @@ pub(super) fn try_splice(
         });
     });
     match commit {
-        PlanKind::Subtree(fresh) => *target = fresh,
+        PlanKind::Subtree(fresh) => {
+            *preorder = None;
+            *target = fresh;
+        }
         PlanKind::Tail { keep, tail } => {
+            *preorder = None;
             target.children.truncate(keep);
             target.children.extend(tail);
         }
@@ -2294,9 +2328,25 @@ pub(super) fn try_splice(
             inserted,
         } => {
             CHILD_SPLICES.with(|count| count.set(count.get() + 1));
+            if let Some(sizes) = preorder.as_mut() {
+                // (`target` is borrowed: take the path starts from the sizes,
+                // which still describe the old tree.)
+                let (starts, removed_start, removed_end) =
+                    preorder_span(sizes, &plan.path, keep, removed);
+                let mut fresh = Vec::new();
+                for item in &inserted {
+                    fresh.extend(super::preorder_sizes_of(item));
+                }
+                let delta = fresh.len() as i64 - (removed_end - removed_start) as i64;
+                sizes.splice(removed_start..removed_end, fresh);
+                for start in starts {
+                    sizes[start] = (sizes[start] as i64 + delta) as u32;
+                }
+            }
             target.children.splice(keep..keep + removed, inserted);
         }
     }
+
     cache.node_ids_stale = true;
     cache.width_memos.clear();
     let solved = child_solved.unwrap_or_else(|| {
@@ -2312,6 +2362,37 @@ pub(super) fn try_splice(
         verify_lowering(cache, plan.node);
     }
     true
+}
+
+/// From preorder sizes: the preorder start of each box on `path` (the root
+/// first, the target last) and the preorder range of the target's children
+/// `keep..keep + removed`.
+fn preorder_span(
+    sizes: &[u32],
+    path: &[usize],
+    keep: usize,
+    removed: usize,
+) -> (Vec<usize>, usize, usize) {
+    let mut starts = Vec::with_capacity(path.len() + 1);
+    let mut index = 0;
+    starts.push(0);
+    for &child in path {
+        let mut at = index + 1;
+        for _ in 0..child {
+            at += sizes[at] as usize;
+        }
+        index = at;
+        starts.push(index);
+    }
+    let mut at = index + 1;
+    for _ in 0..keep {
+        at += sizes[at] as usize;
+    }
+    let removed_start = at;
+    for _ in 0..removed {
+        at += sizes[at] as usize;
+    }
+    (starts, removed_start, at)
 }
 
 struct RebaseShift {
@@ -2337,11 +2418,43 @@ fn rebase_pending_client_rects(
     first: usize,
     len: usize,
     shift: &RebaseShift,
+    preorder: Option<&[u32]>,
 ) {
     let Some(pending) = super::take_pending_client_rects() else {
         return;
     };
     let root = &*cache.component;
+    if let Some(sizes) = preorder {
+        if super::preorder_sizes_mode() == 2 {
+            let counted = super::preorder_sizes_of(root);
+            if counted.as_slice() != sizes {
+                eprintln!(
+                    "[preorder-sizes-verify] mismatch: kept {} counted {}",
+                    sizes.len(),
+                    counted.len()
+                );
+            }
+        }
+        let (starts, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+        let size_at = |start: usize| sizes[start] as usize;
+        let sizes: Vec<usize> = starts.iter().map(|&start| size_at(start)).collect();
+        let target_index = starts[path.len()];
+        rebase_with_spans(
+            root,
+            pending,
+            path,
+            raw,
+            first,
+            len,
+            shift,
+            &starts,
+            &sizes,
+            target_index,
+            removed_start,
+            removed_end,
+        );
+        return;
+    }
     let count = crate::layout::count_nodes;
     // Preorder start of each node on the path, and each one's node count,
     // counted once bottom-up so the large subtree on the path is walked once.
@@ -2373,6 +2486,40 @@ fn rebase_pending_client_rects(
                 .map(|(_, child)| count(child))
                 .sum::<usize>();
     }
+    rebase_with_spans(
+        root,
+        pending,
+        path,
+        raw,
+        first,
+        len,
+        shift,
+        &starts,
+        &sizes,
+        target_index,
+        removed_start,
+        removed_end,
+    );
+}
+
+/// [`rebase_pending_client_rects`] once the preorder spans are known:
+/// `starts`/`sizes` are the preorder start and node count of each box on
+/// `path` (root first).
+#[allow(clippy::too_many_arguments)]
+fn rebase_with_spans(
+    root: &Component,
+    pending: super::PendingClientRects,
+    path: &[usize],
+    raw: RawSolve,
+    first: usize,
+    len: usize,
+    shift: &RebaseShift,
+    starts: &[usize],
+    sizes: &[usize],
+    target_index: usize,
+    removed_start: usize,
+    removed_end: usize,
+) {
     let target_end = target_index + sizes[path.len()];
     let mut shifted: Vec<(usize, usize)> = Vec::new();
     let mut grown: Vec<usize> = Vec::new();
