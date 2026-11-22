@@ -2314,11 +2314,27 @@ fn try_splice_with(
     });
     match commit {
         PlanKind::Subtree(fresh) => {
-            *preorder = None;
+            // A subtree swap is a one-child splice in the parent's list (the
+            // root has none: count the fresh tree).
+            match plan.path.split_last() {
+                Some((&at, parent)) if preorder_tail_keep() => {
+                    if let Some(sizes) = preorder.as_mut() {
+                        splice_preorder(sizes, parent, at, 1, std::slice::from_ref(&fresh));
+                    }
+                }
+                _ => *preorder = None,
+            }
             *target = fresh;
         }
         PlanKind::Tail { keep, tail } => {
-            *preorder = None;
+            if preorder_tail_keep() {
+                if let Some(sizes) = preorder.as_mut() {
+                    let removed = target.children.len() - keep;
+                    splice_preorder(sizes, &plan.path, keep, removed, &tail);
+                }
+            } else {
+                *preorder = None;
+            }
             target.children.truncate(keep);
             target.children.extend(tail);
         }
@@ -2329,21 +2345,22 @@ fn try_splice_with(
         } => {
             CHILD_SPLICES.with(|count| count.set(count.get() + 1));
             if let Some(sizes) = preorder.as_mut() {
-                // (`target` is borrowed: take the path starts from the sizes,
-                // which still describe the old tree.)
-                let (starts, removed_start, removed_end) =
-                    preorder_span(sizes, &plan.path, keep, removed);
-                let mut fresh = Vec::new();
-                for item in &inserted {
-                    fresh.extend(super::preorder_sizes_of(item));
-                }
-                let delta = fresh.len() as i64 - (removed_end - removed_start) as i64;
-                sizes.splice(removed_start..removed_end, fresh);
-                for start in starts {
-                    sizes[start] = (sizes[start] as i64 + delta) as u32;
-                }
+                splice_preorder(sizes, &plan.path, keep, removed, &inserted);
             }
             target.children.splice(keep..keep + removed, inserted);
+        }
+    }
+    if super::preorder_sizes_mode() == 2
+        && preorder_tail_keep()
+        && let Some(sizes) = preorder.as_ref()
+    {
+        let counted = super::preorder_sizes_of(&cache.component);
+        if counted != *sizes {
+            eprintln!(
+                "[preorder-sizes-verify] mismatch after commit: kept {} counted {}",
+                sizes.len(),
+                counted.len()
+            );
         }
     }
 
@@ -2404,6 +2421,42 @@ fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 /// From preorder sizes: the preorder start of each box on `path` (the root
 /// first, the target last) and the preorder range of the target's children
 /// `keep..keep + removed`.
+/// `W3COS_PREORDER_TAIL_KEEP=1` (off by default; only read under
+/// `W3COS_PREORDER_SIZES`): subtree and tail commits (a text edit's
+/// paragraph, a stream step) update the kept preorder sizes like a
+/// child-list commit does, instead of dropping them for the next splice to
+/// recount the whole tree.
+fn preorder_tail_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("W3COS_PREORDER_TAIL_KEEP").as_deref(),
+            Ok("1" | "true")
+        )
+    })
+}
+
+/// Update preorder `sizes` (still describing the old tree) for replacing
+/// children `keep..keep + removed` of the box at `path` with `inserted`.
+fn splice_preorder(
+    sizes: &mut Vec<u32>,
+    path: &[usize],
+    keep: usize,
+    removed: usize,
+    inserted: &[Component],
+) {
+    let (starts, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+    let mut fresh = Vec::new();
+    for item in inserted {
+        fresh.extend(super::preorder_sizes_of(item));
+    }
+    let delta = fresh.len() as i64 - (removed_end - removed_start) as i64;
+    sizes.splice(removed_start..removed_end, fresh);
+    for start in starts {
+        sizes[start] = (sizes[start] as i64 + delta) as u32;
+    }
+}
+
 fn preorder_span(
     sizes: &[u32],
     path: &[usize],
