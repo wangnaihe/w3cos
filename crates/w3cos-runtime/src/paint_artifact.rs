@@ -473,10 +473,12 @@ pub struct PaintArtifact {
     /// `W3COS_PAINT_PERSISTENT_NODES`: the boxes whose text the line-start
     /// trim shortened in this build (sorted), for the next build's clean
     /// boxes, which take this build's adjusted node.
-    persist_trimmed: Option<std::sync::Arc<Vec<u32>>>,
+    pub(crate) persist_trimmed: Option<std::sync::Arc<Vec<u32>>>,
     /// That build found percentage padding (its clean boxes' used padding
     /// depends on their containing blocks: no persistent path from it).
     persist_percent_padding: bool,
+    /// The viewport that build adjusted its used styles for.
+    persist_viewport: Option<(f32, f32)>,
     /// During `append_all_reusing` only: the boxes this frame's layout
     /// splice touched ([`paint_touched_mode`]).
     touched: Option<crate::incremental_layout::PaintChanges>,
@@ -547,6 +549,7 @@ impl Default for PaintArtifact {
             serial: 0,
             persist_trimmed: None,
             persist_percent_padding: false,
+            persist_viewport: None,
             touched: None,
             touched_gaps: false,
             volatile_nodes: None,
@@ -683,6 +686,34 @@ thread_local! {
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
+/// `W3COS_PAINT_PERSIST_INPLACE=1|verify` (with the persistent path on):
+/// a box clean in this splice and the last one keeps the whole node of the
+/// artifact the last frame replaced (its kind and adjusted style) instead of
+/// a node made from the flat tree; `=verify` also builds the nodes in full
+/// and compares, like `W3COS_PAINT_PERSISTENT_NODES=verify`.
+pub(crate) fn persist_inplace_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !matches!(persistent_nodes_mode(), 1 | 2) {
+            return 0;
+        }
+        match std::env::var("W3COS_PAINT_PERSIST_INPLACE").as_deref() {
+            Ok("1" | "true") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+/// The in-place inputs (`persist_inplace_mode`): which boxes took a
+/// recycled node, the flat-tree node of a box, and the trimmed boxes of the
+/// artifact the recycled nodes come from (their kinds hold trimmed text).
+pub(crate) struct PersistRaw<'a> {
+    pub moved: &'a std::cell::RefCell<Vec<bool>>,
+    pub raw: &'a dyn Fn(usize) -> PaintNode,
+    pub stale_trimmed: Option<std::sync::Arc<Vec<u32>>>,
+}
+
 thread_local! {
     /// (frames built on the persistent path, clean boxes taken).
     pub(crate) static PERSISTENT_NODES_STATS: std::cell::Cell<(u64, u64)> =
@@ -706,7 +737,10 @@ impl PersistPlan<'_> {
     fn prefill(&self, nodes: &mut [PaintNode]) {
         for (index, (node, clean)) in nodes.iter_mut().zip(&self.clean).enumerate() {
             if *clean {
-                node.style = self.previous.nodes[index].style.clone();
+                let previous = &self.previous.nodes[index].style;
+                if !node.style.ptr_eq(previous) {
+                    node.style = previous.clone();
+                }
             }
         }
         for &index in self.trimmed.iter() {
@@ -722,10 +756,16 @@ fn persistent_nodes_plan<'a>(
     nodes: &[PaintNode],
     previous: Option<&'a PaintArtifact>,
     body_index: Option<usize>,
+    viewport: Option<(f32, f32)>,
 ) -> Option<PersistPlan<'a>> {
     let previous = previous?;
     let trimmed = previous.persist_trimmed.clone()?;
-    if previous.persist_percent_padding || previous.nodes.len() != nodes.len() || nodes.is_empty() {
+    // Used styles depend on the viewport (fixed backgrounds).
+    if previous.persist_viewport != viewport
+        || previous.persist_percent_padding
+        || previous.nodes.len() != nodes.len()
+        || nodes.is_empty()
+    {
         return None;
     }
     let changed = PAINT_TOUCHED.with(|touched| {
@@ -3641,7 +3681,28 @@ impl PaintArtifact {
         viewport: Option<(f32, f32)>,
         previous: Option<&PaintArtifact>,
     ) -> Self {
+        Self::build_reusing_with(
+            nodes,
+            layout_cache,
+            generation,
+            body_index,
+            viewport,
+            previous,
+            None,
+        )
+    }
+
+    pub(crate) fn build_reusing_with(
+        nodes: impl IntoIterator<Item = PaintNode>,
+        layout_cache: &[(LayoutRect, usize)],
+        generation: u64,
+        body_index: Option<usize>,
+        viewport: Option<(f32, f32)>,
+        previous: Option<&PaintArtifact>,
+        persist_raw: Option<PersistRaw<'_>>,
+    ) -> Self {
         let mut nodes: Vec<_> = nodes.into_iter().collect();
+        let collected = nodes.len();
         // Reused snapshots include paint-only UA children; reconstruct them
         // from their live hosts rather than accumulating another copy.
         nodes.retain(|node| !node.is_paint_only());
@@ -3654,8 +3715,43 @@ impl PaintArtifact {
         // The persistent path (see `persistent_nodes_plan`): boxes the
         // layout splice did not change take last build's adjusted node.
         let plan = persist_on
-            .then(|| persistent_nodes_plan(&nodes, previous, body_index))
+            .then(|| persistent_nodes_plan(&nodes, previous, body_index, viewport))
             .flatten();
+        // In place: a recycled node stays only where the plan keeps the box
+        // clean; elsewhere (and on a box whose recycled kind may hold text
+        // trimmed two builds ago) the box takes its flat-tree node again.
+        let mut moved: Option<Vec<bool>> = None;
+        if let Some(persist_raw) = persist_raw.as_ref() {
+            let taken = std::mem::take(&mut *persist_raw.moved.borrow_mut());
+            if taken.iter().any(|moved| *moved) {
+                let aligned = collected == nodes.len() && taken.len() == nodes.len();
+                let clean =
+                    |index: usize| aligned && plan.as_ref().is_some_and(|plan| plan.clean[index]);
+                for (index, was_moved) in taken.iter().enumerate() {
+                    if *was_moved && !clean(index) && index < nodes.len() {
+                        nodes[index] = (persist_raw.raw)(index);
+                    }
+                }
+                match (&persist_raw.stale_trimmed, aligned) {
+                    (Some(stale), true) => {
+                        for &index in stale.iter() {
+                            let index = index as usize;
+                            if taken.get(index).copied().unwrap_or(false) && clean(index) {
+                                nodes[index].kind = (persist_raw.raw)(index).kind;
+                            }
+                        }
+                    }
+                    _ => {
+                        for (index, was_moved) in taken.iter().enumerate() {
+                            if *was_moved && clean(index) {
+                                nodes[index].kind = (persist_raw.raw)(index).kind;
+                            }
+                        }
+                    }
+                }
+                moved = aligned.then_some(taken);
+            }
+        }
         let adjust = |mut nodes: Vec<PaintNode>, plan: Option<&PersistPlan>| {
             if let Some(plan) = plan {
                 plan.prefill(&mut nodes);
@@ -4044,7 +4140,19 @@ impl PaintArtifact {
                 has_percentage_padding,
             )
         };
-        let source_nodes = (persist_mode == 2 && plan.is_some()).then(|| nodes.clone());
+        let verify = persist_mode == 2 || persist_inplace_mode() == 2;
+        let source_nodes = (verify && plan.is_some()).then(|| {
+            let mut source = nodes.clone();
+            // The full build starts from flat-tree nodes, not recycled ones.
+            if let (Some(moved), Some(persist_raw)) = (moved.as_ref(), persist_raw.as_ref()) {
+                for (index, was_moved) in moved.iter().enumerate() {
+                    if *was_moved {
+                        source[index] = (persist_raw.raw)(index);
+                    }
+                }
+            }
+            source
+        });
         let (
             nodes,
             rect_by_index,
@@ -4108,6 +4216,7 @@ impl PaintArtifact {
             generation,
             persist_trimmed,
             persist_percent_padding: has_percentage_padding,
+            persist_viewport: viewport,
             ..Self::default()
         };
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);

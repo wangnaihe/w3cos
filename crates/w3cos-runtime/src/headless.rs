@@ -105,6 +105,11 @@ thread_local! {
     /// frame that replaced their artifact, when that frame used a touched set
     /// (`W3COS_PAINT_KIND_KEEP`).
     static RECYCLED_CHANGED: RefCell<Option<(usize, Vec<(u32, u32)>)>> = const { RefCell::new(None) };
+    /// `W3COS_PAINT_PERSIST_INPLACE`: the whole nodes of the artifact the
+    /// last frame replaced (instead of `RECYCLED_KINDS`), and its trimmed
+    /// boxes.
+    static RECYCLED_NODES: RefCell<(Vec<Option<PaintNode>>, Option<std::sync::Arc<Vec<u32>>>)> =
+        const { RefCell::new((Vec::new(), None)) };
     /// (kinds kept without a copy, kinds copied, verify mismatches).
     static PAINT_KIND_KEEP_STATS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
 }
@@ -383,9 +388,20 @@ fn finish_headless_frame(
     let frame_len = flat.len();
     let keep_mode = paint_kind_keep_mode();
     let mut recycled = RECYCLED_KINDS.with(|kinds| std::mem::take(&mut *kinds.borrow_mut()));
+    let inplace = crate::paint_artifact::persist_inplace_mode() != 0;
+    let (mut recycled_nodes, stale_trimmed) = if inplace {
+        RECYCLED_NODES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+    } else {
+        (Vec::new(), None)
+    };
+    let recycled_len = if inplace {
+        recycled_nodes.len()
+    } else {
+        recycled.len()
+    };
     let previous_changed = RECYCLED_CHANGED.with(|slot| slot.borrow_mut().take());
     // Boxes either of the last two splices touched; the rest keep their kind.
-    let dirty = (keep_mode != 0 && recycled.len() == frame_len)
+    let dirty = (keep_mode != 0 && recycled_len == frame_len)
         .then_some(())
         .and_then(|()| {
             let (len, previous) = previous_changed.as_ref()?;
@@ -399,7 +415,50 @@ fn finish_headless_frame(
         });
     let mut cursor = 0;
     let (mut kept, mut copied, mut mismatched) = (0u64, 0u64, 0u64);
+    let moved = std::cell::RefCell::new(if inplace {
+        vec![false; frame_len]
+    } else {
+        Vec::new()
+    });
     let paint_nodes = flat.iter().enumerate().map(|(index, node)| {
+        if inplace {
+            let keep = dirty.as_deref().is_some_and(|dirty| {
+                while dirty
+                    .get(cursor)
+                    .is_some_and(|&(_, end)| end as usize <= index)
+                {
+                    cursor += 1;
+                }
+                dirty
+                    .get(cursor)
+                    .is_none_or(|&(start, _)| index < start as usize)
+            });
+            let slot = recycled_nodes.get_mut(index);
+            if keep
+                && let Some(slot) = slot
+                && let Some(mut recycled) = slot.take()
+            {
+                kept += 1;
+                moved.borrow_mut()[index] = true;
+                recycled.parent = node.parent;
+                recycled.sticky_counter_signal = node.sticky_counter_signal;
+                return recycled;
+            }
+            copied += 1;
+            let kind = crate::paint_artifact::refill_kind(
+                recycled_nodes
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .map(|recycled| &mut recycled.kind),
+                node.kind,
+            );
+            return PaintNode {
+                kind,
+                style: crate::paint_artifact::shared_paint_style(node.component, node.style),
+                parent: node.parent,
+                sticky_counter_signal: node.sticky_counter_signal,
+            };
+        }
         let slot = recycled.get_mut(index);
         let keep = dirty.as_deref().is_some_and(|dirty| {
             while dirty
@@ -442,13 +501,27 @@ fn finish_headless_frame(
     let mut artifact = if crate::paint_artifact::paint_append_reuse_enabled() {
         RETAINED_PAINT.with(|slot| {
             let retained = slot.borrow();
-            PaintArtifact::build_reusing(
+            let raw = |index: usize| {
+                let node = &flat[index];
+                PaintNode {
+                    kind: node.kind.clone(),
+                    style: crate::paint_artifact::shared_paint_style(node.component, node.style),
+                    parent: node.parent,
+                    sticky_counter_signal: node.sticky_counter_signal,
+                }
+            };
+            PaintArtifact::build_reusing_with(
                 paint_nodes,
                 &layout_cache,
                 1,
                 body_index,
                 viewport,
                 retained.as_ref().map(|retained| &retained.artifact),
+                inplace.then(|| crate::paint_artifact::PersistRaw {
+                    moved: &moved,
+                    raw: &raw,
+                    stale_trimmed: stale_trimmed.clone(),
+                }),
             )
         })
     } else {
@@ -639,9 +712,16 @@ fn finish_headless_frame(
         })
     });
     if let Some(replaced) = replaced {
-        recycled.clear();
-        recycled.extend(replaced.artifact.nodes.into_iter().map(|node| node.kind));
-        RECYCLED_KINDS.with(|kinds| *kinds.borrow_mut() = recycled);
+        if inplace {
+            let trimmed = replaced.artifact.persist_trimmed.clone();
+            recycled_nodes.clear();
+            recycled_nodes.extend(replaced.artifact.nodes.into_iter().map(Some));
+            RECYCLED_NODES.with(|slot| *slot.borrow_mut() = (recycled_nodes, trimmed));
+        } else {
+            recycled.clear();
+            recycled.extend(replaced.artifact.nodes.into_iter().map(|node| node.kind));
+            RECYCLED_KINDS.with(|kinds| *kinds.borrow_mut() = recycled);
+        }
         if keep_mode != 0
             && let Some(changed) = frame_changed
         {
