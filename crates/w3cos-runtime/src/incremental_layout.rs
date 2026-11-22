@@ -1134,7 +1134,14 @@ fn patch_and_compute(
         // `W3COS_STYLE_PATHS_KEEP`: hold the known style paths across the
         // splice, which forgets them on each subtree it swaps.
         held_paths = (style_paths_keep_mode() != 0).then(take_style_paths);
-        let root = style_local_root(&cache.component, styles[0].0);
+        // The splice solves the root under a wrapper as wide as the root's
+        // old margin box, which is its containing block only while the
+        // root's own used width came from it: an edit to the root's own
+        // width inputs relays out from its parent.
+        let own_width = previous
+            .as_ref()
+            .is_some_and(|old| own_width_inputs_changed(old, &styles[0].1));
+        let root = style_local_root_for(&cache.component, styles[0].0, own_width);
         let spliced = splice::try_splice(cache, &[NodeId::from_u32(root)], viewport_w, viewport_h);
         splice::set_style_reuse(None);
         if !spliced && let Some(paths) = held_paths.take() {
@@ -2332,11 +2339,22 @@ thread_local! {
 /// algorithm (a table cell resizes its column). Start above the topmost such
 /// box on the path to `id`.
 fn style_local_root(component: &Component, id: u32) -> u32 {
+    style_local_root_for(component, id, false)
+}
+
+/// [`style_local_root`]; `own_width` (the edit changed the element's own
+/// width inputs) starts at its parent, since the element's old border box
+/// no longer bounds its new used width.
+fn style_local_root_for(component: &Component, id: u32, own_width: bool) -> u32 {
     let mut path = Vec::new();
     if !find_path(component, id, &mut path) {
         return id;
     }
-    let mut depth = path.len();
+    let mut depth = if own_width {
+        path.len().saturating_sub(1)
+    } else {
+        path.len()
+    };
     for at in 1..=path.len() {
         let (Some(parent), Some(node)) = (
             component_at(component, &path[..at - 1]),
@@ -2356,6 +2374,57 @@ fn style_local_root(component: &Component, id: u32) -> u32 {
         }
     }
     host_id(component).unwrap_or(id)
+}
+
+/// The edit changes an input of the element's own used width (CSS 2
+/// 10.3.3: width, min/max-width, horizontal margins, box-sizing, display,
+/// the intrinsic sizing keywords, or the font a font-relative width
+/// resolves against), so its old border box is not its containing block's
+/// width.
+fn own_width_inputs_changed(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    use w3cos_dom::css_style::{
+        MAX_WIDTH_KEYWORD_PROPERTY, MIN_WIDTH_KEYWORD_PROPERTY, WIDTH_KEYWORD_PROPERTY,
+    };
+    let keyword = |style: &w3cos_std::style::Style, key: &str| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(key).cloned())
+    };
+    let font_relative = |style: &w3cos_std::style::Style| {
+        [style.width, style.min_width, style.max_width]
+            .iter()
+            .any(|d| {
+                !matches!(
+                    d,
+                    Dimension::Auto | Dimension::Px(_) | Dimension::Percent(_)
+                )
+            })
+            || [style.margin.left, style.margin.right].iter().any(|m| {
+                !matches!(
+                    m,
+                    w3cos_std::style::Spacing::Px(_)
+                        | w3cos_std::style::Spacing::Percent(_)
+                        | w3cos_std::style::Spacing::Auto
+                )
+            })
+    };
+    old.width != new.width
+        || old.min_width != new.min_width
+        || old.max_width != new.max_width
+        || old.margin.left != new.margin.left
+        || old.margin.right != new.margin.right
+        || old.box_sizing != new.box_sizing
+        || old.display != new.display
+        || [
+            WIDTH_KEYWORD_PROPERTY,
+            MIN_WIDTH_KEYWORD_PROPERTY,
+            MAX_WIDTH_KEYWORD_PROPERTY,
+        ]
+        .iter()
+        .any(|key| keyword(old, key) != keyword(new, key))
+        || ((font_relative(old) || font_relative(new))
+            && (old.font_size != new.font_size || old.font_family != new.font_family))
 }
 
 /// `node` (child `index` of `parent`) takes its used size from its content

@@ -5253,6 +5253,51 @@ mod tests {
         crate::stylesheet::clear_rules();
     }
 
+    /// css/css-text/letter-spacing/letter-spacing-trim-start-002.html:
+    /// `width: 15ch` -> `width: max-content` on a block (legacy layout reads
+    /// the keyword as auto) must lay it out at its containing block's width,
+    /// not inside a wrapper as wide as its old 15ch border box.
+    #[test]
+    fn style_local_own_width_edit_matches_full() {
+        crate::stylesheet::clear_rules();
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let body = crate::dom::body_id();
+        style(body, &[("font", "20px/1 monospace")]);
+        let mut divs = Vec::new();
+        for width in ["max-content", "15ch"] {
+            let div = crate::dom::create_element("div");
+            style(
+                div,
+                &[
+                    ("width", width),
+                    ("margin", "10px"),
+                    ("letter-spacing", "2ch"),
+                ],
+            );
+            crate::dom::append_child(div, crate::dom::create_text_node("aaaaa bbb"));
+            crate::dom::append_child(body, div);
+            divs.push(div);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("initial");
+        // The edited element's own width changed: relay out from its parent.
+        let (root, _) =
+            crate::incremental_layout::style_local_root_of(divs[1]).expect("retained tree");
+        assert_eq!(root, divs[1], "unchanged-width relayout root");
+        style(divs[1], &[("width", "max-content")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("width max-content");
+        let _ = crate::dom::with_document(|document| {
+            document.get_layout_rect(NodeId::from_u32(divs[1])).width
+        });
+        style(divs[1], &[("width", "15ch")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("width 15ch");
+        crate::stylesheet::clear_rules();
+    }
+
     /// css/css-tables/min-max-size-table-content-box-ref.html: removing and
     /// re-inserting the only child of a max-width grid item (an
     /// inline-block, blockified) with a layout flush in between must lay
