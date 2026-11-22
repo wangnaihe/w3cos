@@ -729,15 +729,36 @@ struct PersistPlan<'a> {
     previous: &'a PaintArtifact,
     clean: Vec<bool>,
     clean_count: usize,
+    /// Last build's trimmed boxes, in this build's indices.
     trimmed: std::sync::Arc<Vec<u32>>,
+    /// `W3COS_PAINT_PERSIST_REMAP`: where each box was in the previous
+    /// build when the splices inserted or removed boxes (`None`: same index).
+    moved_from: Option<Vec<u32>>,
+}
+
+/// `W3COS_PAINT_PERSIST_REMAP=1` (with the persistent path on; off by
+/// default): splices that insert or remove boxes keep the persistent path,
+/// clean boxes taking the previous node at their old index (the splices'
+/// index pieces). Checked by the persistent path's `=verify`.
+fn persist_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PAINT_PERSIST_REMAP").is_ok_and(|value| value == "1"))
 }
 
 impl PersistPlan<'_> {
+    /// Where clean box `index` was in the previous build.
+    #[inline]
+    fn previous_index(&self, index: usize) -> usize {
+        self.moved_from
+            .as_ref()
+            .map_or(index, |map| map[index] as usize)
+    }
+
     /// Clean boxes take last build's adjusted style, and its trimmed text.
     fn prefill(&self, nodes: &mut [PaintNode]) {
         for (index, (node, clean)) in nodes.iter_mut().zip(&self.clean).enumerate() {
             if *clean {
-                let previous = &self.previous.nodes[index].style;
+                let previous = &self.previous.nodes[self.previous_index(index)].style;
                 if !node.style.ptr_eq(previous) {
                     node.style = previous.clone();
                 }
@@ -746,7 +767,7 @@ impl PersistPlan<'_> {
         for &index in self.trimmed.iter() {
             let index = index as usize;
             if self.clean[index] {
-                nodes[index].kind = self.previous.nodes[index].kind.clone();
+                nodes[index].kind = self.previous.nodes[self.previous_index(index)].kind.clone();
             }
         }
     }
@@ -778,22 +799,81 @@ fn persistent_nodes_plan<'a>(
     if previous.persist_percent_padding {
         return full("percentage padding");
     }
-    if previous.nodes.len() != nodes.len() || nodes.is_empty() {
+    let remap = persist_remap_enabled();
+    if nodes.is_empty() || (!remap && previous.nodes.len() != nodes.len()) {
         return full("box count");
     }
-    let Some(changed) = PAINT_TOUCHED.with(|touched| {
+    let Some((changed, segments, base_len)) = PAINT_TOUCHED.with(|touched| {
         touched
             .borrow()
             .as_ref()
             .filter(|changes| changes.len == nodes.len())
-            .map(|changes| changes.changed.clone())
+            .map(|changes| {
+                (
+                    changes.changed.clone(),
+                    changes.segments.clone(),
+                    changes.base_len,
+                )
+            })
     }) else {
         return full("no touched set");
     };
+    let shifted = segments.iter().any(|&(_, offset)| offset != 0);
+    if shifted && !remap {
+        return full("boxes inserted or removed");
+    }
+    if (shifted || previous.nodes.len() != nodes.len()) && base_len != previous.nodes.len() {
+        return full("box count");
+    }
     let mut clean = vec![true; nodes.len()];
     for (a, b) in changed {
         clean[a as usize..(b as usize).min(nodes.len())].fill(false);
     }
+    // New index -> previous index, from the splices' pieces.
+    let moved_from = shifted.then(|| {
+        let mut map = vec![u32::MAX; nodes.len()];
+        for (k, &(from, offset)) in segments.iter().enumerate() {
+            let to = segments
+                .get(k + 1)
+                .map_or(nodes.len(), |&(next, _)| next as usize)
+                .min(nodes.len());
+            for (index, slot) in map.iter_mut().enumerate().take(to).skip(from as usize) {
+                let old = index as i64 + offset;
+                if (0..previous.nodes.len() as i64).contains(&old) {
+                    *slot = old as u32;
+                }
+            }
+        }
+        map
+    });
+    if let Some(map) = moved_from.as_ref() {
+        for (clean, &old) in clean.iter_mut().zip(map) {
+            if old == u32::MAX {
+                *clean = false;
+            }
+        }
+    }
+    // Last build's trimmed boxes in this build's indices.
+    let trimmed = match moved_from.as_ref() {
+        None => trimmed,
+        Some(map) => {
+            let mut at_old = vec![false; previous.nodes.len()];
+            for &old in trimmed.iter() {
+                if let Some(slot) = at_old.get_mut(old as usize) {
+                    *slot = true;
+                }
+            }
+            std::sync::Arc::new(
+                map.iter()
+                    .enumerate()
+                    .filter(|&(index, &old)| {
+                        clean[index] && old != u32::MAX && at_old[old as usize]
+                    })
+                    .map(|(index, _)| index as u32)
+                    .collect(),
+            )
+        }
+    };
     // The table passes add to their boxes' properties (not idempotent on
     // an adjusted node): table subtrees always rebuild.
     let mut in_table = vec![false; nodes.len()];
@@ -828,6 +908,7 @@ fn persistent_nodes_plan<'a>(
         clean,
         clean_count,
         trimmed,
+        moved_from,
     })
 }
 
@@ -3740,8 +3821,14 @@ impl PaintArtifact {
             let taken = std::mem::take(&mut *persist_raw.moved.borrow_mut());
             if taken.iter().any(|moved| *moved) {
                 let aligned = collected == nodes.len() && taken.len() == nodes.len();
-                let clean =
-                    |index: usize| aligned && plan.as_ref().is_some_and(|plan| plan.clean[index]);
+                // Recycled nodes sit at last-but-one build's indices: only
+                // without inserted or removed boxes.
+                let clean = |index: usize| {
+                    aligned
+                        && plan
+                            .as_ref()
+                            .is_some_and(|plan| plan.moved_from.is_none() && plan.clean[index])
+                };
                 for (index, was_moved) in taken.iter().enumerate() {
                     if *was_moved && !clean(index) && index < nodes.len() {
                         nodes[index] = (persist_raw.raw)(index);

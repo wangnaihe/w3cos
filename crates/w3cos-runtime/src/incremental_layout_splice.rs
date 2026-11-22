@@ -2649,6 +2649,12 @@ pub(crate) struct PaintChanges {
     pub(crate) moved: Vec<(u32, u32)>,
     /// The paint layout that replayed these splices.
     pub(crate) generation: u64,
+    /// Boxes in the tree before the first splice.
+    pub(crate) base_len: usize,
+    /// Where a box outside `changed` was before the first splice: sorted
+    /// `(first index now, offset)` pieces, the box at `i` was at
+    /// `i + offset` of the piece holding `i` (empty: no splice yet).
+    pub(crate) segments: Vec<(u32, i64)>,
 }
 
 /// Sort and merge `[start, end)` ranges in place (adjacent ones join).
@@ -2693,6 +2699,8 @@ impl PaintChanges {
         if !self.started {
             self.started = true;
             self.len = geometry.total;
+            self.base_len = geometry.total;
+            self.segments = vec![(0, 0)];
         }
         let (start, end) = (geometry.region_start, geometry.region_end);
         if self.len != geometry.total || end > self.len || start > end {
@@ -2724,6 +2732,33 @@ impl PaintChanges {
         };
         remap(&mut self.changed);
         remap(&mut self.moved);
+        // The pieces before the region stay; the ones after it shift by
+        // `delta` and their offset to the first tree shrinks by `delta`.
+        // (Boxes inside the region are changed: any offset will do.)
+        if delta != 0 {
+            let old_len = self.len;
+            let pieces = std::mem::take(&mut self.segments);
+            let mut next = Vec::with_capacity(pieces.len() + 1);
+            for &(from, offset) in &pieces {
+                if (from as usize) < start {
+                    next.push((from, offset));
+                }
+            }
+            for (k, &(from, offset)) in pieces.iter().enumerate() {
+                let to = pieces
+                    .get(k + 1)
+                    .map_or(old_len, |&(next, _)| next as usize);
+                let a = (from as usize).max(end);
+                if a < to {
+                    next.push(((a as i64 + delta) as u32, offset - delta));
+                }
+            }
+            next.dedup_by(|b, a| a.1 == b.1);
+            if next.first().is_none_or(|&(from, _)| from != 0) {
+                next.insert(0, (0, 0));
+            }
+            self.segments = next;
+        }
         self.changed.push((start as u32, (start + inserted) as u32));
         for &index in geometry.starts.iter().chain(&geometry.grown) {
             let at = map(index);
