@@ -1567,7 +1567,7 @@ mod tests {
             ),
             (
                 "floats",
-                "<div style='border:1px solid green;font:20px/24px monospace;width:230px'><div style='float:left;clear:left;width:50px;height:50px;background:cyan'></div><div style='float:left;clear:left;width:50px;height:50px;background:cyan'></div><div style='display:inline-block;width:80px;height:80px;background:lime'></div><div style='display:inline-block;margin-left:-20px;vertical-align:top'>bc<br>def</div><div id=t style='margin-left:50px'>mno</div></div>",
+                "<style>.sample{border:solid 1px green;font-family:monospace;font-size:20px;line-height:24px;width:230px}.float{background:cyan;clear:left;float:left;height:50px;width:50px}.fake{background:lime;display:inline-block;height:80px;margin-top:2px;width:80px}.sur{display:inline-block;margin-left:-20px;vertical-align:top}.sur2{display:block;margin-left:50px;margin-top:0px}</style><div class=sample><div class=float></div><div class=float></div>\n<div class=fake></div>\n<div class=sur>bc<br>def<br>ghi<br>jkl<br></div>\n<div id=t class=sur2>mno</div>\n</div>",
             ),
         ];
         let mut failures = Vec::new();

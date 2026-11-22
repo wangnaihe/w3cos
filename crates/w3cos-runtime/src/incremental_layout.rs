@@ -2359,6 +2359,27 @@ fn component_is_replaced(component: &Component, id: u32) -> bool {
         .any(|child| component_is_replaced(child, id))
 }
 
+/// A block whose siblings are floats or inline-level items sits in a
+/// formatting context the builder lays out together (anonymous inline
+/// wrappers, float exclusions); Blink relays out that context. A layout
+/// edit there rebuilds.
+fn shares_inline_or_float_context(component: &Component, id: u32) -> bool {
+    if component
+        .children
+        .iter()
+        .any(|child| host_id(child) == Some(id))
+    {
+        return component.children.iter().any(|child| {
+            host_id(child) != Some(id)
+                && (child.style.float != Float::None || inline_level_item(&child.style))
+        });
+    }
+    component
+        .children
+        .iter()
+        .any(|child| shares_inline_or_float_context(child, id))
+}
+
 fn style_patch_is_safe(style: &w3cos_std::style::Style) -> bool {
     !matches!(style.height, Dimension::Percent(_))
         && style.float == Float::None
@@ -3174,7 +3195,8 @@ fn sync_paint_cache(
             if old != &style
                 && (inline_level_item(old)
                     || inline_level_item(&style)
-                    || component_is_replaced(&cache.component, id.as_u32()))
+                    || component_is_replaced(&cache.component, id.as_u32())
+                    || shares_inline_or_float_context(&cache.component, id.as_u32()))
             {
                 return false;
             }
