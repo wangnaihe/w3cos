@@ -1929,6 +1929,12 @@ impl SkiaRasterizer {
 
     /// Layers the last frame kept from the previous recordings, and the
     /// layer count.
+    /// The pixels of the last frame read back, if `width`×`height`.
+    pub(crate) fn last_rgba(&self, width: u32, height: u32) -> Option<&[u8]> {
+        (self.size == (width, height) && self.rgba.len() == width as usize * height as usize * 4)
+            .then_some(self.rgba.as_slice())
+    }
+
     pub(crate) fn last_reused_layers(&self) -> (usize, usize) {
         self.retained.last_reused()
     }

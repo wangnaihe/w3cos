@@ -66,6 +66,11 @@ struct RetainedPaint {
     /// `W3COS_PAINT_QUIET_FRAME`: the artifact's diff against itself (dirty,
     /// moved), kept while the artifact, its rects and its scroll stay as
     /// they are, so a run of quiet frames diffs once.
+    /// `W3COS_PAINT_QUIET_EXIT`: after a quiet frame with nothing dirty, the
+    /// frame size and the nested scrollers' offsets it showed (node id,
+    /// offset); a later frame with the same ones returns the last pixels.
+    #[cfg_attr(not(feature = "skia"), allow(dead_code))]
+    quiet_exit: Option<((u32, u32), Vec<(u32, (f32, f32))>)>,
     #[cfg_attr(not(feature = "skia"), allow(dead_code))]
     quiet_diff: Option<(Vec<bool>, Vec<Option<(f32, f32)>>)>,
 }
@@ -834,6 +839,7 @@ fn finish_headless_frame(
             artifact,
             layout_generation: crate::incremental_layout::paint_layout_generation(),
             quiet_diff: None,
+            quiet_exit: None,
         })
     });
     if let Some(replaced) = replaced {
@@ -956,6 +962,7 @@ fn reuse_retained_paint(
         let scroll_same = retained.artifact.viewport_scroll == scroll;
         if !scroll_same || reuse != crate::incremental_layout::PaintReuse::Scroll {
             retained.quiet_diff = None;
+            retained.quiet_exit = None;
         }
         retained.artifact.viewport_scroll = scroll;
         if crate::paint_artifact::paint_cull_rect_mode() == 2 {
@@ -972,6 +979,36 @@ fn reuse_retained_paint(
             ) {
                 return Ok(None);
             }
+        }
+        // `W3COS_PAINT_QUIET_EXIT`: the last frame was quiet with no dirty or
+        // moved client, and nothing it showed changed since: return its
+        // pixels without flattening, painting, syncing or compositing (cc
+        // draws no frame without damage).
+        #[cfg(feature = "skia")]
+        let exit_mode = quiet_exit_mode();
+        #[cfg(feature = "skia")]
+        let exit_rgba = (exit_mode != 0
+            && quiet_frame_mode() != 0
+            && reuse == crate::incremental_layout::PaintReuse::Scroll
+            && scroll_same
+            && !force_cpu)
+            .then(|| quiet_exit_frame(retained, width, height))
+            .flatten();
+        #[cfg(feature = "skia")]
+        if let Some(rgba) = exit_rgba.as_ref()
+            && exit_mode == 1
+        {
+            QUIET_EXIT_STATS.with(|stats| {
+                let mut value = stats.get();
+                value.0 += 1;
+                stats.set(value);
+            });
+            note_retained_reuse();
+            return Ok(Some(HeadlessFrame {
+                width,
+                height,
+                rgba: rgba.clone(),
+            }));
         }
         let flat = layout::pre_flatten(root);
         // `W3COS_PAINT_QUIET_FRAME`: nothing was invalidated since the kept
@@ -1042,8 +1079,113 @@ fn reuse_retained_paint(
                 }
             }
         }
+        #[cfg(feature = "skia")]
+        {
+            if let Some(rgba) = exit_rgba {
+                QUIET_EXIT_STATS.with(|stats| {
+                    let mut value = stats.get();
+                    value.0 += 1;
+                    if rgba != frame.rgba {
+                        value.1 += 1;
+                    }
+                    stats.set(value);
+                });
+                if rgba == frame.rgba {
+                    eprintln!("[paint-quiet-exit-verify] same");
+                } else {
+                    eprintln!("[paint-quiet-exit-verify] mismatch against the painted frame");
+                }
+            }
+            let clean = quiet
+                && retained.quiet_diff.as_ref().is_some_and(|(dirty, moved)| {
+                    !dirty.iter().any(|client| *client) && moved.iter().all(Option::is_none)
+                });
+            retained.quiet_exit = (exit_mode != 0 && clean)
+                .then(|| quiet_scroll_state(&flat, layout_results))
+                .flatten()
+                .map(|scrolls| ((width, height), scrolls));
+        }
         note_retained_reuse();
         Ok(Some(frame))
+    })
+}
+
+/// `W3COS_PAINT_QUIET_EXIT=1|verify` (off by default, needs
+/// `W3COS_PAINT_QUIET_FRAME`): a frame after a quiet frame that had no
+/// dirty or moved client, at the same size, window scroll and nested
+/// scroll offsets, returns the kept rasterizer's last pixels without
+/// flattening, painting, layer sync or composite. `verify` paints the
+/// frame anyway and compares every pixel.
+#[cfg(feature = "skia")]
+fn quiet_exit_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = QUIET_EXIT_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_QUIET_EXIT").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(feature = "skia")]
+thread_local! {
+    #[cfg(test)]
+    static QUIET_EXIT_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+    /// (frames that took the exit or were verified, verify mismatches).
+    static QUIET_EXIT_STATS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Quiet exits on this thread so far: (frames, verify mismatches).
+#[cfg(feature = "skia")]
+pub fn quiet_exit_stats() -> (u64, u64) {
+    QUIET_EXIT_STATS.with(Cell::get)
+}
+
+/// The nested scrollers' node ids and raw offsets, as `paint_retained_artifact`
+/// reads them; `None` if one is not a DOM node.
+#[cfg(feature = "skia")]
+fn quiet_scroll_state(
+    flat: &[layout::FlatNodeInfo<'_>],
+    layout_results: &layout::LayoutResults,
+) -> Option<Vec<(u32, (f32, f32))>> {
+    layout_results
+        .scrollable_nodes
+        .iter()
+        .map(|(index, _, _)| {
+            let w3cos_std::EventAction::NativeHost { id, .. } = flat.get(*index)?.on_click else {
+                return None;
+            };
+            let node = u32::try_from(*id).ok()?;
+            Some((node, crate::dom::get_scroll_offset(node)))
+        })
+        .collect()
+}
+
+/// The last frame's pixels when the kept quiet-exit state still holds.
+#[cfg(feature = "skia")]
+fn quiet_exit_frame(retained: &RetainedPaint, width: u32, height: u32) -> Option<Vec<u8>> {
+    let (size, scrolls) = retained.quiet_exit.as_ref()?;
+    if *size != (width, height)
+        || !paint_layer_reuse_enabled()
+        || !HEADLESS_SKIA_CURRENT.with(Cell::get)
+        || HEADLESS_SKIA_FONTS.with(Cell::get)
+            != crate::font_face::FontRegistry::global().revision()
+        || scrolls
+            .iter()
+            .any(|(node, offset)| crate::dom::get_scroll_offset(*node) != *offset)
+    {
+        return None;
+    }
+    HEADLESS_SKIA.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rasterizer| rasterizer.last_rgba(width, height))
+            .map(<[u8]>::to_vec)
     })
 }
 
@@ -2892,11 +3034,13 @@ mod tests {
         impl Drop for Off {
             fn drop(&mut self) {
                 super::QUIET_FRAME_OVERRIDE.with(|value| value.set(None));
+                super::QUIET_EXIT_OVERRIDE.with(|value| value.set(None));
             }
         }
         let _off = Off;
-        let run = |mode: u8| {
+        let run = |mode: u8, exit: u8| {
             super::QUIET_FRAME_OVERRIDE.with(|value| value.set(Some(mode)));
+            super::QUIET_EXIT_OVERRIDE.with(|value| value.set(Some(exit)));
             crate::dom::reset_document();
             crate::jsdom::reset_bridge();
             crate::incremental_layout::invalidate();
@@ -2946,7 +3090,7 @@ mod tests {
             (frames, (after.0 - before.0, after.1 - before.1))
         };
         let content_before = crate::retained_layers::quiet_content_mismatches();
-        let (verified, (quiet, mismatched)) = run(2);
+        let (verified, (quiet, mismatched)) = run(2, 0);
         assert_eq!(
             crate::retained_layers::quiet_content_mismatches(),
             content_before,
@@ -2957,9 +3101,9 @@ mod tests {
             "frames without a change must take the quiet path"
         );
         assert_eq!(mismatched, 0, "a quiet frame differs from a full paint");
-        let (kept, (kept_quiet, _)) = run(1);
+        let (kept, (kept_quiet, _)) = run(1, 0);
         assert_eq!(kept_quiet, quiet);
-        let (full, (off_quiet, _)) = run(0);
+        let (full, (off_quiet, _)) = run(0, 0);
         assert_eq!(off_quiet, 0);
         assert!(
             frames_differ_somewhere(&full),
@@ -2967,6 +3111,21 @@ mod tests {
         );
         assert!(verified == full, "verify-mode frames differ");
         assert!(kept == full, "quiet frames differ from full paints");
+        let exits = super::quiet_exit_stats();
+        let (exit_verified, _) = run(1, 2);
+        let verified_exits = super::quiet_exit_stats();
+        assert!(
+            verified_exits.0 > exits.0,
+            "frames after a clean quiet frame must take the quiet exit"
+        );
+        assert_eq!(
+            verified_exits.1, exits.1,
+            "a quiet exit differs from the painted frame"
+        );
+        let (exited, _) = run(1, 1);
+        assert!(super::quiet_exit_stats().0 > verified_exits.0);
+        assert!(exit_verified == full, "quiet-exit verify frames differ");
+        assert!(exited == full, "quiet-exit frames differ from full paints");
     }
 
     #[cfg(feature = "skia")]
