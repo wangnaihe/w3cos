@@ -4,7 +4,12 @@
 //! prints a report to stderr every `W3COS_MEM_STATS_INTERVAL_MS` (default
 //! 5000 ms; `0` disables the periodic report) and once more at process exit.
 //! Each report is one `W3COS_MEM <label> t=<ms> <section> key=value ...` line
-//! per section, so runs can be grepped and diffed. Byte figures are owned
+//! per section, so runs can be grepped and diffed. The JavaScript tables are
+//! thread-local (the window, every worker and the main process each have
+//! their own heap, string table and document), so each JavaScript thread keeps
+//! its own schedule and every line carries the reporting thread after the
+//! time: `W3COS_MEM <label> t=<ms> thread=<name>#<tid> <section> ...`.
+//! The `process` section is process-wide and repeats on every thread. Byte figures are owned
 //! storage estimates (lengths and capacities), not allocator-exact numbers;
 //! compare them with the process lines (`VmRSS`, `RssAnon`).
 //!
@@ -13,10 +18,12 @@
 //! Every counter here is computed by walking existing tables at report time.
 //!
 //! The exit report runs from `atexit`, after thread-local tables may already
-//! be gone, so it re-prints the last periodic report together with the
-//! process high-water mark instead of walking them again. Call [`dump`] from
+//! be gone, so it re-prints the last periodic report of every thread together
+//! with the process high-water mark instead of walking them again. Call [`dump`] from
 //! the JavaScript thread for a fresh report at a point of your choosing.
 
+use std::cell::{Cell, OnceCell};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -28,8 +35,15 @@ const ON: u8 = 2;
 
 static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 static INTERVAL_MS: AtomicU64 = AtomicU64::new(5000);
-static NEXT_DUE_MS: AtomicU64 = AtomicU64::new(0);
-static LAST_REPORT: Mutex<String> = Mutex::new(String::new());
+/// Last periodic report of each thread, keyed by its `thread=` label.
+static LAST_REPORTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+thread_local! {
+    /// When this thread's next periodic report is due. Per thread, so a busy
+    /// worker cannot take every slot from the window thread.
+    static NEXT_DUE_MS: Cell<u64> = const { Cell::new(0) };
+    static THREAD_LABEL: OnceCell<String> = const { OnceCell::new() };
+}
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// One report section: a name and `(key, value)` pairs.
@@ -94,43 +108,72 @@ fn maybe_dump_slow() {
         return;
     }
     let now = elapsed_ms();
-    let due = NEXT_DUE_MS.load(Ordering::Relaxed);
-    if now < due {
+    if now < NEXT_DUE_MS.with(Cell::get) {
         return;
     }
-    NEXT_DUE_MS.store(now + interval, Ordering::Relaxed);
+    NEXT_DUE_MS.with(|due| due.set(now + interval));
     dump("tick");
 }
 
-/// Collect and print a full report now (JavaScript thread).
+/// `<thread name>#<kernel tid>` with whitespace replaced, so it stays one token.
+pub fn thread_label() -> String {
+    THREAD_LABEL.with(|label| {
+        label
+            .get_or_init(|| {
+                let current = std::thread::current();
+                let name: String = current
+                    .name()
+                    .unwrap_or("unnamed")
+                    .chars()
+                    .map(|c| {
+                        if c.is_whitespace() || c == '=' {
+                            '_'
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                // SAFETY: gettid has no preconditions.
+                let tid = unsafe { libc::gettid() };
+                format!("{name}#{tid}")
+            })
+            .clone()
+    })
+}
+
+/// Collect and print a full report of the calling thread now.
 pub fn dump(label: &str) {
-    let report = format_report(label, elapsed_ms(), &collect());
+    let thread = thread_label();
+    let report = format_report(label, elapsed_ms(), &thread, &collect());
     eprint!("{report}");
-    if let Ok(mut last) = LAST_REPORT.lock() {
-        *last = report;
+    if label == "tick"
+        && let Ok(mut last) = LAST_REPORTS.lock()
+    {
+        last.insert(thread, report);
     }
 }
 
 extern "C" fn dump_at_exit() {
-    let process = format_report("exit", elapsed_ms(), &[process_section()]);
-    let last = LAST_REPORT
-        .try_lock()
-        .map(|last| last.clone())
-        .unwrap_or_default();
+    let process = format_report("exit", elapsed_ms(), "process", &[process_section()]);
     eprint!("{process}");
-    for line in last.lines() {
-        eprintln!(
-            "{}",
-            line.replacen("W3COS_MEM tick", "W3COS_MEM exit-last", 1)
-        );
+    let Ok(last) = LAST_REPORTS.try_lock() else {
+        return;
+    };
+    for report in last.values() {
+        for line in report.lines() {
+            eprintln!(
+                "{}",
+                line.replacen("W3COS_MEM tick", "W3COS_MEM exit-last", 1)
+            );
+        }
     }
 }
 
-/// Format sections as `W3COS_MEM <label> t=<ms> <section> k=v ...` lines.
-pub fn format_report(label: &str, t_ms: u64, sections: &[Section]) -> String {
+/// Format sections as `W3COS_MEM <label> t=<ms> thread=<thread> <section> k=v ...` lines.
+pub fn format_report(label: &str, t_ms: u64, thread: &str, sections: &[Section]) -> String {
     let mut out = String::new();
     for (name, values) in sections {
-        let _ = write!(out, "W3COS_MEM {label} t={t_ms} {name}");
+        let _ = write!(out, "W3COS_MEM {label} t={t_ms} thread={thread} {name}");
         for (key, value) in values {
             let _ = write!(out, " {key}={value}");
         }
@@ -326,6 +369,7 @@ mod tests {
         let report = format_report(
             "tick",
             42,
+            "main#7",
             &[
                 ("js_heap", vec![("objects", 3), ("arrays", 4)]),
                 ("fonts", vec![]),
@@ -333,8 +377,23 @@ mod tests {
         );
         assert_eq!(
             report,
-            "W3COS_MEM tick t=42 js_heap objects=3 arrays=4\nW3COS_MEM tick t=42 fonts\n"
+            "W3COS_MEM tick t=42 thread=main#7 js_heap objects=3 arrays=4\nW3COS_MEM tick t=42 thread=main#7 fonts\n"
         );
+    }
+
+    #[test]
+    fn thread_label_is_one_token_and_differs_per_thread() {
+        let here = thread_label();
+        assert!(!here.contains(char::is_whitespace), "{here}");
+        assert_eq!(here, thread_label());
+        let other = std::thread::Builder::new()
+            .name("w3cos worker=a".into())
+            .spawn(thread_label)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(other.starts_with("w3cos_worker_a#"), "{other}");
+        assert_ne!(here, other);
     }
 
     #[test]
