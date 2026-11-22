@@ -370,7 +370,95 @@ fn load_and_render(
     let _document = load_document(url, timeout, width, height, user_stylesheet)?;
     wait_for_reftest_ready(timeout)?;
     wait_for_document_fonts(timeout)?;
-    w3cos_runtime::headless::render_document_rgba(width, height)
+    let frame = w3cos_runtime::headless::render_document_rgba(width, height)?;
+    if let Some(steps) = reuse_frame_steps() {
+        reuse_frames_check(url, width, height, &frame, steps);
+    }
+    Ok(frame)
+}
+
+/// `W3COS_WPT_REUSE_FRAMES=N` (off by default): after the captured frame,
+/// make N small edits (alternately a text edit and a remove/reinsert of an
+/// element), each drawn once edited and once undone, so incremental paint
+/// paths (with their `=verify` modes) see frames after the first. The undone
+/// frame must equal the captured one. The reported frame stays the first.
+fn reuse_frame_steps() -> Option<usize> {
+    static STEPS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *STEPS.get_or_init(|| {
+        std::env::var("W3COS_WPT_REUSE_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|steps| *steps > 0)
+    })
+}
+
+fn reuse_frames_check(url: &str, width: u32, height: u32, first: &HeadlessFrame, steps: usize) {
+    use w3cos_runtime::dom;
+    let skip = |node: u32| {
+        matches!(
+            dom::tag_name(node).to_ascii_lowercase().as_str(),
+            "script" | "style" | "head" | "title" | "link" | "meta"
+        )
+    };
+    // Last text node and last element (preorder) under the body.
+    let body = dom::body_id();
+    let (mut text, mut element) = (None, None);
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node != body && dom::node_type(node) == 1 {
+            if skip(node) {
+                continue;
+            }
+            element = Some(node);
+        }
+        if dom::node_type(node) == 3
+            && dom::get_text_content(node).is_some_and(|text| !text.trim().is_empty())
+        {
+            text = Some(node);
+        }
+        let mut children = dom::children(node);
+        children.reverse();
+        stack.extend(children);
+    }
+    let (mut frames, mut diffs) = (0usize, 0usize);
+    let before = w3cos_runtime::headless::persistent_paint_stats();
+    let mut draw = |restored: bool| match w3cos_runtime::headless::render_document_rgba(width, height) {
+        Ok(frame) => {
+            frames += 1;
+            if restored && frame.rgba != first.rgba {
+                diffs += 1;
+            }
+        }
+        Err(error) => eprintln!("[wpt-reuse-frames] {url} render failed: {error}"),
+    };
+    for step in 0..steps {
+        if step % 2 == 0 {
+            let Some(node) = text else { continue };
+            let original = dom::get_text_content(node).unwrap_or_default();
+            dom::set_text_content(node, &format!("{original} x"));
+            draw(false);
+            dom::set_text_content(node, &original);
+            draw(true);
+        } else {
+            let Some(node) = element else { continue };
+            let Some(parent) = dom::parent_node(node) else { continue };
+            let next = dom::next_sibling(node);
+            dom::remove_child(parent, node);
+            draw(false);
+            match next {
+                Some(next) => dom::insert_before(parent, node, next),
+                None => dom::append_child(parent, node),
+            }
+            draw(true);
+        }
+    }
+    let after = w3cos_runtime::headless::persistent_paint_stats();
+    eprintln!(
+        "[wpt-reuse-frames] {url} frames {frames} restore-diff {diffs} persistent {} clean {} mismatch {}",
+        after.0 - before.0,
+        after.1 - before.1,
+        after.2 - before.2
+    );
 }
 
 fn wait_for_document_fonts(timeout: Duration) -> Result<()> {

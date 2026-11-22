@@ -736,6 +736,14 @@ fn finish_headless_frame(
     })
 }
 
+/// Persistent paint nodes on this thread so far: (builds on the persistent
+/// path, clean boxes taken, verify mismatches). For multi-frame checks.
+pub fn persistent_paint_stats() -> (u64, u64, u64) {
+    let (frames, clean) = crate::paint_artifact::PERSISTENT_NODES_STATS.with(Cell::get);
+    let mismatches = crate::paint_artifact::PERSISTENT_NODES_MISMATCHES.with(Cell::get);
+    (frames, clean, mismatches)
+}
+
 thread_local! {
     /// (frames painted from a splice's flat tree, verify mismatches).
     static SHARED_FLAT_USES: Cell<u64> = const { Cell::new(0) };
