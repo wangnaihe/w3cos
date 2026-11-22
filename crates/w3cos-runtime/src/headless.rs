@@ -947,6 +947,7 @@ fn reuse_retained_paint(
         {
             return Ok(None);
         }
+        let scroll_same = retained.artifact.viewport_scroll == scroll;
         retained.artifact.viewport_scroll = scroll;
         if crate::paint_artifact::paint_cull_rect_mode() == 2 {
             verify_paint_cull(&retained.artifact, width, height);
@@ -964,6 +965,20 @@ fn reuse_retained_paint(
             }
         }
         let flat = layout::pre_flatten(root);
+        // `W3COS_PAINT_QUIET_FRAME`: nothing was invalidated since the kept
+        // recordings were made, so the paint diff is taken against the same
+        // artifact (only volatile clients repaint) and the damage path can
+        // skip raster and composite when that damage is empty.
+        #[cfg(feature = "skia")]
+        let quiet_mode = quiet_frame_mode();
+        #[cfg(feature = "skia")]
+        let quiet = quiet_mode != 0
+            && reuse == crate::incremental_layout::PaintReuse::Scroll
+            && scroll_same
+            && !force_cpu
+            && quiet_frame_invalidation(&retained.artifact);
+        #[cfg(not(feature = "skia"))]
+        let _ = scroll_same;
         let frame = paint_retained_artifact(
             width,
             height,
@@ -972,9 +987,126 @@ fn reuse_retained_paint(
             layout_results,
             &retained.artifact,
         )?;
+        #[cfg(feature = "skia")]
+        if quiet {
+            let skipped = crate::render_skia::paint_offscreen_skip_stats();
+            QUIET_FRAME_STATS.with(|stats| {
+                let mut value = stats.get();
+                value.0 += 1;
+                stats.set(value);
+            });
+            if quiet_mode == 2 {
+                // A frame painted without the diff re-records every layer
+                // and composites in full.
+                crate::render_skia::set_pending_paint_invalidation(None);
+                let full = paint_retained_artifact(
+                    width,
+                    height,
+                    force_cpu,
+                    &flat,
+                    layout_results,
+                    &retained.artifact,
+                )?;
+                let differing = frame
+                    .rgba
+                    .chunks_exact(4)
+                    .zip(full.rgba.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count()
+                    + frame.rgba.len().abs_diff(full.rgba.len());
+                let kept = crate::render_skia::paint_offscreen_skip_stats().0 > skipped.0;
+                if differing == 0 {
+                    eprintln!("[paint-quiet-frame-verify] same (raster skipped: {kept})");
+                } else {
+                    QUIET_FRAME_STATS.with(|stats| {
+                        let mut value = stats.get();
+                        value.1 += 1;
+                        stats.set(value);
+                    });
+                    eprintln!("[paint-quiet-frame-verify] mismatch: DIFF {differing} pixels");
+                    note_retained_reuse();
+                    return Ok(Some(full));
+                }
+            }
+        }
         note_retained_reuse();
         Ok(Some(frame))
     })
+}
+
+/// `W3COS_PAINT_QUIET_FRAME=1|verify` (off by default): a headless frame
+/// with no layout or style change since the last one (the paint cache is
+/// reused with no dirty node, the scroll position is the painted one, the
+/// kept rasterizer painted that artifact with the same fonts) hands the
+/// rasterizer a paint diff of the artifact against itself instead of none.
+/// Only volatile clients (decoded images, canvases, SVG documents, form
+/// values) then count as changed, the kept layer recordings stay, and with
+/// no damage on the surface the off-surface skip (C94) returns the last
+/// frame's pixels without raster or composite (Blink: no invalidation, no
+/// paint, no raster, and cc draws nothing for a frame without damage).
+/// `verify` also paints each such frame in full and compares every pixel.
+#[cfg(feature = "skia")]
+fn quiet_frame_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = QUIET_FRAME_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_QUIET_FRAME").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(all(test, feature = "skia"))]
+thread_local! {
+    static QUIET_FRAME_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+#[cfg(feature = "skia")]
+thread_local! {
+    /// (quiet frames, verify mismatches).
+    static QUIET_FRAME_STATS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Quiet frames on this thread so far: (frames, verify mismatches).
+#[cfg(feature = "skia")]
+pub fn quiet_frame_stats() -> (u64, u64) {
+    QUIET_FRAME_STATS.with(Cell::get)
+}
+
+/// Set the pending paint invalidation of a quiet frame: `artifact` diffed
+/// against itself. False (nothing set) when the kept recordings may not be
+/// current or the damage cannot be bounded.
+#[cfg(feature = "skia")]
+fn quiet_frame_invalidation(artifact: &PaintArtifact) -> bool {
+    if !paint_layer_reuse_enabled()
+        || !HEADLESS_SKIA_CURRENT.with(Cell::get)
+        || HEADLESS_SKIA_FONTS.with(Cell::get)
+            != crate::font_face::FontRegistry::global().revision()
+    {
+        return false;
+    }
+    let Some(diff) = crate::retained_layers::paint_diff_clients(artifact, artifact) else {
+        return false;
+    };
+    let skip_only = !crate::render_skia::paint_damage_enabled()
+        && crate::render_skia::paint_offscreen_skip_mode() != 0;
+    let early_out = crate::render_skia::paint_damage_early_out_active();
+    let damage = (crate::render_skia::paint_damage_enabled() && !early_out)
+        .then(|| crate::retained_layers::paint_damage(artifact, artifact, &diff))
+        .flatten();
+    if damage.is_none() && crate::render_skia::paint_damage_enabled() && !early_out {
+        return false;
+    }
+    crate::render_skia::set_pending_paint_invalidation(Some(diff.dirty));
+    crate::render_skia::set_pending_paint_moved(Some(diff.moved));
+    crate::render_skia::set_pending_paint_damage(damage);
+    crate::render_skia::set_pending_lazy_damage(skip_only || early_out);
+    true
 }
 
 fn assign_retained_rects(
@@ -2702,6 +2834,89 @@ mod tests {
         assert_eq!(off_walked, 0);
         assert!(verified == full, "verify-mode frames differ");
         assert!(walk == full, "frames from the dirty list walk differ");
+    }
+
+    #[cfg(feature = "skia")]
+    #[test]
+    fn quiet_frames_match_a_full_paint() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                super::QUIET_FRAME_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            super::QUIET_FRAME_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::jsdom::set_viewport(160.0, 240.0);
+            let body = crate::dom::body_id();
+            let scroller = crate::dom::create_element("div");
+            for (name, value) in [
+                ("width", "150px"),
+                ("height", "120px"),
+                ("overflow", "auto"),
+                ("background", "#ffffee"),
+            ] {
+                crate::dom::set_style_property(scroller, name, value);
+            }
+            for index in 0..12 {
+                let line = crate::dom::create_element("p");
+                crate::dom::set_style_property(
+                    line,
+                    "color",
+                    if index % 2 == 0 { "#223388" } else { "#882233" },
+                );
+                let words = crate::dom::create_text_node(&format!("line {index} words"));
+                crate::dom::append_child(line, words);
+                crate::dom::append_child(scroller, line);
+            }
+            crate::dom::append_child(body, scroller);
+            let tail = crate::dom::create_element("div");
+            for (name, value) in [
+                ("width", "40px"),
+                ("height", "30px"),
+                ("background", "#3366cc"),
+            ] {
+                crate::dom::set_style_property(tail, name, value);
+            }
+            crate::dom::append_child(body, tail);
+            let before = super::quiet_frame_stats();
+            let mut frames = vec![render_document_rgba(160, 240).expect("first frame").rgba];
+            for step in 0..6 {
+                // Nothing changes, except a nested scroll on step 3.
+                if step == 3 {
+                    crate::dom::set_scroll_offset(scroller, None, Some(40.0));
+                }
+                frames.push(render_document_rgba(160, 240).expect("frame").rgba);
+            }
+            let after = super::quiet_frame_stats();
+            (frames, (after.0 - before.0, after.1 - before.1))
+        };
+        let (verified, (quiet, mismatched)) = run(2);
+        assert!(
+            quiet > 0,
+            "frames without a change must take the quiet path"
+        );
+        assert_eq!(mismatched, 0, "a quiet frame differs from a full paint");
+        let (kept, (kept_quiet, _)) = run(1);
+        assert_eq!(kept_quiet, quiet);
+        let (full, (off_quiet, _)) = run(0);
+        assert_eq!(off_quiet, 0);
+        assert!(
+            frames_differ_somewhere(&full),
+            "the scroll must change the frame"
+        );
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(kept == full, "quiet frames differ from full paints");
+    }
+
+    #[cfg(feature = "skia")]
+    fn frames_differ_somewhere(frames: &[Vec<u8>]) -> bool {
+        frames.windows(2).any(|pair| pair[0] != pair[1])
     }
 
     #[test]
