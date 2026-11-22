@@ -2327,49 +2327,27 @@ thread_local! {
 /// A box whose used size comes from its content in its parent's layout (a
 /// flex or grid item, an inline-block or table-internal box, a float, or an
 /// absolutely positioned box) is not a relayout root in Blink
-/// (LayoutObject::IsRelayoutBoundary / ObjectIsRelayoutBoundary): a change
-/// to its intrinsic size re-runs the parent's algorithm. Climb to the
-/// nearest ancestor whose box does not size from its content that way.
+/// (LayoutObject::IsRelayoutBoundary / ObjectIsRelayoutBoundary), and a
+/// restyle below it changes its intrinsic size, which re-runs its parent's
+/// algorithm (a table cell resizes its column). Start above the topmost such
+/// box on the path to `id`.
 fn style_local_root(component: &Component, id: u32) -> u32 {
     let mut path = Vec::new();
     if !find_path(component, id, &mut path) {
         return id;
     }
     let mut depth = path.len();
-    while depth > 0 {
+    for at in 1..=path.len() {
         let (Some(parent), Some(node)) = (
-            component_at(component, &path[..depth - 1]),
-            component_at(component, &path[..depth]),
+            component_at(component, &path[..at - 1]),
+            component_at(component, &path[..at]),
         ) else {
             break;
         };
-        let content_sized = (matches!(
-            parent.style.display,
-            Display::Flex | Display::InlineFlex | Display::Grid
-        ) && !row_flex_fill_item(parent, path[depth - 1] as usize))
-            || matches!(
-                node.style.display,
-                Display::InlineBlock
-                    | Display::InlineFlex
-                    | Display::InlineTable
-                    | Display::Table
-                    | Display::TableRowGroup
-                    | Display::TableHeaderGroup
-                    | Display::TableFooterGroup
-                    | Display::TableRow
-                    | Display::TableCell
-                    | Display::TableCaption
-            )
-            || !matches!(node.style.float, w3cos_std::style::Float::None)
-            || matches!(
-                node.style.position,
-                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
-            )
-            || host_id(node).is_none();
-        if !content_sized {
+        if sizes_from_content(parent, path[at - 1] as usize, node) {
+            depth = at - 1;
             break;
         }
-        depth -= 1;
     }
     while depth > 0 {
         match component_at(component, &path[..depth]).and_then(host_id) {
@@ -2378,6 +2356,52 @@ fn style_local_root(component: &Component, id: u32) -> u32 {
         }
     }
     host_id(component).unwrap_or(id)
+}
+
+/// `node` (child `index` of `parent`) takes its used size from its content
+/// in `parent`'s layout.
+fn sizes_from_content(parent: &Component, index: usize, node: &Component) -> bool {
+    (matches!(
+        parent.style.display,
+        Display::Flex | Display::InlineFlex | Display::Grid
+    ) && !row_flex_fill_item(parent, index)
+        && !column_flex_stretch_item(parent, node))
+        || matches!(
+            node.style.display,
+            Display::InlineBlock
+                | Display::InlineFlex
+                | Display::InlineTable
+                | Display::Table
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableRow
+                | Display::TableCell
+                | Display::TableCaption
+        )
+        || !matches!(node.style.float, Float::None)
+        || matches!(node.style.position, Position::Absolute | Position::Fixed)
+        || host_id(node).is_none()
+}
+
+/// A column flex item stretched to the container's width (auto width,
+/// `align-items: stretch` or `align-self: stretch`): its width comes from
+/// the container, not from its content; its height change shifts the
+/// following items like a block's.
+fn column_flex_stretch_item(parent: &Component, node: &Component) -> bool {
+    matches!(parent.style.display, Display::Flex | Display::InlineFlex)
+        && matches!(
+            parent.style.flex_direction,
+            FlexDirection::Column | FlexDirection::ColumnReverse
+        )
+        && matches!(node.style.width, Dimension::Auto)
+        && match node.style.align_self {
+            w3cos_std::style::AlignSelf::Stretch => true,
+            w3cos_std::style::AlignSelf::Auto => {
+                parent.style.align_items == w3cos_std::style::AlignItems::Stretch
+            }
+            _ => false,
+        }
 }
 
 /// A row flex item whose used width does not depend on its own content:
