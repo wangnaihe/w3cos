@@ -1428,11 +1428,14 @@ fn resolve_family_with_eligibility(
 
 // ── System font resolution ─────────────────────────────────────────────────
 
+static PARSED_FONTS: std::sync::Mutex<Option<HashMap<u64, Arc<fontdue::Font>>>> =
+    std::sync::Mutex::new(None);
+
 fn cached_parsed_font(data: &[u8]) -> Option<Arc<fontdue::Font>> {
     use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
     use std::sync::Mutex;
-    static CACHE: Mutex<Option<HashMap<u64, Arc<fontdue::Font>>>> = Mutex::new(None);
+    static CACHE: &Mutex<Option<HashMap<u64, Arc<fontdue::Font>>>> = &PARSED_FONTS;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     data.len().hash(&mut hasher);
     data.hash(&mut hasher);
@@ -1462,10 +1465,13 @@ fn read_font_path(path: &std::path::Path) -> Option<Vec<u8>> {
 
 /// Try to load a system font by name from the installed font database, then
 /// common OS font directories.
+static SYSTEM_FONT_BYTES: std::sync::Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> =
+    std::sync::Mutex::new(None);
+
 fn resolve_system_font(name: &str) -> Option<Vec<u8>> {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    static CACHE: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None);
+    static CACHE: &Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = &SYSTEM_FONT_BYTES;
     let key = name.to_ascii_lowercase();
     {
         let guard = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -2422,5 +2428,111 @@ impl FontFaceSet {
 impl Default for FontFaceSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Memory accounting (`W3COS_MEM_STATS`) ──────────────────────────────────
+
+/// Font blob residency: every `Arc<Vec<u8>>` of sfnt data the registries and
+/// caches hold, deduplicated by allocation and by content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FontMemoryStats {
+    /// Cache / registry entries pointing at a font blob.
+    pub font_refs: usize,
+    /// Distinct blob allocations.
+    pub blobs: usize,
+    /// Bytes of distinct blob allocations.
+    pub blob_bytes: usize,
+    /// Bytes after merging allocations with identical content.
+    pub unique_content_bytes: usize,
+    /// `blob_bytes - unique_content_bytes`: the same font loaded twice.
+    pub duplicate_bytes: usize,
+    /// Parsed `fontdue::Font` cache entries (glyph tables, size unknown).
+    pub parsed_fonts: usize,
+}
+
+/// Accumulates [`FontMemoryStats`] over several caches.
+#[derive(Default)]
+pub(crate) struct FontTally {
+    allocations: std::collections::HashSet<usize>,
+    contents: std::collections::HashSet<(usize, u64)>,
+    stats: FontMemoryStats,
+}
+
+impl FontTally {
+    pub(crate) fn add(&mut self, data: &Arc<Vec<u8>>) {
+        use std::hash::{Hash, Hasher};
+        self.stats.font_refs += 1;
+        if !self.allocations.insert(Arc::as_ptr(data) as usize) {
+            return;
+        }
+        self.stats.blobs += 1;
+        self.stats.blob_bytes += data.len();
+        // Length plus head and tail is enough to tell distinct fonts apart
+        // without hashing every byte of a large CJK face on each dump.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let edge = data.len().min(4096);
+        data[..edge].hash(&mut hasher);
+        data[data.len() - edge..].hash(&mut hasher);
+        if self.contents.insert((data.len(), hasher.finish())) {
+            self.stats.unique_content_bytes += data.len();
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> FontMemoryStats {
+        self.stats.duplicate_bytes = self.stats.blob_bytes - self.stats.unique_content_bytes;
+        self.stats
+    }
+}
+
+/// Snapshot of font blob memory across the registry and every font cache.
+/// Diagnostics only; locks are tried, never waited on.
+pub fn font_memory_stats() -> FontMemoryStats {
+    let mut tally = FontTally::default();
+    if let Some(registry) = GLOBAL_REGISTRY.get()
+        && let Ok(fonts) = registry.fonts.try_lock()
+    {
+        for (_, font) in fonts.values().flatten() {
+            tally.add(&font.data);
+        }
+    }
+    if let Some(host) = HOST_UI_FONT.get() {
+        tally.add(&host.data);
+    }
+    system_fonts::tally_font_memory(&mut tally);
+    if let Ok(cache) = SYSTEM_FONT_BYTES.try_lock() {
+        for data in cache.iter().flat_map(|map| map.values()) {
+            tally.add(data);
+        }
+    }
+    let parsed = PARSED_FONTS
+        .try_lock()
+        .map(|cache| cache.as_ref().map_or(0, |map| map.len()))
+        .unwrap_or(0);
+    let mut stats = tally.finish();
+    stats.parsed_fonts = parsed;
+    stats
+}
+
+#[cfg(test)]
+mod font_memory_tests {
+    use super::*;
+
+    #[test]
+    fn font_tally_dedupes_allocations_and_reports_duplicate_content() {
+        let blob = Arc::new(vec![7u8; 10_000]);
+        let copy = Arc::new(blob.as_ref().clone());
+        let other = Arc::new(vec![9u8; 500]);
+        let mut tally = FontTally::default();
+        tally.add(&blob);
+        tally.add(&Arc::clone(&blob));
+        tally.add(&copy);
+        tally.add(&other);
+        let stats = tally.finish();
+        assert_eq!(stats.font_refs, 4);
+        assert_eq!(stats.blobs, 3);
+        assert_eq!(stats.blob_bytes, 20_500);
+        assert_eq!(stats.unique_content_bytes, 10_500);
+        assert_eq!(stats.duplicate_bytes, 10_000);
     }
 }

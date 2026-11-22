@@ -141,6 +141,7 @@ pub mod media_devices_web;
 pub mod media_recording_web;
 pub mod media_session_web;
 pub mod media_source_web;
+pub mod mem_stats;
 pub mod menu;
 pub mod midi_web;
 pub mod multi_window;

@@ -638,6 +638,35 @@ impl ExtentCache {
     }
 }
 
+/// Snapshot returned by [`Document::memory_stats`]. Byte figures are
+/// estimates of owned storage (capacity times element size, plus owned
+/// buffers where cheap to walk), not allocator-exact numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentMemoryStats {
+    pub live_nodes: usize,
+    pub node_slots: usize,
+    pub node_slot_bytes: usize,
+    pub free_slots: usize,
+    pub page_string_bytes: usize,
+    pub inline_style_declarations: usize,
+    pub layout_rect_bytes: usize,
+    /// Entries in the shared computed-style intern table.
+    pub interned_styles: usize,
+    /// Intern entries that nothing but the intern table still references.
+    pub interned_styles_unshared: usize,
+    pub interned_style_bytes: usize,
+    /// Distinct custom-property map allocations referenced by interned styles.
+    pub custom_property_maps: usize,
+    pub custom_property_bytes: usize,
+    pub computed_style_cache_entries: usize,
+    /// Inline `Style` values held by the computed-style cache (own + inherited).
+    pub computed_style_cache_bytes: usize,
+    pub cascade_cache_entries: usize,
+    pub pseudo_cache_entries: usize,
+    /// `size_of::<Style>()`, the unit of the style byte estimates.
+    pub style_size: usize,
+}
+
 pub struct Document {
     nodes: Vec<Option<DomNode>>,
     /// Bump arena for unique per-page strings (ids and text tails). Capacity
@@ -13313,6 +13342,50 @@ impl Document {
 
     pub fn node_count(&self) -> usize {
         self.nodes.iter().filter(|n| n.is_some()).count()
+    }
+
+    /// Point-in-time memory accounting for `W3COS_MEM_STATS`. Walks the
+    /// document's tables once; nothing is computed unless this is called.
+    pub fn memory_stats(&self) -> DocumentMemoryStats {
+        let style_bytes = std::mem::size_of::<w3cos_std::style::Style>();
+        let intern = self.shared_style_intern.borrow();
+        let mut maps = std::collections::HashSet::new();
+        let mut custom_property_bytes = 0;
+        let mut interned_unshared = 0;
+        for style in intern.iter() {
+            if std::sync::Arc::strong_count(style) == 1 {
+                interned_unshared += 1;
+            }
+            if let Some(custom) = style.custom_properties.as_ref()
+                && maps.insert(custom.allocation_addr())
+            {
+                custom_property_bytes += custom.estimated_heap_bytes();
+            }
+        }
+        let computed_cache = self.computed_style_cache.borrow();
+        let computed_style_cache_styles = computed_cache
+            .values()
+            .map(|entry| 1 + usize::from(entry.inherited_style.is_some()))
+            .sum::<usize>();
+        DocumentMemoryStats {
+            live_nodes: self.node_count(),
+            node_slots: self.nodes.len(),
+            node_slot_bytes: self.nodes.capacity() * std::mem::size_of::<Option<DomNode>>(),
+            free_slots: self.free_list.len(),
+            page_string_bytes: self.page_strings.capacity(),
+            inline_style_declarations: self.styles.len(),
+            layout_rect_bytes: self.layout_rects.capacity() * std::mem::size_of::<DOMRect>(),
+            interned_styles: intern.len(),
+            interned_styles_unshared: interned_unshared,
+            interned_style_bytes: intern.len() * style_bytes,
+            custom_property_maps: maps.len(),
+            custom_property_bytes,
+            computed_style_cache_entries: computed_cache.len(),
+            computed_style_cache_bytes: computed_style_cache_styles * style_bytes,
+            cascade_cache_entries: self.cascade_declaration_cache.borrow().len(),
+            pseudo_cache_entries: self.pseudo_declaration_cache.borrow().len(),
+            style_size: style_bytes,
+        }
     }
 
     /// Full W3C event dispatch with capturing and bubbling phases.

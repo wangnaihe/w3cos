@@ -883,6 +883,52 @@ pub fn live_handles() -> usize {
     ARENA.with(|arena| arena.borrow().slots.len().saturating_sub(1))
 }
 
+/// Interned page strings at or above this length count as "large" in
+/// [`string_stats`]: long concatenation results and file contents that stay
+/// on the bump until [`reset`].
+pub const LARGE_STRING_BYTES: usize = 4096;
+
+/// Page-string intern table accounting, see [`string_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageStringStats {
+    /// Interned strings (all retained until [`reset`]).
+    pub strings: usize,
+    /// UTF-8 bytes of those strings.
+    pub bytes: usize,
+    /// Strings of at least [`LARGE_STRING_BYTES`].
+    pub large_strings: usize,
+    pub large_bytes: usize,
+    /// Reserved bump chunks plus the slot and hash tables.
+    pub reserved_bytes: usize,
+}
+
+/// Walks the intern slots once. Only for diagnostics (`W3COS_MEM_STATS`).
+pub fn string_stats() -> PageStringStats {
+    ARENA.with(|arena| {
+        let arena = arena.borrow();
+        let mut stats = PageStringStats {
+            strings: arena.slots.len().saturating_sub(1),
+            bytes: arena.allocated,
+            ..PageStringStats::default()
+        };
+        for slot in arena.slots.iter().skip(1) {
+            if slot.len as usize >= LARGE_STRING_BYTES {
+                stats.large_strings += 1;
+                stats.large_bytes += slot.len as usize;
+            }
+        }
+        stats.reserved_bytes = arena
+            .chunks
+            .iter()
+            .map(Vec::capacity)
+            .sum::<usize>()
+            .saturating_add(arena.current.capacity())
+            .saturating_add(arena.slots.capacity() * std::mem::size_of::<PageString>())
+            .saturating_add(arena.hash_slots.capacity() * std::mem::size_of::<u32>());
+        stats
+    })
+}
+
 thread_local! {
     /// Dead slots whose payloads still have to be dropped: `(kind, slot
     /// index, epoch)`. A LIFO work list instead of recursion, so releasing
@@ -1242,6 +1288,24 @@ mod tests {
         assert_eq!(live_objects(), 0);
         assert_eq!(live_arrays(), 0);
         assert_eq!(live_functions(), 0);
+    }
+
+    #[test]
+    fn string_stats_count_large_interned_strings() {
+        reset();
+        let base = string_stats();
+        let small = intern("small");
+        let large = "x".repeat(LARGE_STRING_BYTES + 10);
+        let _large = intern(&large);
+        let _again = intern(&large);
+        let stats = string_stats();
+        assert_eq!(stats.strings, base.strings + 2);
+        assert_eq!(stats.large_strings, base.large_strings + 1);
+        assert_eq!(stats.large_bytes, base.large_bytes + large.len());
+        assert_eq!(stats.bytes, base.bytes + large.len() + small.as_str().len());
+        assert!(stats.reserved_bytes >= stats.bytes);
+        reset();
+        assert_eq!(string_stats().strings, 0);
     }
 
     #[test]

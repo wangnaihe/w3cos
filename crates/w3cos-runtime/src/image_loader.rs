@@ -126,6 +126,54 @@ struct AnimatedImage {
     cycle: Duration,
 }
 
+/// Decoded-image cache residency (`W3COS_MEM_STATS`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImageCacheStats {
+    /// Cache entries, including failed loads cached as `None`.
+    pub entries: usize,
+    /// Bytes of the source keys (a `data:` URL key holds the whole payload).
+    pub key_bytes: usize,
+    /// Distinct decoded pixel buffers, static and animation frames.
+    pub pixel_buffers: usize,
+    pub pixel_bytes: usize,
+    pub svg_source_bytes: usize,
+    pub animated_images: usize,
+}
+
+/// Walks this thread's image caches once. Diagnostics only.
+pub fn image_cache_stats() -> ImageCacheStats {
+    let mut seen = std::collections::HashSet::new();
+    let mut stats = ImageCacheStats::default();
+    let mut add = |data: &Arc<Vec<u8>>, stats: &mut ImageCacheStats| {
+        if seen.insert(Arc::as_ptr(data) as usize) {
+            stats.pixel_buffers += 1;
+            stats.pixel_bytes += data.len();
+        }
+    };
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        stats.entries = cache.len();
+        for (key, image) in cache.iter() {
+            stats.key_bytes += key.len();
+            if let Some(image) = image {
+                add(&image.data, &mut stats);
+                stats.svg_source_bytes += image.svg_source.as_ref().map_or(0, |svg| svg.len());
+            }
+        }
+    });
+    ANIMATIONS.with(|animations| {
+        let animations = animations.borrow();
+        stats.animated_images = animations.len();
+        for (key, animation) in animations.iter() {
+            stats.key_bytes += key.len();
+            for frame in &animation.frames {
+                add(&frame.data, &mut stats);
+            }
+        }
+    });
+    stats
+}
+
 pub fn get_or_load(src: &str) -> Option<DecodedImage> {
     if let Some(frame) = current_animation_frame(src) {
         record_hit();
@@ -686,6 +734,20 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    #[test]
+    fn image_cache_stats_count_entries_keys_and_pixels() {
+        clear_cache();
+        let src = "data:image/png;base64,stats-test";
+        decode_and_install(src, &png_2x1()).expect("decode png");
+        let stats = image_cache_stats();
+        assert!(stats.entries >= 1);
+        assert!(stats.key_bytes >= src.len());
+        assert!(stats.pixel_buffers >= 1);
+        assert!(stats.pixel_bytes >= 2 * 4);
+        clear_cache();
+        assert_eq!(image_cache_stats().entries, 0);
     }
 
     #[test]

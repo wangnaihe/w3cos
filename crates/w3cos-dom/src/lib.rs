@@ -16,7 +16,7 @@ pub mod stylesheet;
 pub mod user_agent;
 pub mod window;
 
-pub use document::Document;
+pub use document::{Document, DocumentMemoryStats};
 pub use dom_rect::DOMRect;
 pub use element::Element;
 pub use events::{
@@ -4345,6 +4345,55 @@ mod tests {
             .collect::<Vec<_>>();
         use w3cos_std::style::Dimension::Px;
         assert_eq!(heights, vec![Px(4.0), Px(9.0), Px(4.0), Px(9.0)]);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn memory_stats_counts_nodes_interned_styles_and_custom_property_maps() {
+        crate::stylesheet::clear_rules();
+        let mut doc = Document::new();
+        let before = doc.memory_stats();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let parent_style = doc.computed_style_shared(parent.id, None);
+
+        let mut styles = Vec::new();
+        for index in 0..20 {
+            let el = doc.create_element("div");
+            el.style_mut(&mut doc).set_property("--theme", "#123456");
+            el.style_mut(&mut doc)
+                .set_property("height", &format!("{index}px"));
+            parent.append_child(&mut doc, el);
+            styles.push(doc.computed_style_shared(el.id, Some(&parent_style)));
+        }
+        let stats = doc.memory_stats();
+        assert_eq!(stats.live_nodes, before.live_nodes + 21);
+        assert!(stats.node_slot_bytes > 0);
+        // 20 distinct heights plus the parent style.
+        assert_eq!(stats.interned_styles, before.interned_styles + 21);
+        assert_eq!(
+            stats.interned_style_bytes,
+            stats.interned_styles * stats.style_size
+        );
+        assert!(
+            stats.custom_property_maps >= 1 && stats.custom_property_maps <= stats.interned_styles,
+            "{stats:?}"
+        );
+        assert!(stats.custom_property_bytes >= stats.custom_property_maps * "--theme".len());
+        assert!(stats.computed_style_cache_entries >= 21);
+        assert_eq!(
+            stats.interned_styles_unshared,
+            before.interned_styles_unshared
+        );
+
+        // Styles nothing else references any more are visible as retained
+        // only by the intern table.
+        styles.truncate(5);
+        let after_drop = doc.memory_stats();
+        assert_eq!(
+            after_drop.interned_styles_unshared,
+            before.interned_styles_unshared + 15
+        );
         crate::stylesheet::clear_rules();
     }
 

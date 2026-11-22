@@ -35,6 +35,15 @@ pub fn with_document<R>(f: impl FnOnce(&Document) -> R) -> R {
     DOCUMENT.with(|d| f(&d.borrow()))
 }
 
+/// Like [`with_document`], but `None` instead of a panic when the document
+/// is mutably borrowed or its thread-local is already torn down.
+pub fn try_with_document<R>(f: impl FnOnce(&Document) -> R) -> Option<R> {
+    DOCUMENT
+        .try_with(|d| d.try_borrow().ok().map(|doc| f(&doc)))
+        .ok()
+        .flatten()
+}
+
 pub fn with_document_mut<R>(f: impl FnOnce(&mut Document) -> R) -> R {
     DOCUMENT.with(|d| f(&mut d.borrow_mut()))
 }

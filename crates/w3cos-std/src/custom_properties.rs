@@ -246,6 +246,24 @@ impl CustomProperties {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Address of the shared map allocation, for memory accounting (two
+    /// values with the same address share one map).
+    pub fn allocation_addr(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// Estimated heap bytes owned by the shared map: the `Inner` allocation,
+    /// the hash table slots, and every key/value string buffer. Counted once
+    /// per allocation, however many styles share it.
+    pub fn estimated_heap_bytes(&self) -> usize {
+        let map = &self.0.map;
+        let slot = std::mem::size_of::<(String, String)>() + 1;
+        map.iter().fold(
+            std::mem::size_of::<Inner>() + map.capacity() * slot,
+            |bytes, (key, value)| bytes + key.capacity() + value.capacity(),
+        )
+    }
+
     /// Insert unless the map already holds this exact value, so a no-op
     /// write keeps the allocation shared.
     pub fn insert(&mut self, property: String, value: String) -> Option<String> {
@@ -686,5 +704,18 @@ mod tests {
         let mut c = shared.clone();
         c.insert("--late".into(), "1".into());
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn heap_estimate_counts_shared_map_once_and_grows_with_entries() {
+        let mut map = CustomProperties::new();
+        let empty = map.estimated_heap_bytes();
+        map.insert("--long-name".to_string(), "x".repeat(1000));
+        let shared = map.clone();
+        assert_eq!(map.allocation_addr(), shared.allocation_addr());
+        assert!(map.estimated_heap_bytes() >= empty + 1000 + "--long-name".len());
+        let mut edited = shared.clone();
+        edited.insert("--other".to_string(), "y".to_string());
+        assert_ne!(edited.allocation_addr(), map.allocation_addr());
     }
 }
