@@ -110,6 +110,11 @@ thread_local! {
     /// boxes.
     static RECYCLED_NODES: RefCell<(Vec<Option<PaintNode>>, Option<std::sync::Arc<Vec<u32>>>)> =
         const { RefCell::new((Vec::new(), None)) };
+    /// `W3COS_PAINT_NODES_SPLICE`: the nodes of the artifact the last frame
+    /// replaced, kept whole (instead of `RECYCLED_NODES`' per-box slots).
+    static RECYCLED_NODE_VEC: RefCell<Vec<PaintNode>> = const { RefCell::new(Vec::new()) };
+    /// (frames spliced, boxes rebuilt, verify mismatches).
+    pub(crate) static PAINT_NODES_SPLICE_STATS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
     /// (kinds kept without a copy, kinds copied, verify mismatches).
     static PAINT_KIND_KEEP_STATS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
 }
@@ -117,6 +122,28 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     pub(crate) static PAINT_KIND_KEEP_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+/// `W3COS_PAINT_NODES_SPLICE=1|verify` (off by default; with
+/// `W3COS_PAINT_PERSIST_INPLACE`): the paint nodes of the artifact two
+/// frames back are kept as one array and updated in place over the boxes
+/// either of the last two layout splices touched, as Blink keeps its paint
+/// chunks and invalidates only the dirty ones, instead of a node array
+/// rebuilt box by box every frame. A box outside those ranges takes its
+/// recycled node exactly as the per-box path does. `verify` also recomputes
+/// each box's keep decision the per-box way and reports a difference.
+fn paint_nodes_splice_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if crate::paint_artifact::persist_inplace_mode() == 0 {
+            return 0;
+        }
+        match std::env::var("W3COS_PAINT_NODES_SPLICE").as_deref() {
+            Ok("1" | "true") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        }
+    })
 }
 
 /// `W3COS_PAINT_KIND_KEEP=1|verify`: a recycled kind comes from the artifact
@@ -389,12 +416,20 @@ fn finish_headless_frame(
     let keep_mode = paint_kind_keep_mode();
     let mut recycled = RECYCLED_KINDS.with(|kinds| std::mem::take(&mut *kinds.borrow_mut()));
     let inplace = crate::paint_artifact::persist_inplace_mode() != 0;
+    let splice_mode = paint_nodes_splice_mode();
     let (mut recycled_nodes, stale_trimmed) = if inplace {
         RECYCLED_NODES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
     } else {
         (Vec::new(), None)
     };
-    let recycled_len = if inplace {
+    let mut recycled_vec = if splice_mode != 0 {
+        RECYCLED_NODE_VEC.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+    } else {
+        Vec::new()
+    };
+    let recycled_len = if splice_mode != 0 {
+        recycled_vec.len()
+    } else if inplace {
         recycled_nodes.len()
     } else {
         recycled.len()
@@ -420,6 +455,86 @@ fn finish_headless_frame(
     } else {
         Vec::new()
     });
+    // `W3COS_PAINT_NODES_SPLICE`: with the dirty ranges known and the box
+    // count unchanged, update the kept array over those ranges only.
+    let spliced: Option<Vec<PaintNode>> = match dirty.as_deref() {
+        Some(ranges) if splice_mode != 0 && recycled_vec.len() == frame_len => {
+            let mut nodes = std::mem::take(&mut recycled_vec);
+            let mut rebuilt = 0u64;
+            {
+                let mut moved = moved.borrow_mut();
+                moved.fill(true);
+                for (slot, node) in nodes.iter_mut().zip(flat) {
+                    slot.parent = node.parent;
+                    slot.sticky_counter_signal = node.sticky_counter_signal;
+                }
+                for &(start, end) in ranges {
+                    for index in start as usize..(end as usize).min(frame_len) {
+                        let node = &flat[index];
+                        moved[index] = false;
+                        rebuilt += 1;
+                        let slot = &mut nodes[index];
+                        let kind =
+                            crate::paint_artifact::refill_kind(Some(&mut slot.kind), node.kind);
+                        *slot = PaintNode {
+                            kind,
+                            style: crate::paint_artifact::shared_paint_style(
+                                node.component,
+                                node.style,
+                            ),
+                            parent: node.parent,
+                            sticky_counter_signal: node.sticky_counter_signal,
+                        };
+                    }
+                }
+            }
+            let mut mismatched = 0u64;
+            if splice_mode == 2 {
+                // The per-box rule (`keep` below): outside every range.
+                let moved = moved.borrow();
+                let mut at = 0usize;
+                for index in 0..frame_len {
+                    while ranges
+                        .get(at)
+                        .is_some_and(|&(_, end)| end as usize <= index)
+                    {
+                        at += 1;
+                    }
+                    let keep = ranges
+                        .get(at)
+                        .is_none_or(|&(start, _)| index < start as usize);
+                    if keep != moved[index] {
+                        mismatched += 1;
+                        eprintln!(
+                            "[paint-nodes-splice-verify] mismatch: box {index} keep {keep} spliced {}",
+                            moved[index]
+                        );
+                    }
+                }
+            }
+            if splice_mode == 2 {
+                eprintln!(
+                    "[paint-nodes-splice-verify] rebuilt {rebuilt} of {frame_len}, {mismatched} mismatched"
+                );
+            }
+            kept += frame_len as u64 - rebuilt;
+            copied += rebuilt;
+            PAINT_NODES_SPLICE_STATS.with(|stats| {
+                let (f, r, m) = stats.get();
+                stats.set((f + 1, r + rebuilt, m + mismatched));
+            });
+            Some(nodes)
+        }
+        _ => {
+            if splice_mode != 0 && !recycled_vec.is_empty() {
+                recycled_nodes = std::mem::take(&mut recycled_vec)
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+            }
+            None
+        }
+    };
     let paint_nodes = flat.iter().enumerate().map(|(index, node)| {
         if inplace {
             let keep = dirty.as_deref().is_some_and(|dirty| {
@@ -492,6 +607,10 @@ fn finish_headless_frame(
             sticky_counter_signal: node.sticky_counter_signal,
         }
     });
+    let paint_nodes: Vec<PaintNode> = match spliced {
+        Some(nodes) => nodes,
+        None => paint_nodes.collect(),
+    };
     let cull_mode = crate::paint_artifact::paint_cull_rect_mode();
     if cull_mode != 0 {
         crate::paint_artifact::PAINT_CULL_BAND.with(|band| {
@@ -712,7 +831,11 @@ fn finish_headless_frame(
         })
     });
     if let Some(replaced) = replaced {
-        if inplace {
+        if splice_mode != 0 {
+            let trimmed = replaced.artifact.persist_trimmed.clone();
+            RECYCLED_NODE_VEC.with(|slot| *slot.borrow_mut() = replaced.artifact.nodes);
+            RECYCLED_NODES.with(|slot| *slot.borrow_mut() = (Vec::new(), trimmed));
+        } else if inplace {
             let trimmed = replaced.artifact.persist_trimmed.clone();
             recycled_nodes.clear();
             recycled_nodes.extend(replaced.artifact.nodes.into_iter().map(Some));
