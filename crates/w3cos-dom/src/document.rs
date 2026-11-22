@@ -3830,25 +3830,12 @@ impl Document {
         let mut custom_properties = inherited
             .and_then(|style| style.custom_properties.clone())
             .unwrap_or_default();
-        custom_properties.retain(|property, _| {
-            !property.starts_with("--w3cos-internal-")
-                || property == "--w3cos-internal-text-align-last"
-                || property == "--w3cos-internal-text-justify"
-                || property == user_agent::HTML_STANDARD_FONT_PROPERTY
-                // Language is inherited and re-resolved below; keeping the
-                // inherited value lets an unchanged language leave the map
-                // shared instead of cloning it twice per element.
-                || property == user_agent::TEXT_LANGUAGE_PROPERTY
-                // These are rewritten for every element below (the font
-                // origin/size unconditionally, the list image from the parent's
-                // value), and nothing reads the element's own copy first, so
-                // keeping the inherited value turns the rewrite into a no-op.
-                || property == FONT_SIZE_ORIGIN
-                || property == FONT_SPECIFIED_SIZE
-                || property == crate::css_style::LIST_IMAGE_PROPERTY
-                || property == crate::css_style::TAB_SIZE_PROPERTY
+        // Dropping the parent's element-only markers is a pure function of
+        // the parent's map, so siblings share one filtered map instead of
+        // each cloning the inherited map (see `edit_shared`).
+        custom_properties.edit_shared("inherited-custom-properties", "", |properties| {
+            properties.retain(inherited_custom_property)
         });
-
         // Custom properties participate in the cascade independently of
         // declaration order. Collect them first, then resolve ordinary
         // declarations using the winning inherited/scoped/inline values.
@@ -3965,23 +3952,13 @@ impl Document {
             // the retained font-size origin) become logical overrides.
             let mut shadow_properties = custom_properties.clone();
             if let Some(internal) = &shadow.inner.custom_properties {
-                shadow_properties.extend(
-                    internal
-                        .iter()
-                        .filter(|(property, _)| property.starts_with("--w3cos-internal-"))
-                        .map(|(property, value)| (property.clone(), value.clone())),
-                );
+                add_internal_markers(&mut shadow_properties, internal);
             }
             shadow.inner.custom_properties =
                 (!shadow_properties.is_empty()).then_some(shadow_properties);
         }
         if let Some(internal) = &merged.inner.custom_properties {
-            custom_properties.extend(
-                internal
-                    .iter()
-                    .filter(|(property, _)| property.starts_with("--w3cos-internal-"))
-                    .map(|(property, value)| (property.clone(), value.clone())),
-            );
+            add_internal_markers(&mut custom_properties, internal);
         }
         merged.inner.custom_properties =
             (!custom_properties.is_empty()).then_some(custom_properties);
@@ -26710,6 +26687,86 @@ mod image_component_tests {
     }
 
     #[test]
+    fn siblings_share_the_filtered_inherited_map_and_equal_markers() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        let parent = document.create_element("div");
+        body.append_child(&mut document, parent);
+        {
+            let mut style = parent.style_mut(&mut document);
+            // An element-only marker the children must not inherit.
+            style.set_property("display", "inline-grid");
+            for index in 0..64 {
+                style.set_property(&format!("--theme-color-{index}"), "#123456");
+            }
+        }
+        let plain: Vec<_> = (0..24)
+            .map(|_| {
+                let child = document.create_element("span");
+                parent.append_child(&mut document, child);
+                child
+            })
+            .collect();
+        let marked: Vec<_> = (0..24)
+            .map(|_| {
+                let child = document.create_element("span");
+                parent.append_child(&mut document, child);
+                child
+                    .style_mut(&mut document)
+                    .set_property("display", "inline-grid");
+                child
+            })
+            .collect();
+        let parent_style = document.computed_style_for(parent.id);
+        let marker = crate::css_style::UNRECOGNIZED_DISPLAY_PROPERTY;
+        assert_eq!(
+            parent_style
+                .custom_properties
+                .as_ref()
+                .and_then(|p| p.get(marker))
+                .map(String::as_str),
+            Some("inline-grid")
+        );
+        let before = w3cos_std::custom_properties::map_clone_count();
+        let plain_styles: Vec<_> = plain
+            .iter()
+            .map(|c| document.computed_style_for(c.id))
+            .collect();
+        let marked_styles: Vec<_> = marked
+            .iter()
+            .map(|c| document.computed_style_for(c.id))
+            .collect();
+        let clones = w3cos_std::custom_properties::map_clone_count() - before;
+        assert!(
+            clones <= 4,
+            "48 siblings cloned the inherited map {clones} times"
+        );
+        for style in &plain_styles {
+            let properties = style.custom_properties.as_ref().expect("inherited theme");
+            assert_eq!(
+                properties.get("--theme-color-63").map(String::as_str),
+                Some("#123456")
+            );
+            assert!(
+                properties.get(marker).is_none(),
+                "element-only marker was inherited"
+            );
+        }
+        for style in &marked_styles {
+            let properties = style.custom_properties.as_ref().expect("inherited theme");
+            assert_eq!(
+                properties.get("--theme-color-0").map(String::as_str),
+                Some("#123456")
+            );
+            assert_eq!(
+                properties.get(marker).map(String::as_str),
+                Some("inline-grid")
+            );
+        }
+    }
+
+    #[test]
     fn cached_position_and_border_peeks_never_lag_an_ancestor_inline_write() {
         use w3cos_std::style::Position;
         crate::stylesheet::clear_rules();
@@ -34270,4 +34327,55 @@ fn parse_html_non_negative_integer(input: &str) -> Option<u32> {
         return None;
     }
     rest[..digits].parse::<u32>().ok()
+}
+
+/// Whether an inherited custom property survives into a child's computed
+/// map: author custom properties and the inherited internal markers.
+fn inherited_custom_property(property: &String, _value: &String) -> bool {
+    !property.starts_with("--w3cos-internal-")
+            || property == "--w3cos-internal-text-align-last"
+            || property == "--w3cos-internal-text-justify"
+            || property == user_agent::HTML_STANDARD_FONT_PROPERTY
+            // Language is inherited and re-resolved below; keeping the
+            // inherited value lets an unchanged language leave the map
+            // shared instead of cloning it twice per element.
+            || property == user_agent::TEXT_LANGUAGE_PROPERTY
+            // These are rewritten for every element below (the font
+            // origin/size unconditionally, the list image from the parent's
+            // value), and nothing reads the element's own copy first, so
+            // keeping the inherited value turns the rewrite into a no-op.
+            || property == FONT_SIZE_ORIGIN
+            || property == FONT_SPECIFIED_SIZE
+            || property == crate::css_style::LIST_IMAGE_PROPERTY
+            || property == crate::css_style::TAB_SIZE_PROPERTY
+}
+
+/// Copy the `--w3cos-internal-*` markers of `internal` into `properties`.
+/// Elements that start from one shared map and add the same markers (every
+/// `div` under one parent, say) share the result instead of each cloning
+/// the map: the edit is memoized on the map allocation and the markers.
+fn add_internal_markers(
+    properties: &mut w3cos_std::custom_properties::CustomProperties,
+    internal: &w3cos_std::custom_properties::CustomProperties,
+) {
+    let mut markers: Vec<(&String, &String)> = internal
+        .iter()
+        .filter(|(property, _)| property.starts_with("--w3cos-internal-"))
+        .collect();
+    if markers.is_empty() {
+        return;
+    }
+    markers.sort_unstable();
+    let mut key = String::new();
+    for (property, value) in &markers {
+        key.push_str(property);
+        key.push('\u{1}');
+        key.push_str(value);
+        key.push('\u{2}');
+    }
+    properties.edit_shared("internal-markers", &key, |properties| {
+        for (property, value) in markers {
+            properties.insert(property.clone(), value.clone());
+        }
+    });
 }
