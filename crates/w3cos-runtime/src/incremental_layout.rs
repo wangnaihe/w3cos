@@ -15,7 +15,8 @@ type FxHashSet<T> = std::collections::HashSet<T, w3cos_std::fxhash::FxBuildHashe
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
 use w3cos_std::style::{
-    Dimension, Display, Float, Overflow, Position, ScrollMarkerGroup, TextDirection,
+    Dimension, Display, FlexDirection, FlexWrap, Float, Overflow, Position, ScrollMarkerGroup,
+    TextDirection,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -1133,12 +1134,8 @@ fn patch_and_compute(
         // `W3COS_STYLE_PATHS_KEEP`: hold the known style paths across the
         // splice, which forgets them on each subtree it swaps.
         held_paths = (style_paths_keep_mode() != 0).then(take_style_paths);
-        let spliced = splice::try_splice(
-            cache,
-            &[NodeId::from_u32(styles[0].0)],
-            viewport_w,
-            viewport_h,
-        );
+        let root = style_local_root(&cache.component, styles[0].0);
+        let spliced = splice::try_splice(cache, &[NodeId::from_u32(root)], viewport_w, viewport_h);
         splice::set_style_reuse(None);
         if !spliced && let Some(paths) = held_paths.take() {
             let key = paths.0;
@@ -2324,6 +2321,118 @@ type StylePaths = ((u64, u64), w3cos_std::fxhash::FxHashMap<u32, Vec<u32>>);
 
 thread_local! {
     static STYLE_PATHS: RefCell<StylePaths> = RefCell::new(Default::default());
+}
+
+/// The box a `W3COS_STYLE_LOCAL` splice relays out for a restyle of `id`.
+/// A box whose used size comes from its content in its parent's layout (a
+/// flex or grid item, an inline-block or table-internal box, a float, or an
+/// absolutely positioned box) is not a relayout root in Blink
+/// (LayoutObject::IsRelayoutBoundary / ObjectIsRelayoutBoundary): a change
+/// to its intrinsic size re-runs the parent's algorithm. Climb to the
+/// nearest ancestor whose box does not size from its content that way.
+fn style_local_root(component: &Component, id: u32) -> u32 {
+    let mut path = Vec::new();
+    if !find_path(component, id, &mut path) {
+        return id;
+    }
+    let mut depth = path.len();
+    while depth > 0 {
+        let (Some(parent), Some(node)) = (
+            component_at(component, &path[..depth - 1]),
+            component_at(component, &path[..depth]),
+        ) else {
+            break;
+        };
+        let content_sized = (matches!(
+            parent.style.display,
+            Display::Flex | Display::InlineFlex | Display::Grid
+        ) && !row_flex_fill_item(parent, path[depth - 1] as usize))
+            || matches!(
+                node.style.display,
+                Display::InlineBlock
+                    | Display::InlineFlex
+                    | Display::InlineTable
+                    | Display::Table
+                    | Display::TableRowGroup
+                    | Display::TableHeaderGroup
+                    | Display::TableFooterGroup
+                    | Display::TableRow
+                    | Display::TableCell
+                    | Display::TableCaption
+            )
+            || !matches!(node.style.float, w3cos_std::style::Float::None)
+            || matches!(
+                node.style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            )
+            || host_id(node).is_none();
+        if !content_sized {
+            break;
+        }
+        depth -= 1;
+    }
+    while depth > 0 {
+        match component_at(component, &path[..depth]).and_then(host_id) {
+            Some(host) => return host,
+            None => depth -= 1,
+        }
+    }
+    host_id(component).unwrap_or(id)
+}
+
+/// A row flex item whose used width does not depend on its own content:
+/// the only growing item, with a definite flex basis and `min-width: 0`, next
+/// to rigid fixed-width siblings. It fills the row's remaining space, so
+/// its border box keeps its width when its padding, border or content
+/// change (Blink still re-runs the flex algorithm there; here the parent's
+/// result is known to be the same).
+fn row_flex_fill_item(parent: &Component, index: usize) -> bool {
+    let style = &parent.style;
+    if !matches!(style.display, Display::Flex | Display::InlineFlex)
+        || !matches!(
+            style.flex_direction,
+            FlexDirection::Row | FlexDirection::RowReverse
+        )
+        || style.flex_wrap != FlexWrap::NoWrap
+    {
+        return false;
+    }
+    let Some(item) = parent.children.get(index) else {
+        return false;
+    };
+    let item_style = &item.style;
+    if item_style.flex_grow <= 0.0
+        || !matches!(item_style.flex_basis, Dimension::Px(_))
+        || !matches!(item_style.min_width, Dimension::Px(min) if min == 0.0)
+        || !matches!(item_style.max_width, Dimension::Auto)
+    {
+        return false;
+    }
+    parent.children.iter().enumerate().all(|(at, other)| {
+        at == index
+            || matches!(
+                other.style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            )
+            || (other.style.flex_grow == 0.0
+                && other.style.flex_shrink == 0.0
+                && matches!(other.style.width, Dimension::Px(_))
+                && matches!(other.style.flex_basis, Dimension::Auto | Dimension::Px(_)))
+    })
+}
+
+/// Test hook: the `W3COS_STYLE_LOCAL` relayout root for `id` in the
+/// retained tree, and whether that path is enabled.
+#[cfg(test)]
+pub(crate) fn style_local_root_of(id: u32) -> Option<(u32, bool)> {
+    CACHE.with(|slot| {
+        let slot = slot.borrow();
+        let cache = slot.as_ref()?;
+        Some((
+            style_local_root(&cache.component, id),
+            style_splice_enabled(),
+        ))
+    })
 }
 
 fn find_path(component: &Component, id: u32, path: &mut Vec<u32>) -> bool {

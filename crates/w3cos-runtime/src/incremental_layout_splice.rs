@@ -5178,10 +5178,19 @@ mod tests {
         }
         assert!(crate::incremental_layout::flush());
         assert_matches_full("rows initial");
+        // A flex item sizes from its content in the row: a STYLE_LOCAL
+        // restyle relays out the row (Blink: not a relayout boundary).
+        let row = crate::dom::parent_node(items[1]).expect("bubble has a row");
+        let (root, style_local) =
+            crate::incremental_layout::style_local_root_of(items[1]).expect("retained tree");
+        assert_eq!(root, row, "flex item relayout root");
         crate::dom::class_list_add(items[1], "pad");
         assert!(crate::incremental_layout::flush());
         if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
             let stats = crate::incremental_layout::last_flush_stats();
+            // (Under STYLE_LOCAL the row is not a safe splice root either,
+            // so this stays on the retained compute.)
+            let _ = style_local;
             assert_eq!(stats.kind, "retained", "padding on");
         }
         assert_matches_full("padding on");
@@ -5247,6 +5256,53 @@ mod tests {
         crate::dom::append_child(table, td);
         assert!(crate::incremental_layout::flush());
         assert_matches_full("grid item child re-inserted");
+        crate::stylesheet::clear_rules();
+    }
+
+    /// A row flex item that fills the row (the only growing item, definite
+    /// basis, `min-width: 0`, rigid fixed-width siblings) keeps its width
+    /// when its padding changes, so a STYLE_LOCAL restyle relays out only
+    /// that item; the result matches a full layout either way.
+    #[test]
+    fn fill_flex_item_padding_toggle_is_its_own_relayout_root() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".pad", &[("padding", "12px")]);
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let row = crate::dom::create_element("div");
+            style(row, &[("display", "flex"), ("gap", "6px")]);
+            let avatar = crate::dom::create_element("div");
+            style(
+                avatar,
+                &[("width", "20px"), ("height", "20px"), ("flex", "none")],
+            );
+            let bubble = crate::dom::create_element("div");
+            style(bubble, &[("flex", "1 1 0px"), ("min-width", "0px")]);
+            crate::dom::append_child(
+                bubble,
+                crate::dom::create_text_node(&format!(
+                    "message {index} alpha beta gamma delta epsilon zeta eta theta"
+                )),
+            );
+            crate::dom::append_child(row, avatar);
+            crate::dom::append_child(row, bubble);
+            crate::dom::append_child(crate::dom::body_id(), row);
+            items.push(bubble);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("fill rows initial");
+        let (root, _) =
+            crate::incremental_layout::style_local_root_of(items[1]).expect("retained tree");
+        assert_eq!(root, items[1], "fill item relayout root");
+        crate::dom::class_list_add(items[1], "pad");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("fill padding on");
+        crate::dom::class_list_remove(items[1], "pad");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("fill padding off");
         crate::stylesheet::clear_rules();
     }
 
