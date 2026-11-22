@@ -5253,6 +5253,36 @@ mod tests {
         crate::stylesheet::clear_rules();
     }
 
+    /// `W3COS_STYLE_ROOT_PATH=verify`: the relayout root climbed from the
+    /// known style path is the one the tree search finds, over the class
+    /// toggles of the neighbouring tests.
+    #[test]
+    fn style_root_path_matches_the_tree_search() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::incremental_layout::STYLE_ROOT_PATH_OVERRIDE.with(|mode| mode.set(None));
+            }
+        }
+        let _off = Off;
+        crate::incremental_layout::STYLE_ROOT_PATH_OVERRIDE.with(|mode| mode.set(Some(2)));
+        let before =
+            crate::incremental_layout::STYLE_ROOT_PATH_MISMATCHES.with(std::cell::Cell::get);
+        class_width_toggle_matches_full_layout();
+        class_padding_toggle_keeps_lowered_tree();
+        style_local_own_width_edit_matches_full();
+        let after =
+            crate::incremental_layout::STYLE_ROOT_PATH_MISMATCHES.with(std::cell::Cell::get);
+        assert_eq!(
+            after, before,
+            "kept-path relayout root differs from the search"
+        );
+        crate::incremental_layout::STYLE_ROOT_PATH_OVERRIDE.with(|mode| mode.set(Some(1)));
+        class_width_toggle_matches_full_layout();
+        class_padding_toggle_keeps_lowered_tree();
+        style_local_own_width_edit_matches_full();
+    }
+
     /// css/css-text/letter-spacing/letter-spacing-trim-start-002.html:
     /// `width: 15ch` -> `width: max-content` on a block (legacy layout reads
     /// the keyword as auto) must lay it out at its containing block's width,

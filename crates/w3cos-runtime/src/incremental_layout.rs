@@ -1141,6 +1141,18 @@ fn patch_and_compute(
         splice::set_style_reuse(reuse.then_some(styles[0].0));
         // `W3COS_STYLE_PATHS_KEEP`: hold the known style paths across the
         // splice, which forgets them on each subtree it swaps.
+        // `W3COS_STYLE_ROOT_PATH`: the relayout root search starts from the
+        // known style path of the element instead of searching the tree.
+        let root_mode = style_root_path_mode();
+        let known_path = (root_mode != 0)
+            .then(|| {
+                style_path(
+                    (cache.structure, cache.source_structure),
+                    &cache.component,
+                    styles[0].0,
+                )
+            })
+            .flatten();
         held_paths = (style_paths_keep_mode() != 0).then(take_style_paths);
         // The splice solves the root under a wrapper as wide as the root's
         // old margin box, which is its containing block only while the
@@ -1149,7 +1161,25 @@ fn patch_and_compute(
         let own_width = previous
             .as_ref()
             .is_some_and(|old| own_width_inputs_changed(old, &styles[0].1));
-        let root = style_local_root_for(&cache.component, styles[0].0, own_width);
+        let root = match known_path {
+            Some(path) => {
+                let root = style_local_root_at(&cache.component, styles[0].0, own_width, path);
+                if root_mode == 2 {
+                    let full = style_local_root_for(&cache.component, styles[0].0, own_width);
+                    if full != root {
+                        eprintln!(
+                            "[style-root-path-verify] mismatch: id {} kept {root} found {full}",
+                            styles[0].0
+                        );
+                        STYLE_ROOT_PATH_MISMATCHES.with(|count| count.set(count.get() + 1));
+                    }
+                    full
+                } else {
+                    root
+                }
+            }
+            None => style_local_root_for(&cache.component, styles[0].0, own_width),
+        };
         let spliced = splice::try_splice(cache, &[NodeId::from_u32(root)], viewport_w, viewport_h);
         splice::set_style_reuse(None);
         if !spliced && let Some(paths) = held_paths.take() {
@@ -2358,6 +2388,36 @@ fn style_local_root_for(component: &Component, id: u32, own_width: bool) -> u32 
     if !find_path(component, id, &mut path) {
         return id;
     }
+    style_local_root_at(component, id, own_width, path)
+}
+
+/// `W3COS_STYLE_ROOT_PATH=1|verify` (off by default): the class-toggle
+/// relayout root climbs from the element's known style path (Blink walks
+/// the parent chain from the restyled object) instead of searching the
+/// whole box tree for it; `verify` searches anyway and compares the root.
+fn style_root_path_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = STYLE_ROOT_PATH_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_STYLE_ROOT_PATH").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+thread_local! {
+    #[cfg(test)]
+    pub(crate) static STYLE_ROOT_PATH_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static STYLE_ROOT_PATH_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// [`style_local_root_for`] from the path to the element's first box.
+fn style_local_root_at(component: &Component, id: u32, own_width: bool, path: Vec<u32>) -> u32 {
     let mut depth = if own_width {
         path.len().saturating_sub(1)
     } else {
