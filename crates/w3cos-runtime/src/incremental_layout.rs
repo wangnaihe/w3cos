@@ -3136,6 +3136,15 @@ fn sync_paint_cache(
             return false;
         }
         if paint_geometry_edit(old, &style) {
+            // An inline box is laid out as items of its containing block's
+            // inline formatting context. Blink marks that block
+            // `NeedsCollectInlines` on a layout-affecting inline style
+            // change; the items here are collected when the paint tree is
+            // built, so such an edit rebuilds it.
+            if old != &style && (old.display == Display::Inline || style.display == Display::Inline)
+            {
+                return false;
+            }
             paint_only = false;
             insets_only &= paint_insets_only(old, &style);
         } else if local_paint_only(old, &style) {

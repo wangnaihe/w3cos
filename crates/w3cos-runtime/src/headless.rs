@@ -1442,6 +1442,94 @@ mod tests {
         crate::jsdom::reset_bridge();
     }
 
+    /// An inline element's inline padding edit, undone by
+    /// `removeAttribute('style')`, must paint like a cold build of the
+    /// unedited tree (Blink: an inline box style change marks the
+    /// containing block `NeedsCollectInlines`).
+    #[test]
+    fn inline_span_padding_undone_by_remove_attribute_matches_cold_build() {
+        use w3cos_core::Value;
+        fn build() -> u32 {
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::jsdom::set_viewport(120.0, 60.0);
+            let document = crate::jsdom::document_value();
+            let sheet = document.call_method("createElement", vec![Value::string("style")]);
+            sheet.set_property(
+                "textContent",
+                Value::string("body{margin:0} div{font-size:20px} .s{border:3px solid orange}"),
+            );
+            document
+                .get_property("head")
+                .call_method("appendChild", vec![sheet]);
+            let body = crate::dom::body_id();
+            let p = crate::dom::create_element("div");
+            crate::dom::append_child(body, p);
+            let mut last = 0;
+            for text in ["A", "D"] {
+                crate::dom::append_child(p, crate::dom::create_text_node(text));
+                let span = crate::dom::create_element("span");
+                crate::dom::set_attribute(span, "class", "s");
+                crate::dom::append_child(p, span);
+                last = span;
+            }
+            last
+        }
+        let differing = |a: &HeadlessFrame, b: &HeadlessFrame| {
+            a.rgba
+                .chunks(4)
+                .zip(b.rgba.chunks(4))
+                .filter(|(x, y)| x != y)
+                .count()
+        };
+        build();
+        let cold = render_document_rgba(120, 60).unwrap();
+        let span = build();
+        crate::jsdom::element_value(span)
+            .get_property("style")
+            .set_property("paddingBottom", Value::string("13px"));
+        let cold_padded = render_document_rgba(120, 60).unwrap();
+        let mut failures = Vec::new();
+        for undo in [
+            "remove-property",
+            "remove-attribute",
+            "set-attribute",
+            "css-text-empty",
+        ] {
+            let span = build();
+            let first = render_document_rgba(120, 60).unwrap();
+            assert_eq!(differing(&first, &cold), 0, "two cold builds must agree");
+            let style = crate::jsdom::element_value(span).get_property("style");
+            style.set_property("paddingBottom", Value::string("13px"));
+            let edited = render_document_rgba(120, 60).unwrap();
+            assert!(differing(&edited, &cold) > 0, "the padding edit must paint");
+            let count = differing(&edited, &cold_padded);
+            if count != 0 {
+                failures.push(format!(
+                    "{undo} edit: {count} pixels vs a cold padded build"
+                ));
+            }
+            match undo {
+                "remove-property" => {
+                    style.call_method("removeProperty", vec![Value::string("padding-bottom")]);
+                }
+                "remove-attribute" => crate::dom::remove_attribute(span, "style"),
+                "set-attribute" => crate::jsdom::apply_html_attribute(span, "style", ""),
+                _ => style.set_property("cssText", Value::string("")),
+            }
+            let restored = render_document_rgba(120, 60).unwrap();
+            let count = differing(&restored, &cold);
+            if count != 0 {
+                failures.push(format!("{undo}: {count} pixels"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "restored frames differ from a cold build: {failures:?}"
+        );
+        crate::jsdom::reset_bridge();
+    }
+
     #[test]
     fn window_scroll_keeps_fixed_descendants_in_the_viewport() {
         crate::dom::reset_document();
