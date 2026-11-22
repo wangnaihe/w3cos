@@ -1151,6 +1151,16 @@ impl Document {
         })
     }
 
+    /// The element's own inline style declares a counter or quote property.
+    pub fn inline_declares_counters(&self, id: NodeId) -> bool {
+        self.styles.get(id.0 as usize).is_some_and(|style| {
+            style
+                .inline_declarations
+                .iter()
+                .any(|(name, value)| stylesheet::declaration_uses_counters(name, value))
+        })
+    }
+
     /// Identity in [`ChildListChange`] records.
     /// The node's style revision: changes whenever its computed style may
     /// have changed (local edit, selector or inherited invalidation).

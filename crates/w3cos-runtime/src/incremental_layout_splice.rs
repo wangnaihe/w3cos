@@ -869,14 +869,24 @@ fn try_children(
     // Inserted and removed items must not move any counter or quote that a
     // kept item reads.
     let neutral = |id: u32| document.subtree_is_counter_neutral(NodeId::from_u32(id));
-    if !cached[keep..keep + removed].iter().all(|&id| neutral(id))
-        || !inserted_ids.iter().all(|&id| neutral(id))
+    // `W3COS_STYLE_LOCAL`: a restyle removes and re-inserts the same nodes;
+    // the check reads the live DOM, so one pass answers both.
+    let same_nodes =
+        super::style_local_mode() != 0 && cached[keep..keep + removed] == *inserted_ids;
+    let reused = reused_restyled_child(document, old, keep, removed, &cached, inserted_ids);
+    if reused.is_none()
+        && (!cached[keep..keep + removed].iter().all(|&id| neutral(id))
+            || (!same_nodes && !inserted_ids.iter().all(|&id| neutral(id))))
     {
         return None;
     }
     let mut inserted = Vec::with_capacity(inserted_ids.len());
+    let mut reused = reused;
     for &id in inserted_ids {
-        let component = document.to_component_subtree(NodeId::from_u32(id));
+        let component = match reused.take() {
+            Some(component) => component,
+            None => document.to_component_subtree(NodeId::from_u32(id)),
+        };
         if host_id(&component) != Some(id)
             || !column_flex_tail_item(&component)
             || !tree_is_spliceable_with_owners(&component)
@@ -900,6 +910,64 @@ fn try_children(
             inserted,
         },
     })
+}
+
+thread_local! {
+    /// The element a `W3COS_STYLE_LOCAL` restyle splice is for, set only
+    /// when its lowering is stable under the edit (see
+    /// [`set_style_reuse`]).
+    static STYLE_REUSE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// `W3COS_STYLE_LOCAL_REUSE=1` (off by default, needs `W3COS_STYLE_LOCAL`):
+/// a restyle whose lowering is stable (same display, fonts, text and
+/// internal marks; the edited element is the only one restyled) splices the
+/// retained subtree, whose host style the patch already replaced, instead of
+/// lowering the element again from the DOM, like Blink keeps the layout
+/// objects of a restyled element and only marks them for layout. The counter
+/// check reads only the element's own inline declarations: the subtree's
+/// nodes, styles and generated content are the ones already laid out.
+/// `W3COS_STYLE_LOCAL=verify` compares every such splice with a full layout.
+pub(super) fn style_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("W3COS_STYLE_LOCAL_REUSE").as_deref(),
+            Ok("1" | "true")
+        )
+    })
+}
+
+pub(super) fn set_style_reuse(id: Option<u32>) {
+    STYLE_REUSE.with(|cell| cell.set(id));
+}
+
+fn reused_restyled_child(
+    document: &w3cos_dom::document::Document,
+    old: &Component,
+    keep: usize,
+    removed: usize,
+    cached: &[u32],
+    inserted_ids: &[u32],
+) -> Option<Component> {
+    let id = STYLE_REUSE.with(|cell| cell.get())?;
+    // The splice root is the restyled element or the item of the edited
+    // container that holds it; either way the retained item already carries
+    // the patched style.
+    let [item] = inserted_ids else {
+        return None;
+    };
+    if removed != 1
+        || cached.get(keep) != Some(item)
+        || document.inline_declares_counters(NodeId::from_u32(id))
+    {
+        return None;
+    }
+    let child = old.children.get(keep)?;
+    fn holds(component: &Component, id: u32) -> bool {
+        host_id(component) == Some(id) || component.children.iter().any(|child| holds(child, id))
+    }
+    (host_id(child) == Some(*item) && holds(child, id)).then(|| child.clone())
 }
 
 fn try_candidate(
@@ -1100,14 +1168,24 @@ fn try_container_children(
         return None;
     }
     let neutral = |id: u32| document.subtree_is_counter_neutral(NodeId::from_u32(id));
-    if !cached[keep..keep + removed].iter().all(|&id| neutral(id))
-        || !inserted_ids.iter().all(|&id| neutral(id))
+    // `W3COS_STYLE_LOCAL`: a restyle removes and re-inserts the same nodes;
+    // the check reads the live DOM, so one pass answers both.
+    let same_nodes =
+        super::style_local_mode() != 0 && cached[keep..keep + removed] == *inserted_ids;
+    let reused = reused_restyled_child(document, old, keep, removed, &cached, inserted_ids);
+    if reused.is_none()
+        && (!cached[keep..keep + removed].iter().all(|&id| neutral(id))
+            || (!same_nodes && !inserted_ids.iter().all(|&id| neutral(id))))
     {
         return None;
     }
     let mut inserted = Vec::with_capacity(inserted_ids.len());
+    let mut reused = reused;
     for &id in inserted_ids {
-        let component = document.to_component_subtree(NodeId::from_u32(id));
+        let component = match reused.take() {
+            Some(component) => component,
+            None => document.to_component_subtree(NodeId::from_u32(id)),
+        };
         if host_id(&component) != Some(id) || !tree_is_spliceable_with_owners(&component) {
             return None;
         }
@@ -2146,7 +2224,14 @@ pub(super) fn try_splice(
     }
     cache.skip_projections = skip_projections;
     cache.measure_text = measure_text;
+    // `W3COS_STYLE_LOCAL`: keep the known style paths (under their old key)
+    // so the style route can carry them to the new structure key.
+    let carried = (super::style_local_mode() != 0).then(super::take_style_paths);
     crate::layout_ng::forget_patch_memo();
+    if let Some(paths) = carried {
+        let key = paths.0;
+        super::restore_style_paths(paths, key);
+    }
     let child_solved = match &commit {
         PlanKind::Children { inserted, .. } => Some(
             inserted
@@ -2315,6 +2400,84 @@ fn rebase_pending_client_rects(
         }
     };
     let in_shift = |index: usize| shifted.iter().any(|&(a, b)| index >= a && index < b);
+    if super::style_local_mode() != 0 {
+        // `W3COS_STYLE_LOCAL`: edit the index-sorted vectors in place. The
+        // removed range becomes the inserted items; only the entries after
+        // it are renumbered and shifted (every shifted range starts at or
+        // after `removed_end`, every grown box starts before
+        // `removed_start`).
+        let super::PendingClientRects {
+            layouts: mut old_layouts,
+            texts: mut old_texts,
+            ..
+        } = pending;
+        if !old_layouts.is_sorted_by_key(|entry| entry.1) {
+            old_layouts.sort_by_key(|entry| entry.1);
+        }
+        if !old_texts.is_sorted_by_key(|fragment| fragment.index) {
+            old_texts.sort_by_key(|fragment| fragment.index);
+        }
+        let inserted = |index: usize| index >= first && index < first + len;
+        let mut fresh: Vec<_> = raw
+            .layouts
+            .into_iter()
+            .filter(|entry| inserted(entry.1))
+            .map(|(mut rect, index)| {
+                rect.x += shift.dx;
+                rect.y += shift.dy;
+                (rect, removed_start + index - first)
+            })
+            .collect();
+        if !fresh.is_sorted_by_key(|entry| entry.1) {
+            fresh.sort_by_key(|entry| entry.1);
+        }
+        let lo = old_layouts.partition_point(|entry| entry.1 < removed_start);
+        let hi = old_layouts.partition_point(|entry| entry.1 < removed_end);
+        let fresh_len = fresh.len();
+        old_layouts.splice(lo..hi, fresh);
+        for &index in &grown {
+            let from = old_layouts[..lo].partition_point(|entry| entry.1 < index);
+            for entry in old_layouts[from..lo]
+                .iter_mut()
+                .take_while(|entry| entry.1 == index)
+            {
+                entry.0.height += shift.dh;
+            }
+        }
+        for entry in &mut old_layouts[lo + fresh_len..] {
+            if in_shift(entry.1) {
+                entry.0.y += shift.dh;
+            }
+            entry.1 = (entry.1 as isize + delta) as usize;
+        }
+        let mut fresh: Vec<_> = raw
+            .texts
+            .into_iter()
+            .filter(|fragment| inserted(fragment.index))
+            .map(|mut fragment| {
+                fragment.rect.x += shift.dx;
+                fragment.rect.y += shift.dy;
+                fragment.index = removed_start + fragment.index - first;
+                fragment
+            })
+            .collect();
+        if !fresh.is_sorted_by_key(|fragment| fragment.index) {
+            fresh.sort_by_key(|fragment| fragment.index);
+        }
+        let lo = old_texts.partition_point(|fragment| fragment.index < removed_start);
+        let hi = old_texts.partition_point(|fragment| fragment.index < removed_end);
+        let fresh_len = fresh.len();
+        old_texts.splice(lo..hi, fresh);
+        for fragment in &mut old_texts[lo + fresh_len..] {
+            if in_shift(fragment.index) {
+                fragment.rect.y += shift.dh;
+            }
+            fragment.index = (fragment.index as isize + delta) as usize;
+        }
+        super::forget_client_plan();
+        super::defer_client_rects(None, old_layouts, old_texts);
+        return;
+    }
     let removed_range = |index: usize| index >= removed_start && index < removed_end;
     let mut layouts = Vec::with_capacity(pending.layouts.len() + len);
     let mut texts = Vec::with_capacity(pending.texts.len());

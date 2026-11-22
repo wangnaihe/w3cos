@@ -877,6 +877,27 @@ fn rebuild(
     true
 }
 
+/// `W3COS_STYLE_LOCAL=1` (off by default): a geometry edit on one element
+/// that the style-subtree path refuses (it needs the whole document free of
+/// split inlines and projection boxes) lays out only that element's subtree
+/// through the structural splice (local eligibility, owner and projection
+/// checks; the deferred CSSOM fragments of the following boxes are rebased,
+/// not settled), and the paint tree replays it, like Blink re-lays out only
+/// the boxes a style change dirtied. `=verify` compares every such splice
+/// with a full layout (`[splice-verify]` lines).
+fn style_local_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_STYLE_LOCAL").as_deref() {
+        Ok("1" | "true") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+fn style_splice_enabled() -> bool {
+    style_local_mode() != 0
+}
+
 fn patch_and_compute(
     cache: &mut Cache,
     dirty: &[NodeId],
@@ -975,6 +996,15 @@ fn patch_and_compute(
         });
     // The subtree path below edits the published map in place: settle it
     // while the retained tree is still the one it was laid out from.
+    // (`W3COS_STYLE_LOCAL` below rebases deferred rects or settles them
+    // itself, after deciding the splice applies.)
+    // A single px width edit stays on the full patch path, which records
+    // the width memo the next edit back to that width hits (an alternating
+    // toggle then costs a memo restore, not a splice).
+    let style_splice = styles.len() == 1
+        && style_splice_enabled()
+        && !paint_only
+        && single_px_width(&styles).is_none();
     if styles.len() == 1
         && let Some(old) = previous.as_ref()
         && splice::style_subtree_may_apply(cache, old, &styles[0].1, viewport_w, viewport_h)
@@ -1023,6 +1053,38 @@ fn patch_and_compute(
         crate::layout_ng::forget_patch_memo();
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
+        return true;
+    }
+    // A geometry edit on one element the style-subtree path refused: splice
+    // the element's subtree as a structural edit would (fresh lower, local
+    // owner and projection checks, follower shifts, a paint journal entry).
+    if style_splice && previous.is_some() && {
+        // `W3COS_STYLE_LOCAL_REUSE`: splice the retained subtree (its
+        // host style is patched above) when the lowering is stable.
+        let reuse = splice::style_reuse_enabled()
+            && previous
+                .as_ref()
+                .is_some_and(|old| ng_lowering_stable(old, &styles[0].1));
+        splice::set_style_reuse(reuse.then_some(styles[0].0));
+        let spliced = splice::try_splice(
+            cache,
+            &[NodeId::from_u32(styles[0].0)],
+            viewport_w,
+            viewport_h,
+        );
+        splice::set_style_reuse(None);
+        spliced
+    } {
+        // The splice replaced the element's subtree in place: the known
+        // style paths outside it still lead to their boxes (each use checks
+        // the box id), so carry them over to the new structure key.
+        let paths = take_style_paths();
+        crate::layout_ng::forget_patch_memo();
+        restore_style_paths(paths, (cache.structure, cache.source_structure));
+        if style_local_mode() == 2 {
+            settle_client_rects(&cache.component);
+            splice::verify(viewport_w, viewport_h, styles[0].0);
+        }
         return true;
     }
     if ng_relower {
@@ -2224,6 +2286,15 @@ fn component_at_mut<'a>(
     Some(component)
 }
 
+fn take_style_paths() -> StylePaths {
+    STYLE_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
+}
+
+fn restore_style_paths(mut paths: StylePaths, key: (u64, u64)) {
+    paths.0 = key;
+    STYLE_PATHS.with(|slot| *slot.borrow_mut() = paths);
+}
+
 /// The tree changed other than by an in-place restyle.
 pub(crate) fn forget_style_paths() {
     STYLE_PATHS.with(|paths| *paths.borrow_mut() = Default::default());
@@ -2733,7 +2804,36 @@ pub fn with_paint_layout_flat<R>(
         let reusable = slot
             .as_ref()
             .is_some_and(|cache| cache.structure == structure && same_viewport(cache));
-        if reusable {
+        // `W3COS_STYLE_LOCAL`: a style edit the flush spliced left a journal
+        // entry; replay it on the paint tree (as a structural splice is)
+        // instead of laying the paint tree out again, so paint also learns
+        // which boxes changed.
+        let journaled = reusable
+            && style_splice_enabled()
+            && synced
+            && slot
+                .as_ref()
+                .and_then(|cache| cache.journal)
+                .is_some_and(|point| {
+                    let now = splice::paint_journal_point();
+                    now.0 == point.0 && now.1 > point.1
+                });
+        if journaled {
+            let cache = slot.as_mut().unwrap();
+            let point = cache.journal.expect("journal point");
+            if let Some(painted) = splice_paint_cache(
+                cache,
+                point,
+                structure,
+                cascade,
+                viewport_w,
+                viewport_h,
+                &mut use_layout,
+            ) {
+                return painted;
+            }
+            // Not replayed (or partly): rebuild below.
+        } else if reusable {
             let cache = slot.as_mut().unwrap();
             if sync_paint_cache(cache, &dirty, cascade, viewport_w, viewport_h) {
                 let use_layout = use_layout.take().expect("paint layout user");
