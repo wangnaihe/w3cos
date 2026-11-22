@@ -740,6 +740,8 @@ pub struct Document {
     /// Interned equal computed styles (MPC sharing proxy for main tests).
     shared_style_intern: RefCell<Vec<SharedStyle>>,
     shared_style_intern_inserts: Cell<usize>,
+    /// Distinct custom-property maps seen by [`Self::intern_shared_style`].
+    custom_properties_intern: RefCell<Vec<w3cos_std::style::CustomProperties>>,
     /// Intern length at which unreferenced entries are dropped.
     shared_style_intern_prune_at: Cell<usize>,
 }
@@ -887,7 +889,8 @@ impl Document {
         self.intern_shared_style(style)
     }
 
-    fn intern_shared_style(&self, style: SharedStyle) -> SharedStyle {
+    fn intern_shared_style(&self, mut style: SharedStyle) -> SharedStyle {
+        self.canonicalize_custom_properties(&mut style);
         let mut intern = self.shared_style_intern.borrow_mut();
         if let Some(existing) = intern.iter().find(|s| s.as_ref() == style.as_ref()) {
             return existing.clone();
@@ -905,6 +908,31 @@ impl Document {
         self.shared_style_intern_inserts
             .set(self.shared_style_intern_inserts.get() + 1);
         style
+    }
+
+    /// Point `style` at the one shared copy of an equal custom-property map.
+    ///
+    /// Every element inherits the root's (often hundreds of) `--*` variables,
+    /// but maps rebuilt by separate cascades are equal without sharing an
+    /// `Arc`, so each `Style` comparison in the intern scan walked every
+    /// entry. After this, equal maps are pointer-equal and compare in O(1);
+    /// the full walk happens at most once per newly computed map.
+    fn canonicalize_custom_properties(&self, style: &mut SharedStyle) {
+        const MAX_MAPS: usize = 256;
+        let Some(props) = style.custom_properties.as_ref() else {
+            return;
+        };
+        let mut maps = self.custom_properties_intern.borrow_mut();
+        if maps.iter().any(|known| known.ptr_eq(props)) {
+            return;
+        }
+        match maps.iter().find(|known| *known == props).cloned() {
+            Some(canonical) => {
+                std::sync::Arc::make_mut(style).custom_properties = Some(canonical);
+            }
+            None if maps.len() < MAX_MAPS => maps.push(props.clone()),
+            None => {}
+        }
     }
 
     #[cfg(test)]
@@ -1039,6 +1067,7 @@ impl Document {
             }),
             shared_style_intern: RefCell::new(Vec::new()),
             shared_style_intern_inserts: Cell::new(0),
+            custom_properties_intern: RefCell::new(Vec::new()),
             shared_style_intern_prune_at: Cell::new(SHARED_STYLE_INTERN_MIN_PRUNE),
         };
 
