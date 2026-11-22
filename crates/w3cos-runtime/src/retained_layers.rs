@@ -637,7 +637,7 @@ thread_local! {
     static LAYER_SELF_CLIP_EQ_MISMATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `W3COS_LAYER_SELF_CLIP_EQ` (on by default, `=0` turns it off): the layer tree keeps the
+/// `W3COS_LAYER_SELF_CLIP_EQ=1` (off by default): the layer tree keeps the
 /// artifact's per-node self clips and compares them with the next frame's
 /// instead of hashing all of them (one per box) into the global
 /// fingerprint every frame. `=verify` also hashes them and reports when
@@ -646,9 +646,9 @@ fn layer_self_clip_eq_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_LAYER_SELF_CLIP_EQ").as_deref() {
-            Ok("0" | "false") => 0,
+            Ok("1" | "true") => 1,
             Ok("verify") => 2,
-            _ => 1,
+            _ => 0,
         },
     )
 }
