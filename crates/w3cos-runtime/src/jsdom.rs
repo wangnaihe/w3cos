@@ -23121,7 +23121,12 @@ fn js_clear_timer(id: u32) {
 /// entries for removed nodes.
 pub fn binding_table_stats() -> Vec<(&'static str, u64)> {
     fn len<T>(table: &'static std::thread::LocalKey<RefCell<T>>, f: fn(&T) -> usize) -> u64 {
-        table.with(|table| table.try_borrow().map(|table| f(&table) as u64).unwrap_or(0))
+        table.with(|table| {
+            table
+                .try_borrow()
+                .map(|table| f(&table) as u64)
+                .unwrap_or(0)
+        })
     }
     vec![
         ("element_values", len(&ELEMENT_VALUES, |t| t.len())),
