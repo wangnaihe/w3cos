@@ -5422,6 +5422,16 @@ pub(crate) fn parse_html_attributes(mut input: &str) -> Vec<(String, String)> {
                 input = &input[end..];
             }
         }
+        // HTML tokenizer: a repeated attribute name on one start tag is a
+        // duplicate-attribute parse error and the later one is dropped
+        // (Blink HTMLToken::AddNewAttribute / HTMLTokenizer: the first
+        // value wins, e.g. `style="a" style="b"` keeps `a`).
+        if attributes
+            .iter()
+            .any(|(existing, _): &(String, String)| *existing == name)
+        {
+            continue;
+        }
         attributes.push((name, value));
     }
     attributes
@@ -34512,6 +34522,41 @@ try {
         assert_eq!(style.get_property("width"), fresh.get_property("width"));
         assert_eq!(style.get_property("height"), Value::string("5px"));
         assert_eq!(padding_bottom(), w3cos_std::style::Spacing::Px(0.0));
+    }
+
+    /// HTML tokenizer duplicate-attribute rule: the first `style` on a start
+    /// tag wins and the repeated one is dropped, so the whole-block inline
+    /// replacement keeps the first block (WPT grid-intrinsic-maximums-ref.html
+    /// writes `style="grid-template: ..." style="justify-items: start"`).
+    #[test]
+    fn duplicate_style_attribute_keeps_the_first_block() {
+        setup();
+        assert_eq!(
+            parse_html_attributes(r#" style="width: 10px" id=a style="height: 5px""#),
+            vec![
+                ("style".to_string(), "width: 10px".to_string()),
+                ("id".to_string(), "a".to_string()),
+            ]
+        );
+        let host = create_in_body("div");
+        host.set_property(
+            "innerHTML",
+            Value::string(r#"<div style="width: 10px" style="height: 5px"></div>"#),
+        );
+        let div = host.get_property("firstChild");
+        let node = node_id_of(&div).expect("parsed child has a DOM node");
+        let (width, height) = dom::with_document(|document| {
+            let style = Element::new(NodeId::from_u32(node))
+                .style(document)
+                .to_style();
+            (style.width, style.height)
+        });
+        assert_eq!(width, w3cos_std::style::Dimension::Px(10.0));
+        assert_eq!(height, w3cos_std::style::Dimension::Auto);
+        assert_eq!(
+            div.call_method("getAttribute", vec![Value::string("style")]),
+            Value::string("width: 10px")
+        );
     }
 
     #[test]
