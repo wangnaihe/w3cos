@@ -3517,6 +3517,18 @@ pub(super) fn try_style_subtree(
     viewport_h: f32,
 ) -> bool {
     if !style_subtree_may_apply(cache, old, new, viewport_w, viewport_h) {
+        if debug_enabled() {
+            eprintln!(
+                "[splice] style precondition: enabled {} splice_ok {} skip_projections {} viewport {} origin_stable {} margins_are_lengths {}",
+                subtree_relayout_enabled(),
+                cache.splice_ok,
+                cache.skip_projections,
+                cache.viewport_w_bits == viewport_w.to_bits()
+                    && cache.viewport_h_bits == viewport_h.to_bits(),
+                origin_stable(old, new),
+                margins_are_lengths(new)
+            );
+        }
         return bail("style precondition");
     }
     let Some(root_id) = host_id(&cache.component) else {
