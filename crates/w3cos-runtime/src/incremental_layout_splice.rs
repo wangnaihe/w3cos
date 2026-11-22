@@ -919,7 +919,7 @@ thread_local! {
     static STYLE_REUSE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-/// `W3COS_STYLE_LOCAL_REUSE=1` (off by default, needs `W3COS_STYLE_LOCAL`):
+/// `W3COS_STYLE_LOCAL_REUSE` (on by default, `=0` turns it off; needs `W3COS_STYLE_LOCAL`):
 /// a restyle whose lowering is stable (same display, fonts, text and
 /// internal marks; the edited element is the only one restyled) splices the
 /// retained subtree, whose host style the patch already replaced, instead of
@@ -931,9 +931,9 @@ thread_local! {
 pub(super) fn style_reuse_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("W3COS_STYLE_LOCAL_REUSE").as_deref(),
-            Ok("1" | "true")
+            Ok("0" | "false")
         )
     })
 }
@@ -2381,7 +2381,7 @@ fn try_splice_with(
     true
 }
 
-/// `W3COS_REBASE_RANGES=1` (off by default, with `W3COS_STYLE_LOCAL`): the
+/// `W3COS_REBASE_RANGES` (on by default, `=0` turns it off; with `W3COS_STYLE_LOCAL`): the
 /// in-place rebase of the deferred CSSOM rects shifts only the entries of
 /// each shifted range (found by binary search in the sorted tail) and
 /// renumbers only when the splice changed the box count, instead of testing
@@ -2398,9 +2398,9 @@ fn rebase_ranges_mode_verify() -> bool {
 fn rebase_ranges_raw() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("W3COS_REBASE_RANGES").as_deref() {
-        Ok("1" | "true") => 1,
+        Ok("0" | "false") => 0,
         Ok("verify") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -2421,7 +2421,7 @@ fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 /// From preorder sizes: the preorder start of each box on `path` (the root
 /// first, the target last) and the preorder range of the target's children
 /// `keep..keep + removed`.
-/// `W3COS_PREORDER_TAIL_KEEP=1` (off by default; only read under
+/// `W3COS_PREORDER_TAIL_KEEP` (on by default, `=0` turns it off; only read under
 /// `W3COS_PREORDER_SIZES`): subtree and tail commits (a text edit's
 /// paragraph, a stream step) update the kept preorder sizes like a
 /// child-list commit does, instead of dropping them for the next splice to
@@ -2429,9 +2429,9 @@ fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 fn preorder_tail_keep() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("W3COS_PREORDER_TAIL_KEEP").as_deref(),
-            Ok("1" | "true")
+            Ok("0" | "false")
         )
     })
 }

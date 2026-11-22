@@ -205,7 +205,7 @@ pub(super) fn preorder_sizes_of(root: &Component) -> Vec<u32> {
     sizes
 }
 
-/// `W3COS_PREORDER_SIZES=1` (off by default): the structural splice reads
+/// `W3COS_PREORDER_SIZES` (on by default; `=0` turns it off): the structural splice reads
 /// subtree node counts from preorder sizes kept with the retained tree and
 /// updated by each child-list splice, instead of counting the whole tree on
 /// every splice (Blink keeps such counts on the layout tree rather than
@@ -213,9 +213,9 @@ pub(super) fn preorder_sizes_of(root: &Component) -> Vec<u32> {
 pub(super) fn preorder_sizes_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("W3COS_PREORDER_SIZES").as_deref() {
-        Ok("1" | "true") => 1,
+        Ok("0" | "false") => 0,
         Ok("verify") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -941,7 +941,7 @@ fn rebuild(
     true
 }
 
-/// `W3COS_STYLE_LOCAL=1` (off by default): a geometry edit on one element
+/// `W3COS_STYLE_LOCAL` (on by default; `=0` turns it off): a geometry edit on one element
 /// that the style-subtree path refuses (it needs the whole document free of
 /// split inlines and projection boxes) lays out only that element's subtree
 /// through the structural splice (local eligibility, owner and projection
@@ -952,9 +952,9 @@ fn rebuild(
 fn style_local_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("W3COS_STYLE_LOCAL").as_deref() {
-        Ok("1" | "true") => 1,
+        Ok("0" | "false") => 0,
         Ok("verify") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -2490,7 +2490,7 @@ fn component_at_mut<'a>(
     Some(component)
 }
 
-/// `W3COS_STYLE_PATHS_KEEP=1` (off by default): a `W3COS_STYLE_LOCAL`
+/// `W3COS_STYLE_PATHS_KEEP` (on by default; `=0` turns it off): a `W3COS_STYLE_LOCAL`
 /// splice keeps the known style paths (each use still checks the box id at
 /// the path) instead of losing them to the forgets of the subtrees it swaps,
 /// so the next restyle of the same element does not search the whole tree.
@@ -2499,9 +2499,9 @@ fn style_paths_keep_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_STYLE_PATHS_KEEP").as_deref() {
-            Ok("1" | "true") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
