@@ -739,8 +739,11 @@ mod tests {
     #[test]
     fn image_cache_stats_count_entries_keys_and_pixels() {
         clear_cache();
-        let src = "data:image/png;base64,stats-test";
-        decode_and_install(src, &png_2x1()).expect("decode png");
+        // SVG decodes in every feature set (PNG needs the image crate's
+        // png feature, which the cpu-render-only build leaves out).
+        let src = "data:image/svg+xml,stats-test";
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="2" height="1" fill="red"/></svg>"#;
+        decode_and_install(src, svg).expect("decode svg");
         let stats = image_cache_stats();
         assert!(stats.entries >= 1);
         assert!(stats.key_bytes >= src.len());
