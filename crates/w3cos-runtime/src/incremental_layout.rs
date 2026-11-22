@@ -1121,6 +1121,7 @@ fn patch_and_compute(
     // A geometry edit on one element the style-subtree path refused: splice
     // the element's subtree as a structural edit would (fresh lower, local
     // owner and projection checks, follower shifts, a paint journal entry).
+    let mut held_paths = None;
     if style_splice && previous.is_some() && {
         // `W3COS_STYLE_LOCAL_REUSE`: splice the retained subtree (its
         // host style is patched above) when the lowering is stable.
@@ -1129,6 +1130,9 @@ fn patch_and_compute(
                 .as_ref()
                 .is_some_and(|old| ng_lowering_stable(old, &styles[0].1));
         splice::set_style_reuse(reuse.then_some(styles[0].0));
+        // `W3COS_STYLE_PATHS_KEEP`: hold the known style paths across the
+        // splice, which forgets them on each subtree it swaps.
+        held_paths = (style_paths_keep_mode() != 0).then(take_style_paths);
         let spliced = splice::try_splice(
             cache,
             &[NodeId::from_u32(styles[0].0)],
@@ -1136,12 +1140,16 @@ fn patch_and_compute(
             viewport_h,
         );
         splice::set_style_reuse(None);
+        if !spliced && let Some(paths) = held_paths.take() {
+            let key = paths.0;
+            restore_style_paths(paths, key);
+        }
         spliced
     } {
         // The splice replaced the element's subtree in place: the known
         // style paths outside it still lead to their boxes (each use checks
         // the box id), so carry them over to the new structure key.
-        let paths = take_style_paths();
+        let paths = held_paths.take().unwrap_or_else(take_style_paths);
         crate::layout_ng::forget_patch_memo();
         restore_style_paths(paths, (cache.structure, cache.source_structure));
         if style_local_mode() == 2 {
@@ -2349,6 +2357,22 @@ fn component_at_mut<'a>(
     Some(component)
 }
 
+/// `W3COS_STYLE_PATHS_KEEP=1` (off by default): a `W3COS_STYLE_LOCAL`
+/// splice keeps the known style paths (each use still checks the box id at
+/// the path) instead of losing them to the forgets of the subtrees it swaps,
+/// so the next restyle of the same element does not search the whole tree.
+/// `=verify` searches anyway and reports a different path.
+fn style_paths_keep_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_STYLE_PATHS_KEEP").as_deref() {
+            Ok("1" | "true") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
 fn take_style_paths() -> StylePaths {
     STYLE_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
 }
@@ -2375,6 +2399,14 @@ fn style_path(key: (u64, u64), component: &Component, id: u32) -> Option<Vec<u32
     if let Some(path) = known
         && component_at(component, &path).is_some_and(|found| host_id(found) == Some(id))
     {
+        if style_paths_keep_mode() == 2 {
+            let mut found = Vec::new();
+            if !find_path(component, id, &mut found) || found != path {
+                eprintln!(
+                    "[style-paths-keep-verify] mismatch: id {id} kept {path:?} found {found:?}"
+                );
+            }
+        }
         return Some(path);
     }
     let mut path = Vec::new();
