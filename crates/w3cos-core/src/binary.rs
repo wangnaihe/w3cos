@@ -1004,6 +1004,45 @@ fn sync_views_range(changed: &Rc<RefCell<Vec<u8>>>, start: usize, end: usize) {
     });
 }
 
+/// `target.set(source)` for a typed-array `source`, reading its bytes
+/// directly (no element decoding into the source's storage). Same element
+/// types copy bytes, as the spec requires; other types convert per element.
+/// The source range is copied out first, so overlapping views of one buffer
+/// behave as if the source were cloned before writing.
+fn set_from_typed_bytes(
+    (bytes, offset, kind, first): (&Rc<RefCell<Vec<u8>>>, usize, Kind, usize),
+    (source_bytes, source_offset, source_kind, count): (&Rc<RefCell<Vec<u8>>>, usize, Kind, usize),
+) {
+    let source_width = source_kind.bytes();
+    let source: Vec<u8> = {
+        let data = source_bytes.borrow();
+        let end = (source_offset + count * source_width).min(data.len());
+        data.get(source_offset..end).unwrap_or_default().to_vec()
+    };
+    let width = kind.bytes();
+    let start = offset + first * width;
+    let mut end = start;
+    {
+        let mut data = bytes.borrow_mut();
+        if source_kind == kind {
+            let len = source.len().min(data.len().saturating_sub(start));
+            if len > 0 {
+                data[start..start + len].copy_from_slice(&source[..len]);
+                end = start + len;
+            }
+        } else {
+            for element in source.chunks_exact(source_width) {
+                if end + width > data.len() {
+                    break;
+                }
+                data[end..end + width].copy_from_slice(&kind.encode(&source_kind.decode(element)));
+                end += width;
+            }
+        }
+    }
+    sync_views_range(bytes, start, end);
+}
+
 /// Encode `items` into consecutive elements starting at `first` and refresh
 /// the aliasing views once for the whole range (`set`, `fill`).
 fn write_typed_elements(
@@ -1336,17 +1375,35 @@ fn typed_array_sort_order(left: &Value, right: &Value) -> std::cmp::Ordering {
 }
 
 pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>) -> Option<Value> {
-    let (_, offset, length, kind, buffer) = view_for(value)?;
+    let (bytes, offset, length, kind, buffer) = view_for(value)?;
     let argument = |index: usize| args.get(index).cloned().unwrap_or(Value::Undefined);
     let values = || typed_array_values(value).unwrap_or_default();
     Some(match key {
         "set" => {
-            let source = argument(0).iter().collect::<Vec<_>>();
             let number = args.get(1).map(Value::to_number).unwrap_or(0.0);
             if !number.is_finite() || number < 0.0 {
                 binary_error("RangeError", "TypedArray set offset is outside the target");
             }
             let target = number.trunc() as usize;
+            // A typed-array source is read from its bytes. Iterating it would
+            // decode (and keep) one `Value` per element in the source's lazy
+            // storage, which for `VSBuffer.set` of a file buffer made every
+            // copied megabyte cost tens of megabytes for the source's lifetime.
+            if let Some(source) = view_for(&argument(0)) {
+                let (source_bytes, source_offset, source_length, source_kind, _) = source;
+                if target
+                    .checked_add(source_length)
+                    .is_none_or(|end| end > length)
+                {
+                    binary_error("RangeError", "TypedArray source does not fit in the target");
+                }
+                set_from_typed_bytes(
+                    (&bytes, offset, kind, target),
+                    (&source_bytes, source_offset, source_kind, source_length),
+                );
+                return Some(Value::Undefined);
+            }
+            let source = argument(0).iter().collect::<Vec<_>>();
             if target
                 .checked_add(source.len())
                 .is_none_or(|end| end > length)
@@ -2680,6 +2737,70 @@ mod tests {
         assert_eq!(seen, [9.0, 0.0, 1.0, 2.0, 0.0, 0.0, 1.0, 0.0]);
         let wide: Vec<f64> = array.iter().map(|v| v.to_number()).collect();
         assert_eq!(wide, [9.0, 513.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn set_from_a_typed_array_copies_bytes_without_decoding_the_source() {
+        let class =
+            |name: &str, args: Vec<Value>| crate::class::construct(&typed_array_class(name), args);
+        let source = class("Uint8Array", vec![Value::Number(1024.0)]);
+        for index in 0..1024 {
+            source.set_property(&index.to_string(), Value::Number((index % 251) as f64));
+        }
+        let target = class("Uint8Array", vec![Value::Number(2048.0)]);
+        let alias = target.call_method("subarray", vec![Value::Number(1000.0)]);
+        let _ = alias.iter().count(); // decoded alias must still be refreshed
+        target.call_method("set", vec![source.clone(), Value::Number(1000.0)]);
+        assert!(is_lazy(&source), "set decoded the source's elements");
+        assert!(is_lazy(&target));
+        assert_eq!(target.get_property("999").to_number(), 0.0);
+        assert_eq!(target.get_property("1000").to_number(), 0.0);
+        assert_eq!(target.get_property("1300").to_number(), (300 % 251) as f64);
+        assert_eq!(target.get_property("2023").to_number(), (1023 % 251) as f64);
+        assert_eq!(alias.get_property("300").to_number(), (300 % 251) as f64);
+        assert_eq!(
+            alias.iter().nth(1023).unwrap().to_number(),
+            (1023 % 251) as f64
+        );
+
+        // Different element types convert per element.
+        let words = class(
+            "Uint16Array",
+            vec![Value::array(vec![Value::Number(1.0), Value::Number(300.0)])],
+        );
+        let floats = class("Float32Array", vec![Value::Number(3.0)]);
+        floats.call_method("set", vec![words.clone(), Value::Number(1.0)]);
+        assert!(is_lazy(&words));
+        let seen: Vec<f64> = floats.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [0.0, 1.0, 300.0]);
+        let clamped = class("Uint8ClampedArray", vec![Value::Number(2.0)]);
+        clamped.call_method("set", vec![words]);
+        let seen: Vec<f64> = clamped.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [1.0, 255.0]);
+
+        // Overlapping views of one buffer behave as if the source was copied first.
+        let bytes = class(
+            "Uint8Array",
+            vec![Value::array(
+                (1..=6).map(|n| Value::Number(n as f64)).collect(),
+            )],
+        );
+        let head = bytes.call_method("subarray", vec![Value::Number(0.0), Value::Number(4.0)]);
+        bytes.call_method("set", vec![head, Value::Number(2.0)]);
+        let seen: Vec<f64> = bytes.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0]);
+
+        // A source that does not fit is still a RangeError.
+        let small = class("Uint8Array", vec![Value::Number(2.0)]);
+        let three = class("Uint8Array", vec![Value::Number(3.0)]);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            small.call_method("set", vec![three]);
+        }));
+        let error = outcome
+            .expect_err("oversized source must throw")
+            .downcast::<PanicValue>()
+            .expect("JavaScript exception");
+        assert_eq!(error.0.get_property("name").to_js_string(), "RangeError");
     }
 }
 
