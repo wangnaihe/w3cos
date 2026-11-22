@@ -2364,6 +2364,43 @@ fn try_splice_with(
     true
 }
 
+/// `W3COS_REBASE_RANGES=1` (off by default, with `W3COS_STYLE_LOCAL`): the
+/// in-place rebase of the deferred CSSOM rects shifts only the entries of
+/// each shifted range (found by binary search in the sorted tail) and
+/// renumbers only when the splice changed the box count, instead of testing
+/// every following entry. `=verify` also runs the per-entry loop and
+/// reports a difference.
+fn rebase_ranges_mode() -> bool {
+    rebase_ranges_raw() != 0
+}
+
+fn rebase_ranges_mode_verify() -> bool {
+    rebase_ranges_raw() == 2
+}
+
+fn rebase_ranges_raw() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_REBASE_RANGES").as_deref() {
+        Ok("1" | "true") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// Sorted, disjoint union of half-open index ranges.
+fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted: Vec<_> = ranges.iter().copied().filter(|(a, b)| a < b).collect();
+    sorted.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (a, b) in sorted {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
 /// From preorder sizes: the preorder start of each box on `path` (the root
 /// first, the target last) and the preorder range of the target's children
 /// `keep..keep + removed`.
@@ -2591,11 +2628,51 @@ fn rebase_with_spans(
                 entry.0.height += shift.dh;
             }
         }
-        for entry in &mut old_layouts[lo + fresh_len..] {
-            if in_shift(entry.1) {
-                entry.0.y += shift.dh;
+        let ranges = rebase_ranges_mode().then(|| merged_ranges(&shifted));
+        let check = (rebase_ranges_mode_verify()).then(|| {
+            let mut copy = old_layouts[lo + fresh_len..].to_vec();
+            for entry in &mut copy {
+                if in_shift(entry.1) {
+                    entry.0.y += shift.dh;
+                }
+                entry.1 = (entry.1 as isize + delta) as usize;
             }
-            entry.1 = (entry.1 as isize + delta) as usize;
+            copy
+        });
+        if let Some(ranges) = &ranges {
+            // `W3COS_REBASE_RANGES`: the tail is sorted by index; shift only
+            // the entries inside each (merged) shifted range, and renumber
+            // only when the box count changed.
+            let tail = &mut old_layouts[lo + fresh_len..];
+            if shift.dh != 0.0 {
+                for &(a, b) in ranges {
+                    let from = tail.partition_point(|entry| entry.1 < a);
+                    let to = tail.partition_point(|entry| entry.1 < b);
+                    for entry in &mut tail[from..to] {
+                        entry.0.y += shift.dh;
+                    }
+                }
+            }
+            if delta != 0 {
+                for entry in tail.iter_mut() {
+                    entry.1 = (entry.1 as isize + delta) as usize;
+                }
+            }
+        } else {
+            for entry in &mut old_layouts[lo + fresh_len..] {
+                if in_shift(entry.1) {
+                    entry.0.y += shift.dh;
+                }
+                entry.1 = (entry.1 as isize + delta) as usize;
+            }
+        }
+        if let Some(copy) = check
+            && copy
+                .iter()
+                .zip(&old_layouts[lo + fresh_len..])
+                .any(|(a, b)| a.1 != b.1 || a.0.y.to_bits() != b.0.y.to_bits())
+        {
+            eprintln!("[rebase-ranges-verify] layout mismatch");
         }
         let mut fresh: Vec<_> = raw
             .texts
@@ -2615,11 +2692,50 @@ fn rebase_with_spans(
         let hi = old_texts.partition_point(|fragment| fragment.index < removed_end);
         let fresh_len = fresh.len();
         old_texts.splice(lo..hi, fresh);
-        for fragment in &mut old_texts[lo + fresh_len..] {
-            if in_shift(fragment.index) {
-                fragment.rect.y += shift.dh;
+        let check = (rebase_ranges_mode_verify()).then(|| {
+            old_texts[lo + fresh_len..]
+                .iter()
+                .map(|fragment| {
+                    let y = if in_shift(fragment.index) {
+                        fragment.rect.y + shift.dh
+                    } else {
+                        fragment.rect.y
+                    };
+                    ((fragment.index as isize + delta) as usize, y)
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(ranges) = &ranges {
+            let tail = &mut old_texts[lo + fresh_len..];
+            if shift.dh != 0.0 {
+                for &(a, b) in ranges {
+                    let from = tail.partition_point(|fragment| fragment.index < a);
+                    let to = tail.partition_point(|fragment| fragment.index < b);
+                    for fragment in &mut tail[from..to] {
+                        fragment.rect.y += shift.dh;
+                    }
+                }
             }
-            fragment.index = (fragment.index as isize + delta) as usize;
+            if delta != 0 {
+                for fragment in tail.iter_mut() {
+                    fragment.index = (fragment.index as isize + delta) as usize;
+                }
+            }
+        } else {
+            for fragment in &mut old_texts[lo + fresh_len..] {
+                if in_shift(fragment.index) {
+                    fragment.rect.y += shift.dh;
+                }
+                fragment.index = (fragment.index as isize + delta) as usize;
+            }
+        }
+        if let Some(copy) = check
+            && copy
+                .iter()
+                .zip(&old_texts[lo + fresh_len..])
+                .any(|(a, b)| a.0 != b.index || a.1.to_bits() != b.rect.y.to_bits())
+        {
+            eprintln!("[rebase-ranges-verify] text mismatch");
         }
         super::forget_client_plan();
         super::defer_client_rects(None, old_layouts, old_texts);
