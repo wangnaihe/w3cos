@@ -466,19 +466,22 @@ fn shape_visual_run_impl(
     {
         return shape_visual_run_uncached(text, face, style, collect_clusters, expansion);
     }
+    let share = shape_cluster_share_mode();
+    let lookup = |key: &ShapeKey| {
+        SHAPE_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .faces
+                .get(&key.face)?
+                .runs
+                .get(key)?
+                .iter()
+                .find(|(cached, _)| &**cached == text)
+                .map(|(_, run)| run.clone())
+        })
+    };
     let key = shape_key(text, face, style, collect_clusters);
-    let hit = SHAPE_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .faces
-            .get(&key.face)?
-            .runs
-            .get(&key)?
-            .iter()
-            .find(|(cached, _)| &**cached == text)
-            .map(|(_, run)| run.clone())
-    });
-    if let Some(run) = hit {
+    if let Some(run) = lookup(&key) {
         #[cfg(debug_assertions)]
         debug_assert!(
             run == shape_visual_run_uncached(text, face, style, collect_clusters, None),
@@ -486,22 +489,90 @@ fn shape_visual_run_impl(
         );
         return run;
     }
-    let run = shape_visual_run_uncached(text, face, style, collect_clusters, None);
+    // `W3COS_SHAPE_CLUSTER_SHARE`: a run without clusters is the run with
+    // clusters minus its cluster lists (shaping is the same), so both
+    // lookups share one shaped entry (Blink keeps one ShapeResult per item
+    // for measuring and line breaking).
+    let cluster_key = (share != 0 && !collect_clusters).then(|| ShapeKey {
+        clusters: true,
+        ..key
+    });
+    let strip = |run: Option<GlyphRun>| {
+        run.map(|mut run| {
+            run.clusters = Vec::new();
+            run.glyph_clusters = Vec::new();
+            run
+        })
+    };
+    if let Some(cluster_key) = cluster_key.as_ref()
+        && let Some(run) = lookup(cluster_key)
+    {
+        let run = strip(run);
+        if share == 2 {
+            let direct = shape_visual_run_uncached(text, face, style, false, None);
+            if direct != run {
+                eprintln!("[shape-cluster-share-verify] mismatch for {text:?}");
+                SHAPE_CLUSTER_SHARE_MISMATCHES.with(|count| count.set(count.get() + 1));
+                return direct;
+            }
+        }
+        return run;
+    }
+    let store_key = cluster_key.unwrap_or(key);
+    let shaped = shape_visual_run_uncached(text, face, style, store_key.clusters, None);
     SHAPE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let cache = cache.faces.entry(key.face).or_default();
+        let cache = cache.faces.entry(store_key.face).or_default();
         if cache.entries >= SHAPE_CACHE_MAX {
             cache.runs.clear();
             cache.entries = 0;
         }
         cache
             .runs
-            .entry(key)
+            .entry(store_key)
             .or_default()
-            .push((text.into(), run.clone()));
+            .push((text.into(), shaped.clone()));
         cache.entries += 1;
     });
+    if store_key.clusters == collect_clusters {
+        return shaped;
+    }
+    let run = strip(shaped);
+    if share == 2 {
+        let direct = shape_visual_run_uncached(text, face, style, false, None);
+        if direct != run {
+            eprintln!("[shape-cluster-share-verify] mismatch for {text:?}");
+            SHAPE_CLUSTER_SHARE_MISMATCHES.with(|count| count.set(count.get() + 1));
+            return direct;
+        }
+    }
     run
+}
+
+/// `W3COS_SHAPE_CLUSTER_SHARE=1|verify` (off by default): see
+/// `shape_visual_run_impl`; `verify` also shapes without clusters and
+/// compares.
+fn shape_cluster_share_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = SHAPE_CLUSTER_SHARE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_SHAPE_CLUSTER_SHARE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+thread_local! {
+    #[cfg(test)]
+    pub(crate) static SHAPE_CLUSTER_SHARE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static SHAPE_CLUSTER_SHARE_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn shape_visual_run_uncached(
@@ -848,6 +919,56 @@ fn shape_buffer_with_face(
 #[cfg(test)]
 mod shaping_face_tests {
     use super::*;
+
+    #[test]
+    fn cluster_shared_runs_match_direct_shaping() {
+        let Some(face) =
+            skia_safe::FontMgr::new().legacy_make_typeface(None, skia_safe::FontStyle::normal())
+        else {
+            return;
+        };
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                SHAPE_CLUSTER_SHARE_OVERRIDE.with(|mode| mode.set(None));
+            }
+        }
+        let _off = Off;
+        let style = Style {
+            font_size: 15.0,
+            letter_spacing: 0.5,
+            ..Style::default()
+        };
+        let before = SHAPE_CLUSTER_SHARE_MISMATCHES.with(std::cell::Cell::get);
+        for mode in [2, 1] {
+            SHAPE_CLUSTER_SHARE_OVERRIDE.with(|value| value.set(Some(mode)));
+            for (at, text) in [
+                "Waffle office AVA To",
+                "fi fl ffi, kerning: AV Ta",
+                "a b  c",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let text = format!("{text} {mode}");
+                // Clusters first, then without; and the other order.
+                let order = if at % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                };
+                for clusters in order.into_iter().chain(order) {
+                    let run = shape_visual_run_impl(&text, &face, &style, clusters, None);
+                    let direct = shape_visual_run_uncached(&text, &face, &style, clusters, None);
+                    assert!(run == direct, "{text:?} clusters {clusters}");
+                }
+            }
+        }
+        assert_eq!(
+            SHAPE_CLUSTER_SHARE_MISMATCHES.with(std::cell::Cell::get),
+            before
+        );
+    }
 
     #[test]
     fn cached_shaping_face_shapes_like_a_freshly_parsed_face() {
