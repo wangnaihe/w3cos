@@ -4349,6 +4349,57 @@ mod tests {
     }
 
     #[test]
+    fn interned_styles_share_one_equal_custom_property_map() {
+        crate::stylesheet::clear_rules();
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let parent_style = doc.computed_style_shared(parent.id, None);
+
+        // Equal `--*` maps built by separate cascades, on styles that differ
+        // elsewhere so the intern keeps them apart.
+        let walks_before = w3cos_std::custom_properties::eq_path_counts();
+        let mut styles = Vec::new();
+        for index in 0..40 {
+            let el = doc.create_element("div");
+            for (name, value) in [
+                ("--a", "1".to_string()),
+                ("--b", "red".to_string()),
+                ("--c", "2px".to_string()),
+                ("height", format!("{index}px")),
+            ] {
+                el.style_mut(&mut doc).set_property(name, &value);
+            }
+            parent.append_child(&mut doc, el);
+            styles.push(doc.computed_style_shared(el.id, Some(&parent_style)));
+        }
+        let walks_after = w3cos_std::custom_properties::eq_path_counts();
+
+        let first = styles[0]
+            .custom_properties
+            .as_ref()
+            .expect("custom properties");
+        for style in &styles[1..] {
+            let props = style.custom_properties.as_ref().expect("custom properties");
+            assert!(props.ptr_eq(first), "equal maps should share one Arc");
+        }
+        assert_eq!(styles[7].height, w3cos_std::style::Dimension::Px(7.0));
+        assert_eq!(
+            first.get("--b").map(String::as_str),
+            Some("red"),
+            "canonical map keeps the declared values"
+        );
+        // At most one full comparison per newly computed map, not one per
+        // (map, interned style) pair.
+        let walks = (walks_after.0 + walks_after.1) - (walks_before.0 + walks_before.1);
+        assert!(
+            walks <= styles.len(),
+            "{walks} full map walks for {} styles",
+            styles.len()
+        );
+    }
+
+    #[test]
     fn memory_stats_counts_nodes_interned_styles_and_custom_property_maps() {
         crate::stylesheet::clear_rules();
         let mut doc = Document::new();
