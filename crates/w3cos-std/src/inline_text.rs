@@ -66,8 +66,6 @@ pub fn cssom_owner_ranges(text: &str, style: &Style) -> Vec<(u32, usize, usize)>
 }
 
 pub fn set_cssom_owner_ranges(style: &mut Style, text: &str, ranges: &[(u32, usize, usize)]) {
-    let properties = style.custom_properties.get_or_insert_with(Default::default);
-    properties.remove(CSSOM_OWNER_RANGES);
     let records = ranges
         .iter()
         .filter(|(_, start, end)| {
@@ -78,12 +76,19 @@ pub fn set_cssom_owner_ranges(style: &mut Style, text: &str, ranges: &[(u32, usi
         })
         .map(|(owner, start, end)| format!("{owner},{start},{end}"))
         .collect::<Vec<_>>();
-    if !records.is_empty() {
-        properties.insert(
-            CSSOM_OWNER_RANGES.into(),
-            format!("{:x}:{}", fingerprint(text), records.join(";")),
-        );
+    // Write only what changes: the map is usually shared with the parent's
+    // (large) theme map, and every write unshares (clones) it. An unchanged
+    // value, or removing an absent key, keeps it shared; a changed value is
+    // one overwrite instead of a remove plus an insert.
+    let properties = style.custom_properties.get_or_insert_with(Default::default);
+    if records.is_empty() {
+        properties.remove_shared(CSSOM_OWNER_RANGES);
+        return;
     }
+    properties.insert_shared(
+        CSSOM_OWNER_RANGES,
+        &format!("{:x}:{}", fingerprint(text), records.join(";")),
+    );
 }
 
 pub fn cssom_box_owners(style: &Style) -> Vec<u32> {
@@ -360,8 +365,6 @@ pub fn append_source_fragment_ends(
 }
 
 pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
-    let properties = style.custom_properties.get_or_insert_with(Default::default);
-    properties.remove(FRAGMENT_ENDS);
     let mut ends = ends
         .iter()
         .copied()
@@ -372,25 +375,69 @@ pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
     if ends.last().copied() != Some(text.len()) && !text.is_empty() {
         ends.push(text.len());
     }
+    // As in set_cssom_owner_ranges: no write unless the value changes, so a
+    // shared theme map is not cloned just to remove and re-add the same key.
+    let properties = style.custom_properties.get_or_insert_with(Default::default);
     if ends.len() > 1 {
         style.text_source_run = None;
-        let properties = style.custom_properties.get_or_insert_with(Default::default);
-        properties.remove(SOURCE_RUN);
+        properties.remove_shared(SOURCE_RUN);
         let offsets = ends
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        properties.insert(
-            FRAGMENT_ENDS.into(),
-            format!("{:x}:{offsets}", fingerprint(text)),
-        );
+        properties.insert_shared(FRAGMENT_ENDS, &format!("{:x}:{offsets}", fingerprint(text)));
+    } else {
+        properties.remove_shared(FRAGMENT_ENDS);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewriting_unchanged_run_metadata_keeps_a_shared_map_shared() {
+        let mut theme = crate::style::CustomProperties::from_iter(
+            (0..64).map(|i| (format!("--theme-{i}"), i.to_string())),
+        );
+        let text = "hello world";
+        let mut seed = Style {
+            custom_properties: Some(theme.clone()),
+            ..Style::default()
+        };
+        set_cssom_owner_ranges(&mut seed, text, &[(7, 0, 5)]);
+        set_fragment_ends(&mut seed, text, &[5]);
+        theme = seed.custom_properties.clone().unwrap();
+
+        let before = crate::custom_properties::map_clone_count();
+        for _ in 0..16 {
+            let mut style = Style {
+                custom_properties: Some(theme.clone()),
+                ..Style::default()
+            };
+            set_cssom_owner_ranges(&mut style, text, &[(7, 0, 5)]);
+            set_fragment_ends(&mut style, text, &[5]);
+            assert_eq!(style.custom_properties.as_ref(), Some(&theme));
+        }
+        assert_eq!(
+            crate::custom_properties::map_clone_count(),
+            before,
+            "unchanged owner ranges / fragment ends must not unshare the map"
+        );
+
+        // A real change still writes, and an empty set still clears.
+        let mut style = Style {
+            custom_properties: Some(theme.clone()),
+            ..Style::default()
+        };
+        set_cssom_owner_ranges(&mut style, text, &[]);
+        set_fragment_ends(&mut style, text, &[]);
+        assert!(cssom_owner_ranges(text, &style).is_empty());
+        assert!(fragment_ends(text, &style).is_none());
+        set_cssom_owner_ranges(&mut style, text, &[(9, 6, 11)]);
+        assert_eq!(cssom_owner_ranges(text, &style), vec![(9, 6, 11)]);
+    }
 
     #[test]
     fn dedicated_source_run_precedes_legacy_fixture_metadata() {

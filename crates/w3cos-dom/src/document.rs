@@ -3868,10 +3868,27 @@ impl Document {
         // Custom properties participate in the cascade independently of
         // declaration order. Collect them first, then resolve ordinary
         // declarations using the winning inherited/scoped/inline values.
+        // Elements matching the same rules author the same variables onto
+        // the same inherited map, so they share one result too.
+        let mut authored = String::new();
+        let mut authored_changes = false;
         for (prop, value, _specificity) in &author_declarations {
             if prop.starts_with("--") {
-                custom_properties.insert(prop.clone(), value.clone());
+                authored_changes |= custom_properties.get(prop.as_str()) != Some(value);
+                authored.push_str(prop);
+                authored.push('\u{1}');
+                authored.push_str(value);
+                authored.push('\u{2}');
             }
+        }
+        if authored_changes {
+            custom_properties.edit_shared("author-custom-properties", &authored, |properties| {
+                for (prop, value, _specificity) in &author_declarations {
+                    if prop.starts_with("--") {
+                        properties.insert(prop.clone(), value.clone());
+                    }
+                }
+            });
         }
         // `writing-mode` is inherited and decides how the element's logical
         // properties map to physical ones (Blink resolves it first in
@@ -5975,7 +5992,7 @@ impl Document {
         style
             .custom_properties
             .get_or_insert_with(Default::default)
-            .insert(FONT_SPECIFIED_SIZE.to_string(), specified.to_string());
+            .insert_shared(FONT_SPECIFIED_SIZE, &specified.to_string());
         // An authored zero must stay invisible even with hard minima enabled.
         if specified > 0.0 {
             style.font_size = specified.max(self.minimum_font_size);
@@ -9231,10 +9248,7 @@ impl Document {
                     style
                         .custom_properties
                         .get_or_insert_with(Default::default)
-                        .insert(
-                            "--w3cos-internal-text-transform-continues-word".to_string(),
-                            "1".to_string(),
-                        );
+                        .insert_shared("--w3cos-internal-text-transform-continues-word", "1");
                 }
             }
         }
@@ -9286,19 +9300,13 @@ impl Document {
             style
                 .custom_properties
                 .get_or_insert_with(Default::default)
-                .insert(
-                    "--w3cos-internal-rendered-legend".to_string(),
-                    "1".to_string(),
-                );
+                .insert_shared("--w3cos-internal-rendered-legend", "1");
         }
         if tag.as_str() == "table" {
             style
                 .custom_properties
                 .get_or_insert_with(Default::default)
-                .insert(
-                    "--w3cos-internal-html-table-element".to_string(),
-                    "1".to_string(),
-                );
+                .insert_shared("--w3cos-internal-html-table-element", "1");
             let author_declares_border_spacing = self.styles[id.0 as usize]
                 .inline_declarations
                 .iter()
@@ -9387,10 +9395,7 @@ impl Document {
                     style
                         .custom_properties
                         .get_or_insert_with(Default::default)
-                        .insert(
-                            "--w3cos-internal-table-cell-ua-padding".to_string(),
-                            "1".to_string(),
-                        );
+                        .insert_shared("--w3cos-internal-table-cell-ua-padding", "1");
                 }
             }
         }
@@ -9448,7 +9453,7 @@ impl Document {
                         style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert("--w3cos-internal-clearing-line-break".into(), "1".into());
+                            .insert_shared("--w3cos-internal-clearing-line-break", "1");
                     }
                     return self.attach_native_host(
                         id,
@@ -10165,7 +10170,7 @@ impl Document {
                     style
                         .custom_properties
                         .get_or_insert_with(Default::default)
-                        .insert("--w3cos-internal-list-item".into(), "1".into());
+                        .insert_shared("--w3cos-internal-list-item", "1");
                     if children.is_empty()
                         && marker.style.position == w3cos_std::style::Position::Absolute
                     {
@@ -10296,10 +10301,7 @@ impl Document {
                         line_style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-inline-formatting-context".into(),
-                                "1".into(),
-                            );
+                            .insert_shared("--w3cos-internal-inline-formatting-context", "1");
                         children = vec![w3cos_std::Component::row(line_style, children)];
                     } else {
                         anonymous_inline_formatting_context |= children
@@ -10780,10 +10782,7 @@ impl Document {
                     break_style
                         .custom_properties
                         .get_or_insert_with(Default::default)
-                        .insert(
-                            "--w3cos-internal-full-width-atomic-line-break".into(),
-                            "1".into(),
-                        );
+                        .insert_shared("--w3cos-internal-full-width-atomic-line-break", "1");
                     children.insert(1, w3cos_std::Component::text("\u{2028}", break_style));
                     style.display = w3cos_std::style::Display::Contents;
                     return w3cos_std::Component::boxed_shared(
@@ -11098,10 +11097,7 @@ impl Document {
                             .style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-text-line-width".to_string(),
-                                "1".to_string(),
-                            );
+                            .insert_shared("--w3cos-internal-text-line-width", "1");
                         fn clear_inline_indent(component: &mut w3cos_std::Component) {
                             if !matches!(
                                 component.style.display,
@@ -11158,10 +11154,7 @@ impl Document {
                             .style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-text-line-width".to_string(),
-                                "1".to_string(),
-                            );
+                            .insert_shared("--w3cos-internal-text-line-width", "1");
                         children[0].style.min_width = w3cos_std::style::Dimension::Px(0.0);
                         children[0].style.flex_shrink = 1.0;
                     }
@@ -11190,10 +11183,7 @@ impl Document {
                             .style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-text-line-width".to_string(),
-                                "1".to_string(),
-                            );
+                            .insert_shared("--w3cos-internal-text-line-width", "1");
                         trailing.style.min_width = w3cos_std::style::Dimension::Px(0.0);
                         trailing.style.flex_shrink = 1.0;
                     }
@@ -11251,10 +11241,7 @@ impl Document {
                         split_style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-inline-formatting-context".into(),
-                                "1".into(),
-                            );
+                            .insert_shared("--w3cos-internal-inline-formatting-context", "1");
                         let mut split_row = w3cos_std::Component::row(split_style, children);
                         split_padded_inline_text_fragments(&mut split_row);
                         children = split_row.children;
@@ -11434,10 +11421,7 @@ impl Document {
                         line_style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-inline-formatting-context".to_string(),
-                                "1".to_string(),
-                            );
+                            .insert_shared("--w3cos-internal-inline-formatting-context", "1");
                         line_style.width = w3cos_std::style::Dimension::Percent(100.0);
                         line_style.direction = style.direction;
                         line_style.unicode_bidi = style.unicode_bidi;
@@ -11491,10 +11475,7 @@ impl Document {
                             style
                                 .custom_properties
                                 .get_or_insert_with(Default::default)
-                                .insert(
-                                    "--w3cos-internal-inline-formatting-context".to_string(),
-                                    "1".to_string(),
-                                );
+                                .insert_shared("--w3cos-internal-inline-formatting-context", "1");
                         }
                         // Flex is an internal model for the inline children,
                         // not a replacement for the authored outer display.
@@ -11846,7 +11827,7 @@ impl Document {
                         fragment
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert("--w3cos-internal-split-inline-edge".into(), "empty".into());
+                            .insert_shared("--w3cos-internal-split-inline-edge", "empty");
                         fragment.display = w3cos_std::style::Display::Inline;
                         // `boxed_split_inline_group` owns the host opacity.
                         fragment.opacity = 1.0;
@@ -11953,7 +11934,7 @@ impl Document {
                         fragment
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert("--w3cos-internal-split-inline-edge".into(), "1".into());
+                            .insert_shared("--w3cos-internal-split-inline-edge", "1");
                         fragment.display = if passive_fragment {
                             w3cos_std::style::Display::Flex
                         } else {
@@ -12013,10 +11994,7 @@ impl Document {
                             fragment
                                 .custom_properties
                                 .get_or_insert_with(Default::default)
-                                .insert(
-                                    "--w3cos-internal-split-inline-fragment".to_string(),
-                                    "1".to_string(),
-                                );
+                                .insert_shared("--w3cos-internal-split-inline-fragment", "1");
                             fragment.justify_content = match (style.text_align, style.direction) {
                                 (w3cos_std::style::TextAlign::Right, _)
                                 | (
@@ -12108,10 +12086,7 @@ impl Document {
                                     .style
                                     .custom_properties
                                     .get_or_insert_with(Default::default)
-                                    .insert(
-                                        "--w3cos-internal-split-inline-block".to_string(),
-                                        "1".to_string(),
-                                    );
+                                    .insert_shared("--w3cos-internal-split-inline-block", "1");
                             }
                             fragments.push(child);
                         } else {
@@ -12230,7 +12205,7 @@ impl Document {
                         fragment
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert("--w3cos-internal-split-inline-edge".into(), "1".into());
+                            .insert_shared("--w3cos-internal-split-inline-edge", "1");
                         fragment.display = w3cos_std::style::Display::Inline;
                         // `boxed_split_inline_group` owns the host opacity.
                         fragment.opacity = 1.0;
@@ -12374,10 +12349,7 @@ impl Document {
                         style
                             .custom_properties
                             .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-replaced-element".to_string(),
-                                "1".to_string(),
-                            );
+                            .insert_shared("--w3cos-internal-replaced-element", "1");
                         w3cos_std::Component::boxed_shared(
                             self.component_style_shared(style),
                             vec![],
@@ -14468,7 +14440,7 @@ fn resolve_generic_font_size_origin(
     style
         .custom_properties
         .get_or_insert_with(Default::default)
-        .insert(FONT_SIZE_ORIGIN.to_string(), origin);
+        .insert_shared(FONT_SIZE_ORIGIN, &origin);
 }
 
 fn relative_font_size_px(
@@ -26757,6 +26729,59 @@ mod image_component_tests {
             before,
             "text-style comparison must not copy the theme map"
         );
+    }
+
+    #[test]
+    fn siblings_authoring_equal_variables_share_one_map() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        let parent = document.create_element("div");
+        body.append_child(&mut document, parent);
+        {
+            let mut style = parent.style_mut(&mut document);
+            for index in 0..64 {
+                style.set_property(&format!("--theme-color-{index}"), "#123456");
+            }
+        }
+        let rows: Vec<_> = (0..24)
+            .map(|_| {
+                let child = document.create_element("span");
+                parent.append_child(&mut document, child);
+                {
+                    let mut style = child.style_mut(&mut document);
+                    style.set_property("--row-accent", "#abcdef");
+                    style.set_property("--theme-color-3", "#000000");
+                }
+                child
+            })
+            .collect();
+        let _ = document.computed_style_for(parent.id);
+        let before = w3cos_std::custom_properties::map_clone_count();
+        let styles: Vec<_> = rows
+            .iter()
+            .map(|c| document.computed_style_for(c.id))
+            .collect();
+        let clones = w3cos_std::custom_properties::map_clone_count() - before;
+        assert!(
+            clones <= 4,
+            "24 siblings authoring the same variables cloned the map {clones} times"
+        );
+        for style in &styles {
+            let properties = style.custom_properties.as_ref().expect("theme");
+            assert_eq!(
+                properties.get("--row-accent").map(String::as_str),
+                Some("#abcdef")
+            );
+            assert_eq!(
+                properties.get("--theme-color-3").map(String::as_str),
+                Some("#000000")
+            );
+            assert_eq!(
+                properties.get("--theme-color-63").map(String::as_str),
+                Some("#123456")
+            );
+        }
     }
 
     #[test]

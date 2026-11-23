@@ -194,9 +194,16 @@ impl CustomProperties {
     /// equality checks pointer compares). Remembers the last few edits per
     /// thread.
     pub fn edit_shared(&mut self, tag: &'static str, arg: &str, edit: impl FnOnce(&mut Self)) {
-        const SLOTS: usize = 16;
+        const SLOTS: usize = 32;
         if self.is_empty() {
             // A fresh empty map is never the base of a later call.
+            edit(self);
+            return;
+        }
+        if Arc::strong_count(&self.0) == 1 {
+            // Nobody else holds this map, so no later caller can start from
+            // it: edit in place. Remembering it would first take a second
+            // reference, and that alone makes the edit clone the whole map.
             edit(self);
             return;
         }
@@ -238,6 +245,29 @@ impl CustomProperties {
                 slots[*next] = memo;
                 *next = (*next + 1) % SLOTS;
             }
+        });
+    }
+
+    /// `insert` for a marker stamped onto many elements that start from one
+    /// inherited map: equal edits of equal bases share one result through
+    /// [`Self::edit_shared`] instead of each unsharing (cloning) the map.
+    pub fn insert_shared(&mut self, property: &'static str, value: &str) {
+        if self.0.map.get(property).map(String::as_str) == Some(value) {
+            return;
+        }
+        self.edit_shared(property, value, |properties| {
+            properties.insert(property.to_string(), value.to_string());
+        });
+    }
+
+    /// `remove` with the sharing of [`Self::insert_shared`].
+    pub fn remove_shared(&mut self, property: &'static str) {
+        if !self.0.map.contains_key(property) {
+            return;
+        }
+        // No inserted value contains NUL, so this arg never names an insert.
+        self.edit_shared(property, "\u{0}remove", |properties| {
+            properties.remove(property);
         });
     }
 
@@ -465,6 +495,63 @@ impl<'de> Deserialize<'de> for CustomProperties {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edit_shared_edits_an_unshared_map_in_place() {
+        let mut map = CustomProperties::from_iter([("--a".to_string(), "1".to_string())]);
+        let before = map_clone_count();
+        map.edit_shared("unique-edit", "", |p| {
+            p.insert("--b".into(), "2".into());
+        });
+        assert_eq!(
+            map_clone_count(),
+            before,
+            "a map nobody shares needs no clone"
+        );
+        assert_eq!(map.get("--b").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn insert_shared_and_remove_shared_share_equal_edits_of_one_base() {
+        let base =
+            CustomProperties::from_iter((0..32).map(|i| (format!("--theme-{i}"), i.to_string())));
+        let before = map_clone_count();
+        let inserted: Vec<_> = (0..12)
+            .map(|_| {
+                let mut map = base.clone();
+                map.insert_shared("--w3cos-internal-test-marker", "1");
+                map
+            })
+            .collect();
+        assert_eq!(map_clone_count() - before, 1);
+        assert!(inserted.iter().all(|m| m.ptr_eq(&inserted[0])));
+        assert_eq!(
+            inserted[0]
+                .get("--w3cos-internal-test-marker")
+                .map(String::as_str),
+            Some("1")
+        );
+        let before = map_clone_count();
+        let removed: Vec<_> = (0..12)
+            .map(|_| {
+                let mut map = inserted[0].clone();
+                map.remove_shared("--w3cos-internal-test-marker");
+                map.remove_shared("--absent");
+                map
+            })
+            .collect();
+        assert_eq!(map_clone_count() - before, 1);
+        assert!(removed.iter().all(|m| m.ptr_eq(&removed[0]) && *m == base));
+        // A different value is a different edit.
+        let mut other = base.clone();
+        other.insert_shared("--w3cos-internal-test-marker", "2");
+        assert_eq!(
+            other
+                .get("--w3cos-internal-test-marker")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
     #[test]
     fn edit_shared_clones_once_per_base_and_edit() {
         let base: CustomProperties = (0..300)
