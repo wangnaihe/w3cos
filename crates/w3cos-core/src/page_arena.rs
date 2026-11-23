@@ -169,7 +169,7 @@ thread_local! {
 /// zero and stay until `reset`, which drops every initialized slot.
 ///
 /// Measured 64-bit classes:
-/// - `RefCell<JsObject>` = 304 → 13 slots / 4K chunk (lazy-boxed rare fields)
+/// - `RefCell<JsObject>` = 96 → 42 slots / 4K chunk (boxed rare fields + proxy handler)
 /// - `RefCell<ArrayStorage>` = 56 → 73 slots / 4K chunk
 /// - `FunctionData` = 64 → 64 slots / 4K chunk (compact PropertyMap)
 struct SizeClassSlab<T> {
@@ -1454,8 +1454,8 @@ mod tests {
         let fn_slots = SizeClassSlab::<crate::value::FunctionData>::slots_per_chunk();
         let obj_slots = SizeClassSlab::<RefCell<crate::JsObject>>::slots_per_chunk();
         assert_eq!(
-            obj_slots, 13,
-            "lazy-boxed rare JsObject fields densify RefCell slab (was 8 at 480B)"
+            obj_slots, 42,
+            "boxed rare fields and proxy handler densify the RefCell<JsObject> slab (was 13 at 304B, 8 at 480B)"
         );
         let n = fn_slots.min(obj_slots).min(16);
         assert!(n >= 8);

@@ -3120,7 +3120,7 @@ impl Value {
     /// so the trap can read them without re-entering.
     pub fn proxied_object(entries: &[(&str, Value)], handler: crate::proxy::ProxyHandler) -> Self {
         let mut object = crate::JsObject::new();
-        object.proxy_handler = Some(handler);
+        object.proxy_handler = Some(Box::new(handler));
         for (key, value) in entries {
             object.set_direct(key, value.clone());
         }
@@ -3135,7 +3135,7 @@ impl Value {
         handler: crate::proxy::ProxyHandler,
     ) -> Self {
         let mut object = crate::JsObject::new();
-        object.proxy_handler = Some(handler);
+        object.proxy_handler = Some(Box::new(handler));
         for (key, value) in entries {
             object.set_direct(key, value.clone());
         }
