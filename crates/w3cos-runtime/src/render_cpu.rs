@@ -996,6 +996,16 @@ fn render_node(
                         if let Some(decoded) = crate::image_loader::get_or_load(&layer.source) {
                             for tile in layer.tiles {
                                 let viewport = decoded.svg_viewport(tile.width, tile.height);
+                                // Raster tiles snap here; SVG viewports keep the
+                                // fractional CSS size, matching Skia.
+                                let tile = if viewport.is_none() {
+                                    crate::background_image::snap_raster_destination(
+                                        tile,
+                                        layer.snap_raster_axes,
+                                    )
+                                } else {
+                                    tile
+                                };
                                 let decoded = viewport.as_ref().unwrap_or(&decoded);
                                 draw_image_pixels(
                                     pixmap,
@@ -3882,5 +3892,72 @@ mod font_cjk_tests {
             single_line_h_align(&centered, 500.0, 100.0),
             TextAlign::Center
         );
+    }
+}
+
+#[cfg(test)]
+mod background_snap_tests {
+    use super::*;
+
+    #[test]
+    fn single_repeat_tile_row_71_has_no_red_bleed() {
+        crate::image_loader::clear_cache();
+        let mut image = image::RgbaImage::from_pixel(100, 80, image::Rgba([255, 255, 255, 255]));
+        for y in 0..20 {
+            for x in 0..100 {
+                image.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::image_loader::decode_and_install("cpu-single-tile-bleed.png", &bytes.into_inner())
+            .unwrap();
+        let mut pixmap = Pixmap::new(120, 140).unwrap();
+        pixmap.fill(SkColor::from_rgba8(255, 255, 255, 255));
+        let rect = LayoutRect {
+            x: 8.0,
+            y: 51.19,
+            width: 100.0,
+            height: 80.0,
+        };
+        let style = Style {
+            background_image: Some("url(cpu-single-tile-bleed.png)".into()),
+            ..Style::default()
+        };
+        for layer in crate::background_image::raster_background_layers(&style, rect) {
+            let decoded = crate::image_loader::get_or_load(&layer.source).unwrap();
+            for tile in layer.tiles {
+                let viewport = decoded.svg_viewport(tile.width, tile.height);
+                let tile = if viewport.is_none() {
+                    crate::background_image::snap_raster_destination(tile, layer.snap_raster_axes)
+                } else {
+                    tile
+                };
+                let decoded = viewport.as_ref().unwrap_or(&decoded);
+                draw_image_pixels(
+                    &mut pixmap,
+                    tile,
+                    decoded.width,
+                    decoded.height,
+                    &decoded.data,
+                    1.0,
+                    None,
+                    Some(layer.clip),
+                    layer.blend_mode,
+                );
+            }
+        }
+        let pixels = pixmap.data();
+        for x in 8..108 {
+            let offset = (71 * 120 + x) * 4;
+            let pixel = &pixels[offset..offset + 4];
+            assert!(
+                pixel[0] > 250 && pixel[1] > 250 && pixel[2] > 250,
+                "row 71 x={x} bled {pixel:?}"
+            );
+        }
+        crate::image_loader::clear_cache();
     }
 }

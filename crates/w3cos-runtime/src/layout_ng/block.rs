@@ -2706,7 +2706,7 @@ fn constrained_replaced_size(
     auto.max_height = Dimension::Auto;
     // Used size before min/max, with the specified width/height applied.
     let unclamped = crate::layout::image_intrinsic_size(src, &auto, containing);
-    let ratio = crate::layout::image_intrinsic_ratio(src);
+    let ratio = crate::layout::replaced_layout_ratio(src, definite);
     clamp_replaced_size(
         unclamped,
         ratio,

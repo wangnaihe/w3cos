@@ -218,6 +218,131 @@ fn viewport_source(source: &str, width: f32, height: f32) -> Option<String> {
         .flatten()
 }
 
+/// `background-color` from an SVG root `style` attribute. `transparent` and
+/// `none` paint nothing.
+fn svg_root_background_rgba(source: &str) -> Option<[u8; 4]> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+    let mut reader = Reader::from_str(source);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if element.local_name().as_ref() == b"svg" =>
+            {
+                for attribute in element.attributes().flatten() {
+                    if attribute.key.as_ref() != b"style" {
+                        continue;
+                    }
+                    let Ok(value) = attribute.decode_and_unescape_value(reader.decoder()) else {
+                        continue;
+                    };
+                    let color = svg_style_background_color(&value)?;
+                    return css_color_rgba(&color);
+                }
+                return None;
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+fn css_color_rgba(value: &str) -> Option<[u8; 4]> {
+    let value = value.trim();
+    if let Some(hex) = value.strip_prefix('#') {
+        let hex = hex.as_bytes();
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let channel = |text: &[u8]| Some((digit(text[0])? << 4) | digit(text[1])?);
+        let short = |byte: u8| Some(digit(byte)? * 17);
+        return match hex.len() {
+            3 | 4 => Some([
+                short(hex[0])?,
+                short(hex[1])?,
+                short(hex[2])?,
+                if hex.len() == 4 { short(hex[3])? } else { 255 },
+            ]),
+            6 | 8 => Some([
+                channel(&hex[0..2])?,
+                channel(&hex[2..4])?,
+                channel(&hex[4..6])?,
+                if hex.len() == 8 {
+                    channel(&hex[6..8])?
+                } else {
+                    255
+                },
+            ]),
+            _ => None,
+        };
+    }
+    Some(match value.to_ascii_lowercase().as_str() {
+        "black" => [0, 0, 0, 255],
+        "white" => [255, 255, 255, 255],
+        "red" => [255, 0, 0, 255],
+        "lime" => [0, 255, 0, 255],
+        "green" => [0, 128, 0, 255],
+        "blue" => [0, 0, 255, 255],
+        "yellow" => [255, 255, 0, 255],
+        "maroon" => [128, 0, 0, 255],
+        "olive" => [128, 128, 0, 255],
+        "navy" => [0, 0, 128, 255],
+        "purple" => [128, 0, 128, 255],
+        "teal" => [0, 128, 128, 255],
+        "silver" => [192, 192, 192, 255],
+        "gray" | "grey" => [128, 128, 128, 255],
+        "orange" => [255, 165, 0, 255],
+        _ => return None,
+    })
+}
+
+fn underlay_svg_background(image: &mut DecodedImage, [red, green, blue, alpha]: [u8; 4]) {
+    let pixels = std::sync::Arc::make_mut(&mut image.data);
+    for pixel in pixels.chunks_exact_mut(4) {
+        let src_a = u32::from(pixel[3]);
+        if src_a == 255 {
+            continue;
+        }
+        let dst_a = u32::from(alpha);
+        let out_a = src_a + dst_a * (255 - src_a) / 255;
+        if out_a == 0 {
+            continue;
+        }
+        let dst = [red, green, blue];
+        for channel in 0..3 {
+            let src = u32::from(pixel[channel]);
+            let under = u32::from(dst[channel]) * dst_a * (255 - src_a) / 255;
+            pixel[channel] = ((src * src_a + under) / out_a) as u8;
+        }
+        pixel[3] = out_a as u8;
+    }
+}
+
+fn svg_style_background_color(style: &str) -> Option<String> {
+    for declaration in style.split(';') {
+        let mut parts = declaration.splitn(2, ':');
+        let name = parts.next()?.trim();
+        let value = parts.next()?.trim();
+        if !name.eq_ignore_ascii_case("background-color") {
+            continue;
+        }
+        let color = value.split_whitespace().next()?.trim_matches('"');
+        if color.is_empty()
+            || color.eq_ignore_ascii_case("transparent")
+            || color.eq_ignore_ascii_case("none")
+            || color.eq_ignore_ascii_case("initial")
+            || color.eq_ignore_ascii_case("inherit")
+        {
+            return None;
+        }
+        return Some(color.to_string());
+    }
+    None
+}
+
 /// External SVG image documents use the fractional CSS viewport for viewBox
 /// alignment, while the cached physical raster has integer dimensions. Keep
 /// the viewport in the parse identity so equal ceil sizes cannot alias.
@@ -318,7 +443,16 @@ fn get_or_render_document(
             .flatten();
         #[cfg(not(feature = "skia"))]
         let vector_image = None;
-        let image = vector_image.or_else(|| cache.rasterize_document(&tree, width, height, clock));
+        let mut image =
+            vector_image.or_else(|| cache.rasterize_document(&tree, width, height, clock));
+        if image_document
+            && let (Some(image), Some(color)) = (image.as_mut(), svg_root_background_rgba(source))
+        {
+            // The root `background-color` fills the image viewport. usvg
+            // letterboxes the viewBox, so a shape in viewBox space would
+            // not cover that viewport (replaced-element-004).
+            underlay_svg_background(image, color);
+        }
         let bytes = image
             .as_ref()
             .map(|image| image.data.len())

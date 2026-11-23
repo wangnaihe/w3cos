@@ -175,6 +175,7 @@ pub fn image_cache_stats() -> ImageCacheStats {
 }
 
 pub fn get_or_load(src: &str) -> Option<DecodedImage> {
+    ensure_data_image(src);
     if let Some(frame) = current_animation_frame(src) {
         record_hit();
         return Some(frame);
@@ -517,6 +518,122 @@ pub(crate) fn dimensions(src: &str) -> Option<(u32, u32)> {
             .and_then(Option::as_ref)
             .map(|image| (image.intrinsic_width, image.intrinsic_height))
     })
+}
+
+/// Record a `data:image/svg+xml` document's intrinsic size without rasterizing
+/// it. Layout reads ratios only from this cache, and these URLs are never
+/// fetched, so a viewBox would otherwise stay unknown and the box would keep
+/// the 200×200 placeholder. Pixel decode stays on the paint path
+/// (`svg_viewport`) so the ordinary AOT link does not pull in the SVG renderer.
+pub(crate) fn ensure_data_image(src: &str) {
+    if !src.starts_with("data:image/svg") {
+        return;
+    }
+    let present = CACHE.with(|cache| cache.borrow().contains_key(src));
+    if present {
+        return;
+    }
+    let Some((header, payload)) = src.split_once(',') else {
+        CACHE.with(|cache| cache.borrow_mut().insert(src.to_string(), None));
+        return;
+    };
+    let bytes = if header.to_ascii_lowercase().contains(";base64") {
+        match decode_standard_base64(payload) {
+            Some(bytes) => bytes,
+            None => {
+                CACHE.with(|cache| cache.borrow_mut().insert(src.to_string(), None));
+                return;
+            }
+        }
+    } else {
+        percent_decode_data(payload)
+    };
+    if !looks_like_svg(&bytes) {
+        CACHE.with(|cache| cache.borrow_mut().insert(src.to_string(), None));
+        return;
+    }
+    let intrinsic = parse_svg_intrinsic_size(&bytes);
+    let px = |length: SvgIntrinsicLength| match length {
+        SvgIntrinsicLength::Px(value) if value > 0.0 => value as u32,
+        _ => 0,
+    };
+    let source = String::from_utf8(bytes).ok().map(Arc::from);
+    install_decoded(
+        src,
+        DecodedImage {
+            width: 1,
+            height: 1,
+            intrinsic_width: px(intrinsic.width),
+            intrinsic_height: px(intrinsic.height),
+            svg_intrinsic_size: Some(intrinsic),
+            svg_source: source,
+            data: Arc::new(Vec::new()),
+        },
+    );
+}
+
+fn percent_decode_data(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    decoded
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_standard_base64(value: &str) -> Option<Vec<u8>> {
+    fn val(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let filtered = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if filtered.is_empty() || filtered.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
+    for chunk in filtered.chunks_exact(4) {
+        let (a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+        let av = val(a)?;
+        let bv = val(b)?;
+        out.push((av << 2) | (bv >> 4));
+        if c != b'=' {
+            let cv = val(c)?;
+            out.push((bv << 4) | (cv >> 2));
+            if d != b'=' {
+                let dv = val(d)?;
+                out.push((cv << 6) | dv);
+            }
+        }
+    }
+    Some(out)
 }
 
 pub(crate) fn svg_intrinsic_size(src: &str) -> Option<SvgIntrinsicSize> {
