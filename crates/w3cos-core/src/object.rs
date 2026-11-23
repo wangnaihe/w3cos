@@ -52,7 +52,9 @@ pub struct JsObject {
     /// Own string-keyed data properties. Empty is heap-free; ≤4 stay inline.
     pub(crate) properties: PropertyMap,
     pub(crate) prototype: Option<JsObjectRef>,
-    pub(crate) proxy_handler: Option<ProxyHandler>,
+    /// Boxed: a handler is 13 trap slots (~112B) that almost no object has,
+    /// and every page-arena object slot paid for it inline.
+    pub(crate) proxy_handler: Option<Box<ProxyHandler>>,
     has_getter_properties: bool,
     pub(crate) call_slot: Option<Rc<FunctionData>>,
     /// Lazily boxed rare class / private / enumerability fields. `None` on
@@ -114,7 +116,7 @@ impl JsObject {
         let object = Self {
             properties,
             prototype: None,
-            proxy_handler: Some(handler),
+            proxy_handler: Some(Box::new(handler)),
             has_getter_properties,
             call_slot: None,
             rare: None,
@@ -802,18 +804,19 @@ mod tests {
         assert_eq!(small.get_direct("a").to_number(), 1.0);
         assert_eq!(small.get_direct("e").to_number(), 5.0);
 
-        // Rare class/private/enumerability state is lazy-boxed so ordinary empty
-        // objects shrink vs the prior inline HashSet/HashMap/Vec layout (472 /
-        // RefCell 480). PropertyMap stays as-is.
+        // Rare class/private/enumerability state and the proxy handler (13
+        // fat trap pointers) are boxed, so ordinary objects stay small (was
+        // 472 / RefCell 480 inline, then 296 / 304 with an inline handler).
+        // PropertyMap stays as-is.
         assert_eq!(
             std::mem::size_of::<JsObject>(),
-            296,
-            "lazy-boxed rare fields should keep JsObject at 296B (was 472)"
+            88,
+            "boxed rare fields and proxy handler should keep JsObject at 88B (was 296)"
         );
         assert_eq!(
             std::mem::size_of::<RefCell<JsObject>>(),
-            304,
-            "RefCell<JsObject> should be 304B for denser page-arena slabs (was 480)"
+            96,
+            "RefCell<JsObject> should be 96B for denser page-arena slabs (was 304)"
         );
         assert!(
             empty.rare.is_none(),
