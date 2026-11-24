@@ -48,6 +48,56 @@ impl<T> Slots<T> for Vec<Option<T>> {
     }
 }
 
+/// Register file of a generated frame too wide to inline as an array.
+///
+/// Generated code indexes registers with constant positions
+/// (`self.registers[13]`). On an inline array that bounds check is decided at
+/// compile time, but indexing a `Vec` goes through its `#[track_caller]`
+/// `Index` impl, which gives every access site its own
+/// `core::panic::Location` (24 bytes plus a load-time relocation in
+/// `.data.rel.ro`, so a dirty, process-private page once the dylib is
+/// loaded). Code-OSS has ~13M such sites: ~85% of the 370MB of
+/// `.data.rel.ro` across its segment dylibs. These `Index` impls are not
+/// `#[track_caller]`, so the location is the one below, shared by every site.
+pub struct Registers(Box<[Value]>);
+
+impl From<Vec<Value>> for Registers {
+    #[inline]
+    fn from(registers: Vec<Value>) -> Self {
+        Self(registers.into_boxed_slice())
+    }
+}
+
+impl std::ops::Index<usize> for Registers {
+    type Output = Value;
+    #[inline]
+    fn index(&self, index: usize) -> &Value {
+        &self.0[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Registers {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Value {
+        &mut self.0[index]
+    }
+}
+
+impl std::ops::Deref for Registers {
+    type Target = [Value];
+    #[inline]
+    fn deref(&self) -> &[Value] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Registers {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [Value] {
+        &mut self.0
+    }
+}
+
 impl<T> Slots<T> for HashMap<u32, T> {
     #[inline]
     fn slot(&self, key: u32) -> Option<&T> {
@@ -419,5 +469,29 @@ mod tests {
         );
         assert_eq!(load(&getters, &bindings, 1).unwrap().to_number(), 7.0);
         assert!(getters.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn registers_index_like_the_vec_they_replace() {
+        let mut registers: Registers = vec![Value::Undefined; 12].into();
+        assert_eq!(registers.len(), 12);
+        registers[11] = Value::Number(4.0);
+        let taken = std::mem::replace(&mut registers[11], Value::Undefined);
+        assert_eq!(taken.to_number(), 4.0);
+        assert!(registers[11].to_number().is_nan());
+        registers[0] = Value::Number(1.0);
+        let numbers: f64 = registers
+            .iter()
+            .map(Value::to_number)
+            .filter(|n| !n.is_nan())
+            .sum();
+        assert_eq!(numbers, 1.0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn registers_still_bounds_check() {
+        let registers: Registers = vec![Value::Undefined; 9].into();
+        let _ = &registers[9];
     }
 }
