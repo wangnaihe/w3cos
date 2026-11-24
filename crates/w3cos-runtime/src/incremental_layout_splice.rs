@@ -2843,13 +2843,28 @@ fn rebase_with_spans(
         let super::PendingClientRects {
             layouts: mut old_layouts,
             texts: mut old_texts,
+            sorted,
             ..
         } = pending;
-        if !old_layouts.is_sorted_by_key(|entry| entry.1) {
-            old_layouts.sort_by_key(|entry| entry.1);
+        let keep_mode = super::rebase_sorted_keep_mode();
+        if sorted && keep_mode != 0 {
+            super::REBASE_SORTED_KEEP_SKIPS.with(|n| n.set(n.get() + 1));
         }
-        if !old_texts.is_sorted_by_key(|fragment| fragment.index) {
-            old_texts.sort_by_key(|fragment| fragment.index);
+        if keep_mode == 2
+            && sorted
+            && !(old_layouts.is_sorted_by_key(|entry| entry.1)
+                && old_texts.is_sorted_by_key(|fragment| fragment.index))
+        {
+            super::REBASE_SORTED_KEEP_MISMATCHES.with(|n| n.set(n.get() + 1));
+            eprintln!("[rebase-sorted-keep-verify] mismatch: flagged sorted but not");
+        }
+        if !(sorted && keep_mode == 1) {
+            if !old_layouts.is_sorted_by_key(|entry| entry.1) {
+                old_layouts.sort_by_key(|entry| entry.1);
+            }
+            if !old_texts.is_sorted_by_key(|fragment| fragment.index) {
+                old_texts.sort_by_key(|fragment| fragment.index);
+            }
         }
         let inserted = |index: usize| index >= first && index < first + len;
         let mut fresh: Vec<_> = raw
@@ -2988,7 +3003,14 @@ fn rebase_with_spans(
             eprintln!("[rebase-ranges-verify] text mismatch");
         }
         super::forget_client_plan();
-        super::defer_client_rects(None, old_layouts, old_texts);
+        // Sorted: the kept head and tail were, the fresh items are, and
+        // they fill the removed index range (the tail renumbered by one
+        // delta keeps its order).
+        if super::rebase_sorted_keep_mode() != 0 {
+            super::defer_sorted_client_rects(old_layouts, old_texts);
+        } else {
+            super::defer_client_rects(None, old_layouts, old_texts);
+        }
         return;
     }
     let removed_range = |index: usize| index >= removed_start && index < removed_end;
@@ -4796,6 +4818,55 @@ mod tests {
         }
         assert!(crate::incremental_layout::flush());
         streams
+    }
+
+    /// `W3COS_REBASE_SORTED_KEEP`: a rebase leaves the deferred client
+    /// rects sorted and the next one skips the scan; child-list edits still
+    /// match a full layout, rects and fragments.
+    #[test]
+    fn rebase_sorted_keep_matches_full() {
+        use crate::incremental_layout::{
+            REBASE_SORTED_KEEP_MISMATCHES, REBASE_SORTED_KEEP_OVERRIDE, REBASE_SORTED_KEEP_SKIPS,
+        };
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                REBASE_SORTED_KEEP_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        let _retain = RetainGuard::on();
+        for mode in [2u8, 1] {
+            REBASE_SORTED_KEEP_OVERRIDE.with(|m| m.set(Some(mode)));
+            REBASE_SORTED_KEEP_SKIPS.with(|n| n.set(0));
+            // No read between the edits: the CSSOM rects stay deferred and
+            // each child-list splice rebases them.
+            let (chat, msgs) = chat_items();
+            let older = crate::dom::create_element("div");
+            style(
+                older,
+                &[("padding", "5px 7px"), ("margin", "3px 1px 6px 2px")],
+            );
+            crate::dom::append_child(
+                older,
+                crate::dom::create_text_node(&"older words ".repeat(14)),
+            );
+            for step in 0..6 {
+                if step % 2 == 0 {
+                    crate::dom::insert_before(chat, older, msgs[1]);
+                } else {
+                    crate::dom::remove_child(chat, older);
+                }
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("sorted keep mode {mode} step {step}"));
+            }
+            assert_client_rects_match_full(&format!("sorted keep mode {mode}"));
+            assert!(
+                REBASE_SORTED_KEEP_SKIPS.with(std::cell::Cell::get) > 0,
+                "mode {mode}: no rebase saw a sorted flag"
+            );
+        }
+        assert_eq!(REBASE_SORTED_KEEP_MISMATCHES.with(std::cell::Cell::get), 0);
     }
 
     #[test]

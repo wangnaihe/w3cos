@@ -419,6 +419,9 @@ struct PendingClientRects {
     key: Option<(u64, u64)>,
     layouts: Vec<(crate::layout::LayoutRect, usize)>,
     texts: Vec<crate::layout_ng::TextFragment>,
+    /// `W3COS_REBASE_SORTED_KEEP`: both vectors are known sorted by box
+    /// index (a rebase leaves them so), and the next rebase skips the check.
+    sorted: bool,
 }
 
 fn defer_client_rects(
@@ -431,8 +434,53 @@ fn defer_client_rects(
             key,
             layouts,
             texts,
+            sorted: false,
         }))
     });
+}
+
+/// [`defer_client_rects`] for vectors sorted by box index.
+fn defer_sorted_client_rects(
+    layouts: Vec<(crate::layout::LayoutRect, usize)>,
+    texts: Vec<crate::layout_ng::TextFragment>,
+) {
+    CLIENT_PENDING.with(|slot| {
+        *slot.borrow_mut() = Some(std::rc::Rc::new(PendingClientRects {
+            key: None,
+            layouts,
+            texts,
+            sorted: true,
+        }))
+    });
+}
+
+/// `W3COS_REBASE_SORTED_KEEP=1|verify` (off by default): the deferred
+/// client rects a rebase leaves sorted by box index carry that fact, so the
+/// next rebase does not scan them to check (`verify` scans anyway and
+/// reports a flag that was wrong).
+fn rebase_sorted_keep_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = REBASE_SORTED_KEEP_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_REBASE_SORTED_KEEP").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static REBASE_SORTED_KEEP_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(super) static REBASE_SORTED_KEEP_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static REBASE_SORTED_KEEP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Take the deferred rects out (cloning them when a width memo shares them).
@@ -443,6 +491,7 @@ fn take_pending_client_rects() -> Option<PendingClientRects> {
             key: shared.key,
             layouts: shared.layouts.clone(),
             texts: shared.texts.clone(),
+            sorted: shared.sorted,
         }),
     )
 }
