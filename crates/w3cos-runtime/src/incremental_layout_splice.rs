@@ -1746,16 +1746,27 @@ pub(super) fn try_splice(
         return false;
     }
     if super::preorder_sizes_mode() == 0 {
-        return try_splice_with(cache, dirty, viewport_w, viewport_h, &mut None);
+        return try_splice_with(cache, dirty, viewport_w, viewport_h, &mut None, &mut None);
     }
     // `W3COS_PREORDER_SIZES`: hold the retained tree's preorder sizes across
     // the splice (its solve swaps subtrees in and out, which would drop
     // them). A refused splice leaves the tree as it was; a child-list
     // commit updates them; any other commit drops them.
     let mut preorder = Some(cache.component.take_preorder());
-    let spliced = try_splice_with(cache, dirty, viewport_w, viewport_h, &mut preorder);
+    let mut hosts = (super::preorder_hosts_mode() != 0).then(|| cache.component.take_hosts());
+    let spliced = try_splice_with(
+        cache,
+        dirty,
+        viewport_w,
+        viewport_h,
+        &mut preorder,
+        &mut hosts,
+    );
     if let Some(sizes) = preorder {
         cache.component.put_preorder(sizes);
+        if let Some(hosts) = hosts {
+            cache.component.put_hosts(hosts);
+        }
     }
     spliced
 }
@@ -1766,6 +1777,7 @@ fn try_splice_with(
     viewport_w: f32,
     viewport_h: f32,
     preorder: &mut Option<Vec<u32>>,
+    hosts: &mut Option<Vec<u32>>,
 ) -> bool {
     if !cache.splice_owners_ok
         || cache.viewport_w_bits != viewport_w.to_bits()
@@ -2150,12 +2162,45 @@ fn try_splice_with(
         && children_raw.is_some()
         && super::client_rects_pending();
     let mut shifted_owners = std::collections::HashMap::new();
+    // `W3COS_PREORDER_HOSTS`: the moved boxes are preorder ranges of the
+    // kept host ids (the tree here is still the one they describe).
+    let by_range = match (preorder.as_deref(), hosts.as_deref()) {
+        (Some(sizes), Some(ids)) if dh != 0.0 && ids.len() == sizes.len() => {
+            let (keep, removed) = match &commit {
+                PlanKind::Children { keep, removed, .. } => (*keep, *removed),
+                _ => (0, 0),
+            };
+            let (starts, _, removed_end) = preorder_span(sizes, &plan.path, keep, removed);
+            let end = |start: usize| start + sizes[start] as usize;
+            let mut ranges = Vec::new();
+            if matches!(commit, PlanKind::Children { .. }) {
+                ranges.push((removed_end, end(starts[plan.path.len()])));
+            }
+            for level in 0..levels {
+                let depth = plan.path.len() - 1 - level;
+                let parent = at_path(&cache.component, &plan.path[..depth]);
+                if !is_row_flex(parent) {
+                    ranges.push((end(starts[depth + 1]), end(starts[depth])));
+                }
+            }
+            let mut out = Vec::new();
+            for (a, b) in merged_ranges(&ranges) {
+                out.extend(ids[a..b].iter().copied().filter(|&id| id != u32::MAX));
+            }
+            super::PREORDER_HOSTS_RANGED.with(|n| n.set(n.get() + 1));
+            Some(out)
+        }
+        _ => None,
+    };
+    let walk_hosts = by_range.is_none() || super::preorder_hosts_mode() == 2;
     if dh != 0.0 {
         if let PlanKind::Children { keep, removed, .. } = &commit {
             // The kept items after the edit move with the following boxes.
             let target = at_path(&cache.component, &plan.path);
             for item in &target.children[keep + removed..] {
-                collect_hosts(item, &mut shifted);
+                if walk_hosts {
+                    collect_hosts(item, &mut shifted);
+                }
                 if !rebase {
                     super::collect_cssom_owners(item, &mut shifted_owners);
                 }
@@ -2170,7 +2215,9 @@ fn try_splice_with(
             // Items beside the changed one in a row keep their boxes.
             if !is_row_flex(parent) {
                 for sibling in &parent.children[plan.path[depth] + 1..] {
-                    collect_hosts(sibling, &mut shifted);
+                    if walk_hosts {
+                        collect_hosts(sibling, &mut shifted);
+                    }
                     if !rebase {
                         super::collect_cssom_owners(sibling, &mut shifted_owners);
                     }
@@ -2184,6 +2231,25 @@ fn try_splice_with(
         }
     } else {
         grown.clear();
+    }
+    if let Some(ranged) = by_range {
+        if super::preorder_hosts_mode() == 2 {
+            let mut walked = shifted.clone();
+            walked.sort_unstable();
+            walked.dedup();
+            let mut got = ranged.clone();
+            got.sort_unstable();
+            got.dedup();
+            if got != walked {
+                super::PREORDER_HOSTS_MISMATCHES.with(|n| n.set(n.get() + 1));
+                eprintln!(
+                    "[preorder-hosts-verify] mismatch: {} ranged vs {} walked",
+                    got.len(),
+                    walked.len()
+                );
+            }
+        }
+        shifted = ranged;
     }
     dedup_hosts(&mut shifted);
     let shifted_nodes = shifted.len() as u32;
@@ -2408,10 +2474,14 @@ fn try_splice_with(
             match plan.path.split_last() {
                 Some((&at, parent)) if preorder_tail_keep() => {
                     if let Some(sizes) = preorder.as_mut() {
+                        splice_hosts(hosts, sizes, parent, at, 1, std::slice::from_ref(&fresh));
                         splice_preorder(sizes, parent, at, 1, std::slice::from_ref(&fresh));
                     }
                 }
-                _ => *preorder = None,
+                _ => {
+                    *preorder = None;
+                    *hosts = None;
+                }
             }
             *target = fresh;
         }
@@ -2419,10 +2489,12 @@ fn try_splice_with(
             if preorder_tail_keep() {
                 if let Some(sizes) = preorder.as_mut() {
                     let removed = target.children.len() - keep;
+                    splice_hosts(hosts, sizes, &plan.path, keep, removed, &tail);
                     splice_preorder(sizes, &plan.path, keep, removed, &tail);
                 }
             } else {
                 *preorder = None;
+                *hosts = None;
             }
             target.children.truncate(keep);
             target.children.extend(tail);
@@ -2434,10 +2506,21 @@ fn try_splice_with(
         } => {
             CHILD_SPLICES.with(|count| count.set(count.get() + 1));
             if let Some(sizes) = preorder.as_mut() {
+                splice_hosts(hosts, sizes, &plan.path, keep, removed, &inserted);
                 splice_preorder(sizes, &plan.path, keep, removed, &inserted);
             }
             target.children.splice(keep..keep + removed, inserted);
         }
+    }
+    if preorder.is_none() {
+        *hosts = None;
+    }
+    if super::preorder_hosts_mode() == 2
+        && let Some(kept) = hosts.as_ref()
+        && *kept != super::preorder_hosts_of(&cache.component)
+    {
+        super::PREORDER_HOSTS_MISMATCHES.with(|n| n.set(n.get() + 1));
+        eprintln!("[preorder-hosts-verify] mismatch after commit");
     }
     if super::preorder_sizes_mode() == 2
         && preorder_tail_keep()
@@ -2544,6 +2627,31 @@ fn splice_preorder(
     for start in starts {
         sizes[start] = (sizes[start] as i64 + delta) as u32;
     }
+}
+
+/// [`splice_preorder`] for the kept host ids; `sizes` still describe the
+/// old tree (call it first).
+fn splice_hosts(
+    hosts: &mut Option<Vec<u32>>,
+    sizes: &[u32],
+    path: &[usize],
+    keep: usize,
+    removed: usize,
+    inserted: &[Component],
+) {
+    let Some(ids) = hosts.as_mut() else {
+        return;
+    };
+    if ids.len() != sizes.len() {
+        *hosts = None;
+        return;
+    }
+    let (_, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+    let mut fresh = Vec::new();
+    for item in inserted {
+        fresh.extend(super::preorder_hosts_of(item));
+    }
+    ids.splice(removed_start..removed_end, fresh);
 }
 
 fn preorder_span(
@@ -5483,6 +5591,86 @@ mod tests {
                 assert_matches_full(&format!("nest {nest} span {span} pad {pad} step {step}"));
             }
         }
+        crate::stylesheet::clear_rules();
+    }
+
+    /// `W3COS_PREORDER_HOSTS`: the moved boxes read as preorder ranges of
+    /// the kept host ids are the ones the subtree walk finds, through class
+    /// toggles, appended messages, removals and text edits.
+    #[test]
+    fn preorder_hosts_match_the_walk() {
+        use crate::incremental_layout::{
+            PREORDER_HOSTS_MISMATCHES, PREORDER_HOSTS_OVERRIDE, PREORDER_HOSTS_RANGED,
+        };
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                PREORDER_HOSTS_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        for mode in [0u8, 2, 1] {
+            PREORDER_HOSTS_OVERRIDE.with(|m| m.set(Some(mode)));
+            PREORDER_HOSTS_RANGED.with(|n| n.set(0));
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".bub", &[("padding", "4px")]);
+            crate::stylesheet::register_rule(".bub.pad", &[("padding", "14px")]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let list = crate::dom::create_element("div");
+            crate::dom::append_child(crate::dom::body_id(), list);
+            let mut bubbles = Vec::new();
+            let mut texts = Vec::new();
+            let add = |index: usize, bubbles: &mut Vec<u32>, texts: &mut Vec<_>| {
+                let bubble = crate::dom::create_element("div");
+                crate::dom::class_list_add(bubble, "bub");
+                let p = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("message {index} alpha beta"));
+                crate::dom::append_child(p, text);
+                let span = crate::dom::create_element("span");
+                crate::dom::append_child(span, crate::dom::create_text_node("meta"));
+                crate::dom::append_child(bubble, p);
+                crate::dom::append_child(bubble, span);
+                if index >= 10 && bubbles.len() > 2 {
+                    // In the middle: the later messages are kept and move.
+                    crate::dom::insert_before(list, bubble, bubbles[2]);
+                    bubbles.insert(2, bubble);
+                    texts.insert(2, text);
+                } else {
+                    crate::dom::append_child(list, bubble);
+                    bubbles.push(bubble);
+                    texts.push(text);
+                }
+            };
+            for index in 0..6 {
+                add(index, &mut bubbles, &mut texts);
+            }
+            assert!(crate::incremental_layout::flush());
+            for step in 0..8 {
+                match step % 4 {
+                    0 => crate::dom::class_list_add(bubbles[1], "pad"),
+                    1 => add(10 + step, &mut bubbles, &mut texts),
+                    2 => crate::dom::set_text_content(
+                        texts[2],
+                        &format!("message two grows {step} {}", "with many more words to wrap ".repeat(8 * step)),
+                    ),
+                    _ => {
+                        crate::dom::class_list_remove(bubbles[1], "pad");
+                        let gone = bubbles.remove(3);
+                        texts.remove(3);
+                        crate::dom::remove_child(list, gone);
+                    }
+                }
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("preorder hosts mode {mode} step {step}"));
+            }
+            assert!(
+                mode == 0 || PREORDER_HOSTS_RANGED.with(std::cell::Cell::get) > 0,
+                "mode {mode}: no splice read the ranges"
+            );
+        }
+        assert_eq!(PREORDER_HOSTS_MISMATCHES.with(std::cell::Cell::get), 0);
         crate::stylesheet::clear_rules();
     }
 

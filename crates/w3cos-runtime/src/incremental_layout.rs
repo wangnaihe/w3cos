@@ -62,6 +62,9 @@ struct RetainedTree {
     /// preorder index (as [`crate::layout::count_nodes`] counts). Dropped by
     /// any edit but an in-place restyle; a child-list splice updates it.
     preorder: Option<Vec<u32>>,
+    /// `W3COS_PREORDER_HOSTS`: the host id of each box by preorder index
+    /// (`u32::MAX` for none), kept and dropped together with `preorder`.
+    hosts: Option<Vec<u32>>,
 }
 
 impl RetainedTree {
@@ -70,6 +73,7 @@ impl RetainedTree {
             flat: None,
             root: std::ptr::NonNull::from(Box::leak(Box::new(component))),
             preorder: None,
+            hosts: None,
         }
     }
 
@@ -114,6 +118,19 @@ impl RetainedTree {
         self.preorder = Some(sizes);
     }
 
+    /// Take the preorder host ids (computed when missing), like
+    /// [`Self::take_preorder`].
+    fn take_hosts(&mut self) -> Vec<u32> {
+        match self.hosts.take() {
+            Some(hosts) => hosts,
+            None => preorder_hosts_of(self),
+        }
+    }
+
+    fn put_hosts(&mut self, hosts: Vec<u32>) {
+        self.hosts = Some(hosts);
+    }
+
     /// Run `edit` on the box at `path` (child positions from the root),
     /// keeping the flat view. `edit` may change the box's own fields but
     /// not its children. The walk reaches the box through raw pointers and
@@ -143,6 +160,7 @@ impl RetainedTree {
             // An in-place restyle keeps the preorder sizes (only the child
             // lists decide them).
             let preorder = self.preorder.take();
+            let hosts = self.hosts.take();
             let kept = component_at_mut(self, path).map(|node| {
                 let children = (node.children.as_ptr(), node.children.len());
                 edit(node);
@@ -150,6 +168,7 @@ impl RetainedTree {
             });
             if kept == Some(true) {
                 self.preorder = preorder;
+                self.hosts = hosts;
             }
             return kept.is_some();
         };
@@ -171,6 +190,7 @@ impl RetainedTree {
                 // (Not an in-place restyle: flatten again.)
                 self.flat = None;
                 self.preorder = None;
+                self.hosts = None;
                 return true;
             }
             let flat = &mut self.flat.as_mut().expect("flat view").1;
@@ -205,6 +225,47 @@ pub(super) fn preorder_sizes_of(root: &Component) -> Vec<u32> {
     sizes
 }
 
+/// The host id of each box by preorder index (`u32::MAX` for none).
+pub(super) fn preorder_hosts_of(root: &Component) -> Vec<u32> {
+    fn walk(component: &Component, hosts: &mut Vec<u32>) {
+        hosts.push(host_id(component).unwrap_or(u32::MAX));
+        for child in &component.children {
+            walk(child, hosts);
+        }
+    }
+    let mut hosts = Vec::new();
+    walk(root, &mut hosts);
+    hosts
+}
+
+/// `W3COS_PREORDER_HOSTS=1|verify` (off by default; only read under
+/// `W3COS_PREORDER_SIZES`): keep each box's host id by preorder index with
+/// the retained tree, so the boxes a splice only moves are read as preorder
+/// ranges instead of walking their subtrees (Blink moves the fragments of a
+/// shifted subtree as a whole). `verify` also walks and compares.
+pub(super) fn preorder_hosts_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PREORDER_HOSTS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_PREORDER_HOSTS").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static PREORDER_HOSTS_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(super) static PREORDER_HOSTS_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static PREORDER_HOSTS_RANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// `W3COS_PREORDER_SIZES` (on by default; `=0` turns it off): the structural splice reads
 /// subtree node counts from preorder sizes kept with the retained tree and
 /// updated by each child-list splice, instead of counting the whole tree on
@@ -231,6 +292,7 @@ impl std::ops::DerefMut for RetainedTree {
     fn deref_mut(&mut self) -> &mut Component {
         self.flat = None;
         self.preorder = None;
+        self.hosts = None;
         // SAFETY: the flat view (the only other borrow) was just dropped.
         unsafe { self.root.as_mut() }
     }
