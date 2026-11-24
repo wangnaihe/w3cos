@@ -6010,6 +6010,98 @@ mod tests {
         run(true);
     }
 
+    /// `W3COS_ELIG_IFC_SKIP`: a padding toggle on a bubble skips walking
+    /// its paragraphs' inlines again; an inherited `text-align: justify`
+    /// (new paragraph keys) and a text edit walk them, and the page still
+    /// matches a full layout.
+    #[test]
+    fn elig_ifc_skip_matches_the_walk() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::layout_ng::set_elig_ifc_skip_override(None);
+                crate::layout_ng::set_elig_ifc_memo_override(None);
+            }
+        }
+        let _off = Off;
+        let run = |check: bool| {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".pad", &[("padding", "14px")]);
+            crate::stylesheet::register_rule(".just", &[("text-align", "justify")]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let mut bubbles = Vec::new();
+            let mut texts = Vec::new();
+            for index in 0..4 {
+                let row = crate::dom::create_element("div");
+                style(row, &[("display", "flex"), ("gap", "6px")]);
+                let avatar = crate::dom::create_element("div");
+                style(avatar, &[("width", "20px"), ("height", "20px")]);
+                let bubble = crate::dom::create_element("div");
+                style(bubble, &[("min-width", "0px")]);
+                for para in 0..3 {
+                    let p = crate::dom::create_element("p");
+                    let text = crate::dom::create_text_node(&format!(
+                        "message {index} paragraph {para} alpha beta gamma "
+                    ));
+                    crate::dom::append_child(p, text);
+                    texts.push(text);
+                    let b = crate::dom::create_element("b");
+                    crate::dom::append_child(b, crate::dom::create_text_node("bold"));
+                    crate::dom::append_child(p, b);
+                    let code = crate::dom::create_element("code");
+                    crate::dom::append_child(code, crate::dom::create_text_node("fn_1()"));
+                    crate::dom::append_child(p, code);
+                    crate::dom::append_child(p, crate::dom::create_text_node(" tail words"));
+                    crate::dom::append_child(bubble, p);
+                }
+                crate::dom::append_child(row, avatar);
+                crate::dom::append_child(row, bubble);
+                crate::dom::append_child(crate::dom::body_id(), row);
+                bubbles.push(bubble);
+            }
+            assert!(crate::incremental_layout::flush());
+            if check {
+                assert_matches_full("ifc skip initial");
+            }
+            let mid = bubbles[2];
+            for step in 0..8 {
+                match step {
+                    0 | 2 | 6 => crate::dom::class_list_add(mid, "pad"),
+                    1 | 3 | 7 => crate::dom::class_list_remove(mid, "pad"),
+                    4 => crate::dom::class_list_add(mid, "just"),
+                    _ => crate::dom::class_list_remove(mid, "just"),
+                }
+                assert!(crate::incremental_layout::flush());
+                if check {
+                    assert_matches_full(&format!("ifc skip step {step}"));
+                }
+            }
+            crate::dom::set_text_content(texts[7], "edited paragraph text ");
+            assert!(crate::incremental_layout::flush());
+            crate::dom::class_list_add(mid, "pad");
+            assert!(crate::incremental_layout::flush());
+            if check {
+                assert_matches_full("ifc skip after text edit");
+            }
+        };
+        crate::layout_ng::set_elig_ifc_memo_override(Some(1));
+        crate::layout_ng::set_elig_ifc_skip_override(Some(2));
+        let (hits, mismatches) = crate::layout_ng::elig_ifc_skip_stats();
+        run(false);
+        let (hits_after, mismatches_after) = crate::layout_ng::elig_ifc_skip_stats();
+        assert_eq!(
+            mismatches_after, mismatches,
+            "a skipped IFC held an unsupported box"
+        );
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(hits_after > hits, "no IFC walk was skipped");
+        }
+        crate::layout_ng::set_elig_ifc_skip_override(Some(1));
+        run(true);
+    }
+
     /// An inherited `text-align: justify` sends the page to the legacy
     /// fallback (`text:justify`); removing it must bring the paragraphs'
     /// lowered styles back, so the page returns to LayoutNG and matches a

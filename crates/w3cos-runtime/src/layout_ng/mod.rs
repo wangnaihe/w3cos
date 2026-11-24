@@ -819,6 +819,19 @@ pub(crate) fn set_stretch_reuse_override(mode: Option<u8>) {
     cache::STRETCH_REUSE_OVERRIDE.with(|slot| slot.set(mode));
 }
 
+/// `W3COS_ELIG_IFC_SKIP` counters: (skipped containers, verify mismatches).
+pub(crate) fn elig_ifc_skip_stats() -> (u64, u64) {
+    (
+        cache::IFC_SKIP_HITS.with(std::cell::Cell::get),
+        cache::IFC_SKIP_MISMATCHES.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn set_elig_ifc_skip_override(mode: Option<u8>) {
+    cache::IFC_SKIP_OVERRIDE.with(|slot| slot.set(mode));
+}
+
 #[cfg(test)]
 pub(crate) fn set_elig_ifc_memo_override(mode: Option<u8>) {
     cache::IFC_MEMO_OVERRIDE.with(|slot| slot.set(mode));

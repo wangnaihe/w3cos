@@ -1621,6 +1621,12 @@ pub(super) fn unsupported_tree_retained(
     let mut index = 0;
     // Block-level boxes this walk checked itself (not skipped as accepted).
     let mut walked = Vec::new();
+    let ifc_skip = if elig_ifc_memo_mode() != 0 {
+        elig_ifc_skip_mode()
+    } else {
+        0
+    };
+    let mut ifc_pending: Vec<(usize, usize, u64)> = Vec::new();
     // `node_reason` reads subtree fingerprints through `walk_fingerprint`.
     let fp_slot = WalkFingerprints::install(flat, fp);
     let fp = &fp_slot;
@@ -1642,7 +1648,44 @@ pub(super) fn unsupported_tree_retained(
         if fp[index] != 0 && block_level(index) {
             walked.push(fp[index]);
         }
+        // `W3COS_ELIG_IFC_SKIP`: an IFC container whose inline
+        // descendants a walk found clean under the same subtree key (and
+        // none of which is out of flow or floated, the only ones that read
+        // boxes outside it) is not walked again.
+        if ifc_skip != 0
+            && end > index + 1
+            && super::inline::is_inline_container(flat, index)
+            && let Some(key) = walk_subtree_key(flat, index)
+        {
+            let key = mix(key, 0x1fc5_0b1d);
+            if IFC_DESC_OK.with(|ok| ok.borrow().contains(&key)) {
+                IFC_SKIP_HITS.with(|n| n.set(n.get() + 1));
+                if ifc_skip == 2 {
+                    let now = descendants_reason(flat, index, end.min(flat.len()), &node_reason);
+                    if now.is_some() {
+                        IFC_SKIP_MISMATCHES.with(|n| n.set(n.get() + 1));
+                        eprintln!(
+                            "[elig-ifc-skip-verify] mismatch: box {index} descendant {now:?}"
+                        );
+                    }
+                }
+                index = end;
+                continue;
+            }
+            if !holds_oof_or_float(flat, index, end.min(flat.len())) {
+                ifc_pending.push((index, end.min(flat.len()), key));
+            }
+        }
         index += 1;
+    }
+    if reason.is_none() && !ifc_pending.is_empty() {
+        IFC_DESC_OK.with(|ok| {
+            let mut ok = ok.borrow_mut();
+            if ok.len() > 4 * flat.len() + 4096 {
+                ok.clear();
+            }
+            ok.extend(ifc_pending.iter().map(|&(_, _, key)| key));
+        });
     }
     // A fingerprint names a subtree's inputs, so an accepted one stays
     // accepted: add what this walk checked instead of re-inserting every
@@ -1706,6 +1749,71 @@ pub(super) fn unsupported_tree_retained(
         }
     }
     Some(reason)
+}
+
+/// `W3COS_ELIG_IFC_SKIP=1|verify` (off by default; needs
+/// `W3COS_ELIG_IFC_MEMO`): see `unsupported_tree_retained`. `verify` walks
+/// the skipped descendants anyway and reports one that is not clean.
+pub(super) fn elig_ifc_skip_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = IFC_SKIP_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_ELIG_IFC_SKIP").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static IFC_SKIP_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Subtree keys of IFC containers whose inline descendants were clean.
+    static IFC_DESC_OK: RefCell<std::collections::HashSet<u64, w3cos_std::fxhash::FxBuildHasher>> =
+        RefCell::new(Default::default());
+    pub(super) static IFC_SKIP_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static IFC_SKIP_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The first reason among the rendered boxes `index + 1..end`.
+fn descendants_reason(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    end: usize,
+    node_reason: &impl Fn(usize) -> Option<&'static str>,
+) -> Option<&'static str> {
+    let mut at = index + 1;
+    while at < end {
+        if flat[at].style.display == w3cos_std::style::Display::None {
+            at = flat[at].subtree_end.max(at + 1);
+            continue;
+        }
+        if let Some(reason) = node_reason(at) {
+            return Some(reason);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Whether a box in `index + 1..end` is out of flow, floated or a float
+/// group (their checks read boxes outside the subtree).
+fn holds_oof_or_float(flat: &[FlatNodeInfo], index: usize, end: usize) -> bool {
+    use w3cos_std::style::{Float, Position};
+    flat[index + 1..end].iter().any(|info| {
+        matches!(
+            info.style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        ) || info.style.float != Float::None
+            || super::block::is_float_group(info.style)
+    })
 }
 
 thread_local! {
