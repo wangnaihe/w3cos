@@ -1244,9 +1244,9 @@ fn patch_and_compute(
         // An edit that adds or removes the padding/border child margins
         // collapse through moves the element by those margins: its parent
         // lays it out again (Blink recomputes the margin strut there).
-        let own_width = previous.as_ref().is_some_and(|old| {
-            own_width_inputs_changed(old, &styles[0].1) || edge_moves
-        });
+        let own_width = previous
+            .as_ref()
+            .is_some_and(|old| own_width_inputs_changed(old, &styles[0].1) || edge_moves);
         let root = match known_path {
             Some(path) => {
                 let root = style_local_root_at(&cache.component, styles[0].0, own_width, path);

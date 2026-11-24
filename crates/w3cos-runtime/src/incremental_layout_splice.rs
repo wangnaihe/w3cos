@@ -5653,7 +5653,10 @@ mod tests {
                     1 => add(10 + step, &mut bubbles, &mut texts),
                     2 => crate::dom::set_text_content(
                         texts[2],
-                        &format!("message two grows {step} {}", "with many more words to wrap ".repeat(8 * step)),
+                        &format!(
+                            "message two grows {step} {}",
+                            "with many more words to wrap ".repeat(8 * step)
+                        ),
                     ),
                     _ => {
                         crate::dom::class_list_remove(bubbles[1], "pad");
