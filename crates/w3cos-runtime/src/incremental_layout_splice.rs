@@ -339,6 +339,37 @@ thread_local! {
     static TAIL_SHIFT_FAST_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
+/// `W3COS_TAIL_SHIFT_RANGES=1|verify` (default off; needs
+/// `W3COS_TAIL_SHIFT_FAST` and `W3COS_PREORDER_HOSTS`): the boxes after a
+/// splice move as whole preorder ranges of the kept host ids, so the DOM
+/// rects move straight from those ranges (Blink moves the following
+/// fragments by their offset; nothing lists them first). `verify` also
+/// collects the ids and checks each moved by exactly the shift, once.
+fn tail_shift_ranges_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TAIL_SHIFT_RANGES_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_TAIL_SHIFT_RANGES").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static TAIL_SHIFT_RANGES_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    static TAIL_SHIFT_RANGES_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TAIL_SHIFT_RANGES_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 thread_local! {
     static TAIL_SHIFT_FAST_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -2164,6 +2195,12 @@ fn try_splice_with(
     let mut shifted_owners = std::collections::HashMap::new();
     // `W3COS_PREORDER_HOSTS`: the moved boxes are preorder ranges of the
     // kept host ids (the tree here is still the one they describe).
+    let ranges_mode = if tail_shift_fast_mode() != 0 && super::preorder_hosts_mode() != 0 {
+        tail_shift_ranges_mode()
+    } else {
+        0
+    };
+    let mut shift_spans: Option<Vec<(usize, usize)>> = None;
     let by_range = match (preorder.as_deref(), hosts.as_deref()) {
         (Some(sizes), Some(ids)) if dh != 0.0 && ids.len() == sizes.len() => {
             let (keep, removed) = match &commit {
@@ -2183,9 +2220,15 @@ fn try_splice_with(
                     ranges.push((end(starts[depth + 1]), end(starts[depth])));
                 }
             }
+            let spans = merged_ranges(&ranges);
             let mut out = Vec::new();
-            for (a, b) in merged_ranges(&ranges) {
-                out.extend(ids[a..b].iter().copied().filter(|&id| id != u32::MAX));
+            if ranges_mode != 1 || super::preorder_hosts_mode() == 2 {
+                for &(a, b) in &spans {
+                    out.extend(ids[a..b].iter().copied().filter(|&id| id != u32::MAX));
+                }
+            }
+            if ranges_mode != 0 {
+                shift_spans = Some(spans);
             }
             super::PREORDER_HOSTS_RANGED.with(|n| n.set(n.get() + 1));
             Some(out)
@@ -2251,8 +2294,10 @@ fn try_splice_with(
         }
         shifted = ranged;
     }
-    dedup_hosts(&mut shifted);
-    let shifted_nodes = shifted.len() as u32;
+    if shift_spans.is_none() || ranges_mode == 2 {
+        dedup_hosts(&mut shifted);
+    }
+    let mut shifted_nodes = shifted.len() as u32;
 
     // CSSOM fragment rects (Blink keeps them on the fragments; here one map
     // per owner). Republish the owners of the rebuilt boxes, and move the
@@ -2361,7 +2406,30 @@ fn try_splice_with(
                 w3cos_dom::DOMRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
             );
         }
-        if tail_shift_fast_mode() != 0 {
+        if let (Some(spans), Some(ids)) = (shift_spans.as_deref(), hosts.as_deref()) {
+            TAIL_SHIFT_RANGES_HITS.with(|n| n.set(n.get() + 1));
+            let before: Vec<f32> = shifted
+                .iter()
+                .map(|&id| document.get_layout_rect(NodeId::from_u32(id)).y)
+                .collect();
+            let moved = document.shift_layout_rects_y_spans(ids, spans, dh);
+            if ranges_mode == 2 {
+                let bad = moved as usize != shifted.len()
+                    || shifted.iter().zip(&before).any(|(&id, &y)| {
+                        document.get_layout_rect(NodeId::from_u32(id)).y.to_bits()
+                            != (y + dh).to_bits()
+                    });
+                if bad {
+                    TAIL_SHIFT_RANGES_MISMATCHES.with(|n| n.set(n.get() + 1));
+                    eprintln!(
+                        "[tail-shift-ranges-verify] mismatch: {} moved vs {} listed",
+                        moved,
+                        shifted.len()
+                    );
+                }
+            }
+            shifted_nodes = moved;
+        } else if tail_shift_fast_mode() != 0 {
             document.shift_layout_rects_y(&shifted, dh);
         } else {
             for id in shifted {
@@ -5916,6 +5984,94 @@ mod tests {
             );
         }
         assert_eq!(PREORDER_HOSTS_MISMATCHES.with(std::cell::Cell::get), 0);
+        crate::stylesheet::clear_rules();
+    }
+
+    /// `W3COS_TAIL_SHIFT_RANGES`: moving the DOM rects straight from the
+    /// preorder host ranges moves each listed box once, by the shift, and
+    /// class toggles, inserts and removals still match a full layout.
+    #[test]
+    fn tail_shift_ranges_match_the_list() {
+        use crate::incremental_layout::{PREORDER_HOSTS_OVERRIDE, PREORDER_HOSTS_RANGED};
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                PREORDER_HOSTS_OVERRIDE.with(|m| m.set(None));
+                TAIL_SHIFT_FAST_OVERRIDE.with(|m| m.set(None));
+                TAIL_SHIFT_RANGES_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        PREORDER_HOSTS_OVERRIDE.with(|m| m.set(Some(1)));
+        TAIL_SHIFT_FAST_OVERRIDE.with(|m| m.set(Some(1)));
+        for mode in [2u8, 1] {
+            TAIL_SHIFT_RANGES_OVERRIDE.with(|m| m.set(Some(mode)));
+            TAIL_SHIFT_RANGES_HITS.with(|n| n.set(0));
+            PREORDER_HOSTS_RANGED.with(|n| n.set(0));
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".bub", &[("padding", "4px")]);
+            crate::stylesheet::register_rule(".bub.pad", &[("padding", "14px")]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let list = crate::dom::create_element("div");
+            crate::dom::append_child(crate::dom::body_id(), list);
+            let mut bubbles = Vec::new();
+            let mut texts = Vec::new();
+            let make = |index: usize, texts: &mut Vec<_>| {
+                let bubble = crate::dom::create_element("div");
+                crate::dom::class_list_add(bubble, "bub");
+                let p = crate::dom::create_element("p");
+                let text = crate::dom::create_text_node(&format!("message {index} alpha beta"));
+                texts.push(text);
+                crate::dom::append_child(p, text);
+                let span = crate::dom::create_element("span");
+                crate::dom::append_child(span, crate::dom::create_text_node("meta"));
+                crate::dom::append_child(bubble, p);
+                crate::dom::append_child(bubble, span);
+                bubble
+            };
+            for index in 0..6 {
+                let bubble = make(index, &mut texts);
+                crate::dom::append_child(list, bubble);
+                bubbles.push(bubble);
+            }
+            assert!(crate::incremental_layout::flush());
+            for step in 0..8 {
+                match step % 4 {
+                    0 => crate::dom::class_list_add(bubbles[1], "pad"),
+                    1 => {
+                        let bubble = make(10 + step, &mut texts);
+                        crate::dom::insert_before(list, bubble, bubbles[2]);
+                        bubbles.insert(2, bubble);
+                    }
+                    2 => {
+                        crate::dom::set_text_content(
+                            texts[0],
+                            &format!(
+                                "message zero grows {step} {}",
+                                "with many more words to wrap ".repeat(8 * step)
+                            ),
+                        );
+                    }
+                    _ => {
+                        crate::dom::class_list_remove(bubbles[1], "pad");
+                        let gone = bubbles.remove(2);
+                        crate::dom::remove_child(list, gone);
+                    }
+                }
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("tail shift ranges mode {mode} step {step}"));
+            }
+            let kept = crate::incremental_layout::style_local_mode() != 0
+                && crate::incremental_layout::preorder_sizes_mode() != 0
+                && preorder_tail_keep();
+            assert!(
+                !kept || TAIL_SHIFT_RANGES_HITS.with(std::cell::Cell::get) > 0,
+                "mode {mode}: no splice moved the rects by ranges"
+            );
+        }
+        assert_eq!(TAIL_SHIFT_RANGES_MISMATCHES.with(std::cell::Cell::get), 0);
         crate::stylesheet::clear_rules();
     }
 

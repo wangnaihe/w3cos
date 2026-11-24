@@ -2319,6 +2319,46 @@ impl Document {
         }
     }
 
+    /// Move every distinct id in `ids[a..b]` (over `spans`) down by `dy`,
+    /// skipping `u32::MAX` holes; returns how many distinct ids it saw.
+    pub fn shift_layout_rects_y_spans(
+        &mut self,
+        ids: &[u32],
+        spans: &[(usize, usize)],
+        dy: f32,
+    ) -> u32 {
+        self.settle_layout_rects();
+        let len = self.layout_rects.get_mut().len();
+        let mut seen = vec![0u64; len / 64 + 1];
+        let mut count = 0u32;
+        let mut touched = false;
+        for &(a, b) in spans {
+            for &id in &ids[a..b] {
+                let idx = id as usize;
+                if idx >= len {
+                    continue;
+                }
+                let (word, bit) = (idx / 64, 1u64 << (idx % 64));
+                if seen[word] & bit != 0 {
+                    continue;
+                }
+                seen[word] |= bit;
+                count += 1;
+                if !touched {
+                    touched = true;
+                    self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+                }
+                let rect = &mut self.layout_rects.get_mut()[idx];
+                let before = rect.y;
+                rect.y += dy;
+                if rect.y != before {
+                    self.mark_extent_dirty(NodeId(id));
+                }
+            }
+        }
+        count
+    }
+
     fn mark_extent_dirty(&mut self, id: NodeId) {
         mark_extent_chain(&self.nodes, self.extent.get_mut(), id);
     }
