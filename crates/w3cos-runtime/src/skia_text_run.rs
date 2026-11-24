@@ -598,6 +598,7 @@ fn shape_visual_run_uncached(
         expansion,
         buffer,
         native_caps,
+        true,
     )
 }
 
@@ -721,6 +722,7 @@ fn shape_synthetic_small_caps(
             expansion.map(|(expansion, offset)| (expansion, offset + start)),
             buffer,
             false,
+            false,
         )?;
         output.positions.extend(
             run.positions
@@ -755,6 +757,7 @@ fn shape_buffer(
     expansion: Option<(crate::text_layout::JustificationExpansion, usize)>,
     buffer: rustybuzz::UnicodeBuffer,
     native_caps: bool,
+    reusable: bool,
 ) -> Option<GlyphRun> {
     with_shaping_face(face, |shaping_face| {
         shape_buffer_with_face(
@@ -766,6 +769,7 @@ fn shape_buffer(
             expansion,
             buffer,
             native_caps,
+            reusable,
         )
     })?
 }
@@ -780,6 +784,8 @@ fn shape_buffer_with_face(
     expansion: Option<(crate::text_layout::JustificationExpansion, usize)>,
     mut buffer: rustybuzz::UnicodeBuffer,
     native_caps: bool,
+    // `buffer` holds exactly `text` (not a synthesized small-caps segment).
+    reusable: bool,
 ) -> Option<GlyphRun> {
     // The typeface only supplies macOS nominal advances.
     #[cfg(not(target_os = "macos"))]
@@ -813,13 +819,15 @@ fn shape_buffer_with_face(
     let verify_text = (shape_plan_cache_verify()
         && style.font_variant != w3cos_std::style::FontVariant::SmallCaps)
         .then_some(text);
-    let shaped = shape_with_cached_plan(
+    let shaped = shape_raw_reusing(
+        text,
         face.unique_id(),
         shaping_face,
         &features,
         features_key,
         buffer,
         verify_text,
+        reusable && expansion.is_none() && !native_caps,
     );
     // Do not derive a cluster's width by subtracting accumulated f32 cursors:
     // its precision would depend on the unrelated text before the cluster.
@@ -827,9 +835,8 @@ fn shape_buffer_with_face(
     let scale =
         f64::from(effective_font_size(style.font_size)) / f64::from(shaping_face.units_per_em());
     let glyphs = shaped
-        .glyph_infos()
         .iter()
-        .map(|info| u16::try_from(info.glyph_id).ok())
+        .map(|glyph| u16::try_from(glyph.id).ok())
         .collect::<Option<Vec<_>>>()?;
     #[cfg(target_os = "macos")]
     let nominal_advances = skia_nominal_advances(face, style, &glyphs);
@@ -838,12 +845,8 @@ fn shape_buffer_with_face(
     let mut clusters = Vec::new();
     let mut glyph_clusters = Vec::new();
     let mut cluster_start_advance = 0.0;
-    for (i, (info, position)) in shaped
-        .glyph_infos()
-        .iter()
-        .zip(shaped.glyph_positions())
-        .enumerate()
-    {
+    for (i, info) in shaped.iter().enumerate() {
+        let position = info;
         if collect_clusters {
             glyph_clusters.push(info.cluster as usize);
         }
@@ -876,7 +879,6 @@ fn shape_buffer_with_face(
         };
         cursor += advance;
         let cluster_ends = shaped
-            .glyph_infos()
             .get(i + 1)
             .is_none_or(|next| next.cluster != info.cluster);
         if cluster_ends {
@@ -970,6 +972,53 @@ mod shaping_face_tests {
         );
     }
 
+    /// `W3COS_SHAPE_REUSE`: a growing paragraph keeps the glyphs before
+    /// its last safe cut and matches shaping the whole text.
+    #[test]
+    fn shape_reuse_matches_whole_shaping() {
+        let Some(face) =
+            skia_safe::FontMgr::new().legacy_make_typeface(None, skia_safe::FontStyle::normal())
+        else {
+            return;
+        };
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                SHAPE_REUSE_OVERRIDE.with(|mode| mode.set(None));
+            }
+        }
+        let _off = Off;
+        for (mode, spacing) in [(2u8, 0.0f32), (1, 0.0), (2, 0.5), (1, 0.5)] {
+            SHAPE_REUSE_OVERRIDE.with(|value| value.set(Some(mode)));
+            SHAPE_REUSE.with(|kept| kept.borrow_mut().clear());
+            let hits = SHAPE_REUSE_HITS.with(std::cell::Cell::get);
+            let style = Style {
+                font_size: 15.0,
+                letter_spacing: spacing,
+                ..Style::default()
+            };
+            let mut text = String::from("Waffle office AVA To fi fl ffi, kerning: AV Ta. ");
+            for step in 0..12 {
+                text.push_str(["Wave ", "office ", "AVAT ", "fluffy, ", "To. "][step % 5]);
+                for clusters in [true, false] {
+                    let reused = shape_visual_run_uncached(&text, &face, &style, clusters, None);
+                    SHAPE_REUSE_OVERRIDE.with(|value| value.set(Some(0)));
+                    let direct = shape_visual_run_uncached(&text, &face, &style, clusters, None);
+                    SHAPE_REUSE_OVERRIDE.with(|value| value.set(Some(mode)));
+                    assert!(
+                        reused == direct,
+                        "mode {mode} spacing {spacing} step {step} clusters {clusters}"
+                    );
+                }
+            }
+            assert!(
+                SHAPE_REUSE_HITS.with(std::cell::Cell::get) > hits,
+                "mode {mode}: no reuse"
+            );
+        }
+        assert_eq!(SHAPE_REUSE_MISMATCHES.with(std::cell::Cell::get), 0);
+    }
+
     #[test]
     fn cached_shaping_face_shapes_like_a_freshly_parsed_face() {
         // Any concrete system face; a host without fonts has nothing to shape.
@@ -991,11 +1040,21 @@ mod shaping_face_tests {
         };
         let bytes = font_tables(&face).unwrap();
         let fresh = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
-        let expected =
-            shape_buffer_with_face(text, &face, &fresh, &style, true, None, buffer(), false)
-                .unwrap();
+        let expected = shape_buffer_with_face(
+            text,
+            &face,
+            &fresh,
+            &style,
+            true,
+            None,
+            buffer(),
+            false,
+            false,
+        )
+        .unwrap();
         for _ in 0..2 {
-            let cached = shape_buffer(text, &face, &style, true, None, buffer(), false).unwrap();
+            let cached =
+                shape_buffer(text, &face, &style, true, None, buffer(), false, false).unwrap();
             assert_eq!(cached.glyphs, expected.glyphs);
             assert_eq!(cached.positions, expected.positions);
             assert_eq!(cached.advance.to_bits(), expected.advance.to_bits());
@@ -1411,6 +1470,206 @@ fn shape_plan_cache_verify() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("W3COS_SHAPE_PLAN_CACHE").is_ok_and(|value| value == "verify")
     })
+}
+
+/// One shaped glyph in font units, as the shaper returned it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RawGlyph {
+    id: u32,
+    cluster: u32,
+    x_advance: i32,
+    x_offset: i32,
+    y_offset: i32,
+    unsafe_to_break: bool,
+}
+
+fn raw_glyphs(shaped: &rustybuzz::GlyphBuffer) -> Vec<RawGlyph> {
+    shaped
+        .glyph_infos()
+        .iter()
+        .zip(shaped.glyph_positions())
+        .map(|(info, position)| RawGlyph {
+            id: info.glyph_id,
+            cluster: info.cluster,
+            x_advance: position.x_advance,
+            x_offset: position.x_offset,
+            y_offset: position.y_offset,
+            unsafe_to_break: info.unsafe_to_break(),
+        })
+        .collect()
+}
+
+/// `W3COS_SHAPE_REUSE=1|verify` (default off): Blink's ReusingTextShaper.
+/// When a paragraph's text changes after an unchanged prefix (a streamed
+/// message growing), the glyphs of the previous shaping up to a
+/// safe-to-break cluster after a space, well inside the unchanged prefix,
+/// are kept and only the rest is shaped, with the kept text as pre-context.
+/// ASCII text only (no joining scripts or reordering). `verify` also shapes
+/// the whole text and compares the glyphs.
+fn shape_reuse_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = SHAPE_REUSE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_SHAPE_REUSE").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+type RawShapeKey = (u32, u32, (bool, bool, bool));
+
+/// Recent paragraph shapings (Blink keeps the previous ShapeResults on the
+/// inline items; here the last few long runs).
+const SHAPE_REUSE_KEEP: usize = 16;
+/// Shorter runs are words and labels: reshaping them is cheap.
+const SHAPE_REUSE_MIN_BYTES: usize = 64;
+/// Unchanged text kept after the cut, so the shaper's context at the cut
+/// is the same as in the previous shaping.
+const SHAPE_REUSE_MARGIN: usize = 16;
+
+thread_local! {
+    static SHAPE_REUSE: RefCell<std::collections::VecDeque<(RawShapeKey, Box<str>, std::rc::Rc<[RawGlyph]>)>> =
+        RefCell::new(std::collections::VecDeque::new());
+    #[cfg(test)]
+    pub(crate) static SHAPE_REUSE_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    pub(crate) static SHAPE_REUSE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static SHAPE_REUSE_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The kept glyph count and byte cut for reshaping `text` from `old`.
+fn shape_reuse_cut(old_text: &str, old: &[RawGlyph], text: &str) -> Option<(usize, usize)> {
+    let common = old_text
+        .bytes()
+        .zip(text.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common == text.len() && common == old_text.len() {
+        return None;
+    }
+    let limit = common.checked_sub(SHAPE_REUSE_MARGIN)?;
+    let bytes = text.as_bytes();
+    // Last glyph that starts a safe-to-break cluster right after a space.
+    let glyph = (1..old.len()).rev().find(|&index| {
+        let glyph = &old[index];
+        let at = glyph.cluster as usize;
+        at > 0
+            && at <= limit
+            && !glyph.unsafe_to_break
+            && old[index - 1].cluster != glyph.cluster
+            && bytes[at - 1] == b' '
+    })?;
+    let cut = old[glyph].cluster as usize;
+    // LTR ASCII: every kept glyph's cluster is before the cut.
+    old[..glyph]
+        .iter()
+        .all(|kept| (kept.cluster as usize) < cut)
+        .then_some((glyph, cut))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_raw_reusing(
+    text: &str,
+    face_id: u32,
+    shaping_face: &rustybuzz::Face<'_>,
+    features: &[rustybuzz::Feature],
+    features_key: (bool, bool, bool),
+    mut buffer: rustybuzz::UnicodeBuffer,
+    verify_text: Option<&str>,
+    plain: bool,
+) -> Vec<RawGlyph> {
+    let mode = shape_reuse_mode();
+    if mode == 0 || !plain || text.len() < SHAPE_REUSE_MIN_BYTES || !text.is_ascii() {
+        return raw_glyphs(&shape_with_cached_plan(
+            face_id,
+            shaping_face,
+            features,
+            features_key,
+            buffer,
+            verify_text,
+        ));
+    }
+    buffer.guess_segment_properties();
+    let script = buffer.script();
+    let language = buffer.language();
+    let key: RawShapeKey = (
+        face_id,
+        u32::from_be_bytes(script.tag().to_bytes()),
+        features_key,
+    );
+    let previous = SHAPE_REUSE.with(|kept| {
+        kept.borrow().iter().find_map(|(other, old_text, old)| {
+            (*other == key)
+                .then(|| shape_reuse_cut(old_text, old, text).map(|cut| (old.clone(), cut)))
+                .flatten()
+        })
+    });
+    let reused = previous.map(|(old, (glyph, cut))| {
+        let mut rest = rustybuzz::UnicodeBuffer::new();
+        rest.push_str(&text[cut..]);
+        rest.set_direction(rustybuzz::Direction::LeftToRight);
+        rest.set_script(script);
+        if let Some(language) = language.clone() {
+            rest.set_language(language);
+        }
+        rest.set_pre_context(&text[..cut]);
+        let tail =
+            shape_with_cached_plan(face_id, shaping_face, features, features_key, rest, None);
+        let mut glyphs = old[..glyph].to_vec();
+        glyphs.extend(raw_glyphs(&tail).into_iter().map(|mut glyph| {
+            glyph.cluster += cut as u32;
+            glyph
+        }));
+        glyphs
+    });
+    let glyphs = match reused {
+        Some(glyphs) => {
+            SHAPE_REUSE_HITS.with(|n| n.set(n.get() + 1));
+            if mode == 2 {
+                let whole = raw_glyphs(&shape_with_cached_plan(
+                    face_id,
+                    shaping_face,
+                    features,
+                    features_key,
+                    buffer,
+                    verify_text,
+                ));
+                let same = whole.len() == glyphs.len()
+                    && whole.iter().zip(&glyphs).all(|(a, b)| {
+                        (a.id, a.cluster, a.x_advance, a.x_offset, a.y_offset)
+                            == (b.id, b.cluster, b.x_advance, b.x_offset, b.y_offset)
+                    });
+                if !same {
+                    SHAPE_REUSE_MISMATCHES.with(|n| n.set(n.get() + 1));
+                    eprintln!(
+                        "[shape-reuse-verify] mismatch: {} reused vs {} shaped glyphs for {} bytes",
+                        glyphs.len(),
+                        whole.len(),
+                        text.len()
+                    );
+                }
+                whole
+            } else {
+                glyphs
+            }
+        }
+        None => raw_glyphs(&shape_with_cached_plan(
+            face_id,
+            shaping_face,
+            features,
+            features_key,
+            buffer,
+            verify_text,
+        )),
+    };
+    SHAPE_REUSE.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        kept.push_front((key, text.into(), glyphs.as_slice().into()));
+        kept.truncate(SHAPE_REUSE_KEEP);
+    });
+    glyphs
 }
 
 fn shape_with_cached_plan(
