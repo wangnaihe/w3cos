@@ -77,7 +77,6 @@ fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
         .custom_properties
         .as_ref()
         .and_then(|props| props.get(key))
-        .map(String::as_str)
 }
 
 fn to_content(style: &Style, edges: f32, size: f32) -> f32 {

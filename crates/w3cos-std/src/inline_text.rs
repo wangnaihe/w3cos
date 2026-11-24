@@ -12,7 +12,6 @@ pub fn source_run(style: &Style) -> Option<&str> {
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get(SOURCE_RUN))
-            .map(String::as_str)
     })
 }
 
@@ -104,7 +103,10 @@ pub fn cssom_box_owners(style: &Style) -> Vec<u32> {
 
 pub fn append_cssom_box_owner(style: &mut Style, owner: u32) {
     let properties = style.custom_properties.get_or_insert_with(Default::default);
-    let owners = properties.entry(CSSOM_BOX_OWNERS.into()).or_default();
+    let mut owners = properties
+        .get(CSSOM_BOX_OWNERS)
+        .unwrap_or_default()
+        .to_string();
     if owners
         .split(',')
         .filter_map(|value| value.parse::<u32>().ok())
@@ -116,6 +118,7 @@ pub fn append_cssom_box_owner(style: &mut Style, owner: u32) {
         owners.push(',');
     }
     owners.push_str(&owner.to_string());
+    properties.insert(CSSOM_BOX_OWNERS.into(), owners);
 }
 
 /// Anonymous text paints its decorating element's used properties; CSS
@@ -130,7 +133,7 @@ pub fn copy_used_decoration(style: &mut Style, owner: &Style) {
         style
             .custom_properties
             .get_or_insert_with(Default::default)
-            .insert(DECORATION_COLOR.into(), value.clone());
+            .insert(DECORATION_COLOR.into(), value.to_string());
     } else if let Some(properties) = style.custom_properties.as_mut() {
         properties.remove(DECORATION_COLOR);
     }
@@ -178,7 +181,10 @@ pub fn prepend_decoration_owner(style: &mut Style, owner: &Style) {
         .min(p.len());
     for index in (0..count).rev() {
         if let Some(value) = p.remove(&format!("{DECORATION_OWNER}{index}")) {
-            p.insert(format!("{DECORATION_OWNER}{}", index + 1), value);
+            p.insert(
+                format!("{DECORATION_OWNER}{}", index + 1),
+                value.to_string(),
+            );
         }
     }
     let variant = if owner.font_variant == FontVariant::SmallCaps {

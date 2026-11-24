@@ -3456,7 +3456,6 @@ fn dialog_role(node: &Component) -> Option<&str> {
         .custom_properties
         .as_ref()
         .and_then(|props| props.get("--w3cos-dialog"))
-        .map(String::as_str)
 }
 
 fn defocus_outside(node: &mut Component, role: &str) {
@@ -10265,8 +10264,7 @@ mod shell_ux_tests {
             .style
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get("--w3cos-dialog"))
-            .map(String::as_str);
+            .and_then(|props| props.get("--w3cos-dialog"));
         assert_eq!(role, Some("sign"));
         let confirm = build_confirm_dialog();
         assert_ne!(confirm.style.background, sheet.style.background);
@@ -11136,7 +11134,7 @@ mod shell_ux_tests {
                         && let Some(props) = &node.style.custom_properties
                         && let Some(suffix) = props.get("--w3cos-ime-preedit")
                     {
-                        found = Some((value.clone(), suffix.clone()));
+                        found = Some((value.clone(), suffix.to_string()));
                     }
                 });
                 found
@@ -12843,7 +12841,7 @@ mod shell_ux_tests {
         node.style
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get(key).cloned())
+            .and_then(|props| props.get(key).map(str::to_string))
     }
 
     fn button_face(

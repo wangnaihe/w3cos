@@ -411,8 +411,7 @@ fn shape_synthetic_small_caps(
     let language = style
         .custom_properties
         .as_ref()
-        .and_then(|properties| properties.get("--w3cos-internal-text-language"))
-        .map(String::as_str);
+        .and_then(|properties| properties.get("--w3cos-internal-text-language"));
     let mut segments = Vec::<(usize, bool)>::new();
     let mut behavior = false;
     for (index, character) in text.char_indices() {

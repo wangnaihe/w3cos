@@ -3180,8 +3180,7 @@ mod tests {
                 .style
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword")),
             Some("bottom")
         );
         crate::stylesheet::clear_rules();
@@ -4385,7 +4384,7 @@ mod tests {
         }
         assert_eq!(styles[7].height, w3cos_std::style::Dimension::Px(7.0));
         assert_eq!(
-            first.get("--b").map(String::as_str),
+            first.get("--b"),
             Some("red"),
             "canonical map keeps the declared values"
         );

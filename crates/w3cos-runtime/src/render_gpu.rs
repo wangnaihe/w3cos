@@ -1215,7 +1215,6 @@ fn draw_ime_preedit_underline(
         .custom_properties
         .as_ref()
         .and_then(|props| props.get("--w3cos-ime-preedit"))
-        .map(String::as_str)
         .filter(|suffix| !suffix.is_empty())
     else {
         return;

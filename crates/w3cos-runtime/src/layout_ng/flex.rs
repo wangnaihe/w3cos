@@ -4337,7 +4337,6 @@ fn custom_property<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
         .custom_properties
         .as_ref()
         .and_then(|props| props.get(key))
-        .map(String::as_str)
 }
 
 /// `(factor, reversed, safe)`: the share of the free space before the

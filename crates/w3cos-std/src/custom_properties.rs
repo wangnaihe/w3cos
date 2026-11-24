@@ -5,6 +5,12 @@
 //! the per-element `Style` clone and the inherited-style equality check
 //! O(1) when the map is shared, instead of copying and comparing every
 //! entry; mutation clones the map only while it is still shared.
+//!
+//! Keys and values are `Arc<str>`: a map unshared to stamp one per-element
+//! marker onto an inherited theme copies only its table, and every theme
+//! string stays shared with the map it came from. (A Code-OSS boot holds a
+//! few hundred such copies of a ~1000-entry theme; with owned `String`s each
+//! copy also duplicated every key and value.)
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
@@ -23,7 +29,10 @@ fn shared_state() -> RandomState {
     STATE.get_or_init(RandomState::new).clone()
 }
 
-fn with_shared_state(map: HashMap<String, String>) -> HashMap<String, String> {
+type Text = Arc<str>;
+type Map = HashMap<Text, Text>;
+
+fn with_shared_state(map: Map) -> Map {
     use std::hash::BuildHasher;
     let shared = shared_state();
     if map.hasher().hash_one("--") == shared.hash_one("--") {
@@ -37,7 +46,7 @@ fn with_shared_state(map: HashMap<String, String>) -> HashMap<String, String> {
 /// The shared map plus a lazily computed content fingerprint. Any mutation
 /// resets the fingerprint, so it always describes the current entries.
 struct Inner {
-    map: HashMap<String, String>,
+    map: Map,
     fingerprint: OnceLock<u64>,
 }
 
@@ -103,7 +112,7 @@ fn entry_hash(key: &str, value: &str) -> u64 {
 }
 
 impl Inner {
-    fn from_map(map: HashMap<String, String>) -> Self {
+    fn from_map(map: Map) -> Self {
         Self {
             map: with_shared_state(map),
             fingerprint: OnceLock::new(),
@@ -151,19 +160,10 @@ struct FingerprintDelta {
 
 impl CustomProperties {
     /// Unique access to the map: unshares it and drops the stale fingerprint.
-    fn map_mut(&mut self) -> &mut HashMap<String, String> {
-        let inner = Arc::make_mut(&mut self.0);
-        inner.fingerprint = OnceLock::new();
-        &mut inner.map
-    }
-
     /// Unique access that keeps an already computed fingerprint current: the
     /// closure reports the fingerprint change (`entries` added and the hash
     /// sum added and removed) for the writes it performed.
-    fn write_tracked<R>(
-        &mut self,
-        write: impl FnOnce(&mut HashMap<String, String>, &mut FingerprintDelta) -> R,
-    ) -> R {
+    fn write_tracked<R>(&mut self, write: impl FnOnce(&mut Map, &mut FingerprintDelta) -> R) -> R {
         let inner = Arc::make_mut(&mut self.0);
         let known = inner.fingerprint.take();
         let mut delta = FingerprintDelta::default();
@@ -252,7 +252,7 @@ impl CustomProperties {
     /// inherited map: equal edits of equal bases share one result through
     /// [`Self::edit_shared`] instead of each unsharing (cloning) the map.
     pub fn insert_shared(&mut self, property: &'static str, value: &str) {
-        if self.0.map.get(property).map(String::as_str) == Some(value) {
+        if self.get(property) == Some(value) {
             return;
         }
         self.edit_shared(property, value, |properties| {
@@ -287,25 +287,38 @@ impl CustomProperties {
     /// per allocation, however many styles share it.
     pub fn estimated_heap_bytes(&self) -> usize {
         let map = &self.0.map;
-        let slot = std::mem::size_of::<(String, String)>() + 1;
+        // Key and value text is shared by every map cloned from this one, so
+        // each map is charged its share (the allocation over its holders):
+        // summing over all maps counts every string once.
+        fn share(text: &Text) -> usize {
+            (2 * std::mem::size_of::<usize>() + text.len()) / Arc::strong_count(text)
+        }
+        let slot = std::mem::size_of::<(Text, Text)>() + 1;
         map.iter().fold(
             std::mem::size_of::<Inner>() + map.capacity() * slot,
-            |bytes, (key, value)| bytes + key.capacity() + value.capacity(),
+            |bytes, (key, value)| bytes + share(key) + share(value),
         )
     }
 
     /// Insert unless the map already holds this exact value, so a no-op
     /// write keeps the allocation shared.
-    pub fn insert(&mut self, property: String, value: String) -> Option<String> {
-        if self.0.map.get(&property) == Some(&value) {
-            return Some(value);
+    pub fn insert(&mut self, property: String, value: String) -> Option<Text> {
+        let (property, value) = (property.as_str(), value.as_str());
+        if let Some(existing) = self.0.map.get(property) {
+            if &**existing == value {
+                return Some(existing.clone());
+            }
         }
         self.write_tracked(|map, delta| {
-            delta.added = delta.added.wrapping_add(entry_hash(&property, &value));
-            let previous = map.insert(property.clone(), value);
+            delta.added = delta.added.wrapping_add(entry_hash(property, value));
+            // Reuse the stored key when overwriting, so its text stays shared.
+            let key = map
+                .get_key_value(property)
+                .map_or_else(|| Text::from(property), |(key, _)| key.clone());
+            let previous = map.insert(key, Text::from(value));
             match &previous {
                 Some(old) => {
-                    delta.removed = delta.removed.wrapping_add(entry_hash(&property, old));
+                    delta.removed = delta.removed.wrapping_add(entry_hash(property, old));
                 }
                 None => delta.len_added += 1,
             }
@@ -314,11 +327,7 @@ impl CustomProperties {
     }
 
     /// Remove a property, unsharing the map only when it is present.
-    pub fn remove<Q>(&mut self, property: &Q) -> Option<String>
-    where
-        String: std::borrow::Borrow<Q>,
-        Q: std::hash::Hash + Eq + ?Sized,
-    {
+    pub fn remove(&mut self, property: &str) -> Option<Text> {
         if !self.0.map.contains_key(property) {
             return None;
         }
@@ -360,12 +369,12 @@ impl CustomProperties {
                 .0
                 .map
                 .iter()
-                .filter(|(key, _)| !ignored.contains(&key.as_str()))
+                .filter(|(key, _)| !ignored.contains(&&***key))
                 .all(|(key, value)| other.0.map.get(key) == Some(value))
     }
 
     /// Retain matching properties, unsharing the map only when one goes.
-    pub fn retain(&mut self, mut keep: impl FnMut(&String, &String) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&str, &str) -> bool) {
         if self
             .0
             .map
@@ -373,7 +382,7 @@ impl CustomProperties {
             .any(|(property, value)| !keep(property, value))
         {
             self.write_tracked(|map, delta| {
-                map.retain(|property, value| {
+                map.retain(|property: &Text, value: &mut Text| {
                     let kept = keep(property, value);
                     if !kept {
                         delta.removed = delta.removed.wrapping_add(entry_hash(property, value));
@@ -387,26 +396,58 @@ impl CustomProperties {
 
     /// The owned map, cloning it only when it is shared.
     pub fn into_inner(self) -> HashMap<String, String> {
-        match Arc::try_unwrap(self.0) {
-            Ok(inner) => inner.map,
-            Err(shared) => shared.map.clone(),
+        self.iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    pub fn get(&self, property: &str) -> Option<&str> {
+        self.0.map.get(property).map(|value| &**value)
+    }
+
+    pub fn get_key_value(&self, property: &str) -> Option<(&str, &str)> {
+        self.0
+            .map
+            .get_key_value(property)
+            .map(|(key, value)| (&**key, &**value))
+    }
+
+    pub fn contains_key(&self, property: &str) -> bool {
+        self.0.map.contains_key(property)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.map.is_empty()
+    }
+
+    pub fn iter(&self) -> Iter<'_> {
+        self.0.map.iter().map(|(key, value)| (&**key, &**value))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> + '_ {
+        self.0.map.keys().map(|key| &**key)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &str> + '_ {
+        self.0.map.values().map(|value| &**value)
+    }
+
+    /// Drop every property (a no-op that keeps sharing when already empty).
+    pub fn clear(&mut self) {
+        if !self.is_empty() {
+            *self = Self::default();
         }
     }
 }
 
-impl std::ops::Deref for CustomProperties {
-    type Target = HashMap<String, String>;
+type IterFn = for<'a> fn((&'a Text, &'a Text)) -> (&'a str, &'a str);
 
-    fn deref(&self) -> &Self::Target {
-        &self.0.map
-    }
-}
-
-impl std::ops::DerefMut for CustomProperties {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.map_mut()
-    }
-}
+/// Borrowing iterator over `(property, value)` pairs.
+pub type Iter<'a> = std::iter::Map<std::collections::hash_map::Iter<'a, Text, Text>, IterFn>;
 
 impl PartialEq for CustomProperties {
     fn eq(&self, other: &Self) -> bool {
@@ -431,13 +472,13 @@ impl std::fmt::Debug for CustomProperties {
 
 impl From<crate::fxhash::FxHashMap<String, String>> for CustomProperties {
     fn from(map: crate::fxhash::FxHashMap<String, String>) -> Self {
-        Self::from(HashMap::<String, String>::from_iter(map))
+        map.into_iter().collect()
     }
 }
 
 impl From<HashMap<String, String>> for CustomProperties {
     fn from(map: HashMap<String, String>) -> Self {
-        Self(Arc::new(Inner::from_map(map)))
+        map.into_iter().collect()
     }
 }
 
@@ -450,7 +491,10 @@ impl From<CustomProperties> for HashMap<String, String> {
 impl FromIterator<(String, String)> for CustomProperties {
     fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
         let mut map = HashMap::with_hasher(shared_state());
-        map.extend(iter);
+        map.extend(
+            iter.into_iter()
+                .map(|(key, value)| (Text::from(key), Text::from(value))),
+        );
         Self(Arc::new(Inner::from_map(map)))
     }
 }
@@ -464,11 +508,11 @@ impl Extend<(String, String)> for CustomProperties {
 }
 
 impl<'a> IntoIterator for &'a CustomProperties {
-    type Item = (&'a String, &'a String);
-    type IntoIter = std::collections::hash_map::Iter<'a, String, String>;
+    type Item = (&'a str, &'a str);
+    type IntoIter = Iter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.map.iter()
+        self.iter()
     }
 }
 
@@ -483,7 +527,7 @@ impl IntoIterator for CustomProperties {
 
 impl Serialize for CustomProperties {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.map.serialize(serializer)
+        serializer.collect_map(self.iter())
     }
 }
 
@@ -507,7 +551,7 @@ mod tests {
             before,
             "a map nobody shares needs no clone"
         );
-        assert_eq!(map.get("--b").map(String::as_str), Some("2"));
+        assert_eq!(map.get("--b"), Some("2"));
     }
 
     #[test]
@@ -524,12 +568,7 @@ mod tests {
             .collect();
         assert_eq!(map_clone_count() - before, 1);
         assert!(inserted.iter().all(|m| m.ptr_eq(&inserted[0])));
-        assert_eq!(
-            inserted[0]
-                .get("--w3cos-internal-test-marker")
-                .map(String::as_str),
-            Some("1")
-        );
+        assert_eq!(inserted[0].get("--w3cos-internal-test-marker"), Some("1"));
         let before = map_clone_count();
         let removed: Vec<_> = (0..12)
             .map(|_| {
@@ -544,12 +583,7 @@ mod tests {
         // A different value is a different edit.
         let mut other = base.clone();
         other.insert_shared("--w3cos-internal-test-marker", "2");
-        assert_eq!(
-            other
-                .get("--w3cos-internal-test-marker")
-                .map(String::as_str),
-            Some("2")
-        );
+        assert_eq!(other.get("--w3cos-internal-test-marker"), Some("2"));
     }
 
     #[test]
@@ -573,23 +607,23 @@ mod tests {
             "second stamp reuses the first"
         );
         assert!(first.ptr_eq(&second));
-        assert_eq!(first.get("--marker").map(String::as_str), Some("1"));
+        assert_eq!(first.get("--marker"), Some("1"));
         assert!(base.get("--marker").is_none());
         // Another value or another base is its own edit.
         let mut other_value = base.clone();
         stamp(&mut other_value, "2");
         assert!(!other_value.ptr_eq(&first));
-        assert_eq!(other_value.get("--marker").map(String::as_str), Some("2"));
+        assert_eq!(other_value.get("--marker"), Some("2"));
         let mut other_base = base.clone();
         other_base.insert("--extra".into(), "x".into());
         stamp(&mut other_base, "1");
         assert!(!other_base.ptr_eq(&first));
-        assert_eq!(other_base.get("--extra").map(String::as_str), Some("x"));
+        assert_eq!(other_base.get("--extra"), Some("x"));
         // Writing to a shared result unshares it and leaves the memo intact.
         first.insert("--marker".into(), "changed".into());
         let mut third = base.clone();
         stamp(&mut third, "1");
-        assert_eq!(third.get("--marker").map(String::as_str), Some("1"));
+        assert_eq!(third.get("--marker"), Some("1"));
         assert!(third.ptr_eq(&second));
     }
 
@@ -744,11 +778,10 @@ mod tests {
         assert_ne!(a, b);
         b.retain(|property, _| property != "--v5");
         assert_eq!(a, b);
-        // Mutation through DerefMut on a map that is no longer shared.
-        use std::ops::DerefMut;
-        a.deref_mut().insert("--v6".into(), "direct".into());
+        // Mutation of a map that is no longer shared.
+        a.insert("--v6".into(), "direct".into());
         assert_ne!(a, b);
-        b.deref_mut().insert("--v6".into(), "direct".into());
+        b.insert("--v6".into(), "direct".into());
         assert_eq!(a, b);
         // Unshared in-place write after the fingerprint was cached.
         let mut c = a.clone();
@@ -804,5 +837,39 @@ mod tests {
         let mut edited = shared.clone();
         edited.insert("--other".to_string(), "y".to_string());
         assert_ne!(edited.allocation_addr(), map.allocation_addr());
+    }
+
+    #[test]
+    fn unsharing_a_map_copies_its_table_but_not_its_text() {
+        let base = CustomProperties::from_iter(
+            (0..64).map(|i| (format!("--theme-color-{i}"), format!("#{i:06x}"))),
+        );
+        let mut marked = base.clone();
+        marked.insert("--w3cos-internal-marker".into(), "1".into());
+        assert!(!marked.ptr_eq(&base));
+        for (key, value) in base.iter() {
+            let (marked_key, marked_value) = marked.get_key_value(key).unwrap();
+            assert_eq!(marked_key.as_ptr(), key.as_ptr());
+            assert_eq!(marked_value.as_ptr(), value.as_ptr());
+        }
+        // Overwriting a value keeps the stored key's text.
+        let key_text = marked.get_key_value("--theme-color-3").unwrap().0.as_ptr();
+        marked.insert("--theme-color-3".into(), "red".into());
+        assert_eq!(
+            marked.get_key_value("--theme-color-3").unwrap().0.as_ptr(),
+            key_text
+        );
+        assert_eq!(marked.get("--theme-color-3"), Some("red"));
+        assert_eq!(base.get("--theme-color-3"), Some("#000003"));
+        // The shared text is charged once across both maps.
+        let text: usize = base.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let alone = CustomProperties::from_iter(
+            (0..64).map(|i| (format!("--theme-color-{i}"), format!("#{i:06x}"))),
+        );
+        assert!(
+            base.estimated_heap_bytes() + marked.estimated_heap_bytes()
+                < 2 * alone.estimated_heap_bytes()
+        );
+        assert!(alone.estimated_heap_bytes() > text);
     }
 }

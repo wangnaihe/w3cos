@@ -6125,7 +6125,7 @@ impl App {
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get("--w3cos-ime"))
-            .cloned()
+            .map(str::to_string)
             .unwrap_or_default();
         let current = self
             .text_input_values
@@ -6156,7 +6156,7 @@ impl App {
             .custom_properties
             .as_ref()?
             .get(name)
-            .cloned()
+            .map(str::to_string)
     }
 
     /// Remember a text field for the shell keyboard, and keep that note while
