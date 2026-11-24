@@ -40,6 +40,8 @@ pub const MAX_SHAPES: usize = 1 << 15;
 pub(crate) const MARKER_PREFIX: &str = "__w3cos_";
 /// Shapes with at most this many keys are searched linearly.
 const LINEAR_SCAN: usize = 8;
+/// Linear lookups a wide shape serves before it builds its key index.
+const INDEX_AFTER_SCANS: u8 = 8;
 /// Transition lists longer than this get a hash index.
 const LINEAR_TRANSITIONS: usize = 8;
 
@@ -83,6 +85,8 @@ pub(crate) struct Shape {
     keys: Box<[JsString]>,
     /// Key -> slot for shapes wider than [`LINEAR_SCAN`], built on first use.
     index: OnceCell<FastMap<JsString, u32>>,
+    /// Linear lookups served while `index` is still unbuilt.
+    linear_scans: Cell<u8>,
     /// Any key is a canonical array index (enumeration must reorder).
     has_index_key: bool,
     /// Any key is an internal `__w3cos_` marker (accessor halves etc.).
@@ -96,6 +100,7 @@ impl Shape {
             id: ROOT_SHAPE_ID,
             keys: Box::new([]),
             index: OnceCell::new(),
+            linear_scans: Cell::new(0),
             has_index_key: false,
             has_marker_key: false,
             transitions: RefCell::new(Transitions::Few(Vec::new())),
@@ -105,7 +110,24 @@ impl Shape {
     #[inline]
     pub(crate) fn lookup(&self, key: &str) -> Option<usize> {
         if self.keys.len() <= LINEAR_SCAN {
-            return self.keys.iter().position(|k| k.as_str() == key);
+            return self.linear_lookup(key);
+        }
+        if let Some(index) = self.index.get() {
+            return index.get(key).map(|&i| i as usize);
+        }
+        // Most shapes past LINEAR_SCAN are transient prefixes of one wide
+        // object being filled key by key (a class prototype, a constructor
+        // table): looked up a handful of times, then never again. An index
+        // for each of them made the memory quadratic in the final width.
+        // A key this shape transitions on is not one of its own keys, and
+        // only a shape that keeps being searched pays for an index.
+        if self.transitions_on(key) {
+            return None;
+        }
+        let scans = self.linear_scans.get();
+        if scans < INDEX_AFTER_SCANS {
+            self.linear_scans.set(scans + 1);
+            return self.linear_lookup(key);
         }
         self.index
             .get_or_init(|| {
@@ -117,6 +139,22 @@ impl Shape {
             })
             .get(key)
             .map(|&i| i as usize)
+    }
+
+    #[inline]
+    fn linear_lookup(&self, key: &str) -> Option<usize> {
+        self.keys.iter().position(|k| k.as_str() == key)
+    }
+
+    /// `key` names an existing child transition (so it is not an own key).
+    fn transitions_on(&self, key: &str) -> bool {
+        let Ok(transitions) = self.transitions.try_borrow() else {
+            return false;
+        };
+        match &*transitions {
+            Transitions::Few(list) => list.iter().any(|(k, _)| k.as_str() == key),
+            Transitions::Many(map) => map.contains_key(key),
+        }
     }
 
     /// Child shape with `key` appended, creating it if the budget allows.
@@ -155,6 +193,7 @@ impl Shape {
             has_marker_key: self.has_marker_key || key.as_str().starts_with(MARKER_PREFIX),
             keys: keys.into_boxed_slice(),
             index: OnceCell::new(),
+            linear_scans: Cell::new(0),
             transitions: RefCell::new(Transitions::Few(Vec::new())),
         });
         let mut transitions = self.transitions.borrow_mut();
@@ -618,6 +657,42 @@ mod tests {
         assert!(grown.is_dictionary());
         assert_eq!(grown.get("d").map(|v| v.to_number()), Some(3.0));
         assert!(grown.get("c").is_none());
+    }
+
+    #[test]
+    fn wide_shapes_index_only_once_they_keep_being_searched() {
+        let keys: Vec<String> = (0..40).map(|i| format!("wide_index_key_{i}")).collect();
+        let mut map = PropertyMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            assert!(map.get(key).is_none(), "fill-path miss");
+            map.insert_str(key, Value::Number(i as f64));
+        }
+        let shape = match map.inner.as_deref() {
+            Some(PropertyStore::Shaped { shape, .. }) => Rc::clone(shape),
+            _ => panic!("40 keys stay shape-backed"),
+        };
+        // Every prefix shape was searched once on the way: none indexed.
+        let mut prefix = root_shape();
+        for key in &keys {
+            prefix = prefix.transition(key).expect("existing transition");
+            assert!(prefix.index.get().is_none(), "{} keys", prefix.keys.len());
+        }
+        assert!(Rc::ptr_eq(&prefix, &shape));
+        // Lookups stay correct before and after the index exists.
+        for round in 0..3 {
+            for (i, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    map.get(key).map(Value::to_number),
+                    Some(i as f64),
+                    "round {round}"
+                );
+            }
+            assert!(map.get("wide_index_key_absent").is_none());
+        }
+        assert!(
+            shape.index.get().is_some(),
+            "a shape that keeps being searched indexes"
+        );
     }
 
     #[test]
