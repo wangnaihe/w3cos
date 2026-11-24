@@ -170,18 +170,41 @@ fn border_side(style: &Style, side: usize) -> f32 {
     style.computed_border_widths[side].unwrap_or(0.0)
 }
 
-/// Children margins cannot collapse through this edge of `component`.
-fn edge_blocks_margin_collapse(component: &Component, top: bool) -> bool {
-    let style = &component.style;
+/// Padding or border on this edge of `style` keeps child margins inside.
+fn edge_has_padding_or_border(style: &Style, top: bool) -> bool {
     let (padding, border) = if top {
         (style.padding.top, border_side(style, 0))
     } else {
         (style.padding.bottom, border_side(style, 2))
     };
-    if px_spacing(padding).is_some_and(|px| px > 0.0) || border > 0.0 {
-        return true;
+    px_spacing(padding).is_some_and(|px| px > 0.0) || border > 0.0
+}
+
+/// Children margins cannot collapse through this edge of `component`.
+fn edge_blocks_margin_collapse(component: &Component, top: bool) -> bool {
+    edge_has_padding_or_border(&component.style, top) || only_inline_children(component)
+}
+
+/// A restyle that adds or removes the padding/border on an edge child
+/// margins could collapse through moves the box (and its followers) by
+/// those margins (CSS 2 §8.3.1; Blink's NGBlockLayoutAlgorithm recomputes
+/// the margin strut), which a subtree solve and a tail shift do not model.
+pub(super) fn edge_collapse_changes(component: &Component, old: &Style) -> bool {
+    // Margins only collapse through a block container in its parent's
+    // block formatting context (not a flex, grid or flow-root box).
+    let collapses_through = |style: &Style| {
+        matches!(style.display, Display::Block | Display::ListItem) && in_flow_static(style)
+    };
+    if !collapses_through(old) && !collapses_through(&component.style) {
+        return false;
     }
-    // Only inline content: there is no child margin to collapse.
+    [true, false].into_iter().any(|top| {
+        edge_has_padding_or_border(old, top) != edge_has_padding_or_border(&component.style, top)
+    }) && !only_inline_children(component)
+}
+
+/// Only inline content: there is no child margin to collapse.
+fn only_inline_children(component: &Component) -> bool {
     component.children.iter().all(|child| {
         // A block element whose only content is text is lowered to a Text
         // component carrying the element's style; that is still a block.
@@ -4137,6 +4160,9 @@ pub(super) fn try_style_subtree(
     if path.is_empty() || host_id(at_path(&cache.component, &path)) != Some(id) {
         return bail("style host");
     }
+    if edge_collapse_changes(at_path(&cache.component, &path), old) {
+        return bail("style margin collapse edge");
+    }
     // A column-flex item whose width just became definite (or auto again)
     // is re-lowered below. The cached text still has the previous
     // `text-line-width` mark, and the paragraph line count would not match
@@ -5400,6 +5426,63 @@ mod tests {
             }
         }
         assert_eq!(TAIL_SHIFT_FAST_MISMATCHES.with(std::cell::Cell::get), 0);
+        crate::stylesheet::clear_rules();
+    }
+
+    /// A class that adds padding to a box whose first child's top margin
+    /// used to collapse through it moves the box by that margin (CSS 2
+    /// §8.3.1): the edit relays out from the parent, as Blink recomputes the
+    /// margin strut there, instead of a subtree solve plus a tail shift.
+    #[test]
+    fn padding_toggle_through_collapsed_margin_matches_full() {
+        for (nest, span, pad) in [
+            (false, false, "14px"),
+            (true, false, "14px"),
+            (false, true, "14px"),
+            (true, true, "14px"),
+            (true, true, "0px 14px"),
+            (true, false, "14px 0px"),
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".pad", &[("padding", pad)]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let list = if nest {
+                let list = crate::dom::create_element("div");
+                crate::dom::append_child(crate::dom::body_id(), list);
+                list
+            } else {
+                crate::dom::body_id()
+            };
+            let mut bubbles = Vec::new();
+            for index in 0..4 {
+                let bubble = crate::dom::create_element("div");
+                let p = crate::dom::create_element("p");
+                crate::dom::append_child(
+                    p,
+                    crate::dom::create_text_node(&format!("message {index}")),
+                );
+                crate::dom::append_child(bubble, p);
+                if span {
+                    let meta = crate::dom::create_element("span");
+                    crate::dom::append_child(meta, crate::dom::create_text_node("meta"));
+                    crate::dom::append_child(bubble, meta);
+                }
+                crate::dom::append_child(list, bubble);
+                bubbles.push(bubble);
+            }
+            assert!(crate::incremental_layout::flush());
+            for step in 0..2 {
+                if step == 0 {
+                    crate::dom::class_list_add(bubbles[1], "pad");
+                } else {
+                    crate::dom::class_list_remove(bubbles[1], "pad");
+                }
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("nest {nest} span {span} pad {pad} step {step}"));
+            }
+        }
         crate::stylesheet::clear_rules();
     }
 

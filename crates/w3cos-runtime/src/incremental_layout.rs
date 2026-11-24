@@ -1166,14 +1166,25 @@ fn patch_and_compute(
                 )
             })
             .flatten();
+        // (Read while the known style paths are still held.)
+        let edge_moves = previous.as_ref().is_some_and(|old| {
+            known_path
+                .clone()
+                .or_else(|| style_path(key, &cache.component, styles[0].0))
+                .and_then(|path| component_at(&cache.component, &path))
+                .is_some_and(|node| splice::edge_collapse_changes(node, old))
+        });
         held_paths = (style_paths_keep_mode() != 0).then(take_style_paths);
         // The splice solves the root under a wrapper as wide as the root's
         // old margin box, which is its containing block only while the
         // root's own used width came from it: an edit to the root's own
         // width inputs relays out from its parent.
-        let own_width = previous
-            .as_ref()
-            .is_some_and(|old| own_width_inputs_changed(old, &styles[0].1));
+        // An edit that adds or removes the padding/border child margins
+        // collapse through moves the element by those margins: its parent
+        // lays it out again (Blink recomputes the margin strut there).
+        let own_width = previous.as_ref().is_some_and(|old| {
+            own_width_inputs_changed(old, &styles[0].1) || edge_moves
+        });
         let root = match known_path {
             Some(path) => {
                 let root = style_local_root_at(&cache.component, styles[0].0, own_width, path);
