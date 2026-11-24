@@ -1627,8 +1627,51 @@ fn spliced_skip_projections(cache: &Cache, removed: &[Component], inserted: &[Co
         // Whatever needed projections is outside the replaced subtree.
         false
     } else {
-        can_skip_projections(&cache.component)
+        let mode = skip_proj_inserted_mode();
+        // `W3COS_SKIP_PROJ_INSERTED`: the inserted boxes are already in the
+        // tree, so one that needs projections answers for the whole tree
+        // without walking it.
+        if mode == 1 && !clean(inserted) {
+            SKIP_PROJ_INSERTED_HITS.with(|n| n.set(n.get() + 1));
+            return false;
+        }
+        let walked = can_skip_projections(&cache.component);
+        if mode == 2 && !clean(inserted) {
+            SKIP_PROJ_INSERTED_HITS.with(|n| n.set(n.get() + 1));
+            if walked {
+                SKIP_PROJ_INSERTED_MISMATCHES.with(|n| n.set(n.get() + 1));
+                eprintln!("[skip-proj-inserted-verify] mismatch: tree walk says clean");
+            }
+        }
+        walked
     }
+}
+
+/// `W3COS_SKIP_PROJ_INSERTED=1|verify` (default off): see
+/// [`spliced_skip_projections`]. `verify` still walks the tree and compares.
+fn skip_proj_inserted_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = SKIP_PROJ_INSERTED_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_SKIP_PROJ_INSERTED").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static SKIP_PROJ_INSERTED_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    static SKIP_PROJ_INSERTED_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SKIP_PROJ_INSERTED_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn component_same(left: &Component, right: &Component) -> bool {
@@ -5984,6 +6027,74 @@ mod tests {
             );
         }
         assert_eq!(PREORDER_HOSTS_MISMATCHES.with(std::cell::Cell::get), 0);
+        crate::stylesheet::clear_rules();
+    }
+
+    /// `W3COS_SKIP_PROJ_INSERTED`: toggling padding on a bubble that holds
+    /// a table keeps the projections on without walking the whole tree, and
+    /// still matches a full layout.
+    #[test]
+    fn skip_proj_inserted_matches_the_walk() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                SKIP_PROJ_INSERTED_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        for mode in [2u8, 1] {
+            SKIP_PROJ_INSERTED_OVERRIDE.with(|m| m.set(Some(mode)));
+            SKIP_PROJ_INSERTED_HITS.with(|n| n.set(0));
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".bub", &[("padding", "4px")]);
+            crate::stylesheet::register_rule(".bub.pad", &[("padding", "14px")]);
+            crate::stylesheet::register_rule("table", &[("display", "table")]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let list = crate::dom::create_element("div");
+            crate::dom::append_child(crate::dom::body_id(), list);
+            let mut bubbles = Vec::new();
+            for index in 0..4 {
+                let bubble = crate::dom::create_element("div");
+                crate::dom::class_list_add(bubble, "bub");
+                let p = crate::dom::create_element("p");
+                crate::dom::append_child(
+                    p,
+                    crate::dom::create_text_node(&format!("message {index} alpha beta")),
+                );
+                crate::dom::append_child(bubble, p);
+                let table = crate::dom::create_element("table");
+                let row = crate::dom::create_element("tr");
+                for cell in 0..2 {
+                    let td = crate::dom::create_element("td");
+                    crate::dom::append_child(
+                        td,
+                        crate::dom::create_text_node(&format!("cell {cell}")),
+                    );
+                    crate::dom::append_child(row, td);
+                }
+                crate::dom::append_child(table, row);
+                crate::dom::append_child(bubble, table);
+                crate::dom::append_child(list, bubble);
+                bubbles.push(bubble);
+            }
+            assert!(crate::incremental_layout::flush());
+            for step in 0..4 {
+                if step % 2 == 0 {
+                    crate::dom::class_list_add(bubbles[1], "pad");
+                } else {
+                    crate::dom::class_list_remove(bubbles[1], "pad");
+                }
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("skip proj inserted mode {mode} step {step}"));
+            }
+            assert!(
+                SKIP_PROJ_INSERTED_HITS.with(std::cell::Cell::get) > 0,
+                "mode {mode}: no splice kept the projections from the inserted boxes"
+            );
+        }
+        assert_eq!(SKIP_PROJ_INSERTED_MISMATCHES.with(std::cell::Cell::get), 0);
         crate::stylesheet::clear_rules();
     }
 
