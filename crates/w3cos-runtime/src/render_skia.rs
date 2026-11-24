@@ -9754,7 +9754,87 @@ pub(crate) fn css_font_runs<'a>(
     runs
 }
 
+/// `W3COS_GLYPH_PAGE=1|verify` (default off). Blink keeps per-font glyph
+/// pages (`GlyphPage`, one cmap lookup per page rather than per character);
+/// here the primary face's ASCII page is kept as a coverage mask so an ASCII
+/// run the primary fully maps skips the per-character cmap. `verify` also
+/// runs the per-character lookup and compares the runs.
+fn glyph_page_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = GLYPH_PAGE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_GLYPH_PAGE").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static GLYPH_PAGE_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// ASCII coverage of each primary face, by Skia unique id (never reused).
+    static GLYPH_PAGES: std::cell::RefCell<std::collections::HashMap<u32, u128>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    pub(crate) static GLYPH_PAGE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static GLYPH_PAGE_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bit `c` is set when `primary` maps ASCII character `c` to a glyph.
+fn ascii_glyph_page(primary: &Typeface) -> u128 {
+    let id = primary.unique_id();
+    if let Some(mask) = GLYPH_PAGES.with(|pages| pages.borrow().get(&id).copied()) {
+        return mask;
+    }
+    let unichars: Vec<i32> = (0..128).collect();
+    let mut glyphs = vec![0u16; 128];
+    primary.unichars_to_glyphs(&unichars, &mut glyphs);
+    let mask = glyphs
+        .iter()
+        .enumerate()
+        .filter(|(_, glyph)| **glyph != 0)
+        .fold(0u128, |mask, (index, _)| mask | (1u128 << index));
+    GLYPH_PAGES.with(|pages| pages.borrow_mut().insert(id, mask));
+    mask
+}
+
 fn fallback_font_runs<'a>(
+    text: &'a str,
+    primary: &Typeface,
+    font_weight: u16,
+) -> Vec<FallbackFontRun<'a>> {
+    let mode = glyph_page_mode();
+    if mode != 0 && font_weight == 400 && !text.is_empty() && text.is_ascii() {
+        let mask = ascii_glyph_page(primary);
+        if text.bytes().all(|byte| mask & (1u128 << byte) != 0) {
+            GLYPH_PAGE_HITS.with(|n| n.set(n.get() + 1));
+            let runs = vec![FallbackFontRun {
+                text,
+                typeface: primary.clone(),
+            }];
+            if mode == 2 {
+                let walked = fallback_font_runs_by_character(text, primary, font_weight);
+                let same = walked.len() == 1
+                    && walked[0].text.len() == text.len()
+                    && walked[0].typeface.unique_id() == primary.unique_id();
+                if !same {
+                    GLYPH_PAGE_MISMATCHES.with(|n| n.set(n.get() + 1));
+                    eprintln!("[glyph-page-verify] mismatch for {text:?}");
+                    return walked;
+                }
+            }
+            return runs;
+        }
+    }
+    fallback_font_runs_by_character(text, primary, font_weight)
+}
+
+fn fallback_font_runs_by_character<'a>(
     text: &'a str,
     primary: &Typeface,
     font_weight: u16,
@@ -18059,6 +18139,46 @@ mod tests {
     }
 
     #[cfg(any(target_os = "ios", target_os = "macos"))]
+    /// `W3COS_GLYPH_PAGE`: an ASCII run the primary maps is one primary
+    /// run, like the per-character lookup; others still walk.
+    #[test]
+    fn glyph_page_matches_the_character_walk() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                GLYPH_PAGE_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        let primary = crate::font_face::pinned_font_mgr()
+            .new_from_data(TEST_FONT, None)
+            .unwrap();
+        let texts = ["message 1 alpha beta", "A丹丹B", "tab\there", "", "x"];
+        GLYPH_PAGE_OVERRIDE.with(|m| m.set(Some(0)));
+        let plain: Vec<Vec<(usize, u32)>> = texts
+            .iter()
+            .map(|text| {
+                fallback_font_runs(text, &primary, 400)
+                    .iter()
+                    .map(|run| (run.text.len(), run.typeface.unique_id()))
+                    .collect()
+            })
+            .collect();
+        for mode in [2u8, 1] {
+            GLYPH_PAGE_OVERRIDE.with(|m| m.set(Some(mode)));
+            GLYPH_PAGE_HITS.with(|n| n.set(0));
+            for (text, want) in texts.iter().zip(&plain) {
+                let got: Vec<(usize, u32)> = fallback_font_runs(text, &primary, 400)
+                    .iter()
+                    .map(|run| (run.text.len(), run.typeface.unique_id()))
+                    .collect();
+                assert_eq!(&got, want, "mode {mode} {text:?}");
+            }
+            assert!(GLYPH_PAGE_HITS.with(std::cell::Cell::get) > 0, "mode {mode}: no page hit");
+        }
+        assert_eq!(GLYPH_PAGE_MISMATCHES.with(std::cell::Cell::get), 0);
+    }
+
     #[test]
     fn missing_cjk_glyphs_use_one_cached_system_font_run() {
         let primary = crate::font_face::pinned_font_mgr()
