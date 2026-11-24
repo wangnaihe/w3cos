@@ -742,6 +742,35 @@ pub(crate) struct ParagraphWidths {
     before: Vec<f32>,
     len: usize,
     margin: f32,
+    /// `W3COS_PARAGRAPH_INDEX`: `by_byte[b]` is the number of clusters
+    /// starting before byte `b` (`0..=len`), so the per-character checks of
+    /// the line breaker read offsets without a search (Blink's ShapeResult
+    /// keeps per-character data indexed by offset).
+    by_byte: Option<Vec<u32>>,
+}
+
+/// `W3COS_PARAGRAPH_INDEX=1|verify` (default off): see
+/// [`ParagraphWidths::by_byte`]. `verify` also searches and compares.
+fn paragraph_index_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PARAGRAPH_INDEX_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_PARAGRAPH_INDEX").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARAGRAPH_INDEX_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static PARAGRAPH_INDEX_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl ParagraphWidths {
@@ -762,24 +791,61 @@ impl ParagraphWidths {
             sum += advance;
             before.push(sum);
         }
+        let starts: Vec<usize> = clusters.iter().map(|(start, _)| *start).collect();
+        let by_byte = (paragraph_index_mode() != 0).then(|| {
+            let mut by_byte = Vec::with_capacity(len + 1);
+            let mut count = 0usize;
+            for byte in 0..=len {
+                while count < starts.len() && starts[count] < byte {
+                    count += 1;
+                }
+                by_byte.push(count as u32);
+            }
+            by_byte
+        });
         Some(Self {
-            starts: clusters.iter().map(|(start, _)| *start).collect(),
+            starts,
             before,
             len,
             margin,
+            by_byte,
         })
+    }
+
+    /// Number of clusters starting before `byte`.
+    fn clusters_before(&self, byte: usize) -> usize {
+        let searched = || self.starts.partition_point(|&start| start < byte);
+        match self.by_byte.as_ref().and_then(|by_byte| by_byte.get(byte)) {
+            Some(&count) => {
+                let count = count as usize;
+                if paragraph_index_mode() == 2 && count != searched() {
+                    PARAGRAPH_INDEX_MISMATCHES.with(|n| n.set(n.get() + 1));
+                    eprintln!("[paragraph-index-verify] mismatch at byte {byte}");
+                    return searched();
+                }
+                count
+            }
+            None => searched(),
+        }
     }
 
     /// Advance of the clusters starting before `byte`.
     fn advance_before(&self, byte: usize) -> f32 {
-        self.before[self.starts.partition_point(|&start| start < byte)]
+        self.before[self.clusters_before(byte)]
     }
 
     /// A cut that does not split a cluster (Blink reuses a ShapeResult only
     /// at safe-to-break offsets; a partial cluster such as half an emoji ZWJ
     /// sequence shapes to different glyphs on its own).
     fn is_cluster_boundary(&self, byte: usize) -> bool {
-        byte == self.len || self.starts.binary_search(&byte).is_ok()
+        if byte == self.len {
+            return true;
+        }
+        if self.by_byte.is_some() && byte < self.len {
+            let index = self.clusters_before(byte);
+            return self.starts.get(index) == Some(&byte);
+        }
+        self.starts.binary_search(&byte).is_ok()
     }
 
     /// Whether `text[start..end]` certainly fits `available`: both cuts are
@@ -3534,6 +3600,47 @@ mod tests {
             assert!(WRAP_FIT_ESTIMATE_HITS.with(std::cell::Cell::get) > 0);
         }
         assert_eq!(WRAP_FIT_ESTIMATE_MISMATCHES.with(std::cell::Cell::get), 0);
+    }
+
+    /// `W3COS_PARAGRAPH_INDEX`: the byte index answers like the searches.
+    #[test]
+    fn paragraph_index_matches_the_search() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                PARAGRAPH_INDEX_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        let clusters = [(0, 10.0), (1, 10.0), (4, 7.5), (5, 3.0), (9, 1.0)];
+        PARAGRAPH_INDEX_OVERRIDE.with(|m| m.set(Some(0)));
+        let plain = ParagraphWidths::new(&clusters, 11, 2.0).unwrap();
+        for mode in [2u8, 1] {
+            PARAGRAPH_INDEX_OVERRIDE.with(|m| m.set(Some(mode)));
+            let indexed = ParagraphWidths::new(&clusters, 11, 2.0).unwrap();
+            assert!(indexed.by_byte.is_some());
+            for byte in 0..=11 {
+                assert_eq!(
+                    indexed.advance_before(byte).to_bits(),
+                    plain.advance_before(byte).to_bits(),
+                    "byte {byte}"
+                );
+                assert_eq!(
+                    indexed.is_cluster_boundary(byte),
+                    plain.is_cluster_boundary(byte),
+                    "byte {byte}"
+                );
+                for end in byte..=11 {
+                    for available in [5.0, 20.0, 40.0] {
+                        assert_eq!(
+                            indexed.certainly_fits(byte, end, available),
+                            plain.certainly_fits(byte, end, available)
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(PARAGRAPH_INDEX_MISMATCHES.with(std::cell::Cell::get), 0);
     }
 
     #[test]
