@@ -183,7 +183,7 @@ impl Element {
             node.class_list.push(atom);
             doc.add_to_class_index(self.id, &atom);
             if stylesheet::has_rules() {
-                doc.mark_selector_dirty(self.id);
+                doc.mark_class_dirty(self.id, atom.as_static());
             }
         }
     }
@@ -192,7 +192,7 @@ impl Element {
         let atom = Atom::intern(class);
         doc.get_node_mut(self.id).class_list.retain(|c| *c != atom);
         doc.remove_from_class_index(self.id, &atom);
-        doc.mark_selector_dirty(self.id);
+        doc.mark_class_dirty(self.id, class);
     }
 
     pub fn class_list_toggle(&self, doc: &mut Document, class: &str) -> bool {

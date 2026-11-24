@@ -476,6 +476,46 @@ fn same_style(shared: &SharedStyle, other: &w3cos_std::style::Style) -> bool {
     std::ptr::eq(&**shared, other) || **shared == *other
 }
 
+/// `W3COS_CLASS_INVALIDATION`: 0 off (default), 1 on, 2 verify.
+fn class_invalidation_mode() -> u8 {
+    thread_local! {
+        static MODE: u8 = match std::env::var("W3COS_CLASS_INVALIDATION").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        };
+    }
+    #[cfg(test)]
+    if let Some(mode) = CLASS_INVALIDATION_OVERRIDE.with(Cell::get) {
+        return mode;
+    }
+    MODE.with(|mode| *mode)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLASS_INVALIDATION_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+/// Test hook: force `W3COS_CLASS_INVALIDATION` on this thread.
+#[cfg(test)]
+pub(crate) fn set_class_invalidation_mode_for_test(mode: Option<u8>) {
+    CLASS_INVALIDATION_OVERRIDE.with(|cell| cell.set(mode));
+}
+
+thread_local! {
+    static CLASS_INVALIDATION_MISMATCHES: Cell<usize> = const { Cell::new(0) };
+    static CLASS_INVALIDATION_KEPT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// (mismatches, nodes the narrow walk kept) since the thread started.
+pub fn class_invalidation_verify_counts() -> (usize, usize) {
+    (
+        CLASS_INVALIDATION_MISMATCHES.with(Cell::get),
+        CLASS_INVALIDATION_KEPT.with(Cell::get),
+    )
+}
+
 struct CachedComputedStyle {
     node_revision: u64,
     stylesheet_generation: u64,
@@ -1486,6 +1526,12 @@ impl Document {
     pub(crate) fn mark_selector_dirty(&mut self, id: NodeId) {
         let detached = self.edit_is_detached(&[Some(id)]);
         self.detached_scope(detached, |doc| doc.mark_selector_dirty_inner(id));
+    }
+
+    /// `mark_selector_dirty` for a classList edit of `class` on `id`.
+    pub(crate) fn mark_class_dirty(&mut self, id: NodeId, class: &str) {
+        let detached = self.edit_is_detached(&[Some(id)]);
+        self.detached_scope(detached, |doc| doc.mark_class_dirty_inner(id, class));
     }
 
     pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
@@ -2688,6 +2734,152 @@ impl Document {
         self.invalidate_style_subtree(invalidation_root);
         self.record_layout_dirty(id);
         self.note_cascade_change();
+    }
+
+    /// Blink's class invalidation (`StyleEngine::ClassChangedForElement` with
+    /// descendant invalidation sets, then `StyleRecalcChange` propagation):
+    /// when no selector reaches a descendant through `class`, only `id` is
+    /// restyled, and a child is restyled only when the style it inherits
+    /// produces a different computed style (Blink's
+    /// `ComputedStyle::ComputeDifference` -> `kRecalcChildren`). Text
+    /// children of a restyled element are always touched, since a lowered
+    /// text leaf carries its parent's style. `W3COS_CLASS_INVALIDATION=1`
+    /// enables it; `=verify` restyles the whole subtree as before and
+    /// reports every node the narrow walk left untouched whose style changed.
+    fn mark_class_dirty_inner(&mut self, id: NodeId, class: &str) {
+        let mode = class_invalidation_mode();
+        if mode == 0
+            || stylesheet::class_change_reaches_descendants(class)
+            || self
+                .nodes
+                .get(id.0 as usize)
+                .is_none_or(|node| node.is_none())
+            || self.get_node(id).node_type != NodeType::Element
+        {
+            self.mark_selector_dirty_inner(id);
+            return;
+        }
+        if mode == 2 {
+            self.verify_class_restyle(id, class);
+        } else {
+            self.narrow_class_restyle(id);
+        }
+        self.record_layout_dirty(id);
+        self.note_cascade_change();
+    }
+
+    /// The valid computed-style cache entry of `id`: (inherited, style).
+    fn valid_cached_style(&self, id: NodeId) -> Option<(Option<SharedStyle>, SharedStyle)> {
+        let revision = *self.style_revisions.get(id.0 as usize)?;
+        let generation = stylesheet::generation();
+        self.computed_style_cache
+            .borrow()
+            .get(&id)
+            .filter(|cached| {
+                cached.node_revision == revision && cached.stylesheet_generation == generation
+            })
+            .map(|cached| (cached.inherited_style.clone(), cached.style.clone()))
+    }
+
+    /// Restyle `id` and the descendants whose computed style changes.
+    /// Returns the nodes whose revision was bumped (only when `collect`).
+    fn narrow_class_restyle(&mut self, id: NodeId) -> Vec<NodeId> {
+        let mut bumped = Vec::new();
+        self.touch_style_revision(id);
+        let style: SharedStyle = Arc::new(self.computed_style_for(id));
+        let mut pending = vec![(id, style)];
+        while let Some((parent, parent_style)) = pending.pop() {
+            let mut child = self.get_node(parent).first_child;
+            while let Some(cid) = child {
+                child = crate::node::sib(self.get_node(cid).next_sibling);
+                if self.get_node(cid).node_type != NodeType::Element {
+                    self.bump_node_style_revision(cid);
+                    bumped.push(cid);
+                    continue;
+                }
+                let Some((inherited, cached)) = self.valid_cached_style(cid) else {
+                    // Never resolved (or already dirty): restyle it all.
+                    self.invalidate_style_subtree(cid);
+                    self.collect_subtree(cid, &mut bumped);
+                    continue;
+                };
+                if inherited
+                    .as_ref()
+                    .is_some_and(|old| same_style(old, &parent_style))
+                {
+                    continue;
+                }
+                let restyled = self.computed_style_shared(cid, Some(&parent_style));
+                if *restyled == *cached {
+                    continue;
+                }
+                self.bump_node_style_revision(cid);
+                bumped.push(cid);
+                pending.push((cid, restyled));
+            }
+        }
+        bumped.push(id);
+        bumped
+    }
+
+    fn collect_subtree(&self, root: NodeId, out: &mut Vec<NodeId>) {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if self
+                .nodes
+                .get(id.0 as usize)
+                .is_none_or(|node| node.is_none())
+            {
+                continue;
+            }
+            out.push(id);
+            let mut child = self.get_node(id).first_child;
+            while let Some(cid) = child {
+                stack.push(cid);
+                child = crate::node::sib(self.get_node(cid).next_sibling);
+            }
+        }
+    }
+
+    /// Verify mode: run the narrow walk, then invalidate the whole subtree as
+    /// the default does and compare every node the walk kept.
+    fn verify_class_restyle(&mut self, id: NodeId, class: &str) {
+        let mut subtree = Vec::new();
+        self.collect_subtree(id, &mut subtree);
+        let before: Vec<(NodeId, Option<SharedStyle>)> = subtree
+            .iter()
+            .map(|&node| (node, self.valid_cached_style(node).map(|(_, style)| style)))
+            .collect();
+        let bumped: std::collections::HashSet<NodeId> =
+            self.narrow_class_restyle(id).into_iter().collect();
+        self.invalidate_style_subtree(id);
+        let mut kept = 0usize;
+        for (node, old) in before {
+            // Nothing was resolved for it, so nothing can be stale.
+            let Some(old) = old.filter(|_| !bumped.contains(&node)) else {
+                continue;
+            };
+            kept += 1;
+            let fresh = self.computed_style_for(node);
+            if *old != fresh {
+                CLASS_INVALIDATION_MISMATCHES.with(|count| count.set(count.get() + 1));
+                let (a, b) = (format!("{:#?}", *old), format!("{fresh:#?}"));
+                let diff: Vec<String> = a
+                    .lines()
+                    .zip(b.lines())
+                    .filter(|(x, y)| x != y)
+                    .take(3)
+                    .map(|(x, y)| format!("{} -> {}", x.trim(), y.trim()))
+                    .collect();
+                eprintln!(
+                    "[class-invalidation-verify] mismatch node {} ({:?}) class {class} root {} {diff:?}",
+                    node.0,
+                    self.get_node(node).node_type,
+                    id.0
+                );
+            }
+        }
+        CLASS_INVALIDATION_KEPT.with(|count| count.set(count.get() + kept));
     }
 
     /// Inline declarations cannot change selector matching, but inherited
@@ -32154,6 +32346,82 @@ mod computed_style_cache_tests {
         leaf.class_list_add(&mut document, "changed");
 
         assert!(document.computed_style_cache_is_current(right.id));
+    }
+
+    #[test]
+    fn class_invalidation_restyles_only_the_descendants_that_need_it() {
+        for mode in [1u8, 2] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".pad", &[("padding", "20px")]);
+            crate::stylesheet::register_rule(".warm", &[("color", "red")]);
+            crate::stylesheet::register_rule(".scope .inner", &[("color", "blue")]);
+            crate::stylesheet::register_rule(".own", &[("color", "green")]);
+            set_class_invalidation_mode_for_test(Some(mode));
+            let mut document = Document::new();
+            let host = document.create_element("div");
+            let label = document.create_element("span");
+            let text = document.create_text_node("hi");
+            let inner = document.create_element("p");
+            inner.set_attribute(&mut document, "class", "inner own");
+            let deep = document.create_element("b");
+            label.append_child(&mut document, text);
+            host.append_child(&mut document, label);
+            inner.append_child(&mut document, deep);
+            host.append_child(&mut document, inner);
+            document.body().append_child(&mut document, host);
+            for id in [host.id, label.id, inner.id, deep.id] {
+                document.computed_style_for(id);
+            }
+            let revisions = |doc: &Document| {
+                [label.id, text.id, inner.id, deep.id].map(|id| doc.style_revision(id))
+            };
+
+            // Non-inherited and no descendant selector: only the host.
+            let before = revisions(&document);
+            let host_before = document.style_revision(host.id);
+            host.class_list_add(&mut document, "pad");
+            assert_ne!(document.style_revision(host.id), host_before);
+            if mode == 1 {
+                assert_eq!(revisions(&document), before);
+                assert!(document.computed_style_cache_is_current(deep.id));
+            }
+            assert_ne!(
+                document.computed_style_for(host.id).padding,
+                w3cos_std::style::Edges::ZERO
+            );
+
+            // An inherited value reaches every descendant that inherits it.
+            host.class_list_add(&mut document, "warm");
+            let red = w3cos_std::Color::rgb(255, 0, 0);
+            assert_eq!(document.computed_style_for(label.id).color, red);
+            let green = w3cos_std::Color::rgb(0, 128, 0);
+            assert_eq!(document.computed_style_for(deep.id).color, green);
+            if mode == 1 {
+                assert_ne!(revisions(&document)[0], before[0]);
+                // `.inner` sets its own color: its subtree does not change.
+                assert_eq!(revisions(&document)[2], before[2]);
+                assert_eq!(revisions(&document)[3], before[3]);
+            }
+
+            // `.scope` is a descendant feature: the whole subtree restyles.
+            host.class_list_add(&mut document, "scope");
+            assert_eq!(
+                document.computed_style_for(deep.id).color,
+                w3cos_std::Color::rgb(0, 0, 255)
+            );
+            host.class_list_remove(&mut document, "warm");
+            host.class_list_remove(&mut document, "scope");
+            host.class_list_remove(&mut document, "pad");
+            assert_ne!(document.computed_style_for(label.id).color, red);
+            assert_eq!(
+                document.computed_style_for(host.id).padding,
+                w3cos_std::style::Edges::ZERO
+            );
+            set_class_invalidation_mode_for_test(None);
+            crate::stylesheet::clear_rules();
+        }
+        assert_eq!(class_invalidation_verify_counts().0, 0);
+        assert!(class_invalidation_verify_counts().1 > 0);
     }
 
     #[test]

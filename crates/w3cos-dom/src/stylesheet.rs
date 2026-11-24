@@ -487,6 +487,72 @@ pub fn generation() -> u64 {
     STYLE_GENERATION.with(Cell::get)
 }
 
+/// Blink's descendant invalidation sets for class changes
+/// (`RuleFeatureSet::CollectFeaturesFromSelector`): the classes that appear
+/// in a compound left of a descendant/child combinator. Toggling any other
+/// class can only change the element's own matched rules. `None` when the
+/// sheet has a selector this summary cannot bound (`:not()`/`:has()` or an
+/// attribute selector off the subject, sibling or relational combinators,
+/// match-volatile rules); callers then invalidate the whole subtree.
+/// Pseudo-element rules count their subject classes too, since the generated
+/// box is a child of the element. Classes are ASCII-lowercased (quirks mode
+/// matches them case-insensitively).
+fn descendant_class_features() -> Option<std::rc::Rc<std::collections::HashSet<String>>> {
+    thread_local! {
+        static FEATURES: RefCell<Option<(u64, Option<std::rc::Rc<std::collections::HashSet<String>>>)>> =
+            const { RefCell::new(None) };
+    }
+    let generation = generation();
+    if let Some(hit) = FEATURES.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, features)| features.clone())
+    }) {
+        return hit;
+    }
+    let features = RULES.with(|rules| {
+        let rules = rules.borrow();
+        if rules.has_sibling_dependencies()
+            || rules.has_relational_dependencies()
+            || rules.has_match_volatile_rules()
+        {
+            return None;
+        }
+        let mut classes = std::collections::HashSet::new();
+        for rule in &rules.rules {
+            let subject = rule.chain.len().saturating_sub(1);
+            for (index, compound) in rule.chain.iter().enumerate() {
+                let off_subject = index < subject;
+                if off_subject || rule.pseudo_element.is_some() {
+                    if !compound.attributes.is_empty()
+                        || compound.pseudo_classes.iter().any(|pseudo| {
+                            matches!(pseudo, PseudoClass::Not(_) | PseudoClass::Has(_))
+                        })
+                    {
+                        return None;
+                    }
+                    classes.extend(
+                        compound
+                            .classes
+                            .iter()
+                            .map(|class| class.to_ascii_lowercase()),
+                    );
+                }
+            }
+        }
+        Some(std::rc::Rc::new(classes))
+    });
+    FEATURES.with(|slot| *slot.borrow_mut() = Some((generation, features.clone())));
+    features
+}
+
+/// `true` when changing `class` on an element can change the matched rules
+/// of its descendants (or the sheet is too complex to tell).
+pub(crate) fn class_change_reaches_descendants(class: &str) -> bool {
+    descendant_class_features().is_none_or(|classes| classes.contains(&class.to_ascii_lowercase()))
+}
+
 pub(crate) fn has_sibling_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 2 != 0)
 }
