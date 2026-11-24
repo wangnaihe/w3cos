@@ -26,7 +26,7 @@ use w3cos_std::style::{
     Style, TextDirection, Visibility,
 };
 
-const TABLE_MARKERS: &[&str] = &[
+pub(super) const TABLE_MARKERS: &[&str] = &[
     "--w3cos-internal-html-table-element",
     "--w3cos-internal-border-spacing-source",
     "--w3cos-internal-table-cell-ua-padding",

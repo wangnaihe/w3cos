@@ -793,6 +793,32 @@ pub(crate) fn elig_ifc_memo_stats() -> (u64, u64) {
     cache::elig_ifc_memo_stats()
 }
 
+/// `W3COS_STRETCH_REUSE` counters: (kept results used, verify mismatches).
+pub(crate) fn stretch_reuse_stats() -> (u64, u64) {
+    (
+        cache::STRETCH_REUSE_HITS.with(std::cell::Cell::get),
+        cache::STRETCH_REUSE_MISMATCHES.with(std::cell::Cell::get),
+    )
+}
+
+/// (`W3COS_TABLE_BLOCK_FREE=verify` hits laid out again, mismatches).
+pub(crate) fn table_block_free_stats() -> (u64, u64) {
+    (
+        cache::TABLE_BLOCK_FREE_CHECKS.with(std::cell::Cell::get),
+        cache::TABLE_BLOCK_FREE_MISMATCHES.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn set_table_block_free_override(mode: Option<u8>) {
+    cache::TABLE_BLOCK_FREE_OVERRIDE.with(|slot| slot.set(mode));
+}
+
+#[cfg(test)]
+pub(crate) fn set_stretch_reuse_override(mode: Option<u8>) {
+    cache::STRETCH_REUSE_OVERRIDE.with(|slot| slot.set(mode));
+}
+
 #[cfg(test)]
 pub(crate) fn set_elig_ifc_memo_override(mode: Option<u8>) {
     cache::IFC_MEMO_OVERRIDE.with(|slot| slot.set(mode));

@@ -4874,6 +4874,163 @@ mod tests {
         assert_eq!(REBASE_SORTED_KEEP_MISMATCHES.with(std::cell::Cell::get), 0);
     }
 
+    /// `W3COS_STRETCH_REUSE`: a stretched bubble whose own content set the
+    /// row's height keeps its auto-height layout; every rect matches the
+    /// layout that lays it out again, and verify finds no difference.
+    #[test]
+    fn stretch_reuse_matches_relayout() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::layout_ng::set_stretch_reuse_override(None);
+            }
+        }
+        let _off = Off;
+        // A row of an avatar and a column bubble: the bubble is stretched
+        // to the row's height (its own), its items to their flexed main
+        // size (their own). A fresh page per mode: the retained cache
+        // would replay a second layout of the same tree.
+        let page = || {
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            let list = crate::dom::create_element("div");
+            let mut bubbles = Vec::new();
+            for m in 0..4 {
+                let row = crate::dom::create_element("div");
+                style(
+                    row,
+                    &[
+                        ("display", "flex"),
+                        ("gap", "8px"),
+                        ("margin-bottom", "6px"),
+                    ],
+                );
+                let avatar = crate::dom::create_element("div");
+                style(avatar, &[("width", "32px"), ("height", "32px")]);
+                let bubble = crate::dom::create_element("div");
+                style(
+                    bubble,
+                    &[
+                        ("display", "flex"),
+                        ("flex-direction", "column"),
+                        ("padding", "12px"),
+                        ("flex", "1"),
+                    ],
+                );
+                for line in 0..3 {
+                    let div = crate::dom::create_element("div");
+                    crate::dom::append_child(
+                        div,
+                        crate::dom::create_text_node(&format!(
+                            "message {m} line {line} {}",
+                            "words ".repeat(4 + 9 * line)
+                        )),
+                    );
+                    crate::dom::append_child(bubble, div);
+                }
+                crate::dom::append_child(row, avatar);
+                crate::dom::append_child(row, bubble);
+                crate::dom::append_child(list, row);
+                bubbles.push(bubble);
+            }
+            crate::dom::append_child(crate::dom::body_id(), list);
+            assert!(crate::incremental_layout::flush());
+            bubbles
+        };
+        crate::layout_ng::set_stretch_reuse_override(Some(2));
+        let (hits, mismatches) = crate::layout_ng::stretch_reuse_stats();
+        let _ = page();
+        let (hits_verify, mismatches_verify) = crate::layout_ng::stretch_reuse_stats();
+        assert!(hits_verify > hits, "verify pass found no stretch to reuse");
+        assert_eq!(
+            mismatches_verify, mismatches,
+            "stretch reuse differs from relayout"
+        );
+        assert_matches_full("stretch reuse verify");
+        crate::layout_ng::set_stretch_reuse_override(Some(1));
+        let bubbles = page();
+        assert_matches_full("stretch reuse initial");
+        // Edits under reuse still match a full layout.
+        style(bubbles[1], &[("padding", "20px")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("stretch reuse after padding edit");
+        let markdown = markdown_chat_page(12);
+        assert!(!markdown.is_empty());
+        assert_matches_full("stretch reuse markdown page");
+        assert_eq!(crate::layout_ng::stretch_reuse_stats().1, mismatches);
+    }
+
+    /// `W3COS_TABLE_BLOCK_FREE`: a table in a stretched flex item keeps its
+    /// cached layout through the definite block size the stretch gives;
+    /// `verify` lays every such hit out again and compares.
+    #[test]
+    fn table_block_free_matches_relayout() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::layout_ng::set_table_block_free_override(None);
+            }
+        }
+        let _off = Off;
+        let page = || {
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            let row = crate::dom::create_element("div");
+            style(row, &[("display", "flex"), ("gap", "8px")]);
+            let avatar = crate::dom::create_element("div");
+            style(avatar, &[("width", "32px"), ("height", "32px")]);
+            let bubble = crate::dom::create_element("div");
+            style(
+                bubble,
+                &[
+                    ("display", "flex"),
+                    ("flex-direction", "column"),
+                    ("padding", "12px"),
+                    ("flex", "1"),
+                ],
+            );
+            let p = crate::dom::create_element("p");
+            crate::dom::append_child(p, crate::dom::create_text_node("a table follows"));
+            crate::dom::append_child(bubble, p);
+            let table = crate::dom::create_element("table");
+            let mut cells = Vec::new();
+            for r in 0..3 {
+                let tr = crate::dom::create_element("tr");
+                for c in 0..3 {
+                    let td = crate::dom::create_element("td");
+                    let text = crate::dom::create_text_node(&format!("cell {r} {c} words"));
+                    crate::dom::append_child(td, text);
+                    crate::dom::append_child(tr, td);
+                    cells.push(text);
+                }
+                crate::dom::append_child(table, tr);
+            }
+            crate::dom::append_child(bubble, table);
+            crate::dom::append_child(row, avatar);
+            crate::dom::append_child(row, bubble);
+            crate::dom::append_child(crate::dom::body_id(), row);
+            assert!(crate::incremental_layout::flush());
+            (bubble, cells)
+        };
+        crate::layout_ng::set_table_block_free_override(Some(2));
+        let (checks, mismatches) = crate::layout_ng::table_block_free_stats();
+        let _ = page();
+        let (checks_verify, mismatches_verify) = crate::layout_ng::table_block_free_stats();
+        assert!(checks_verify > checks, "verify found no relaxed hit");
+        assert_eq!(mismatches_verify, mismatches);
+        assert_matches_full("table block free verify");
+        crate::layout_ng::set_table_block_free_override(Some(1));
+        let (bubble, cells) = page();
+        assert_matches_full("table block free initial");
+        style(bubble, &[("padding", "20px")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("table block free after padding edit");
+        crate::dom::set_text_content(cells[4], &"much longer cell text ".repeat(6));
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("table block free after cell text edit");
+        assert_eq!(crate::layout_ng::table_block_free_stats().1, mismatches);
+    }
+
     #[test]
     fn split_inline_owner_rects_follow_streamed_splice() {
         let streams = markdown_chat_page(32);

@@ -46,6 +46,9 @@ struct Pass {
     /// `DependsOnPercentageBlockSize`), so `percentage_block` and
     /// `fixed_block_indefinite` cannot change the result.
     block_free: Vec<bool>,
+    /// `W3COS_TABLE_BLOCK_FREE=verify`: `block_free` without the table
+    /// relaxation (empty otherwise).
+    strict_block_free: Vec<bool>,
     /// Nothing in the subtree resolves a percentage against the inline
     /// size, so min/max-content sizes do not depend on `available_inline`
     /// (Blink's `MinMaxSizes` cache ignores the available inline size).
@@ -302,6 +305,11 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
     } else {
         Vec::new()
     };
+    let strict_block_free = if table_block_free_mode() == 2 {
+        strict_block_free(flat)
+    } else {
+        Vec::new()
+    };
     let (layouts, min_max) = entry_tables(flat.len());
     PASSES.with(|passes| {
         passes.borrow_mut().push(Pass {
@@ -309,6 +317,7 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
             flat_len: flat.len(),
             cacheable,
             block_free,
+            strict_block_free,
             inline_free,
             layouts,
             min_max,
@@ -322,13 +331,30 @@ pub(super) fn begin_pass(flat: &[FlatNodeInfo]) -> PassGuard {
     PassGuard(true)
 }
 
+/// Subtree `block_free` without the `W3COS_TABLE_BLOCK_FREE` relaxation.
+fn strict_block_free(flat: &[FlatNodeInfo]) -> Vec<bool> {
+    let mut free = vec![true; flat.len()];
+    for index in (0..flat.len()).rev() {
+        let mut ok = !percent_dependence(&flat[index], false).0;
+        let end = flat[index].subtree_end.max(index + 1).min(flat.len());
+        let mut child = index + 1;
+        while child < end {
+            ok &= free[child];
+            child = flat[child].subtree_end.max(child + 1);
+        }
+        free[index] = ok;
+    }
+    free
+}
+
 /// One box's own cache-dependence flags (`FLAGS_VALID` plus grid,
 /// block-percent and inline-percent bits), kept in `slot` once read.
 fn own_flags(flat: &[FlatNodeInfo], index: usize, slot: &mut u8) -> u8 {
     if *slot & FLAGS_VALID != 0 {
         return *slot & OWN_FLAG_BITS;
     }
-    let (block_dep, inline_dep, grid) = percent_dependence(&flat[index]);
+    let (block_dep, inline_dep, grid) =
+        percent_dependence(&flat[index], table_block_free_mode() != 0);
     let flags = FLAGS_VALID | grid as u8 | (block_dep as u8) << 1 | (inline_dep as u8) << 2;
     *slot = (*slot & !OWN_FLAG_BITS) | flags;
     flags
@@ -513,11 +539,43 @@ pub(super) fn layout(
             .map(|entry| entry.result.clone())
     });
     match hit {
-        Some(Some(result)) => Some(result),
+        Some(Some(result)) => {
+            // `W3COS_TABLE_BLOCK_FREE=verify`: a hit that only the table
+            // relaxation allowed is laid out again and compared.
+            let relaxed = table_block_free_mode() == 2
+                && with_pass(flat, index, |pass| {
+                    pass.block_free[index] && pass.strict_block_free.get(index) == Some(&false)
+                })
+                .unwrap_or(false);
+            if !relaxed {
+                return Some(result);
+            }
+            TABLE_BLOCK_FREE_CHECKS.with(|n| n.set(n.get() + 1));
+            let fresh = compute()?;
+            if format!("{fresh:?}") != format!("{result:?}") {
+                TABLE_BLOCK_FREE_MISMATCHES.with(|n| n.set(n.get() + 1));
+                eprintln!("[table-block-free-verify] mismatch at box #{index} sized {sized:?}");
+            }
+            Some(fresh)
+        }
         Some(None) => {
-            let result = match retained_layout(flat, index, &key, force_bfc_root, sized) {
-                Some(result) => result,
-                None => compute()?,
+            let reused = stretch_reuse(flat, index, space, &key, force_bfc_root, sized);
+            let result = match (reused, stretch_reuse_mode()) {
+                (Some(reused), 2) => {
+                    let fresh = compute()?;
+                    if format!("{fresh:?}") != format!("{reused:?}") {
+                        STRETCH_REUSE_MISMATCHES.with(|n| n.set(n.get() + 1));
+                        eprintln!(
+                            "[stretch-reuse-verify] mismatch at box #{index} sized {sized:?}"
+                        );
+                    }
+                    fresh
+                }
+                (Some(reused), _) => reused,
+                (None, _) => match retained_layout(flat, index, &key, force_bfc_root, sized) {
+                    Some(result) => result,
+                    None => compute()?,
+                },
             };
             with_pass(flat, index, |pass| {
                 if pass.layouts[index].is_empty() && pass.min_max[index].is_empty() {
@@ -534,6 +592,95 @@ pub(super) fn layout(
         }
         None => compute(),
     }
+}
+
+/// `W3COS_STRETCH_REUSE=1|verify` (off by default): a block or flex box
+/// laid out again at a definite content block size equal to the one its
+/// auto-height layout in this pass produced (the flex stretch pass of an
+/// item whose own content set the line's cross size) keeps that result
+/// instead of laying the subtree out again. Blink's
+/// `CalculateSizeBasedLayoutCacheStatus` reuses a cached result when the
+/// border-box block size is unchanged and nothing below depends on the
+/// percentage block size. Here also only when no margin collapses through
+/// the box (a definite height stops collapse-through at the bottom edge).
+/// `verify` lays the box out anyway and compares the results.
+pub(super) fn stretch_reuse_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = STRETCH_REUSE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_STRETCH_REUSE").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static STRETCH_REUSE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(super) static STRETCH_REUSE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static STRETCH_REUSE_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// See [`stretch_reuse_mode`]. `space` is the space as passed, `key` its
+/// normalized cache key.
+fn stretch_reuse(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    key: &ConstraintSpace,
+    force_bfc_root: bool,
+    sized: Sized,
+) -> Option<LayoutResult> {
+    use w3cos_std::style::Display;
+    if stretch_reuse_mode() == 0 {
+        return None;
+    }
+    let (width, Some(height)) = sized? else {
+        return None;
+    };
+    let style = flat[index].style;
+    if !matches!(
+        style.display,
+        Display::Block | Display::FlowRoot | Display::ListItem | Display::Flex
+    ) || super::block::marker(style, "--w3cos-internal-aspect-ratio").is_some()
+    {
+        return None;
+    }
+    let cached = with_pass(flat, index, |pass| {
+        if !pass.block_free[index] {
+            return None;
+        }
+        pass.layouts[index]
+            .iter()
+            .find(|entry| {
+                entry.force_bfc_root == force_bfc_root
+                    && entry.sized == Some((width, None))
+                    && entry.space == *key
+            })
+            .map(|entry| entry.result.clone())
+    })??;
+    let free = |strut: &super::MarginStrut| strut.positive == 0.0 && strut.negative == 0.0;
+    if cached.self_collapsing || !free(&cached.start_strut) || !free(&cached.end_strut) {
+        return None;
+    }
+    let metrics = super::block::resolve_inline(style, space);
+    let edges = metrics.padding[0] + metrics.padding[2] + metrics.border[0] + metrics.border[2];
+    let border_box = height + edges;
+    if !border_box.is_finite() || (cached.fragment.height - border_box).abs() > 1e-3 {
+        return None;
+    }
+    STRETCH_REUSE_HITS.with(|n| n.set(n.get() + 1));
+    let mut result = cached;
+    result.fragment.height = border_box;
+    Some(result)
 }
 
 pub(super) fn min_max(
@@ -596,6 +743,36 @@ fn auto_inline_margin(flat: &[FlatNodeInfo], index: usize) -> bool {
     matches!(margin.left, Spacing::Auto) || matches!(margin.right, Spacing::Auto)
 }
 
+/// See `percent_dependence` (`=verify` compares a hit that relied on it
+/// with a fresh layout).
+pub(super) fn table_block_free_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TABLE_BLOCK_FREE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_TABLE_BLOCK_FREE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TABLE_BLOCK_FREE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(super) static TABLE_BLOCK_FREE_CHECKS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    pub(super) static TABLE_BLOCK_FREE_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Internal markers that carry no size or percentage information.
 const SIZE_FREE_MARKERS: &[&str] = &[
     "--w3cos-internal-font-size-origin",
@@ -612,7 +789,7 @@ const SIZE_FREE_MARKERS: &[&str] = &[
 /// percentage basis, is an author grid) for one box. Conservative: anything
 /// not known to be free counts as dependent. The grid and lanes markers are
 /// not size-free, so with only size-free markers a grid is `display: grid`.
-fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool, bool) {
+fn percent_dependence(info: &FlatNodeInfo, tables: bool) -> (bool, bool, bool) {
     use w3cos_std::style::{Dimension, Display, Position, Spacing, WritingMode};
     let style = info.style;
     let pct = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
@@ -636,26 +813,61 @@ fn percent_dependence(info: &FlatNodeInfo) -> (bool, bool, bool) {
             !key.starts_with("--w3cos-internal") || SIZE_FREE_MARKERS.contains(&key.as_str())
         })
     });
-    let common = !markers_ok
+    let rest = !markers_ok
         || style.logical_overrides.is_some()
         || style.writing_mode != WritingMode::HorizontalTb
         || matches!(
             style.position,
             Position::Absolute | Position::Fixed | Position::Sticky
         )
-        || super::block::is_replaced(info.kind)
-        || !matches!(
-            style.display,
-            Display::Block
-                | Display::FlowRoot
-                | Display::Flex
-                | Display::Inline
-                | Display::InlineBlock
-                | Display::InlineFlex
-                | Display::ListItem
-                | Display::None
-        );
-    let block = common
+        || super::block::is_replaced(info.kind);
+    let other_display = !matches!(
+        style.display,
+        Display::Block
+            | Display::FlowRoot
+            | Display::Flex
+            | Display::Inline
+            | Display::InlineBlock
+            | Display::InlineFlex
+            | Display::ListItem
+            | Display::None
+    );
+    let common = rest || other_display;
+    // `W3COS_TABLE_BLOCK_FREE`: a table part reads the percentage block
+    // size only through its own height, min-height and max-height (cells
+    // lay their contents out with none), like a block.
+    let table_part = matches!(
+        style.display,
+        Display::Table
+            | Display::TableRowGroup
+            | Display::TableHeaderGroup
+            | Display::TableFooterGroup
+            | Display::TableRow
+            | Display::TableCell
+            | Display::TableCaption
+            | Display::TableColumn
+            | Display::TableColumnGroup
+    );
+    let table_free = table_part && tables;
+    // The table markers carry no percentage block size either.
+    let table_markers_ok = table_free
+        && style.custom_properties.as_ref().is_none_or(|props| {
+            props.keys().all(|key| {
+                !key.starts_with("--w3cos-internal")
+                    || SIZE_FREE_MARKERS.contains(&key.as_str())
+                    || super::table::TABLE_MARKERS.contains(&key.as_str())
+            })
+        });
+    let rest_block = (!markers_ok && !table_markers_ok)
+        || style.logical_overrides.is_some()
+        || style.writing_mode != WritingMode::HorizontalTb
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+        || super::block::is_replaced(info.kind);
+    let block_common = rest_block || (other_display && !table_free);
+    let block = block_common
         || pct(style.height)
         || pct(style.min_height)
         || pct(style.max_height)
