@@ -18174,7 +18174,10 @@ mod tests {
                     .collect();
                 assert_eq!(&got, want, "mode {mode} {text:?}");
             }
-            assert!(GLYPH_PAGE_HITS.with(std::cell::Cell::get) > 0, "mode {mode}: no page hit");
+            assert!(
+                GLYPH_PAGE_HITS.with(std::cell::Cell::get) > 0,
+                "mode {mode}: no page hit"
+            );
         }
         assert_eq!(GLYPH_PAGE_MISMATCHES.with(std::cell::Cell::get), 0);
     }
