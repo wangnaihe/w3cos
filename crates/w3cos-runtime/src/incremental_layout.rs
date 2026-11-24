@@ -1065,11 +1065,23 @@ fn patch_and_compute(
     // inherited edit (a class removing `text-align: justify`) must reach the
     // descendants' lowered styles too, or the walk keeps the stale verdict
     // and the page stays on legacy (Blink recalcs the children's styles).
+    // (One edited element: its old style is `previous`; the verdict is kept
+    // for the `W3COS_STYLE_LOCAL_REUSE` check below.)
+    let single_stable = (styles.len() == 1)
+        .then(|| {
+            previous
+                .as_ref()
+                .map(|old| ng_lowering_stable(old, &styles[0].1))
+        })
+        .flatten();
     let ng_relower = crate::layout_ng::mode() == crate::layout_ng::Mode::On
-        && styles.iter().any(|(id, style)| {
-            located_style(key, &cache.component, *id)
-                .is_none_or(|old| !ng_lowering_stable(old, style))
-        });
+        && match single_stable {
+            Some(stable) => !stable,
+            None => styles.iter().any(|(id, style)| {
+                located_style(key, &cache.component, *id)
+                    .is_none_or(|old| !ng_lowering_stable(old, style))
+            }),
+        };
     // The subtree path below edits the published map in place: settle it
     // while the retained tree is still the one it was laid out from.
     // (`W3COS_STYLE_LOCAL` below rebases deferred rects or settles them
@@ -1138,10 +1150,7 @@ fn patch_and_compute(
     if style_splice && previous.is_some() && {
         // `W3COS_STYLE_LOCAL_REUSE`: splice the retained subtree (its
         // host style is patched above) when the lowering is stable.
-        let reuse = splice::style_reuse_enabled()
-            && previous
-                .as_ref()
-                .is_some_and(|old| ng_lowering_stable(old, &styles[0].1));
+        let reuse = splice::style_reuse_enabled() && single_stable == Some(true);
         splice::set_style_reuse(reuse.then_some(styles[0].0));
         // `W3COS_STYLE_PATHS_KEEP`: hold the known style paths across the
         // splice, which forgets them on each subtree it swaps.
