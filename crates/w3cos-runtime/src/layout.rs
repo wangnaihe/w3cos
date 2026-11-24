@@ -1351,7 +1351,6 @@ pub(crate) fn replaced_layout_ratio(src: &str, style: &w3cos_std::style::Style) 
             .custom_properties
             .as_ref()
             .and_then(|props| props.get(key))
-            .map(String::as_str)
     };
     // object-fit is not painted, so the natural box stays (replaced-element-024).
     if marker("--w3cos-internal-object-fit").is_some() {
@@ -3952,7 +3951,7 @@ pub(crate) fn install_font_unit_provider() {
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get(w3cos_dom::user_agent::TEXT_LANGUAGE_PROPERTY))
-            .cloned();
+            .map(str::to_string);
         let key = FontUnitKey {
             family: style.font_family.clone(),
             standard,
@@ -7222,7 +7221,6 @@ fn align_table_cell_baselines(
                             .and_then(|properties| {
                                 properties.get("--w3cos-internal-vertical-align-keyword")
                             })
-                            .map(String::as_str)
                             .unwrap_or(match child.style.align_self {
                                 WAlignSelf::FlexStart => "top",
                                 WAlignSelf::FlexEnd => "bottom",
@@ -16172,7 +16170,6 @@ fn project_forced_break_inline_block_alignment(
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-            .map(String::as_str)
             .unwrap_or(match component.style.align_self {
                 WAlignSelf::FlexStart => "top",
                 WAlignSelf::Center => "middle",
@@ -17162,7 +17159,6 @@ pub(crate) fn inline_style_alignment_keyword(style: &w3cos_std::style::Style) ->
         .custom_properties
         .as_ref()
         .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-        .map(String::as_str)
         .unwrap_or(match style.align_self {
             WAlignSelf::FlexStart => "top",
             WAlignSelf::FlexEnd => "bottom",
@@ -18463,7 +18459,6 @@ fn project_inline_block_vertical_align_keywords(
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-            .map(String::as_str)
             .unwrap_or("baseline")
     }
 
@@ -30819,7 +30814,7 @@ mod tests {
                         node.style.position,
                         node.style.width,
                         node.style.white_space,
-                        node.style.custom_properties.as_ref().and_then(|p| p.get("--w3cos-internal-text-line-width").cloned()),
+                        node.style.custom_properties.as_ref().and_then(|p| p.get("--w3cos-internal-text-line-width").map(str::to_string)),
                         rect_of(index)
                     ));
                     if let Some(parent) = node.parent {

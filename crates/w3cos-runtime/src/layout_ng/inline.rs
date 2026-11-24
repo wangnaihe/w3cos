@@ -313,11 +313,7 @@ fn trim_line_for_block_ellipsis(
 }
 
 fn marker_value<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
-    style
-        .custom_properties
-        .as_ref()?
-        .get(key)
-        .map(String::as_str)
+    style.custom_properties.as_ref()?.get(key)
 }
 /// The cascade's UAX #9 pass (reorder_explicit_bidi_*) replaces a bidi
 /// paragraph's text by visual-order fragments: ltr, already reversed and
@@ -385,7 +381,6 @@ pub(super) fn line_relative_align(style: &Style) -> Option<bool> {
         .custom_properties
         .as_ref()
         .and_then(|p| p.get(VALIGN_MARKER))
-        .map(String::as_str)
     {
         Some("top") => Some(true),
         Some("bottom") => Some(false),
@@ -401,7 +396,7 @@ fn valign_reason(style: &Style) -> Option<&'static str> {
         .custom_properties
         .as_ref()
         .and_then(|p| p.get(VALIGN_MARKER));
-    match (marker.map(String::as_str), style.align_self) {
+    match (marker, style.align_self) {
         // middle: a baseline shift (vertical_align_shift).
         (None, AlignSelf::Auto | AlignSelf::Baseline | AlignSelf::Center) => None,
         (Some("top" | "text-top"), AlignSelf::FlexStart)
@@ -451,7 +446,6 @@ fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style
         .custom_properties
         .as_ref()
         .and_then(|p| p.get(VALIGN_MARKER))
-        .map(String::as_str)
     {
         Some("text-top") => return Some(ascent - inline_font_content_ascent(parent)),
         Some("text-bottom") => {
@@ -1383,8 +1377,7 @@ fn inline_box_reason(
         style
             .custom_properties
             .as_ref()
-            .and_then(|p| p.get(VALIGN_MARKER))
-            .map(String::as_str),
+            .and_then(|p| p.get(VALIGN_MARKER)),
         Some("text-top" | "text-bottom")
     ) {
         return Some("vertical-align-text-edge-box");
@@ -1743,13 +1736,11 @@ fn text_box_trim_ends(style: &Style) -> (bool, bool) {
     let trim = style
         .custom_properties
         .as_ref()
-        .and_then(|properties| properties.get("--w3cos-internal-text-box-trim"))
-        .map(String::as_str);
+        .and_then(|properties| properties.get("--w3cos-internal-text-box-trim"));
     let edge = style
         .custom_properties
         .as_ref()
-        .and_then(|properties| properties.get("--w3cos-internal-text-box-edge"))
-        .map(String::as_str);
+        .and_then(|properties| properties.get("--w3cos-internal-text-box-edge"));
     // Only an authored `text-box-edge: text` is implemented so far.
     // Initial/`auto` is left alone: unclassed start-001 refs assume no
     // trim until a variant sets the edge class.

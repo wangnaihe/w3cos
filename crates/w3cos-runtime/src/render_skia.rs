@@ -1069,7 +1069,7 @@ fn paint_display_list_with_suppressed_effects(
                     .custom_properties
                     .as_ref()
                     .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
-                    .filter(|source| source.as_str() == "first-line")
+                    .filter(|source| *source == "first-line")
                     .and_then(|_| artifact.nodes[idx].parent)
                     .and_then(|parent| {
                         group.iter().find(|&&member| {
@@ -1912,10 +1912,7 @@ fn inline_background_groups(
             && matches!(node.kind, ComponentKind::Text { .. })
             && artifact.rect_by_index[index].is_some()
         {
-            sources
-                .entry((parent, source.as_str()))
-                .or_default()
-                .push(index);
+            sources.entry((parent, source)).or_default().push(index);
         }
     }
     sources
@@ -2280,8 +2277,7 @@ fn paint_html_auto_control(
     let part = style
         .custom_properties
         .as_ref()
-        .and_then(|p| p.get("--w3cos-internal-html-control-appearance"))
-        .map(String::as_str);
+        .and_then(|p| p.get("--w3cos-internal-html-control-appearance"));
     let button = match (part, kind) {
         (Some("button"), ComponentKind::Button { .. }) => true,
         (Some("textfield" | "textarea"), ComponentKind::TextInput { .. }) => false,
@@ -2638,11 +2634,11 @@ fn render_node_with_applied_decorations(
         draw_box_border(canvas, inline_decoration_rect, style);
     }
 
-    if style.custom_properties.as_ref().is_some_and(|p| {
-        p.get("--w3cos-internal-media-controls-layer")
-            .map(String::as_str)
-            == Some("no-source")
-    }) {
+    if style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|p| p.get("--w3cos-internal-media-controls-layer") == Some("no-source"))
+    {
         media_controls_paint::draw(canvas, rect, style);
     }
 
@@ -2840,7 +2836,6 @@ fn render_node_with_applied_decorations(
                     .custom_properties
                     .as_ref()
                     .and_then(|props| props.get("--w3cos-ime-preedit"))
-                    .map(String::as_str)
                     .filter(|suffix| !suffix.is_empty())
                     && let Some((prefix, suffix)) = text_layout::split_preedit_suffix(text, suffix)
                 {
@@ -2919,7 +2914,7 @@ fn has_css_resize_indicator(style: &Style) -> bool {
         .and_then(|properties| properties.get(w3cos_dom::css_style::RESIZE_PROPERTY))
         .is_some_and(|value| {
             matches!(
-                value.as_str(),
+                value,
                 "both" | "horizontal" | "vertical" | "block" | "inline"
             )
         });
@@ -4590,7 +4585,7 @@ fn line_box_half_leading(style: &Style) -> f32 {
         .custom_properties
         .as_ref()
         .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"))
-        .is_some_and(|kind| matches!(kind.as_str(), "decimal" | "string"))
+        .is_some_and(|kind| matches!(kind, "decimal" | "string"))
     {
         return 0.0;
     }
@@ -4701,7 +4696,7 @@ fn effective_text_align_last(style: &Style) -> Option<TextAlign> {
         .custom_properties
         .as_ref()?
         .get("--w3cos-internal-text-align-last")?;
-    Some(match value.as_str() {
+    Some(match value {
         "left" => TextAlign::Left,
         "right" => TextAlign::Right,
         "center" => TextAlign::Center,

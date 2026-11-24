@@ -400,7 +400,7 @@ fn child_scroll_marker_host_is_the_originating_element() {
         .custom_properties
         .as_ref()
         .and_then(|properties| properties.get(super::SCROLL_MARKER_ORIGIN))
-        .cloned();
+        .map(str::to_string);
     assert_eq!(origin, Some(target.id.as_u32().to_string()));
     assert!(
         !matches!(

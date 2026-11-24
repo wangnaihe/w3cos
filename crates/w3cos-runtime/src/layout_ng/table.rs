@@ -136,7 +136,6 @@ fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
         .custom_properties
         .as_ref()
         .and_then(|props| props.get(key))
-        .map(String::as_str)
 }
 
 fn scrollish(overflow: Overflow) -> bool {

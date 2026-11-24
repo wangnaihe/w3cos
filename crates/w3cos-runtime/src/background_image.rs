@@ -518,7 +518,6 @@ fn layer_geometry(
             .custom_properties
             .as_ref()?
             .get(FIXED_BACKGROUND_POSITION)
-            .map(String::as_str)
     });
     let position = layer_value(
         original_position.or(style.background_position.as_deref()),

@@ -594,8 +594,7 @@ mod tests {
             root.custom_properties
                 .as_ref()
                 .unwrap()
-                .get(HTML_STANDARD_FONT_PROPERTY)
-                .map(String::as_str),
+                .get(HTML_STANDARD_FONT_PROPERTY),
             Some("1")
         );
     }
@@ -853,8 +852,7 @@ mod tests {
                         .style
                         .custom_properties
                         .as_ref()
-                        .and_then(|properties| properties.get(HTML_STANDARD_FONT_PROPERTY))
-                        .map(String::as_str),
+                        .and_then(|properties| properties.get(HTML_STANDARD_FONT_PROPERTY)),
                     Some("1"),
                     "anonymous line strut must use the same HTML face as its text"
                 );

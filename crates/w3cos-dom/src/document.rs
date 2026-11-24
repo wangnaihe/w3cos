@@ -267,7 +267,7 @@ impl CounterSnapshot {
 
 fn resolve_css_variables(
     value: &str,
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &w3cos_std::custom_properties::CustomProperties,
 ) -> String {
     let mut current = value.to_string();
     for _ in 0..10 {
@@ -297,7 +297,7 @@ fn resolve_css_variables(
             .map_or((inner, None), |(name, fallback)| {
                 (name.trim(), Some(fallback.trim()))
             });
-        let Some(replacement) = custom_properties.get(name).map(String::as_str).or(fallback) else {
+        let Some(replacement) = custom_properties.get(name).or(fallback) else {
             break;
         };
         current = format!("{}{}{}", &current[..start], replacement, &after[end + 1..]);
@@ -3853,7 +3853,6 @@ impl Document {
         let inherited_list_image = inherited
             .and_then(|style| style.custom_properties.as_ref())
             .and_then(|properties| properties.get(crate::css_style::LIST_IMAGE_PROPERTY))
-            .map(String::as_str)
             .unwrap_or("none");
         merged.set_property("list-style-image", inherited_list_image);
         let mut custom_properties = inherited
@@ -4186,7 +4185,7 @@ impl Document {
                 inherited
                     .and_then(|parent| parent.custom_properties.as_ref())
                     .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY))
-                    .cloned()
+                    .map(str::to_string)
             })
             // The document language also selects generic font defaults. Use
             // the selector's metadata fallback before resolving font metrics,
@@ -4326,10 +4325,10 @@ impl Document {
                 let Some(property) = crate::css_style::multicol_property_name(property) else {
                     continue;
                 };
-                let empty = std::collections::HashMap::<String, String>::new();
+                let empty = w3cos_std::custom_properties::CustomProperties::default();
                 let value = resolve_css_variables(
                     value,
-                    style.custom_properties.as_deref().unwrap_or(&empty),
+                    style.custom_properties.as_ref().unwrap_or(&empty),
                 );
                 if !crate::css_style::valid_multicol_declaration(property, &value) {
                     continue;
@@ -8505,11 +8504,10 @@ impl Document {
             ends: &mut Vec<usize>,
             previous_source: &mut Option<String>,
         ) {
-            let language = style.custom_properties.as_ref().and_then(|properties| {
-                properties
-                    .get("--w3cos-internal-text-language")
-                    .map(String::as_str)
-            });
+            let language = style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-text-language"));
             let continues_word = output
                 .chars()
                 .next_back()
@@ -8583,8 +8581,7 @@ impl Document {
                         .style
                         .custom_properties
                         .as_ref()
-                        .and_then(|properties| properties.get("--w3cos-internal-text-language"))
-                        .map(String::as_str),
+                        .and_then(|properties| properties.get("--w3cos-internal-text-language")),
                     output
                         .chars()
                         .next_back()
@@ -10821,7 +10818,7 @@ impl Document {
                             style
                                 .custom_properties
                                 .get_or_insert_with(Default::default)
-                                .insert(key.into(), value.clone());
+                                .insert(key.into(), value.to_string());
                         } else if let Some(properties) = style.custom_properties.as_mut() {
                             properties.remove(key);
                         }
@@ -14206,7 +14203,7 @@ fn inherit_text_style(
             style
                 .custom_properties
                 .get_or_insert_with(Default::default)
-                .insert(property.to_string(), value.clone());
+                .insert(property.to_string(), value.to_string());
         }
     }
     if !declares("font-style")
@@ -14272,7 +14269,7 @@ fn inherit_text_style(
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get(key))
-            .cloned();
+            .map(str::to_string);
         match inherited {
             Some(value) => {
                 style
@@ -14375,7 +14372,6 @@ fn resolve_generic_font_size_origin(
     let parent_origin = inherited
         .and_then(|parent| parent.custom_properties.as_ref())
         .and_then(|properties| properties.get(FONT_SIZE_ORIGIN))
-        .map(String::as_str)
         .unwrap_or("keyword:medium");
     let fixed = |family: Option<&str>| {
         family.is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"))
@@ -16739,12 +16735,16 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
         }
         if !decorated_border && style.background.a > 0 {
             for piece in &mut pieces {
-                piece
+                let properties = piece
                     .style
                     .custom_properties
-                    .get_or_insert_with(Default::default)
-                    .entry("--w3cos-internal-inline-background-group".into())
-                    .or_insert_with(|| format!("leaf:{source_index}"));
+                    .get_or_insert_with(Default::default);
+                if !properties.contains_key("--w3cos-internal-inline-background-group") {
+                    properties.insert(
+                        "--w3cos-internal-inline-background-group".into(),
+                        format!("leaf:{source_index}"),
+                    );
+                }
             }
         }
         fragments.extend(pieces);
@@ -19735,7 +19735,7 @@ mod generated_counter_format_tests {
                             properties.get("--w3cos-internal-outside-list-marker")
                         })
                 });
-                assert_eq!(marker.map(String::as_str), expected);
+                assert_eq!(marker, expected);
                 let text = generated
                     .children
                     .iter()
@@ -19802,8 +19802,7 @@ mod generated_counter_format_tests {
                     .custom_properties
                     .as_ref()
                     .unwrap()
-                    .get("--w3cos-internal-outside-list-marker")
-                    .map(String::as_str),
+                    .get("--w3cos-internal-outside-list-marker"),
                 Some("square")
             );
         }
@@ -19883,8 +19882,7 @@ mod generated_counter_format_tests {
                     .style
                     .custom_properties
                     .as_ref()
-                    .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"))
-                    .map(String::as_str);
+                    .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"));
                 assert_eq!(
                     kind,
                     if position == "outside" {
@@ -19916,8 +19914,7 @@ mod generated_counter_format_tests {
             let actual = marker
                 .as_ref()
                 .and_then(|marker| marker.style.custom_properties.as_ref())
-                .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"))
-                .map(String::as_str);
+                .and_then(|properties| properties.get("--w3cos-internal-outside-list-marker"));
             assert_eq!(actual, expected, "{value}");
         }
     }
@@ -19956,8 +19953,7 @@ mod generated_counter_format_tests {
                         .custom_properties
                         .as_ref()
                         .unwrap()
-                        .get("--w3cos-internal-outside-list-marker")
-                        .map(String::as_str),
+                        .get("--w3cos-internal-outside-list-marker"),
                     Some(previous),
                     "{value}"
                 );
@@ -20264,8 +20260,7 @@ mod generated_counter_format_tests {
                     .custom_properties
                     .as_ref()
                     .unwrap()
-                    .get("--w3cos-internal-outside-list-marker")
-                    .map(String::as_str),
+                    .get("--w3cos-internal-outside-list-marker"),
                 Some(marker_type)
             );
             if marker_type == "circle" {
@@ -21603,7 +21598,7 @@ mod image_component_tests {
                 .as_ref()
                 .and_then(|properties| properties.get(SPLIT_INLINE_FRAGMENT_OWNER))
             {
-                owners.push(owner.clone());
+                owners.push(owner.to_string());
             }
             for child in &component.children {
                 collect(child, owners);
@@ -21912,8 +21907,7 @@ mod image_component_tests {
                 .style
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-bidi-visual-order"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-bidi-visual-order")),
             Some("1")
         );
     }
@@ -22226,8 +22220,7 @@ mod image_component_tests {
                 .as_ref()
                 .and_then(|properties| {
                     properties.get("--w3cos-internal-quirks-percentage-height")
-                })
-                .map(String::as_str),
+                }),
             Some("1")
         );
 
@@ -24565,7 +24558,7 @@ mod image_component_tests {
                 .custom_properties
                 .as_ref()
                 .and_then(|p| p.get("--w3cos-internal-inline-background-group"))
-                .cloned()
+                .map(str::to_string)
         };
         let mut groups = Vec::new();
         for (size, alignment) in [(60.0, AlignSelf::Auto), (75.0, AlignSelf::FlexEnd)] {
@@ -24879,8 +24872,7 @@ mod image_component_tests {
                 .1
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-reserved-line-lift"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-reserved-line-lift")),
             None
         );
         assert_eq!(pseudo_runs[1].0, "X");
@@ -24908,8 +24900,7 @@ mod image_component_tests {
                 .style
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-reserved-line-lift"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-reserved-line-lift")),
             Some("40")
         );
         assert!(
@@ -26675,8 +26666,7 @@ mod image_component_tests {
                 .computed_style_for(block.id)
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-text-align-last"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-text-align-last")),
             Some("right")
         );
         crate::stylesheet::clear_rules();
@@ -26769,18 +26759,9 @@ mod image_component_tests {
         );
         for style in &styles {
             let properties = style.custom_properties.as_ref().expect("theme");
-            assert_eq!(
-                properties.get("--row-accent").map(String::as_str),
-                Some("#abcdef")
-            );
-            assert_eq!(
-                properties.get("--theme-color-3").map(String::as_str),
-                Some("#000000")
-            );
-            assert_eq!(
-                properties.get("--theme-color-63").map(String::as_str),
-                Some("#123456")
-            );
+            assert_eq!(properties.get("--row-accent"), Some("#abcdef"));
+            assert_eq!(properties.get("--theme-color-3"), Some("#000000"));
+            assert_eq!(properties.get("--theme-color-63"), Some("#123456"));
         }
     }
 
@@ -26822,8 +26803,7 @@ mod image_component_tests {
             parent_style
                 .custom_properties
                 .as_ref()
-                .and_then(|p| p.get(marker))
-                .map(String::as_str),
+                .and_then(|p| p.get(marker)),
             Some("inline-grid")
         );
         let before = w3cos_std::custom_properties::map_clone_count();
@@ -26842,10 +26822,7 @@ mod image_component_tests {
         );
         for style in &plain_styles {
             let properties = style.custom_properties.as_ref().expect("inherited theme");
-            assert_eq!(
-                properties.get("--theme-color-63").map(String::as_str),
-                Some("#123456")
-            );
+            assert_eq!(properties.get("--theme-color-63"), Some("#123456"));
             assert!(
                 properties.get(marker).is_none(),
                 "element-only marker was inherited"
@@ -26853,14 +26830,8 @@ mod image_component_tests {
         }
         for style in &marked_styles {
             let properties = style.custom_properties.as_ref().expect("inherited theme");
-            assert_eq!(
-                properties.get("--theme-color-0").map(String::as_str),
-                Some("#123456")
-            );
-            assert_eq!(
-                properties.get(marker).map(String::as_str),
-                Some("inline-grid")
-            );
+            assert_eq!(properties.get("--theme-color-0"), Some("#123456"));
+            assert_eq!(properties.get(marker), Some("inline-grid"));
         }
     }
 
@@ -27795,8 +27766,7 @@ mod image_component_tests {
                     .style
                     .custom_properties
                     .as_ref()
-                    .and_then(|properties| properties.get("--w3cos-internal-table-row-span"))
-                    .map(String::as_str);
+                    .and_then(|properties| properties.get("--w3cos-internal-table-row-span"));
                 assert_eq!(actual, expected, "{tag} rowspan={value}");
             }
         }
@@ -30061,7 +30031,7 @@ mod computed_style_cache_tests {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(key))
-                .cloned()
+                .map(str::to_string)
         };
         assert_eq!(child.font_size, 15.0);
         assert_eq!(grandchild.font_size, 15.0);
@@ -30107,8 +30077,7 @@ mod computed_style_cache_tests {
         assert_eq!(maps.len(), 3);
         for map in &maps {
             assert_eq!(
-                map.get("--w3cos-internal-computed-height-percent")
-                    .map(String::as_str),
+                map.get("--w3cos-internal-computed-height-percent"),
                 Some("20")
             );
             assert!(map.contains_key("--theme-color-31"));
@@ -30151,7 +30120,7 @@ mod computed_style_cache_tests {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY))
-                .cloned()
+                .map(str::to_string)
         };
         let parent = document.computed_style_for(body.id);
         let inherited = document.computed_style_for(inheriting.id);
@@ -30181,8 +30150,7 @@ mod computed_style_cache_tests {
                 .custom_properties
                 .as_ref()
                 .unwrap()
-                .get("--theme-color-9")
-                .map(String::as_str),
+                .get("--theme-color-9"),
             Some("#123456")
         );
     }
@@ -30210,20 +30178,11 @@ mod computed_style_cache_tests {
         let parent_properties = parent.custom_properties.as_ref().unwrap();
         let child_properties = shared.custom_properties.as_ref().unwrap();
         assert!(child_properties.ptr_eq(parent_properties));
-        assert_eq!(
-            child_properties.get("--theme-color-0").map(String::as_str),
-            Some("#123456")
-        );
+        assert_eq!(child_properties.get("--theme-color-0"), Some("#123456"));
         let overridden = overridden.custom_properties.as_ref().unwrap();
         assert!(!overridden.ptr_eq(parent_properties));
-        assert_eq!(
-            overridden.get("--theme-color-3").map(String::as_str),
-            Some("red")
-        );
-        assert_eq!(
-            parent_properties.get("--theme-color-3").map(String::as_str),
-            Some("#123456")
-        );
+        assert_eq!(overridden.get("--theme-color-3"), Some("red"));
+        assert_eq!(parent_properties.get("--theme-color-3"), Some("#123456"));
     }
 
     #[test]
@@ -30334,7 +30293,11 @@ mod computed_style_cache_tests {
             document
                 .computed_style_for(id)
                 .custom_properties
-                .and_then(|properties| properties.get(crate::css_style::TAB_SIZE_PROPERTY).cloned())
+                .and_then(|properties| {
+                    properties
+                        .get(crate::css_style::TAB_SIZE_PROPERTY)
+                        .map(str::to_string)
+                })
         };
         // (parent declarations, target declarations, target, child)
         for (parent_css, target_css, expected) in [
@@ -30412,10 +30375,11 @@ mod computed_style_cache_tests {
         // Same entries in a fresh allocation, as after the parent was
         // recomputed with identical variables.
         let mut rebuilt = parent.clone();
-        rebuilt.custom_properties = parent
-            .custom_properties
-            .as_ref()
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        rebuilt.custom_properties = parent.custom_properties.as_ref().map(|map| {
+            map.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        });
         assert!(
             !rebuilt
                 .custom_properties
@@ -30472,7 +30436,7 @@ mod computed_style_cache_tests {
             style
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get(name).cloned())
+                .and_then(|properties| properties.get(name).map(str::to_string))
         };
         let first = document.computed_style_for(leaf);
         assert_eq!(
@@ -30662,8 +30626,7 @@ mod computed_style_cache_tests {
                 .custom_properties
                 .as_ref()
                 .unwrap()
-                .get(crate::css_style::TEXT_DECORATION_COLOR_PROPERTY)
-                .map(String::as_str),
+                .get(crate::css_style::TEXT_DECORATION_COLOR_PROPERTY),
             Some("black")
         );
     }
@@ -30820,7 +30783,7 @@ mod computed_style_cache_tests {
         assert_eq!(style.padding_lengths().left, 8.0);
         assert_eq!(
             style.custom_properties.as_ref().unwrap().get("--chosen"),
-            Some(&"green".to_string())
+            Some("green")
         );
     }
 
@@ -31047,11 +31010,7 @@ mod computed_style_cache_tests {
         crate::stylesheet::clear_rules();
         const LANGUAGE: &str = "--w3cos-internal-text-language";
         fn language(style: &w3cos_std::Style) -> Option<&str> {
-            style
-                .custom_properties
-                .as_ref()?
-                .get(LANGUAGE)
-                .map(String::as_str)
+            style.custom_properties.as_ref()?.get(LANGUAGE)
         }
         fn line_height(style: &w3cos_std::Style) -> Option<f32> {
             Some(if language(style) == Some("en-us") {
@@ -31137,7 +31096,7 @@ mod computed_style_cache_tests {
                     .custom_properties
                     .as_ref()
                     .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY))
-                    .cloned()
+                    .map(str::to_string)
             };
             assert_eq!(
                 language(&document.computed_style_for(child.id)),
@@ -31340,7 +31299,7 @@ mod computed_style_cache_tests {
                 .as_ref()
                 .unwrap()
                 .get("--text"),
-            Some(&"  ordinary value  ".to_string())
+            Some("  ordinary value  ")
         );
         assert_eq!(
             document
@@ -31349,7 +31308,7 @@ mod computed_style_cache_tests {
                 .as_ref()
                 .unwrap()
                 .get("--text"),
-            Some(&"  ordinary value  ".to_string())
+            Some("  ordinary value  ")
         );
     }
 
@@ -34429,7 +34388,7 @@ fn parse_html_non_negative_integer(input: &str) -> Option<u32> {
 
 /// Whether an inherited custom property survives into a child's computed
 /// map: author custom properties and the inherited internal markers.
-fn inherited_custom_property(property: &String, _value: &String) -> bool {
+fn inherited_custom_property(property: &str, _value: &str) -> bool {
     !property.starts_with("--w3cos-internal-")
             || property == "--w3cos-internal-text-align-last"
             || property == "--w3cos-internal-text-justify"
@@ -34456,7 +34415,7 @@ fn add_internal_markers(
     properties: &mut w3cos_std::custom_properties::CustomProperties,
     internal: &w3cos_std::custom_properties::CustomProperties,
 ) {
-    let mut markers: Vec<(&String, &String)> = internal
+    let mut markers: Vec<(&str, &str)> = internal
         .iter()
         .filter(|(property, _)| property.starts_with("--w3cos-internal-"))
         .collect();
@@ -34473,7 +34432,7 @@ fn add_internal_markers(
     }
     properties.edit_shared("internal-markers", &key, |properties| {
         for (property, value) in markers {
-            properties.insert(property.clone(), value.clone());
+            properties.insert(property.to_string(), value.to_string());
         }
     });
 }

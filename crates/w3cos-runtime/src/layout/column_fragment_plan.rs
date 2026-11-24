@@ -630,7 +630,7 @@ fn forced_column_break_offsets(
             let style = nodes.get(index)?.0;
             let properties = style.custom_properties.as_ref()?;
             let value = properties.get("--w3cos-internal-break-before")?;
-            if !matches!(value.as_str(), "column" | "always" | "all" | "page") {
+            if !matches!(value, "column" | "always" | "all" | "page") {
                 return None;
             }
             rects.get(index).copied().flatten().map(|rect| rect.y)

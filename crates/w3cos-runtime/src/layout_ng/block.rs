@@ -79,11 +79,7 @@ pub(super) fn used_height(style: &Style, space: &ConstraintSpace) -> Dimension {
 }
 
 pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
-    style
-        .custom_properties
-        .as_ref()
-        .and_then(|p| p.get(key))
-        .map(String::as_str)
+    style.custom_properties.as_ref().and_then(|p| p.get(key))
 }
 
 /// An HTML `<button>` (the DOM marks it; a collapsed `<select>` lowers to
@@ -383,7 +379,7 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
             props.keys().any(|key| {
                 key.starts_with("--w3cos-internal")
                     && !is_value_carrier_marker(key)
-                    && !allowed.contains(&key.as_str())
+                    && !allowed.contains(&key)
                     // Intrinsic width keywords: in-flow blocks resolve
                     // them (keyword_inline_size), flex containers through
                     // apply_width_keywords.
@@ -4207,7 +4203,7 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
                 properties.remove("--w3cos-internal-webkit-box-orient");
                 // `-webkit-line-clamp` counts the box's lines (inline.rs).
                 if let Some(lines) = properties.remove("--w3cos-internal-webkit-line-clamp") {
-                    properties.insert(inline::CLAMP_MARKER.into(), lines);
+                    properties.insert(inline::CLAMP_MARKER.into(), lines.to_string());
                 }
                 if properties.is_empty() {
                     style.custom_properties = None;

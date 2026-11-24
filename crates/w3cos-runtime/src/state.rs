@@ -520,7 +520,7 @@ pub fn shell_win_label(root: &Component, index: usize) -> Option<String> {
         .custom_properties
         .as_ref()?
         .get("--w3cos-win")
-        .cloned()
+        .map(str::to_string)
 }
 
 pub fn with_shell_win_draft(root: &Component, index: usize, draft: String) -> String {
@@ -530,7 +530,7 @@ pub fn with_shell_win_draft(root: &Component, index: usize, draft: String) -> St
     if let Some(label) = node_at(root, index)
         .and_then(|node| node.style.custom_properties.as_ref())
         .and_then(|props| props.get("--w3cos-draft"))
-        .cloned()
+        .map(str::to_string)
     {
         return label;
     }
@@ -541,7 +541,7 @@ pub fn with_shell_win_draft(root: &Component, index: usize, draft: String) -> St
 pub fn shell_gesture_at(root: &Component, index: usize) -> Option<(i64, u8)> {
     let props = node_at(root, index)?.style.custom_properties.as_ref()?;
     let id = props.get("--w3cos-win")?.parse().ok()?;
-    let mode = match props.get("--w3cos-gesture")?.as_str() {
+    let mode = match props.get("--w3cos-gesture")? {
         "move" => 0,
         "n" => 1,
         "s" => 2,
