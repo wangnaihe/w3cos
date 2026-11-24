@@ -1746,9 +1746,12 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
             fields.push_str(&format!("    num_regs: [f64; {}],\n", plan.n_num));
             inits.push_str(&format!("        num_regs: [0.0_f64; {}],\n", plan.n_num));
         } else {
-            fields.push_str("    num_regs: Vec<f64>,\n");
+            fields.push_str(&format!(
+                "    num_regs: w3cos_core::aot_frame::Registers<{}, f64>,\n",
+                plan.n_num
+            ));
             inits.push_str(&format!(
-                "        num_regs: vec![0.0_f64; {}],\n",
+                "        num_regs: vec![0.0_f64; {}].into(),\n",
                 plan.n_num
             ));
         }
@@ -1758,9 +1761,12 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
             fields.push_str(&format!("    bool_regs: [bool; {}],\n", plan.n_bool));
             inits.push_str(&format!("        bool_regs: [false; {}],\n", plan.n_bool));
         } else {
-            fields.push_str("    bool_regs: Vec<bool>,\n");
+            fields.push_str(&format!(
+                "    bool_regs: w3cos_core::aot_frame::Registers<{}, bool>,\n",
+                plan.n_bool
+            ));
             inits.push_str(&format!(
-                "        bool_regs: vec![false; {}],\n",
+                "        bool_regs: vec![false; {}].into(),\n",
                 plan.n_bool
             ));
         }
@@ -1776,9 +1782,12 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
                 plan.n_num_bindings
             ));
         } else {
-            fields.push_str("    num_bindings: Vec<f64>,\n");
+            fields.push_str(&format!(
+                "    num_bindings: w3cos_core::aot_frame::Registers<{}, f64>,\n",
+                plan.n_num_bindings
+            ));
             inits.push_str(&format!(
-                "        num_bindings: vec![0.0_f64; {}],\n",
+                "        num_bindings: vec![0.0_f64; {}].into(),\n",
                 plan.n_num_bindings
             ));
         }
@@ -2312,7 +2321,7 @@ fn emit_binding_assign(storage: SlotStorage, id: u32, value: &str) -> String {
     match storage {
         SlotStorage::Dense(_) | SlotStorage::Packed(_, _) => {
             let index = slot_index(storage, id);
-            format!("        bindings[{index}] = Some({value});\n")
+            format!("        w3cos_core::aot_frame::set_slot(&mut bindings, {index}, {value});\n")
         }
         SlotStorage::Map => format!("        bindings.insert({id}, {value});\n"),
     }
@@ -9929,6 +9938,52 @@ fn main() {{
             "protected calls should match a JS completion: {generated}"
         );
         assert!(generated.contains("match self.block"));
+    }
+
+    #[test]
+    fn wide_unboxed_banks_and_binding_slots_avoid_vec_indexing() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function wide() {
+                    return (1 + 2) * (3 + 4) - (5 + 6) / (7 + 8) + (9 + 10) * (11 + 12) - (13 + 14) / (15 + 16)
+                        + ((1 < 2) === (3 < 4) ? 1 : 0) + ((5 < 6) === (7 < 8) ? 1 : 0)
+                        + ((9 < 10) === (11 < 12) ? 1 : 0) + ((13 < 14) === (15 < 16) ? 1 : 0)
+                        + ((17 < 18) === (19 < 20) ? 1 : 0);
+                }
+                function outer() {
+                    let c0 = 0, c1 = 1, c2 = 2, c3 = 3, c4 = 4, c5 = 5, c6 = 6, c7 = 7, c8 = 8, c9 = 9;
+                    function inner() { return c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9; }
+                    return inner;
+                }
+                wide; outer;
+            "#,
+            "app:///frame-banks.js",
+        )
+        .unwrap();
+        let generated = |name: &str| {
+            let function = module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(name))
+                .unwrap();
+            generate_sync_function_from_module(&module, function, &format!("{name}_aot")).unwrap()
+        };
+        let wide = generated("wide");
+        assert!(
+            wide.contains("num_regs: w3cos_core::aot_frame::Registers<")
+                && wide.contains("bool_regs: w3cos_core::aot_frame::Registers<"),
+            "wide unboxed banks should use Registers: {wide}"
+        );
+        assert!(
+            !wide.contains("Vec<f64>") && !wide.contains("Vec<bool>"),
+            "no Vec banks (a panic location per indexing site): {wide}"
+        );
+        let outer = generated("outer");
+        assert!(
+            outer.contains("w3cos_core::aot_frame::set_slot(&mut bindings, ")
+                && !outer.contains("        bindings[0] = Some("),
+            "binding slots should be filled through set_slot: {outer}"
+        );
     }
 
     #[test]
