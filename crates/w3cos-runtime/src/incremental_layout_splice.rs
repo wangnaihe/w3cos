@@ -6089,8 +6089,11 @@ mod tests {
                 assert!(crate::incremental_layout::flush());
                 assert_matches_full(&format!("skip proj inserted mode {mode} step {step}"));
             }
+            // The class toggle is a splice only with STYLE_LOCAL on; with it
+            // off the full layout still matches.
             assert!(
-                SKIP_PROJ_INSERTED_HITS.with(std::cell::Cell::get) > 0,
+                crate::incremental_layout::style_local_mode() == 0
+                    || SKIP_PROJ_INSERTED_HITS.with(std::cell::Cell::get) > 0,
                 "mode {mode}: no splice kept the projections from the inserted boxes"
             );
         }
