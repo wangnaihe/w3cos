@@ -2197,7 +2197,9 @@ fn emit_registers_field(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
         format!("    registers: [w3cos_core::Value; {n}],\n")
     } else {
-        "    registers: Vec<w3cos_core::Value>,\n".to_string()
+        // Not a `Vec`: see `w3cos_core::aot_frame::Registers` (one shared
+        // panic location instead of one per register access site).
+        "    registers: w3cos_core::aot_frame::Registers,\n".to_string()
     }
 }
 
@@ -2205,7 +2207,7 @@ fn emit_registers_init(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
         format!("        registers: [const {{ w3cos_core::Value::Undefined }}; {n}],\n")
     } else {
-        format!("        registers: vec![w3cos_core::Value::Undefined; {n}],\n")
+        format!("        registers: vec![w3cos_core::Value::Undefined; {n}].into(),\n")
     }
 }
 
