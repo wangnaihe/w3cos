@@ -48,52 +48,42 @@ impl<T> Slots<T> for Vec<Option<T>> {
     }
 }
 
-/// Register file of a generated frame too wide to inline as an array.
+/// Register file of a generated frame too wide to inline as an array: a
+/// heap-allocated `[Value; N]` reached through `Deref`.
 ///
 /// Generated code indexes registers with constant positions
-/// (`self.registers[13]`). On an inline array that bounds check is decided at
-/// compile time, but indexing a `Vec` goes through its `#[track_caller]`
-/// `Index` impl, which gives every access site its own
-/// `core::panic::Location` (24 bytes plus a load-time relocation in
-/// `.data.rel.ro`, so a dirty, process-private page once the dylib is
-/// loaded). Code-OSS has ~13M such sites: ~85% of the 370MB of
-/// `.data.rel.ro` across its segment dylibs. These `Index` impls are not
-/// `#[track_caller]`, so the location is the one below, shared by every site.
-pub struct Registers(Box<[Value]>);
+/// (`self.registers[13]`). Each indexing of a `Vec` (or any `Index` impl,
+/// since `Index::index` is `#[track_caller]`), and each direct deref of a
+/// `Box` (debug alignment/null checks), records a per-site
+/// `core::panic::Location`: 24 bytes plus a load-time relocation in
+/// `.data.rel.ro`, a process-private dirty page once the dylib is loaded.
+/// Code-OSS has ~11M such sites. Through this type the site only calls
+/// `Deref::deref` (not `#[track_caller]`) and then indexes an array with a
+/// constant, which is checked at compile time, so the only locations are
+/// the ones inside these impls (once per `N`).
+pub struct Registers<const N: usize>(Box<[Value; N]>);
 
-impl From<Vec<Value>> for Registers {
+impl<const N: usize> From<Vec<Value>> for Registers<N> {
     #[inline]
     fn from(registers: Vec<Value>) -> Self {
-        Self(registers.into_boxed_slice())
+        match registers.into_boxed_slice().try_into() {
+            Ok(registers) => Self(registers),
+            Err(registers) => panic!("{} registers for a frame of {N}", registers.len()),
+        }
     }
 }
 
-impl std::ops::Index<usize> for Registers {
-    type Output = Value;
+impl<const N: usize> std::ops::Deref for Registers<N> {
+    type Target = [Value; N];
     #[inline]
-    fn index(&self, index: usize) -> &Value {
-        &self.0[index]
-    }
-}
-
-impl std::ops::IndexMut<usize> for Registers {
-    #[inline]
-    fn index_mut(&mut self, index: usize) -> &mut Value {
-        &mut self.0[index]
-    }
-}
-
-impl std::ops::Deref for Registers {
-    type Target = [Value];
-    #[inline]
-    fn deref(&self) -> &[Value] {
+    fn deref(&self) -> &[Value; N] {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for Registers {
+impl<const N: usize> std::ops::DerefMut for Registers<N> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut [Value] {
+    fn deref_mut(&mut self) -> &mut [Value; N] {
         &mut self.0
     }
 }
@@ -473,7 +463,7 @@ mod tests {
 
     #[test]
     fn registers_index_like_the_vec_they_replace() {
-        let mut registers: Registers = vec![Value::Undefined; 12].into();
+        let mut registers: Registers<12> = vec![Value::Undefined; 12].into();
         assert_eq!(registers.len(), 12);
         registers[11] = Value::Number(4.0);
         let taken = std::mem::replace(&mut registers[11], Value::Undefined);
@@ -491,7 +481,8 @@ mod tests {
     #[test]
     #[should_panic]
     fn registers_still_bounds_check() {
-        let registers: Registers = vec![Value::Undefined; 9].into();
-        let _ = &registers[9];
+        let registers: Registers<9> = vec![Value::Undefined; 9].into();
+        let index = registers.len();
+        let _ = &registers[index];
     }
 }

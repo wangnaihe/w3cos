@@ -2197,9 +2197,9 @@ fn emit_registers_field(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
         format!("    registers: [w3cos_core::Value; {n}],\n")
     } else {
-        // Not a `Vec`: see `w3cos_core::aot_frame::Registers` (one shared
-        // panic location instead of one per register access site).
-        "    registers: w3cos_core::aot_frame::Registers,\n".to_string()
+        // Not a `Vec`: see `w3cos_core::aot_frame::Registers` (no panic
+        // location per register access site).
+        format!("    registers: w3cos_core::aot_frame::Registers<{n}>,\n")
     }
 }
 
