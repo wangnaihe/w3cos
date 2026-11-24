@@ -1738,58 +1738,47 @@ fn apply_register_def(
     }
 }
 
+/// Widest unboxed bank kept as a fixed-size array behind
+/// `w3cos_core::aot_frame::Registers`. Beyond this the bank stays a `Vec`:
+/// a single 2049-slot `Registers<_, f64>` frame (test262
+/// `Array/prototype/sort/stability-2048-elements.js`) pushed a test262
+/// batch build past its 6 GiB address-space cap, while the `Vec` form
+/// builds. Code-OSS has ~13.2k wide banks, all but ~40 at or below this.
+const UNBOXED_ARRAY_MAX: usize = 256;
+
+/// Field and initializer for one unboxed register bank of `n` slots.
+fn emit_unboxed_bank(name: &str, ty: &str, zero: &str, n: usize) -> (String, String) {
+    if n <= INLINE_FRAME {
+        (
+            format!("    {name}: [{ty}; {n}],\n"),
+            format!("        {name}: [{zero}; {n}],\n"),
+        )
+    } else if n <= UNBOXED_ARRAY_MAX {
+        // No panic location per constant-index site (see `Registers`).
+        (
+            format!("    {name}: w3cos_core::aot_frame::Registers<{n}, {ty}>,\n"),
+            format!("        {name}: vec![{zero}; {n}].into(),\n"),
+        )
+    } else {
+        (
+            format!("    {name}: Vec<{ty}>,\n"),
+            format!("        {name}: vec![{zero}; {n}],\n"),
+        )
+    }
+}
+
 fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
     let mut fields = String::new();
     let mut inits = String::new();
-    if plan.n_num > 0 {
-        if (plan.n_num as usize) <= INLINE_FRAME {
-            fields.push_str(&format!("    num_regs: [f64; {}],\n", plan.n_num));
-            inits.push_str(&format!("        num_regs: [0.0_f64; {}],\n", plan.n_num));
-        } else {
-            fields.push_str(&format!(
-                "    num_regs: w3cos_core::aot_frame::Registers<{}, f64>,\n",
-                plan.n_num
-            ));
-            inits.push_str(&format!(
-                "        num_regs: vec![0.0_f64; {}].into(),\n",
-                plan.n_num
-            ));
-        }
-    }
-    if plan.n_bool > 0 {
-        if (plan.n_bool as usize) <= INLINE_FRAME {
-            fields.push_str(&format!("    bool_regs: [bool; {}],\n", plan.n_bool));
-            inits.push_str(&format!("        bool_regs: [false; {}],\n", plan.n_bool));
-        } else {
-            fields.push_str(&format!(
-                "    bool_regs: w3cos_core::aot_frame::Registers<{}, bool>,\n",
-                plan.n_bool
-            ));
-            inits.push_str(&format!(
-                "        bool_regs: vec![false; {}].into(),\n",
-                plan.n_bool
-            ));
-        }
-    }
-    if plan.n_num_bindings > 0 {
-        if (plan.n_num_bindings as usize) <= INLINE_FRAME {
-            fields.push_str(&format!(
-                "    num_bindings: [f64; {}],\n",
-                plan.n_num_bindings
-            ));
-            inits.push_str(&format!(
-                "        num_bindings: [0.0_f64; {}],\n",
-                plan.n_num_bindings
-            ));
-        } else {
-            fields.push_str(&format!(
-                "    num_bindings: w3cos_core::aot_frame::Registers<{}, f64>,\n",
-                plan.n_num_bindings
-            ));
-            inits.push_str(&format!(
-                "        num_bindings: vec![0.0_f64; {}].into(),\n",
-                plan.n_num_bindings
-            ));
+    for (name, ty, zero, n) in [
+        ("num_regs", "f64", "0.0_f64", plan.n_num),
+        ("bool_regs", "bool", "false", plan.n_bool),
+        ("num_bindings", "f64", "0.0_f64", plan.n_num_bindings),
+    ] {
+        if n > 0 {
+            let (field, init) = emit_unboxed_bank(name, ty, zero, n as usize);
+            fields.push_str(&field);
+            inits.push_str(&init);
         }
     }
     if !plan.tdz_cache.is_empty() {
@@ -9983,6 +9972,33 @@ fn main() {{
             outer.contains("w3cos_core::aot_frame::set_slot(&mut bindings, ")
                 && !outer.contains("        bindings[0] = Some("),
             "binding slots should be filled through set_slot: {outer}"
+        );
+    }
+
+    #[test]
+    fn unboxed_banks_pick_array_registers_or_vec_by_width() {
+        assert_eq!(
+            emit_unboxed_bank("num_regs", "f64", "0.0_f64", 4),
+            (
+                "    num_regs: [f64; 4],\n".to_string(),
+                "        num_regs: [0.0_f64; 4],\n".to_string()
+            )
+        );
+        assert_eq!(
+            emit_unboxed_bank("bool_regs", "bool", "false", UNBOXED_ARRAY_MAX),
+            (
+                format!(
+                    "    bool_regs: w3cos_core::aot_frame::Registers<{UNBOXED_ARRAY_MAX}, bool>,\n"
+                ),
+                format!("        bool_regs: vec![false; {UNBOXED_ARRAY_MAX}].into(),\n")
+            )
+        );
+        assert_eq!(
+            emit_unboxed_bank("num_regs", "f64", "0.0_f64", 2049),
+            (
+                "    num_regs: Vec<f64>,\n".to_string(),
+                "        num_regs: vec![0.0_f64; 2049],\n".to_string()
+            )
         );
     }
 
