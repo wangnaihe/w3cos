@@ -294,6 +294,69 @@ fn common_prefix(a: &mut Vec<u32>, b: &[u32]) {
     a.truncate(len);
 }
 
+/// `W3COS_TAIL_SHIFT_FAST=1|verify` (off by default): the boxes after a
+/// splice that only move (Blink moves their fragments as a whole) are
+/// deduplicated with a bitmap instead of a sort, and their DOM rects move in
+/// one batched write. `verify` also sorts and compares the two sets.
+fn tail_shift_fast_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TAIL_SHIFT_FAST_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_TAIL_SHIFT_FAST").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TAIL_SHIFT_FAST_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    static TAIL_SHIFT_FAST_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Remove repeated host ids (a host can own several boxes). Order is not
+/// observable: every id gets the same edit.
+fn dedup_hosts(ids: &mut Vec<u32>) {
+    let mode = tail_shift_fast_mode();
+    if mode == 0 {
+        ids.sort_unstable();
+        ids.dedup();
+        return;
+    }
+    let reference = (mode == 2).then(|| {
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted
+    });
+    let max = ids.iter().copied().max().unwrap_or(0) as usize;
+    let mut seen = vec![0u64; max / 64 + 1];
+    ids.retain(|&id| {
+        let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
+        let fresh = seen[word] & bit == 0;
+        seen[word] |= bit;
+        fresh
+    });
+    if let Some(reference) = reference {
+        let mut got = ids.clone();
+        got.sort_unstable();
+        if got != reference {
+            TAIL_SHIFT_FAST_MISMATCHES.with(|n| n.set(n.get() + 1));
+            eprintln!(
+                "[tail-shift-fast-verify] mismatch: {} ids vs {} sorted",
+                got.len(),
+                reference.len()
+            );
+        }
+    }
+}
+
 fn collect_hosts(component: &Component, out: &mut Vec<u32>) {
     let mut stack = vec![component];
     while let Some(node) = stack.pop() {
@@ -2099,8 +2162,7 @@ fn try_splice_with(
     } else {
         grown.clear();
     }
-    shifted.sort_unstable();
-    shifted.dedup();
+    dedup_hosts(&mut shifted);
     let shifted_nodes = shifted.len() as u32;
 
     // CSSOM fragment rects (Blink keeps them on the fragments; here one map
@@ -2210,11 +2272,15 @@ fn try_splice_with(
                 w3cos_dom::DOMRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
             );
         }
-        for id in shifted {
-            let id = NodeId::from_u32(id);
-            let mut rect = document.get_layout_rect(id);
-            rect.y += dh;
-            document.set_layout_rect(id, rect);
+        if tail_shift_fast_mode() != 0 {
+            document.shift_layout_rects_y(&shifted, dh);
+        } else {
+            for id in shifted {
+                let id = NodeId::from_u32(id);
+                let mut rect = document.get_layout_rect(id);
+                rect.y += dh;
+                document.set_layout_rect(id, rect);
+            }
         }
         for id in grown {
             let id = NodeId::from_u32(id);
@@ -5281,6 +5347,60 @@ mod tests {
         class_width_toggle_matches_full_layout();
         class_padding_toggle_keeps_lowered_tree();
         style_local_own_width_edit_matches_full();
+    }
+
+    /// `W3COS_TAIL_SHIFT_FAST`: the bitmap dedup keeps exactly the sorted
+    /// set, and a class toggle that moves the following messages still
+    /// matches a full layout.
+    #[test]
+    fn tail_shift_fast_matches_the_sorted_shift() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                TAIL_SHIFT_FAST_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        TAIL_SHIFT_FAST_OVERRIDE.with(|m| m.set(Some(2)));
+        let mut ids = vec![9, 3, 70, 3, 0, 70, 129, 9];
+        dedup_hosts(&mut ids);
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 3, 9, 70, 129]);
+        assert_eq!(ids.len(), 5);
+        assert_eq!(TAIL_SHIFT_FAST_MISMATCHES.with(std::cell::Cell::get), 0);
+        for mode in [2u8, 1] {
+            TAIL_SHIFT_FAST_OVERRIDE.with(|m| m.set(Some(mode)));
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".pad", &[("padding", "14px")]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let mut bubbles = Vec::new();
+            for index in 0..5 {
+                let bubble = crate::dom::create_element("div");
+                let p = crate::dom::create_element("p");
+                crate::dom::append_child(
+                    p,
+                    crate::dom::create_text_node(&format!("message {index} alpha beta")),
+                );
+                crate::dom::append_child(bubble, p);
+                crate::dom::append_child(crate::dom::body_id(), bubble);
+                bubbles.push(bubble);
+            }
+            assert!(crate::incremental_layout::flush());
+            for step in 0..4 {
+                if step % 2 == 0 {
+                    crate::dom::class_list_add(bubbles[1], "pad");
+                } else {
+                    crate::dom::class_list_remove(bubbles[1], "pad");
+                }
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("tail shift mode {mode} step {step}"));
+            }
+        }
+        assert_eq!(TAIL_SHIFT_FAST_MISMATCHES.with(std::cell::Cell::get), 0);
+        crate::stylesheet::clear_rules();
     }
 
     /// `W3COS_ELIG_IFC_MEMO`: a padding toggle on a bubble keeps its

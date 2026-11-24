@@ -2296,6 +2296,29 @@ impl Document {
         }
     }
 
+    /// Move the rects of `ids` down by `dy` (a splice's following boxes):
+    /// one settle and one epoch bump for the batch, otherwise exactly
+    /// `set_layout_rect(id, rect + dy)` per id.
+    pub fn shift_layout_rects_y(&mut self, ids: &[u32], dy: f32) {
+        self.settle_layout_rects();
+        if ids.is_empty() {
+            return;
+        }
+        self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+        for &id in ids {
+            let idx = id as usize;
+            let rects = self.layout_rects.get_mut();
+            let Some(rect) = rects.get_mut(idx) else {
+                continue;
+            };
+            let before = rect.y;
+            rect.y += dy;
+            if rect.y != before {
+                self.mark_extent_dirty(NodeId(id));
+            }
+        }
+    }
+
     fn mark_extent_dirty(&mut self, id: NodeId) {
         mark_extent_chain(&self.nodes, self.extent.get_mut(), id);
     }
