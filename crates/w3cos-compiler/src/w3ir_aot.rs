@@ -7745,7 +7745,7 @@ fn emit_instruction(
             };
             if propagates_with_question_mark(&propagate) {
                 format!(
-                    "self.registers[{dst_reg}] = w3cos_core::aot_frame::{helper}(&self.capture_getters, &self.bindings, {key})?;"
+                    "self.registers[{dst_reg}] = w3cos_core::frame_try!(w3cos_core::aot_frame::{helper}(&self.capture_getters, &self.bindings, {key}));"
                 )
             } else {
                 format!(
@@ -7804,7 +7804,8 @@ fn emit_instruction(
                 "w3cos_core::aot_frame::{helper}(&self.capture_setters, &self.bindings, {key}, {value_expr})"
             );
             if propagates_with_question_mark(&propagate) {
-                format!("{call}?;")
+                // Not `?`: see `w3cos_core::frame_try!`.
+                format!("w3cos_core::frame_try!({call});")
             } else {
                 format!("match {call} {{ Ok(()) => {{}} Err(__w3cos_exception) => {propagate} }}")
             }
@@ -9926,6 +9927,41 @@ fn main() {{
             "protected calls should match a JS completion: {generated}"
         );
         assert!(generated.contains("match self.block"));
+    }
+
+    #[test]
+    fn binding_loads_and_stores_return_errors_without_question_mark() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function outer() {
+                    let count = 0;
+                    function bump() {
+                        count = count + 1;
+                        return count;
+                    }
+                    return bump;
+                }
+                outer;
+            "#,
+            "app:///frame-try-bindings.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("bump"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "bump_aot").unwrap();
+        assert!(
+            generated.contains("w3cos_core::frame_try!(w3cos_core::aot_frame::load(")
+                && generated.contains("w3cos_core::frame_try!(w3cos_core::aot_frame::store("),
+            "binding access should propagate through frame_try!: {generated}"
+        );
+        assert!(
+            !generated.contains("aot_frame::load(&self.capture_getters, &self.bindings, 0)?")
+                && !generated.contains(")?;"),
+            "no `?` (a panic location per site): {generated}"
+        );
     }
 
     #[test]

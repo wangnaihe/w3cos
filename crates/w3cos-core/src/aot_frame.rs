@@ -12,6 +12,26 @@ use std::rc::Rc;
 
 use crate::{AotCapture, AotCaptureMap, Value, catch_js, intrinsics};
 
+/// `$result?` for generated frames, without a panic location per site.
+///
+/// `?` on a `Result` calls `FromResidual::from_residual`, which is
+/// `#[track_caller]`, so every `?` in generated code records its own
+/// `core::panic::Location` (24 bytes plus a load-time relocation in
+/// `.data.rel.ro`, a process-private dirty page once the dylib is loaded).
+/// Code-OSS emits ~1.6M binding loads and stores through `?`. This is the same
+/// early return without the location.
+#[macro_export]
+macro_rules! frame_try {
+    ($result:expr) => {
+        match $result {
+            ::core::result::Result::Ok(value) => value,
+            ::core::result::Result::Err(error) => {
+                return ::core::result::Result::Err(::core::convert::From::from(error));
+            }
+        }
+    };
+}
+
 /// A W3IR binding cell: `(value, initialized)`.
 pub type BindingCell = Rc<RefCell<(Value, bool)>>;
 
@@ -419,5 +439,15 @@ mod tests {
         );
         assert_eq!(load(&getters, &bindings, 1).unwrap().to_number(), 7.0);
         assert!(getters.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn frame_try_returns_the_error_like_question_mark() {
+        fn run(input: Result<Value, Value>) -> Result<f64, Value> {
+            let value = crate::frame_try!(input);
+            Ok(value.to_number() + 1.0)
+        }
+        assert_eq!(run(Ok(Value::Number(1.0))).unwrap(), 2.0);
+        assert_eq!(run(Err(Value::Number(7.0))).unwrap_err().to_number(), 7.0);
     }
 }
