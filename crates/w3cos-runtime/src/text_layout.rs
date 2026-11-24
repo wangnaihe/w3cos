@@ -790,6 +790,42 @@ impl ParagraphWidths {
             && self.is_cluster_boundary(end)
             && self.advance_before(end) - self.advance_before(start) + self.margin < available
     }
+
+    /// Whether the whole paragraph certainly overflows `available`: its
+    /// advance exceeds it by more than a whole margin.
+    fn certainly_overflows(&self, available: f32) -> bool {
+        self.advance_before(self.len) - self.margin > available
+    }
+}
+
+/// `W3COS_WRAP_FIT_ESTIMATE=1|verify` (default off): the one-line check
+/// before greedy wrapping reads the paragraph's single shaping (Blink's
+/// line breaker takes the whole paragraph's ShapeResult width) and shapes
+/// the whole text on its own only when that lands within a margin of the
+/// available width. `verify` also shapes it and reports a differing answer.
+pub(crate) fn wrap_fit_estimate_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = WRAP_FIT_ESTIMATE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_WRAP_FIT_ESTIMATE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WRAP_FIT_ESTIMATE_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static WRAP_FIT_ESTIMATE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static WRAP_FIT_ESTIMATE_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn wrap_estimate_verify() -> bool {
@@ -816,6 +852,8 @@ fn wrap_greedy_with_line_width_estimated(
     // change neutral resolution and reduce the complete run's advance. Never
     // invent a soft break when that complete run fits the first available band.
     // Mandatory breaks still take the ordinary line-by-line path below.
+    // Shaped on the first overflow check, like the opportunities.
+    let mut paragraph: Option<Option<ParagraphWidths>> = None;
     if !text.is_empty()
         && !text
             .chars()
@@ -823,7 +861,44 @@ fn wrap_greedy_with_line_width_estimated(
     {
         let available_width = line_width(0).max(1.0);
         let fitting_roundoff = available_width * f32::EPSILON * 4.0;
-        if run_width(text) <= available_width + fitting_roundoff {
+        let limit = available_width + fitting_roundoff;
+        let fit_mode = wrap_fit_estimate_mode();
+        // `Some(fits)` when the paragraph shaping decides it.
+        let estimated = match (fit_mode, estimate.as_mut()) {
+            (0, _) | (_, None) => None,
+            (_, Some(estimate)) => paragraph
+                .get_or_insert_with(|| estimate(text))
+                .as_ref()
+                .and_then(|widths| {
+                    if widths.certainly_fits(0, text.len(), limit) {
+                        Some(true)
+                    } else if widths.certainly_overflows(limit) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }),
+        };
+        let fits = match estimated {
+            Some(fits) if fit_mode == 1 => {
+                WRAP_FIT_ESTIMATE_HITS.with(|n| n.set(n.get() + 1));
+                fits
+            }
+            Some(fits) => {
+                WRAP_FIT_ESTIMATE_HITS.with(|n| n.set(n.get() + 1));
+                let exact = run_width(text) <= limit;
+                if exact != fits {
+                    WRAP_FIT_ESTIMATE_MISMATCHES.with(|n| n.set(n.get() + 1));
+                    eprintln!(
+                        "[wrap-fit-estimate-verify] mismatch: estimate {fits} exact {exact} for {} bytes",
+                        text.len()
+                    );
+                }
+                exact
+            }
+            None => run_width(text) <= limit,
+        };
+        if fits {
             return vec![text.to_string()];
         }
     }
@@ -835,8 +910,6 @@ fn wrap_greedy_with_line_width_estimated(
     // UAX #14 opportunities (crate::line_break), computed on the first
     // overflow only: most runs fit and never need them.
     let mut opportunities: Option<Vec<usize>> = None;
-    // Shaped on the first overflow check, like the opportunities.
-    let mut paragraph: Option<Option<ParagraphWidths>> = None;
     let flush = |lines: &mut Vec<String>, current: &mut String| {
         if !current.is_empty() {
             lines.push(std::mem::take(current));
@@ -3392,6 +3465,75 @@ mod tests {
             );
             assert_eq!(plain, estimated, "width {width}");
         }
+    }
+
+    /// `W3COS_WRAP_FIT_ESTIMATE`: the one-line check read from the
+    /// paragraph shaping keeps every break, and skips shaping the whole
+    /// text on its own when the answer is clear.
+    #[test]
+    fn wrap_fit_estimate_keeps_every_break() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                WRAP_FIT_ESTIMATE_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        let text = "Wo Wo Wooo oWo Wo foo bar Wo baz quux Woo Wo";
+        let mut estimate = |prepared: &str| {
+            let clusters: Vec<(usize, f32)> =
+                prepared.char_indices().map(|(at, _)| (at, 10.0)).collect();
+            ParagraphWidths::new(&clusters, prepared.len(), 10.0)
+        };
+        for mode in [2u8, 1] {
+            WRAP_FIT_ESTIMATE_OVERRIDE.with(|m| m.set(Some(mode)));
+            WRAP_FIT_ESTIMATE_HITS.with(|n| n.set(0));
+            for width in [25.0, 40.0, 97.0, 140.0, 430.0, 438.0, 440.0, 445.0, 600.0] {
+                let run_width = |line: &str| {
+                    let mut width = line.chars().count() as f32 * 10.0;
+                    if line.ends_with('o') {
+                        width -= 3.0;
+                    }
+                    if line.starts_with('W') {
+                        width += 2.0;
+                    }
+                    width
+                };
+                WRAP_FIT_ESTIMATE_OVERRIDE.with(|m| m.set(Some(0)));
+                let plain = wrap_greedy_with_line_width_estimated(
+                    text,
+                    1,
+                    false,
+                    crate::line_break::BreakMode::default(),
+                    |_| width,
+                    run_width,
+                    Some(&mut estimate),
+                );
+                WRAP_FIT_ESTIMATE_OVERRIDE.with(|m| m.set(Some(mode)));
+                let whole = std::cell::Cell::new(0);
+                let counted = |line: &str| {
+                    if line == text {
+                        whole.set(whole.get() + 1);
+                    }
+                    run_width(line)
+                };
+                let estimated = wrap_greedy_with_line_width_estimated(
+                    text,
+                    1,
+                    false,
+                    crate::line_break::BreakMode::default(),
+                    |_| width,
+                    counted,
+                    Some(&mut estimate),
+                );
+                assert_eq!(plain, estimated, "mode {mode} width {width}");
+                if mode == 1 && (width < 400.0 || width > 450.0) {
+                    assert_eq!(whole.get(), 0, "width {width}: shaped the whole text");
+                }
+            }
+            assert!(WRAP_FIT_ESTIMATE_HITS.with(std::cell::Cell::get) > 0);
+        }
+        assert_eq!(WRAP_FIT_ESTIMATE_MISMATCHES.with(std::cell::Cell::get), 0);
     }
 
     #[test]
