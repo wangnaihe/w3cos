@@ -1016,6 +1016,7 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
                 // Same structure key: the tree is the one the memo saw, with
                 // only the restyled nodes' styles patched in place.
                 let fp = patch_fingerprints(flat, m, &ids, salt, &revision);
+                publish_subtree_keys(flat, &m.subtree, &m.known_sub);
                 m.epoch = h.epoch;
                 RESTYLED.with(|ids| ids.borrow_mut().clear());
                 let memo = memo.take();
@@ -1089,6 +1090,7 @@ fn fingerprints(flat: &[FlatNodeInfo]) -> Option<Vec<u64>> {
             next.known = known.clone();
         }
         let (subtree, known_sub, fp) = subtree_fingerprints(flat, &own, known);
+        publish_subtree_keys(flat, &subtree, &known_sub);
         if keep {
             RESTYLED.with(|ids| ids.borrow_mut().clear());
             if box_tree_enabled() {
@@ -1397,6 +1399,7 @@ pub(super) fn unsupported_tree_retained(
         return None;
     }
     let fp = fingerprints(flat)?;
+    let _sub_keys = WalkSubtreeKeys::install(flat);
     let block_level = |index: usize| {
         flat[index].style.display != Display::Inline
             && !matches!(flat[index].kind, w3cos_std::ComponentKind::Text { .. })
@@ -1568,6 +1571,148 @@ fn walk_fingerprint(flat: &[FlatNodeInfo], index: usize) -> Option<u64> {
             .flatten()
             .filter(|fp| *fp != 0)
     })
+}
+
+thread_local! {
+    /// Subtree keys `fingerprints` computed last (flat pointer, length,
+    /// keys), picked up by the eligibility walk that follows it.
+    static PENDING_SUB: RefCell<Option<(usize, usize, std::rc::Rc<Vec<u64>>)>> =
+        const { RefCell::new(None) };
+    /// The subtree keys of the flat tree an eligibility walk is checking.
+    static WALK_SUB: RefCell<Option<(usize, usize, std::rc::Rc<Vec<u64>>)>> =
+        const { RefCell::new(None) };
+    /// IFC container verdicts by subtree key (`W3COS_ELIG_IFC_MEMO`).
+    static IFC_REASON: RefCell<
+        std::collections::HashMap<u64, Option<&'static str>, w3cos_std::fxhash::FxBuildHasher>,
+    > = RefCell::new(Default::default());
+    static IFC_MEMO_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static IFC_MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static IFC_MEMO_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `W3COS_ELIG_IFC_MEMO=1|verify` (off by default): the eligibility walk
+/// keeps an IFC container's verdict (`inline::container_reason`) by the
+/// hash of the container's own subtree, without its parent. The verdict
+/// reads only the container, its inline descendants and the first box's
+/// quirks marker, so a parent's restyle (a class toggle on the bubble
+/// around paragraphs) does not re-collect the paragraphs' inlines; Blink
+/// recomputes nothing below a box whose style did not change.
+/// `verify` computes the verdict anyway and compares.
+pub(super) fn elig_ifc_memo_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = IFC_MEMO_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("W3COS_ELIG_IFC_MEMO").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// (kept verdicts found, verify-mode verdicts that differed from the kept one).
+pub(super) fn elig_ifc_memo_stats() -> (u64, u64) {
+    (
+        IFC_MEMO_HITS.with(std::cell::Cell::get),
+        IFC_MEMO_MISMATCHES.with(std::cell::Cell::get),
+    )
+}
+
+/// Keep the subtree keys of the tree `fingerprints` just hashed (a zero key:
+/// a subtree some input of which no revision tracks).
+fn publish_subtree_keys(flat: &[FlatNodeInfo], subtree: &[u64], known_sub: &[bool]) {
+    if elig_ifc_memo_mode() == 0 || subtree.len() != flat.len() || known_sub.len() != flat.len() {
+        return;
+    }
+    let keys: Vec<u64> = subtree
+        .iter()
+        .zip(known_sub)
+        .map(|(&h, &ok)| if ok { mix(h, 0x1fc0_4d3e).max(1) } else { 0 })
+        .collect();
+    PENDING_SUB.with(|slot| {
+        *slot.borrow_mut() = Some((flat.as_ptr() as usize, flat.len(), std::rc::Rc::new(keys)))
+    });
+}
+
+/// The pending keys, published to `walk_subtree_key` while the walk lives.
+struct WalkSubtreeKeys;
+
+impl WalkSubtreeKeys {
+    fn install(flat: &[FlatNodeInfo]) -> Self {
+        let pending = PENDING_SUB.with(|slot| slot.borrow_mut().take());
+        let keys =
+            pending.filter(|(ptr, len, _)| *ptr == flat.as_ptr() as usize && *len == flat.len());
+        WALK_SUB.with(|slot| *slot.borrow_mut() = keys);
+        Self
+    }
+}
+
+impl Drop for WalkSubtreeKeys {
+    fn drop(&mut self) {
+        WALK_SUB.with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = None;
+            }
+        });
+    }
+}
+
+fn walk_subtree_key(flat: &[FlatNodeInfo], index: usize) -> Option<u64> {
+    WALK_SUB.with(|slot| {
+        let slot = slot.borrow();
+        let (ptr, len, keys) = slot.as_ref()?;
+        (*ptr == flat.as_ptr() as usize && *len == flat.len())
+            .then(|| keys.get(index).copied())
+            .flatten()
+            .filter(|key| *key != 0)
+    })
+}
+
+/// `reason()` (the IFC container gate of box `index`), kept by the
+/// container's subtree key during an eligibility walk. `quirks`: the first
+/// box's quirks marker, the one input outside the subtree.
+pub(super) fn ifc_container_reason(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    quirks: bool,
+    reason: impl FnOnce() -> Option<&'static str>,
+) -> Option<&'static str> {
+    let mode = elig_ifc_memo_mode();
+    let Some(key) = (mode != 0)
+        .then(|| walk_subtree_key(flat, index))
+        .flatten()
+        .map(|key| mix(key, quirks as u64 + 7))
+    else {
+        return reason();
+    };
+    let kept = IFC_REASON.with(|memo| memo.borrow().get(&key).copied());
+    if let Some(kept) = kept {
+        IFC_MEMO_HITS.with(|n| n.set(n.get() + 1));
+        if mode == 1 {
+            return kept;
+        }
+        let now = reason();
+        if now != kept {
+            IFC_MEMO_MISMATCHES.with(|n| n.set(n.get() + 1));
+            eprintln!("[elig-ifc-memo-verify] mismatch: kept {kept:?} now {now:?} (box {index})");
+        }
+        return now;
+    }
+    let now = reason();
+    IFC_REASON.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() > 2 * flat.len() + 1024 {
+            memo.clear();
+        }
+        memo.insert(key, now);
+    });
+    now
 }
 
 /// `scan(flat, index)` (whether the subtree holds a rendered float),

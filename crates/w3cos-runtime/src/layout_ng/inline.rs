@@ -1480,6 +1480,13 @@ fn inline_box_reason(
 
 /// Why this IFC container (and its items) is outside S2a.
 pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
+    super::cache::ifc_container_reason(flat, index, quirks, || {
+        container_reason_uncached(flat, index)
+    })
+}
+
+fn container_reason_uncached(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     // The cascade marks multi-item IFC roots.  An unmarked box may still be
     // the parent of plain text (`<div>text</div>`), whose style then is the

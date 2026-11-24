@@ -5283,6 +5283,97 @@ mod tests {
         style_local_own_width_edit_matches_full();
     }
 
+    /// `W3COS_ELIG_IFC_MEMO`: a padding toggle on a bubble keeps its
+    /// paragraphs' IFC verdicts; an inherited `text-align: justify` (the
+    /// paragraphs' own revisions change) and a text edit recompute them.
+    #[test]
+    fn elig_ifc_memo_matches_the_gate() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::layout_ng::set_elig_ifc_memo_override(None);
+            }
+        }
+        let _off = Off;
+        let run = |check: bool| {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".pad", &[("padding", "14px")]);
+            crate::stylesheet::register_rule(".just", &[("text-align", "justify")]);
+            crate::dom::reset_document();
+            crate::incremental_layout::invalidate();
+            crate::jsdom::set_viewport(1024.0, 768.0);
+            let mut bubbles = Vec::new();
+            let mut texts = Vec::new();
+            for index in 0..4 {
+                let row = crate::dom::create_element("div");
+                style(row, &[("display", "flex"), ("gap", "6px")]);
+                let avatar = crate::dom::create_element("div");
+                style(avatar, &[("width", "20px"), ("height", "20px")]);
+                let bubble = crate::dom::create_element("div");
+                style(bubble, &[("min-width", "0px")]);
+                for para in 0..3 {
+                    let p = crate::dom::create_element("p");
+                    let text = crate::dom::create_text_node(&format!(
+                        "message {index} paragraph {para} alpha beta gamma "
+                    ));
+                    crate::dom::append_child(p, text);
+                    texts.push(text);
+                    let b = crate::dom::create_element("b");
+                    crate::dom::append_child(b, crate::dom::create_text_node("bold"));
+                    crate::dom::append_child(p, b);
+                    crate::dom::append_child(p, crate::dom::create_text_node(" tail words"));
+                    crate::dom::append_child(bubble, p);
+                }
+                crate::dom::append_child(row, avatar);
+                crate::dom::append_child(row, bubble);
+                crate::dom::append_child(crate::dom::body_id(), row);
+                bubbles.push(bubble);
+            }
+            assert!(crate::incremental_layout::flush());
+            if check {
+                assert_matches_full("ifc memo initial");
+            }
+            let mid = bubbles[2];
+            for step in 0..6 {
+                match step {
+                    0 | 2 => crate::dom::class_list_add(mid, "pad"),
+                    1 | 3 => crate::dom::class_list_remove(mid, "pad"),
+                    4 => crate::dom::class_list_add(mid, "just"),
+                    _ => crate::dom::class_list_remove(mid, "just"),
+                }
+                assert!(crate::incremental_layout::flush());
+                if check {
+                    assert_matches_full(&format!("ifc memo step {step}"));
+                }
+            }
+            crate::dom::set_text_content(texts[7], "edited paragraph text ");
+            assert!(crate::incremental_layout::flush());
+            crate::dom::class_list_add(mid, "pad");
+            assert!(crate::incremental_layout::flush());
+            if check {
+                assert_matches_full("ifc memo after text edit");
+            }
+        };
+        if std::env::var_os("W3COS_IFC_MEMO_TEST_OFF").is_some() {
+            crate::layout_ng::set_elig_ifc_memo_override(Some(0));
+            run(true);
+            return;
+        }
+        crate::layout_ng::set_elig_ifc_memo_override(Some(2));
+        let (hits, mismatches) = crate::layout_ng::elig_ifc_memo_stats();
+        run(false);
+        let (hits_after, mismatches_after) = crate::layout_ng::elig_ifc_memo_stats();
+        assert_eq!(
+            mismatches_after, mismatches,
+            "kept IFC verdict differs from the gate"
+        );
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(hits_after > hits, "no kept IFC verdict was used");
+        }
+        crate::layout_ng::set_elig_ifc_memo_override(Some(1));
+        run(true);
+    }
+
     /// An inherited `text-align: justify` sends the page to the legacy
     /// fallback (`text:justify`); removing it must bring the paragraphs'
     /// lowered styles back, so the page returns to LayoutNG and matches a

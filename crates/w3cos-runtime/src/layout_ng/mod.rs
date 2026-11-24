@@ -788,6 +788,16 @@ fn has_spacing_trim_punctuation(flat: &[FlatNodeInfo]) -> bool {
     })
 }
 
+/// `W3COS_ELIG_IFC_MEMO` counters: (kept IFC verdicts used, verify mismatches).
+pub(crate) fn elig_ifc_memo_stats() -> (u64, u64) {
+    cache::elig_ifc_memo_stats()
+}
+
+#[cfg(test)]
+pub(crate) fn set_elig_ifc_memo_override(mode: Option<u8>) {
+    cache::IFC_MEMO_OVERRIDE.with(|slot| slot.set(mode));
+}
+
 fn run_in_patched<'a>(
     flat: &[FlatNodeInfo<'a>],
     run_in: &'a [(usize, w3cos_std::style::Style)],
