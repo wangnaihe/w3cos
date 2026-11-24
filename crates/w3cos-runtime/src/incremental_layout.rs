@@ -1060,8 +1060,12 @@ fn patch_and_compute(
     // formatting, font, width auto-ness, and text alignment (the sole text
     // run's line-width marker), so those edits rebuild.
     // (Checked after the subtree path below, which re-lowers what it needs.)
+    // A document on the legacy fallback keeps a valid Taffy tree, but the
+    // eligibility walk and LayoutNG still read the lowered component: an
+    // inherited edit (a class removing `text-align: justify`) must reach the
+    // descendants' lowered styles too, or the walk keeps the stale verdict
+    // and the page stays on legacy (Blink recalcs the children's styles).
     let ng_relower = crate::layout_ng::mode() == crate::layout_ng::Mode::On
-        && !cache.engine.tree_valid()
         && styles.iter().any(|(id, style)| {
             located_style(key, &cache.component, *id)
                 .is_none_or(|old| !ng_lowering_stable(old, style))

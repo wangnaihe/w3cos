@@ -5283,6 +5283,71 @@ mod tests {
         style_local_own_width_edit_matches_full();
     }
 
+    /// An inherited `text-align: justify` sends the page to the legacy
+    /// fallback (`text:justify`); removing it must bring the paragraphs'
+    /// lowered styles back, so the page returns to LayoutNG and matches a
+    /// full layout (the retained patch kept their stale justify).
+    #[test]
+    fn inherited_justify_toggle_leaves_the_fallback() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".pad", &[("padding", "14px")]);
+        crate::stylesheet::register_rule(".just", &[("text-align", "justify")]);
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let mut bubbles = Vec::new();
+        for index in 0..4 {
+            let row = crate::dom::create_element("div");
+            style(row, &[("display", "flex"), ("gap", "6px")]);
+            let avatar = crate::dom::create_element("div");
+            style(avatar, &[("width", "20px"), ("height", "20px")]);
+            let bubble = crate::dom::create_element("div");
+            style(bubble, &[("min-width", "0px")]);
+            for para in 0..3 {
+                let p = crate::dom::create_element("p");
+                crate::dom::append_child(
+                    p,
+                    crate::dom::create_text_node(&format!(
+                        "message {index} paragraph {para} alpha beta gamma "
+                    )),
+                );
+                let b = crate::dom::create_element("b");
+                crate::dom::append_child(b, crate::dom::create_text_node("bold"));
+                crate::dom::append_child(p, b);
+                crate::dom::append_child(p, crate::dom::create_text_node(" tail words"));
+                crate::dom::append_child(bubble, p);
+            }
+            crate::dom::append_child(row, avatar);
+            crate::dom::append_child(row, bubble);
+            crate::dom::append_child(crate::dom::body_id(), row);
+            bubbles.push(bubble);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("justify initial");
+        let mid = bubbles[2];
+        for (step, (class, add)) in [
+            ("pad", true),
+            ("pad", false),
+            ("just", true),
+            ("just", false),
+            ("pad", true),
+            ("just", true),
+            ("pad", false),
+            ("just", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if add {
+                crate::dom::class_list_add(mid, class);
+            } else {
+                crate::dom::class_list_remove(mid, class);
+            }
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full(&format!("justify step {step} ({class} {add})"));
+        }
+    }
+
     /// css/css-text/letter-spacing/letter-spacing-trim-start-002.html:
     /// `width: 15ch` -> `width: max-content` on a block (legacy layout reads
     /// the keyword as auto) must lay it out at its containing block's width,
