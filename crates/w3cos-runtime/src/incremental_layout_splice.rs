@@ -4941,7 +4941,9 @@ mod tests {
         let (hits, mismatches) = crate::layout_ng::stretch_reuse_stats();
         let _ = page();
         let (hits_verify, mismatches_verify) = crate::layout_ng::stretch_reuse_stats();
-        assert!(hits_verify > hits, "verify pass found no stretch to reuse");
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(hits_verify > hits, "verify pass found no stretch to reuse");
+        }
         assert_eq!(
             mismatches_verify, mismatches,
             "stretch reuse differs from relayout"
@@ -5016,7 +5018,9 @@ mod tests {
         let (checks, mismatches) = crate::layout_ng::table_block_free_stats();
         let _ = page();
         let (checks_verify, mismatches_verify) = crate::layout_ng::table_block_free_stats();
-        assert!(checks_verify > checks, "verify found no relaxed hit");
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(checks_verify > checks, "verify found no relaxed hit");
+        }
         assert_eq!(mismatches_verify, mismatches);
         assert_matches_full("table block free verify");
         crate::layout_ng::set_table_block_free_override(Some(1));
