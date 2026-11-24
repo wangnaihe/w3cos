@@ -4861,8 +4861,11 @@ mod tests {
                 assert_matches_full(&format!("sorted keep mode {mode} step {step}"));
             }
             assert_client_rects_match_full(&format!("sorted keep mode {mode}"));
+            // The in-place rebase that keeps the flag runs only under
+            // `W3COS_STYLE_LOCAL`; with it off the edits still match.
             assert!(
-                REBASE_SORTED_KEEP_SKIPS.with(std::cell::Cell::get) > 0,
+                crate::incremental_layout::style_local_mode() == 0
+                    || REBASE_SORTED_KEEP_SKIPS.with(std::cell::Cell::get) > 0,
                 "mode {mode}: no rebase saw a sorted flag"
             );
         }
@@ -5739,8 +5742,13 @@ mod tests {
                 assert!(crate::incremental_layout::flush());
                 assert_matches_full(&format!("preorder hosts mode {mode} step {step}"));
             }
+            // The ranges need the kept preorder sizes (and the style
+            // splices that keep them); with those off the walk still matches.
+            let kept = crate::incremental_layout::style_local_mode() != 0
+                && crate::incremental_layout::preorder_sizes_mode() != 0
+                && preorder_tail_keep();
             assert!(
-                mode == 0 || PREORDER_HOSTS_RANGED.with(std::cell::Cell::get) > 0,
+                mode == 0 || !kept || PREORDER_HOSTS_RANGED.with(std::cell::Cell::get) > 0,
                 "mode {mode}: no splice read the ranges"
             );
         }
