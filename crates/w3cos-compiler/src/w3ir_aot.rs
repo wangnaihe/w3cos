@@ -2949,6 +2949,229 @@ pub fn generate_sync_function_from_module(
     )
 }
 
+/// Sync functions whose emitted blocks exceed this many lines get their
+/// straight-line statement runs outlined into helper methods (see
+/// [`outline_straight_line_runs`]); smaller functions are emitted unchanged.
+const OUTLINE_MIN_LINES: usize = 2000;
+/// Shortest statement run worth a helper call.
+const OUTLINE_CHUNK_MIN: usize = 8;
+/// Longest helper body, in statement lines.
+const OUTLINE_CHUNK_MAX: usize = 256;
+
+/// `line` with the contents of string and char literals blanked out, so
+/// braces, `?` or keywords inside JS strings do not count. Labels and
+/// lifetimes (`'drive`, `'_`) are kept.
+fn strip_literals(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+                out.push_str("\"\"");
+            }
+            '\'' if i + 2 < chars.len() && chars[i + 2] == '\'' && chars[i + 1] != '\\' => {
+                i += 3;
+                out.push_str("' '");
+            }
+            '\'' if i + 1 < chars.len() && chars[i + 1] == '\\' => {
+                let close = chars[i + 2..]
+                    .iter()
+                    .position(|c| *c == '\'')
+                    .map_or(chars.len(), |p| i + 2 + p);
+                i = close + 1;
+                out.push_str("' '");
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn contains_ident(haystack: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    haystack.match_indices(name).any(|(at, _)| {
+        !haystack[..at].chars().next_back().is_some_and(is_ident)
+            && !haystack[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_ident)
+    })
+}
+
+/// Names bound by `let` / `let mut` anywhere in a (literal-stripped) line.
+fn let_names(stripped: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (at, _) in stripped.match_indices("let ") {
+        if stripped[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = &stripped[at + 4..];
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// A statement line that can move into a `&mut self -> Result<(), Value>`
+/// helper unchanged: balanced delimiters, and no control flow that targets
+/// `run` itself (loop labels, `continue`/`break`, `return Ok`, `?`).
+/// `return Err(..)` and `frame_try!` keep their meaning in the helper.
+fn outlinable_line(stripped: &str) -> bool {
+    let count = |c: char| stripped.chars().filter(|x| *x == c).count();
+    if count('{') != count('}') || count('(') != count(')') || count('[') != count(']') {
+        return false;
+    }
+    if stripped.contains('?')
+        || contains_ident(stripped, "continue")
+        || contains_ident(stripped, "break")
+        || contains_ident(stripped, "loop")
+        || contains_ident(stripped, "yield")
+    {
+        return false;
+    }
+    // Any `return` must be an error return.
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    for (at, _) in stripped.match_indices("return") {
+        let rest = &stripped[at + "return".len()..];
+        let standalone = !stripped[..at].chars().next_back().is_some_and(is_ident)
+            && !rest.chars().next().is_some_and(is_ident);
+        let rest = rest.trim_start();
+        if standalone
+            && !(rest.starts_with("Err(")
+                || rest.starts_with("::core::result::Result::Err(")
+                || rest.starts_with("::std::result::Result::Err("))
+        {
+            return false;
+        }
+    }
+    // Labels / lifetimes (`'drive`, `'a`): keep anything label-like in `run`.
+    let chars: Vec<char> = stripped.chars().collect();
+    !chars
+        .windows(2)
+        .any(|w| w[0] == '\'' && (w[1].is_ascii_alphabetic() || w[1] == '_'))
+}
+
+/// Moves runs of [`outlinable_line`]s (one generated statement per line)
+/// out of a block body into `__w3cos_chunk_{tag}_{k}` helper methods,
+/// appended to `helpers`, and returns the body with each run replaced by a
+/// `frame_try!` call. A `let` binding and every later line that uses it
+/// (until it is re-declared) stay in the same helper.
+fn outline_straight_line_runs(tag: &str, body: &str, helpers: &mut String) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let stripped: Vec<String> = lines.iter().map(|line| strip_literals(line)).collect();
+    let n = lines.len();
+    // Only top-level statements of the body: a line inside a multi-line
+    // construct may use names its opening line binds (match arms, closure
+    // parameters), which a helper could not see.
+    let mut depth = 0isize;
+    let mut ok: Vec<bool> = Vec::with_capacity(n);
+    for line in &stripped {
+        ok.push(depth == 0 && outlinable_line(line));
+        for c in line.chars() {
+            match c {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    // unit_end[i]: last line that must share a helper with line i.
+    let mut unit_end: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for name in let_names(&stripped[i]) {
+            let mut last = i;
+            for (j, line) in stripped.iter().enumerate().skip(i + 1) {
+                if !line.contains(name.as_str()) {
+                    continue;
+                }
+                let redeclared = let_names(line).contains(&name);
+                let used_before_let = line
+                    .split_once("let ")
+                    .is_some_and(|(before, _)| contains_ident(before, &name));
+                if redeclared && !used_before_let {
+                    break;
+                }
+                if contains_ident(line, &name) {
+                    last = j;
+                }
+            }
+            for j in i..=last {
+                unit_end[j] = unit_end[j].max(last);
+            }
+            if (i..=last).any(|j| !ok[j]) {
+                for flag in &mut ok[i..=last] {
+                    *flag = false;
+                }
+            }
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut chunk = 0usize;
+    let mut i = 0;
+    while i < n {
+        if !ok[i] {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < n && ok[end] {
+            end += 1;
+        }
+        let mut start = i;
+        while start < end {
+            let mut stop = (start + OUTLINE_CHUNK_MAX).min(end);
+            while stop < end && unit_end[start..stop].iter().any(|last| *last >= stop) {
+                stop += 1;
+            }
+            let escapes = unit_end[start..stop].iter().any(|last| *last >= stop);
+            if stop - start < OUTLINE_CHUNK_MIN || escapes {
+                for line in &lines[start..stop] {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            } else {
+                let name = format!("__w3cos_chunk_{tag}_{chunk}");
+                chunk += 1;
+                helpers.push_str(&format!(
+                    "    fn {name}(&mut self) -> Result<(), w3cos_core::Value> {{\n"
+                ));
+                for line in &lines[start..stop] {
+                    helpers.push_str(line);
+                    helpers.push('\n');
+                }
+                helpers.push_str("        Ok(())\n    }\n");
+                out.push_str(&format!(
+                    "                    w3cos_core::frame_try!(self.{name}());\n"
+                ));
+            }
+            start = stop;
+        }
+        i = end;
+    }
+    out
+}
+
 /// One emitted sync variant: the frame type + `impl` block, and the entry
 /// statements that build and run a frame (ending in the call's `Value`).
 struct SyncVariant {
@@ -2977,6 +3200,7 @@ fn emit_sync_variant(
     let slot_capture_init = emit_capture_init(storage);
     let sync_blocks = coalesce_sync_blocks(function);
     let mut blocks = String::new();
+    let mut emitted_blocks: Vec<(u32, String)> = Vec::new();
     let mut direct_body = None;
     for (block_id, instructions) in &sync_blocks {
         let exception_target = exception_target_for_block(function, *block_id);
@@ -3025,8 +3249,34 @@ fn emit_sync_variant(
         {
             direct_body = Some(emitted.clone());
         }
-        blocks.push_str(&format!("                {} => {{\n", block_id.0));
-        blocks.push_str(&emitted);
+        emitted_blocks.push((block_id.0, emitted));
+    }
+    // Giant functions (e.g. a minified library's module body) would be one
+    // huge `run`: rustc's MIR building/borrowck memory grows superlinearly in
+    // function size (a 38.6k-line katex `run` needed >11G). Outline their
+    // straight-line statement runs into small helper methods.
+    let total_lines: usize = emitted_blocks
+        .iter()
+        .map(|(_, emitted)| emitted.lines().count())
+        .sum();
+    let mut outlined = String::new();
+    let outline = total_lines > OUTLINE_MIN_LINES;
+    if outline {
+        if let Some(body) = &direct_body {
+            direct_body = Some(outline_straight_line_runs("direct", body, &mut outlined));
+        }
+    }
+    for (block_id, emitted) in &emitted_blocks {
+        blocks.push_str(&format!("                {block_id} => {{\n"));
+        if outline && direct_body.is_none() {
+            blocks.push_str(&outline_straight_line_runs(
+                &block_id.to_string(),
+                emitted,
+                &mut outlined,
+            ));
+        } else {
+            blocks.push_str(emitted);
+        }
         blocks.push_str("                }\n");
     }
     let is_direct = direct_body.is_some();
@@ -3133,7 +3383,7 @@ impl {type_name} {{
     fn run(&mut self) -> Result<w3cos_core::Value, w3cos_core::Value> {{
 {run_body}
     }}
-}}
+{outlined}}}
 "#
     );
     let frame = format!(
@@ -10420,6 +10670,168 @@ fn main() {{
         assert!(
             output.status.success(),
             "generated sync exception fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
+    #[test]
+    fn outlines_straight_line_runs_but_keeps_control_flow_and_let_units() {
+        let mut body = String::new();
+        for index in 0..600 {
+            body.push_str(&format!(
+                "                    self.num_regs[{index}] = {index}.0_f64;\n"
+            ));
+        }
+        // A `let` used two lines later must share a helper with its use.
+        body.push_str("                    let __w3cos_owned_7 = std::mem::replace(&mut self.registers[7], w3cos_core::Value::Undefined);\n");
+        body.push_str("                    self.num_regs[0] = 1.0_f64;\n");
+        body.push_str("                    self.registers[8] = __w3cos_owned_7;\n");
+        // Multi-line construct: its inner lines use the arm binding.
+        body.push_str(
+            "                    match w3cos_core::aot_frame::ready_cell(&self.bindings, 3) {\n",
+        );
+        body.push_str("                        Ok(__w3cos_cell) => { self.registers[1] = w3cos_core::aot_frame::read_cell(__w3cos_cell).0.clone(); }\n");
+        body.push_str("                        Err(__w3cos_exception) => { return Err(__w3cos_exception); }\n");
+        body.push_str("                    }\n");
+        body.push_str("                    self.registers[2] = w3cos_core::Value::string(\"a { brace ? and 'drive\");\n");
+        body.push_str("                    self.block = 4; continue 'drive;\n");
+        let mut helpers = String::new();
+        let outlined = outline_straight_line_runs("9", &body, &mut helpers);
+        let chunks = helpers.matches("fn __w3cos_chunk_9_").count();
+        assert!(
+            chunks >= 3,
+            "600 statements should fill several helpers: {helpers}"
+        );
+        assert_eq!(
+            outlined.matches("frame_try!(self.__w3cos_chunk_9_").count(),
+            chunks
+        );
+        for helper in helpers.split("    fn ").skip(1) {
+            assert!(
+                helper.lines().count() <= OUTLINE_CHUNK_MAX + 3,
+                "helper too long: {helper}"
+            );
+            assert!(
+                !helper.contains("continue 'drive"),
+                "control flow moved: {helper}"
+            );
+            assert!(
+                !helper.contains("Ok(__w3cos_cell)"),
+                "nested arm moved: {helper}"
+            );
+        }
+        assert!(outlined.contains("self.block = 4; continue 'drive;"));
+        assert!(outlined.contains("Ok(__w3cos_cell) =>"));
+        let owner = helpers
+            .split("    fn ")
+            .find(|helper| helper.contains("let __w3cos_owned_7"))
+            .expect("let unit outlined");
+        assert!(
+            owner.contains("self.registers[8] = __w3cos_owned_7;"),
+            "let and its use must share a helper: {owner}"
+        );
+    }
+
+    #[test]
+    fn small_sync_functions_are_not_outlined() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function read(input) {
+                    try {
+                        return input.missing.value;
+                    } catch (error) {
+                        return "invalid";
+                    }
+                }
+                read;
+            "#,
+            "app:///sync-small-no-outline.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
+        assert!(!generated.contains("__w3cos_chunk_"), "{generated}");
+    }
+
+    #[test]
+    fn giant_sync_function_is_outlined_and_still_runs() {
+        let mut source =
+            String::from("function big(seed) {\n    var total = seed;\n    var parts = [];\n");
+        for index in 0..1500 {
+            source.push_str(&format!(
+                "    total = total + {index};\n    parts[{}] = total;\n",
+                index % 7
+            ));
+        }
+        source.push_str("    try { seed.missing.value; } catch (error) { total = total + 1; }\n");
+        source.push_str("    return total + parts.length;\n}\nbig;\n");
+        let module =
+            crate::w3ir_lowering::lower_script(&source, "app:///sync-giant-outline.js").unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("big"))
+            .unwrap()
+            .clone();
+        let generated = generate_sync_function_from_module(&module, &function, "big_aot").unwrap();
+        assert!(
+            generated.contains("fn __w3cos_chunk_"),
+            "a giant function should be outlined"
+        );
+        // 0 + (0 + 1 + .. + 1499) + 1 (catch) + 7 (parts.length)
+        let expected = (1499 * 1500 / 2 + 1 + 7).to_string();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_outline_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{generated}
+fn main() {{
+    println!(
+        "{{}}",
+        big_aot(
+            w3cos_core::Value::Undefined,
+            &[w3cos_core::Value::Number(0.0)],
+            &w3cos_core::AotCaptureMap::new(),
+        )
+        .to_js_string(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "outlined giant function fixture failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
