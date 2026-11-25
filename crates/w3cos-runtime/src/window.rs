@@ -7455,6 +7455,39 @@ pub(crate) fn build_headless_scroll_info(
     )
 }
 
+/// `W3COS_SCROLL_INFO_SHARED=1|verify` (off by default): compute each scroll
+/// container's scroll offset and clip once and share it with every
+/// descendant that is not under a sticky box, like the scroll translation
+/// and clip nodes Blink's paint property trees keep per scroller
+/// (sticky descendants still resolve their own offset). `verify` also
+/// computes every box on its own, reports a difference and uses it.
+pub(crate) fn scroll_info_shared_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = SCROLL_INFO_SHARED_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_SCROLL_INFO_SHARED").ok().as_deref() {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SCROLL_INFO_SHARED_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (boxes that took a shared entry, verify mismatches).
+    pub(crate) static SCROLL_INFO_SHARED_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 fn build_scroll_info_fast<T: PaintNodeView>(
     scroll_ancestor: &[Option<usize>],
     scrollable: &[(usize, LayoutRect, ScrollExtent)],
@@ -7496,11 +7529,16 @@ fn build_scroll_info_fast<T: PaintNodeView>(
             )
         })
         .collect();
+    let shared = scroll_info_shared_mode();
+    // The shared path without retained PrePaint data finds a box's sticky
+    // owner by walking up from it, only for boxes under a scroll or clip
+    // container; the full per-box tables are built for the other modes.
+    let full_tables = retained_prepaint.is_some() || shared != 1;
     let mut owned_rect_by_index = Vec::new();
     let mut owned_sticky_owner = Vec::new();
     let (sticky_owner, rect_by_index) = if let Some(retained) = retained_prepaint {
         retained
-    } else {
+    } else if full_tables {
         owned_rect_by_index.resize(flat.len(), None);
         for &(rect, idx) in layout_cache {
             if idx < owned_rect_by_index.len() {
@@ -7520,12 +7558,23 @@ fn build_scroll_info_fast<T: PaintNodeView>(
             owned_sticky_owner.as_slice(),
             owned_rect_by_index.as_slice(),
         )
+    } else {
+        (&[][..], &[][..])
+    };
+    let sticky_from_tables = |idx: usize| {
+        sticky_owner.get(idx).copied().flatten().and_then(|owner| {
+            rect_by_index
+                .get(owner)
+                .copied()
+                .flatten()
+                .map(|rect| (owner, rect))
+        })
     };
 
-    scroll_ancestor
-        .iter()
-        .enumerate()
-        .map(|(idx, ancestor)| match ancestor {
+    let entry = |ancestor: &Option<usize>,
+                 sticky: Option<(usize, LayoutRect)>|
+     -> Option<(f32, f32, LayoutRect)> {
+        match ancestor {
             Some(anc_idx) => {
                 if let Some(&clip) = scrollable_rect.get(anc_idx) {
                     let (outer_sx, outer_sy) = accumulated_outer_scroll_transform(
@@ -7558,9 +7607,7 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                     ) {
                         effective_clip = intersect_layout_rect(effective_clip, outer_clip);
                     }
-                    if let Some(owner) = sticky_owner.get(idx).copied().flatten()
-                        && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
-                    {
+                    if let Some((owner, owner_rect)) = sticky {
                         let style = flat[owner].paint_style();
                         if let Some(sticky_scroll_idx) = nearest_scrollable_ancestor(
                             scroll_ancestor.get(owner).copied().flatten(),
@@ -7635,9 +7682,7 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                     ) {
                         effective_clip = intersect_layout_rect(effective_clip, outer_clip);
                     }
-                    if let Some(owner) = sticky_owner.get(idx).copied().flatten()
-                        && let Some(owner_rect) = rect_by_index.get(owner).copied().flatten()
-                    {
+                    if let Some((owner, owner_rect)) = sticky {
                         sx = 0.0;
                         sy = 0.0;
                         effective_clip = clip;
@@ -7685,8 +7730,90 @@ fn build_scroll_info_fast<T: PaintNodeView>(
                 }
             }
             None => None,
-        })
-        .collect()
+        }
+    };
+    if shared == 0 {
+        return scroll_ancestor
+            .iter()
+            .enumerate()
+            .map(|(idx, ancestor)| entry(ancestor, sticky_from_tables(idx)))
+            .collect();
+    }
+    // One scroll node per scroll container (Blink paint property trees):
+    // every non-sticky descendant of the same container shares its offset
+    // and clip.
+    let lazy_rects: std::cell::OnceCell<Vec<Option<LayoutRect>>> = std::cell::OnceCell::new();
+    let sticky_walk = |idx: usize| -> Option<(usize, LayoutRect)> {
+        let mut current = Some(idx);
+        while let Some(index) = current {
+            let node = flat.get(index)?;
+            if matches!(node.paint_style().position, Position::Sticky) {
+                let rects = lazy_rects.get_or_init(|| {
+                    let mut rects = vec![None; flat.len()];
+                    for &(rect, at) in layout_cache {
+                        if let Some(slot) = rects.get_mut(at) {
+                            *slot = Some(rect);
+                        }
+                    }
+                    rects
+                });
+                return rects
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .map(|rect| (index, rect));
+            }
+            current = node.paint_parent();
+        }
+        None
+    };
+    let mut memo: HashMap<usize, Option<(f32, f32, LayoutRect)>> = HashMap::new();
+    let (mut shared_hits, mut mismatches) = (0u64, 0u64);
+    let mut out = Vec::with_capacity(scroll_ancestor.len());
+    for (idx, ancestor) in scroll_ancestor.iter().enumerate() {
+        let Some(anc_idx) = *ancestor else {
+            out.push(None);
+            continue;
+        };
+        if !scrollable_rect.contains_key(&anc_idx) && !clip_only_rect.contains_key(&anc_idx) {
+            out.push(None);
+            continue;
+        }
+        let sticky = if retained_prepaint.is_some() {
+            sticky_from_tables(idx)
+        } else {
+            sticky_walk(idx)
+        };
+        let value = if sticky.is_some() {
+            entry(ancestor, sticky)
+        } else if let Some(value) = memo.get(&anc_idx) {
+            shared_hits += 1;
+            *value
+        } else {
+            let value = entry(ancestor, None);
+            memo.insert(anc_idx, value);
+            value
+        };
+        out.push(value);
+    }
+    if shared == 2 {
+        for (idx, ancestor) in scroll_ancestor.iter().enumerate() {
+            let fresh = entry(ancestor, sticky_from_tables(idx));
+            if fresh != out[idx] {
+                mismatches += 1;
+                eprintln!(
+                    "[scroll-info-shared-verify] mismatch: box {idx}: shared {:?} fresh {fresh:?}",
+                    out[idx]
+                );
+                out[idx] = fresh;
+            }
+        }
+    }
+    SCROLL_INFO_SHARED_STATS.with(|stats| {
+        let (hits, bad) = stats.get();
+        stats.set((hits + shared_hits, bad + mismatches));
+    });
+    out
 }
 
 fn accumulated_outer_scroll_transform(

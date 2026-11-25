@@ -2534,6 +2534,95 @@ mod tests {
         );
     }
 
+    /// Scroll info shared per scroll container (`W3COS_SCROLL_INFO_SHARED`)
+    /// equals the per-box computation, with sticky boxes, a nested scroller
+    /// and a clip-only box, before and after scrolling; the frames match.
+    #[test]
+    fn scroll_info_shared_matches_per_box_scroll_info() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::window::SCROLL_INFO_SHARED_OVERRIDE.with(|value| value.set(None));
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::window::SCROLL_INFO_SHARED_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::jsdom::set_viewport(160.0, 240.0);
+            let body = crate::dom::body_id();
+            let scroller = crate::dom::create_element("div");
+            crate::dom::set_style_property(scroller, "height", "80px");
+            crate::dom::set_style_property(scroller, "overflow", "auto");
+            let header = crate::dom::create_element("div");
+            crate::dom::set_style_property(header, "position", "sticky");
+            crate::dom::set_style_property(header, "top", "0px");
+            crate::dom::set_style_property(header, "background", "yellow");
+            let label = crate::dom::create_element("span");
+            crate::dom::append_child(label, crate::dom::create_text_node("sticky header"));
+            crate::dom::append_child(header, label);
+            crate::dom::append_child(scroller, header);
+            for line in 0..8 {
+                let row = crate::dom::create_element("p");
+                crate::dom::set_style_property(
+                    row,
+                    "color",
+                    if line % 2 == 0 { "red" } else { "blue" },
+                );
+                crate::dom::append_child(row, crate::dom::create_text_node(&format!("row {line}")));
+                crate::dom::append_child(scroller, row);
+            }
+            let nested = crate::dom::create_element("div");
+            crate::dom::set_style_property(nested, "height", "30px");
+            crate::dom::set_style_property(nested, "overflow", "auto");
+            for line in 0..4 {
+                let row = crate::dom::create_element("p");
+                crate::dom::append_child(
+                    row,
+                    crate::dom::create_text_node(&format!("inner {line}")),
+                );
+                crate::dom::append_child(nested, row);
+            }
+            crate::dom::append_child(scroller, nested);
+            let clip = crate::dom::create_element("div");
+            crate::dom::set_style_property(clip, "height", "20px");
+            crate::dom::set_style_property(clip, "overflow", "hidden");
+            for line in 0..3 {
+                let row = crate::dom::create_element("p");
+                crate::dom::append_child(
+                    row,
+                    crate::dom::create_text_node(&format!("clipped {line}")),
+                );
+                crate::dom::append_child(clip, row);
+            }
+            crate::dom::append_child(body, scroller);
+            crate::dom::append_child(body, clip);
+            assert!(crate::incremental_layout::flush());
+            let before = crate::window::SCROLL_INFO_SHARED_STATS.with(std::cell::Cell::get);
+            let mut frames = vec![render_document_rgba(160, 240).expect("first frame").rgba];
+            for (target, offset) in [(scroller, 20.0), (nested, 10.0), (scroller, 45.0)] {
+                crate::dom::set_scroll_offset(target, None, Some(offset));
+                frames.push(render_document_rgba(160, 240).expect("scrolled frame").rgba);
+            }
+            let after = crate::window::SCROLL_INFO_SHARED_STATS.with(std::cell::Cell::get);
+            (frames, (after.0 - before.0, after.1 - before.1))
+        };
+        let (verified, (hits, mismatched)) = run(2);
+        assert!(hits > 0, "descendants of a scroller must share its entry");
+        assert_eq!(
+            mismatched, 0,
+            "shared scroll info differs from per-box scroll info"
+        );
+        let (shared, _) = run(1);
+        let (fresh, (off_hits, _)) = run(0);
+        assert_eq!(off_hits, 0);
+        assert!(verified == fresh, "verify-mode frames differ");
+        assert!(shared == fresh, "frames with shared scroll info differ");
+    }
+
     /// Kinds kept from two frames back for boxes no splice touched equal the
     /// copied ones, and the frames are the same.
     #[test]
