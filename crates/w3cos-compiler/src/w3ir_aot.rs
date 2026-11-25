@@ -3475,16 +3475,16 @@ impl {type_name} {{
         resolve: w3cos_core::Value,
         reject: w3cos_core::Value,
     ) {{
-        let outcome = match w3cos_core::catch_js_result(|| frame.borrow_mut().run()) {{
+        let outcome = match w3cos_core::catch_js_result(|| w3cos_core::aot_frame::write_cell(&frame).run()) {{
             Ok(outcome) => outcome,
             Err(reason) => {{
-                reject.call(w3cos_core::Value::Undefined, vec![reason]);
+                reject.call(w3cos_core::Value::Undefined, w3cos_core::aot_frame::args([reason]));
                 return;
             }}
         }};
         match outcome {{
             {type_name}Outcome::Complete(value) => {{
-                resolve.call(w3cos_core::Value::Undefined, vec![value]);
+                resolve.call(w3cos_core::Value::Undefined, w3cos_core::aot_frame::args([value]));
             }}
             {type_name}Outcome::Await {{
                 value,
@@ -3498,7 +3498,7 @@ impl {type_name} {{
                     w3cos_core::promise::status(&awaited)
                 {{
                     {{
-                        let mut frame = frame.borrow_mut();
+                        let mut frame = w3cos_core::aot_frame::write_cell(&frame);
                         frame.registers[dst] = ready;
                         frame.block = resume;
                     }}
@@ -3510,7 +3510,7 @@ impl {type_name} {{
                 let fulfilled_reject = reject.clone();
                 let on_fulfilled = w3cos_core::Value::function(move |_, arguments| {{
                     {{
-                        let mut frame = fulfilled_frame.borrow_mut();
+                        let mut frame = w3cos_core::aot_frame::write_cell(&fulfilled_frame);
                         frame.registers[dst] =
                             arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
                         frame.block = resume;
@@ -3527,7 +3527,7 @@ impl {type_name} {{
                 let rejected_reject = reject.clone();
                 let on_rejected = w3cos_core::Value::function(move |_, arguments| {{
                     {{
-                        let mut frame = rejected_frame.borrow_mut();
+                        let mut frame = w3cos_core::aot_frame::write_cell(&rejected_frame);
                         frame.registers[dst] =
                             arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
                         frame.block = reject_block;
@@ -3542,7 +3542,7 @@ impl {type_name} {{
                 w3cos_core::intrinsics::call_method(
                     &awaited,
                     &w3cos_core::Value::string("then"),
-                    vec![on_fulfilled, on_rejected],
+                    w3cos_core::aot_frame::args([on_fulfilled, on_rejected]),
                 );
             }}
         }}
@@ -3561,12 +3561,12 @@ pub fn {rust_name}(
         capture_setters,
         block: {entry},
     }}));
-    w3cos_core::intrinsics::promise_new(vec![w3cos_core::Value::function(move |_, arguments| {{
+    w3cos_core::intrinsics::promise_new(w3cos_core::aot_frame::args([w3cos_core::Value::function(move |_, arguments| {{
         let resolve = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
         let reject = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined);
         {type_name}::drive(std::rc::Rc::clone(&frame), resolve, reject);
         w3cos_core::Value::Undefined
-    }})])
+    }})]))
 }}
 "#,
         registers_field = emit_registers_field(plan.n_val),
@@ -3844,7 +3844,7 @@ pub fn {rust_name}(
         let frame = std::rc::Rc::clone(&frame);
         generator.set_property(name, w3cos_core::Value::function(move |_, arguments| {{
             let input = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
-            frame.borrow_mut().resume(kind, input)
+            w3cos_core::aot_frame::write_cell(&frame).resume(kind, input)
         }}));
     }}
     // `[Symbol.iterator]()` returns its receiver; capturing `generator`
@@ -4201,10 +4201,10 @@ impl {type_name} {{
         fulfilled: bool,
         value: w3cos_core::Value,
     ) {{
-        let request = frame.borrow_mut().active.take();
+        let request = w3cos_core::aot_frame::write_cell(&frame).active.take();
         if let Some(request) = request {{
             let callback = if fulfilled {{ request.resolve }} else {{ request.reject }};
-            callback.call(w3cos_core::Value::Undefined, vec![value]);
+            callback.call(w3cos_core::Value::Undefined, w3cos_core::aot_frame::args([value]));
         }}
         Self::drive(frame);
     }}
@@ -4223,7 +4223,7 @@ impl {type_name} {{
             let on_fulfilled = w3cos_core::Value::function(move |_, arguments| {{
                 let result = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
                 if !result.is_object() && !result.is_function() {{
-                    fulfilled_frame.borrow_mut().reject_yield(
+                    w3cos_core::aot_frame::write_cell(&fulfilled_frame).reject_yield(
                         suspension,
                         w3cos_core::Value::string(
                             "TypeError: delegated iterator result is not an object"
@@ -4233,7 +4233,7 @@ impl {type_name} {{
                     return w3cos_core::Value::Undefined;
                 }}
                 if action == 3 {{
-                    fulfilled_frame.borrow_mut().complete_delegate(
+                    w3cos_core::aot_frame::write_cell(&fulfilled_frame).complete_delegate(
                         suspension,
                         action,
                         w3cos_core::Value::Undefined,
@@ -4251,7 +4251,7 @@ impl {type_name} {{
                     let yielded_frame = std::rc::Rc::clone(&fulfilled_frame);
                     let on_yielded = w3cos_core::Value::function(move |_, arguments| {{
                         let value = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
-                        yielded_frame.borrow_mut().state =
+                        w3cos_core::aot_frame::write_cell(&yielded_frame).state =
                             {type_name}State::SuspendedDelegate(suspension);
                         Self::settle_active(
                             std::rc::Rc::clone(&yielded_frame),
@@ -4281,7 +4281,7 @@ impl {type_name} {{
             let rejected_frame = std::rc::Rc::clone(&frame);
             let on_rejected = w3cos_core::Value::function(move |_, arguments| {{
                 let reason = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
-                rejected_frame.borrow_mut().reject_yield(suspension, reason);
+                w3cos_core::aot_frame::write_cell(&rejected_frame).reject_yield(suspension, reason);
                 Self::continue_active(std::rc::Rc::clone(&rejected_frame));
                 w3cos_core::Value::Undefined
             }});
@@ -4294,7 +4294,7 @@ impl {type_name} {{
             w3cos_core::intrinsics::call_method(
                 &awaited,
                 &w3cos_core::Value::string("then"),
-                vec![on_fulfilled, on_rejected],
+                w3cos_core::aot_frame::args([on_fulfilled, on_rejected]),
             );
             return;
         }}
@@ -4310,7 +4310,7 @@ impl {type_name} {{
             let on_fulfilled = w3cos_core::Value::function(move |_, arguments| {{
                 let value = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
                 {{
-                    let mut frame = fulfilled_frame.borrow_mut();
+                    let mut frame = w3cos_core::aot_frame::write_cell(&fulfilled_frame);
                     frame.registers[dst] = value;
                     frame.block = resume_block;
                     frame.state = {type_name}State::Ready;
@@ -4322,7 +4322,7 @@ impl {type_name} {{
             let on_rejected = w3cos_core::Value::function(move |_, arguments| {{
                 let reason = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
                 {{
-                    let mut frame = rejected_frame.borrow_mut();
+                    let mut frame = w3cos_core::aot_frame::write_cell(&rejected_frame);
                     frame.registers[dst] = reason;
                     frame.block = reject_block;
                     frame.state = {type_name}State::Ready;
@@ -4339,7 +4339,7 @@ impl {type_name} {{
             w3cos_core::intrinsics::call_method(
                 &awaited,
                 &w3cos_core::Value::string("then"),
-                vec![on_fulfilled, on_rejected],
+                w3cos_core::aot_frame::args([on_fulfilled, on_rejected]),
             );
             return;
         }}
@@ -4360,14 +4360,14 @@ impl {type_name} {{
         let on_rejected = w3cos_core::Value::function(move |_, arguments| {{
             let reason = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
             if done {{
-                rejected_frame.borrow_mut().state = {type_name}State::Completed;
+                w3cos_core::aot_frame::write_cell(&rejected_frame).state = {type_name}State::Completed;
                 Self::settle_active(
                     std::rc::Rc::clone(&rejected_frame),
                     false,
                     reason,
                 );
             }} else {{
-                let suspension = match rejected_frame.borrow().state {{
+                let suspension = match w3cos_core::aot_frame::read_cell(&rejected_frame).state {{
                     {type_name}State::Suspended(suspension) => suspension,
                     _ => {{
                         Self::settle_active(
@@ -4378,7 +4378,7 @@ impl {type_name} {{
                         return w3cos_core::Value::Undefined;
                     }}
                 }};
-                rejected_frame.borrow_mut().reject_yield(suspension, reason);
+                w3cos_core::aot_frame::write_cell(&rejected_frame).reject_yield(suspension, reason);
                 Self::continue_active(std::rc::Rc::clone(&rejected_frame));
             }}
             w3cos_core::Value::Undefined
@@ -4387,7 +4387,7 @@ impl {type_name} {{
         w3cos_core::intrinsics::call_method(
             &awaited,
             &w3cos_core::Value::string("then"),
-            vec![on_fulfilled, on_rejected],
+            w3cos_core::aot_frame::args([on_fulfilled, on_rejected]),
         );
     }}
 
@@ -4399,7 +4399,7 @@ impl {type_name} {{
         }}) {{
             Ok(outcome) => Self::handle(frame, outcome),
             Err(reason) => {{
-                frame.borrow_mut().state = {type_name}State::Completed;
+                w3cos_core::aot_frame::write_cell(&frame).state = {type_name}State::Completed;
                 Self::settle_active(frame, false, reason);
             }}
         }}
@@ -4407,7 +4407,7 @@ impl {type_name} {{
 
     fn drive(frame: std::rc::Rc<std::cell::RefCell<Self>>) {{
         let request = {{
-            let mut frame = frame.borrow_mut();
+            let mut frame = w3cos_core::aot_frame::write_cell(&frame);
             if frame.active.is_some() {{
                 return;
             }}
@@ -4420,11 +4420,11 @@ impl {type_name} {{
             (kind, input)
         }};
         match w3cos_core::catch_js(|| {{
-            frame.borrow_mut().resume(request.0, request.1)
+            w3cos_core::aot_frame::write_cell(&frame).resume(request.0, request.1)
         }}) {{
             Ok(outcome) => Self::handle(frame, outcome),
             Err(reason) => {{
-                frame.borrow_mut().state = {type_name}State::Completed;
+                w3cos_core::aot_frame::write_cell(&frame).state = {type_name}State::Completed;
                 Self::settle_active(frame, false, reason);
             }}
         }}
@@ -4435,10 +4435,10 @@ impl {type_name} {{
         kind: u8,
         input: w3cos_core::Value,
     ) -> w3cos_core::Value {{
-        w3cos_core::intrinsics::promise_new(vec![w3cos_core::Value::function(move |_, arguments| {{
+        w3cos_core::intrinsics::promise_new(w3cos_core::aot_frame::args([w3cos_core::Value::function(move |_, arguments| {{
             let resolve = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined);
             let reject = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined);
-            frame.borrow_mut().queue.push_back({request_name} {{
+            w3cos_core::aot_frame::write_cell(&frame).queue.push_back({request_name} {{
                 kind,
                 input: input.clone(),
                 resolve,
@@ -4446,7 +4446,7 @@ impl {type_name} {{
             }});
             Self::drive(std::rc::Rc::clone(&frame));
             w3cos_core::Value::Undefined
-        }})])
+        }})]))
     }}
 }}
 
@@ -4897,7 +4897,7 @@ fn fuse_private_binding_loads(
             prewrapped.insert(next);
         }
         emitted[next] = format!(
-            "match w3cos_core::aot_frame::ready_cell(&self.bindings, {key}) {{ Ok(__w3cos_cell) => {{ let {local} = __w3cos_cell.borrow(); {replaced} }} Err(__w3cos_exception) => {propagate} }}"
+            "match w3cos_core::aot_frame::ready_cell(&self.bindings, {key}) {{ Ok(__w3cos_cell) => {{ let {local} = w3cos_core::aot_frame::read_cell(__w3cos_cell); {replaced} }} Err(__w3cos_exception) => {propagate} }}"
         );
         fused.insert(current);
         index = next + 1;
@@ -5056,12 +5056,12 @@ fn fuse_multi_use_binding_loads(
             // The TDZ check already ran at the load; the cell is present and
             // initialized from here on.
             emitted[index] = format!(
-                "match {cell} {{ Some(__w3cos_cell) => {{ let {local} = __w3cos_cell.borrow(); {text} }} None => {{ {tdz} }} }}"
+                "match {cell} {{ Some(__w3cos_cell) => {{ let {local} = w3cos_core::aot_frame::read_cell(__w3cos_cell); {text} }} None => {{ {tdz} }} }}"
             );
             prewrapped.insert(index);
         }
         emitted[current] = format!(
-            "match {cell} {{ Some(__w3cos_cell) => {{ if !__w3cos_cell.borrow().1 {{ {tdz} }} }} None => {{ {tdz} }} }}"
+            "match {cell} {{ Some(__w3cos_cell) => {{ if !w3cos_core::aot_frame::read_cell(__w3cos_cell).1 {{ {tdz} }} }} None => {{ {tdz} }} }}"
         );
         prewrapped.insert(current);
     }
@@ -8227,7 +8227,7 @@ fn emit_instruction(
                     .unwrap_or_default()
             });
             let meta = format!(
-                "{{ static __W3COS_FN_META: ::std::sync::Once = ::std::sync::Once::new(); __W3COS_FN_META.call_once(|| w3cos_core::register_aot_function_meta({factory}, {meta_name:?}, {meta_length}, {meta_constructor})); }} "
+                "{{ static __W3COS_FN_META: ::std::sync::Once = ::std::sync::Once::new(); w3cos_core::aot_frame::once(&__W3COS_FN_META, || w3cos_core::register_aot_function_meta({factory}, {meta_name:?}, {meta_length}, {meta_constructor})); }} "
             );
             let adapters = format!("{meta}{adapters}");
             let slow = format!(
@@ -8310,7 +8310,7 @@ fn emit_instruction(
             reads.extend(arguments.iter().map(|argument| argument.0));
             let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
             let expr = format!(
-                "w3cos_core::intrinsics::call_completion(&{}, {}, vec![{}])",
+                "w3cos_core::intrinsics::call_completion(&{}, {}, w3cos_core::aot_frame::args([{}]))",
                 uses.emit(callee.0),
                 uses.emit(this_value.0),
                 emit_arguments_from(&mut uses, arguments)
@@ -8392,7 +8392,7 @@ fn emit_instruction(
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
                 let expr = format!(
-                    "w3cos_core::intrinsics::call_method_completion(&{}, &{}, vec![{}])",
+                    "w3cos_core::intrinsics::call_method_completion(&{}, &{}, w3cos_core::aot_frame::args([{}]))",
                     uses.emit(object.0),
                     uses.emit(key.0),
                     emit_arguments_from(&mut uses, arguments)
@@ -11101,6 +11101,10 @@ fn main() {{
             "the numeric loop must not reload RefCell bindings: {generated}"
         );
         assert!(
+            !generated.contains("read_cell(__w3cos_cell)"),
+            "the numeric loop must not reload RefCell bindings: {generated}"
+        );
+        assert!(
             generated.contains("let mut nb_") || generated.contains("let mut nr_"),
             "the native loop should promote f64 slots to locals: {generated}"
         );
@@ -12072,8 +12076,17 @@ fn main() {{
                 "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
             ) || generated.contains(
                 "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
+            ) || generated.contains(
+                "args([std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)])"
+            ) || generated.contains(
+                "args([std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
             ),
             "last-use Call argument must be taken, not cloned: {generated}"
+        );
+        assert!(
+            generated.contains("call_completion(")
+                && generated.contains("w3cos_core::aot_frame::args(["),
+            "call arguments should be built through aot_frame::args, not vec!: {generated}"
         );
         assert!(
             !generated.contains("self.registers[2].clone()"),
