@@ -81,11 +81,14 @@ impl<T> Slots<T> for Vec<Option<T>> {
 /// `Deref::deref` (not `#[track_caller]`) and then indexes an array with a
 /// constant, which is checked at compile time, so the only locations are
 /// the ones inside these impls (once per `N`).
-pub struct Registers<const N: usize>(Box<[Value; N]>);
+///
+/// The unboxed number and boolean banks (`num_regs`, `bool_regs`,
+/// `num_bindings`) use the same type with `T = f64` / `T = bool`.
+pub struct Registers<const N: usize, T = Value>(Box<[T; N]>);
 
-impl<const N: usize> From<Vec<Value>> for Registers<N> {
+impl<const N: usize, T> From<Vec<T>> for Registers<N, T> {
     #[inline]
-    fn from(registers: Vec<Value>) -> Self {
+    fn from(registers: Vec<T>) -> Self {
         match registers.into_boxed_slice().try_into() {
             Ok(registers) => Self(registers),
             Err(registers) => panic!("{} registers for a frame of {N}", registers.len()),
@@ -93,19 +96,28 @@ impl<const N: usize> From<Vec<Value>> for Registers<N> {
     }
 }
 
-impl<const N: usize> std::ops::Deref for Registers<N> {
-    type Target = [Value; N];
+impl<const N: usize, T> std::ops::Deref for Registers<N, T> {
+    type Target = [T; N];
     #[inline]
-    fn deref(&self) -> &[Value; N] {
+    fn deref(&self) -> &[T; N] {
         &self.0
     }
 }
 
-impl<const N: usize> std::ops::DerefMut for Registers<N> {
+impl<const N: usize, T> std::ops::DerefMut for Registers<N, T> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut [Value; N] {
+    fn deref_mut(&mut self) -> &mut [T; N] {
         &mut self.0
     }
+}
+
+/// `slots[index] = Some(value)` for a frame's binding slots under
+/// construction. A call instead of indexing at the site keeps one panic
+/// location here rather than one per generated assignment; out-of-range
+/// indexes still panic.
+#[inline]
+pub fn set_slot<T>(slots: &mut [Option<T>], index: usize, value: T) {
+    slots[index] = Some(value);
 }
 
 impl<T> Slots<T> for HashMap<u32, T> {
@@ -504,6 +516,33 @@ mod tests {
         let registers: Registers<9> = vec![Value::Undefined; 9].into();
         let index = registers.len();
         let _ = &registers[index];
+    }
+
+    #[test]
+    fn registers_hold_unboxed_number_and_bool_banks() {
+        let mut numbers: Registers<10, f64> = vec![0.0_f64; 10].into();
+        let mut bools: Registers<9, bool> = vec![false; 9].into();
+        numbers[9] = 2.5;
+        bools[8] = true;
+        assert_eq!(numbers[9] + numbers[0], 2.5);
+        assert!(bools[8] && !bools[7]);
+        assert_eq!((numbers.len(), bools.len()), (10, 9));
+    }
+
+    #[test]
+    fn set_slot_fills_vec_and_array_slots() {
+        let mut heap: Vec<Option<u32>> = vec![None; 10];
+        let mut inline: [Option<u32>; 2] = [None, None];
+        set_slot(&mut heap, 9, 7);
+        set_slot(&mut inline, 1, 3);
+        assert_eq!((heap[9], heap[8], inline[1]), (Some(7), None, Some(3)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn set_slot_still_bounds_checks() {
+        let mut heap: Vec<Option<u32>> = vec![None; 10];
+        set_slot(&mut heap, 10, 7);
     }
 
     #[test]
