@@ -3141,14 +3141,16 @@ impl {type_name} {{
     );
     // `match` instead of `.unwrap_or_else(..)`: the pinned std marks
     // `Result::unwrap_or_else` `#[track_caller]`, so every generated entry
-    // carried its own panic location in `.data.rel.ro`.
+    // carried its own panic location in `.data.rel.ro`. Fully qualified
+    // patterns: generated code may shadow `Ok`/`Err` (e.g. JS classes
+    // named after them in test262 NativeError subclass tests).
     let run = if typed_parameter_stores.is_empty() {
         format!(
-            "    match ({frame}).run() {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
+            "    match ({frame}).run() {{ ::std::result::Result::Ok(__w3cos_value) => __w3cos_value, ::std::result::Result::Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
         )
     } else {
         format!(
-            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    match __w3cos_frame.run() {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
+            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    match __w3cos_frame.run() {{ ::std::result::Result::Ok(__w3cos_value) => __w3cos_value, ::std::result::Result::Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
         )
     };
     let entry = format!(
@@ -10421,6 +10423,82 @@ fn main() {{
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
+    #[test]
+    fn generated_sync_entry_compiles_when_err_is_shadowed() {
+        // test262 NativeError subclass tests declare a JS class named `Err`,
+        // which becomes a Rust item in the same module; the entry's `match`
+        // on `run()` must not resolve its `Err(..)` pattern against it.
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function read() {
+                    return "ok!";
+                }
+                read;
+            "#,
+            "app:///sync-aot-shadowed-result.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .unwrap()
+            .clone();
+        let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_shadowed_result_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+#[allow(dead_code, non_snake_case)]
+fn Err() {{}}
+{generated}
+fn main() {{
+    println!(
+        "{{}}",
+        read_aot(
+            w3cos_core::Value::Undefined,
+            &[],
+            &w3cos_core::AotCaptureMap::new(),
+        )
+        .to_js_string(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated entry with shadowed Err failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok!");
     }
 
     #[test]
