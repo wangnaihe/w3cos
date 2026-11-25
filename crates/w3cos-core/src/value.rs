@@ -1304,8 +1304,148 @@ pub enum AotCapture {
 
 /// Capture environment for an AOT-emitted nested function factory.
 ///
-/// Keys are W3IR binding ids.
-pub type AotCaptureMap = HashMap<u32, AotCapture>;
+/// Keys are W3IR binding ids. A closure captures only a handful of
+/// bindings, so this is a small vector searched linearly instead of a
+/// `HashMap`: no `RandomState`, no power-of-two bucket table and no rehash as
+/// it fills. The first few inserts grow the buffer one slot at a time so a
+/// closure that captures one binding holds exactly one entry.
+#[derive(Clone, Default)]
+pub struct AotCaptureMap {
+    entries: Vec<(u32, AotCapture)>,
+}
+
+impl AotCaptureMap {
+    /// Entries up to this count grow the buffer by exactly one slot.
+    const EXACT_GROWTH: usize = 4;
+
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    fn position(&self, key: u32) -> Option<usize> {
+        self.entries.iter().position(|(id, _)| *id == key)
+    }
+
+    /// Same contract as `HashMap::insert`: returns the replaced capture.
+    pub fn insert(&mut self, key: u32, capture: AotCapture) -> Option<AotCapture> {
+        if let Some(index) = self.position(key) {
+            return Some(std::mem::replace(&mut self.entries[index].1, capture));
+        }
+        let len = self.entries.len();
+        if len == self.entries.capacity() && len < Self::EXACT_GROWTH {
+            self.entries.reserve_exact(1);
+        }
+        self.entries.push((key, capture));
+        None
+    }
+
+    pub fn get(&self, key: &u32) -> Option<&AotCapture> {
+        self.entries
+            .iter()
+            .find(|(id, _)| id == key)
+            .map(|(_, capture)| capture)
+    }
+
+    pub fn get_mut(&mut self, key: &u32) -> Option<&mut AotCapture> {
+        self.entries
+            .iter_mut()
+            .find(|(id, _)| id == key)
+            .map(|(_, capture)| capture)
+    }
+
+    pub fn contains_key(&self, key: &u32) -> bool {
+        self.position(*key).is_some()
+    }
+
+    pub fn remove(&mut self, key: &u32) -> Option<AotCapture> {
+        let index = self.position(*key)?;
+        Some(self.entries.swap_remove(index).1)
+    }
+
+    /// Iterates in insertion order. Callers must not rely on any order,
+    /// as with the `HashMap` this replaced.
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &AotCapture)> {
+        self.entries.iter().map(|(id, capture)| (id, capture))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &u32> {
+        self.entries.iter().map(|(id, _)| id)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &AotCapture> {
+        self.entries.iter().map(|(_, capture)| capture)
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+    }
+}
+
+impl std::ops::Index<&u32> for AotCaptureMap {
+    type Output = AotCapture;
+
+    fn index(&self, key: &u32) -> &AotCapture {
+        self.get(key)
+            .expect("AotCaptureMap: no capture for binding id")
+    }
+}
+
+impl<const N: usize> From<[(u32, AotCapture); N]> for AotCaptureMap {
+    fn from(entries: [(u32, AotCapture); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+
+impl FromIterator<(u32, AotCapture)> for AotCaptureMap {
+    fn from_iter<I: IntoIterator<Item = (u32, AotCapture)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let mut map = Self::with_capacity(iter.size_hint().0);
+        for (key, capture) in iter {
+            map.insert(key, capture);
+        }
+        map
+    }
+}
+
+impl Extend<(u32, AotCapture)> for AotCaptureMap {
+    fn extend<I: IntoIterator<Item = (u32, AotCapture)>>(&mut self, iter: I) {
+        for (key, capture) in iter {
+            self.insert(key, capture);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a AotCaptureMap {
+    type Item = (&'a u32, &'a AotCapture);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (u32, AotCapture)>,
+        fn(&'a (u32, AotCapture)) -> (&'a u32, &'a AotCapture),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(id, capture)| (id, capture))
+    }
+}
 
 static FAST_DOM_DISPATCH: OnceLock<fn(u32, &Value) -> Option<bool>> = OnceLock::new();
 
@@ -5895,6 +6035,39 @@ mod tests {
             "5th own prop spills FunctionData props to HashMap"
         );
         crate::page_arena::reset();
+    }
+
+    #[test]
+    fn aot_capture_map_keeps_hash_map_semantics_with_exact_small_buffers() {
+        let number = |n: f64| AotCapture::Accessors(Value::Number(n), Value::Undefined);
+        let read = |map: &AotCaptureMap, id: u32| match map.get(&id) {
+            Some(AotCapture::Accessors(getter, _)) => Some(getter.to_number()),
+            _ => None,
+        };
+        let mut map = AotCaptureMap::new();
+        assert!(map.is_empty());
+        assert!(map.insert(9, number(1.0)).is_none());
+        assert_eq!(map.capacity(), 1, "one capture holds one slot");
+        assert!(map.insert(3, number(2.0)).is_none());
+        assert!(map.insert(9, number(3.0)).is_some(), "insert replaces");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.capacity(), 2);
+        assert_eq!(read(&map, 9), Some(3.0));
+        assert_eq!(read(&map, 3), Some(2.0));
+        assert_eq!(read(&map, 4), None);
+        assert!(map.contains_key(&3) && !map.contains_key(&4));
+        let mut ids = map.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 9]);
+        assert!(matches!(map[&3], AotCapture::Accessors(..)));
+        for id in 10..40 {
+            map.insert(id, number(f64::from(id)));
+        }
+        assert_eq!(map.len(), 32);
+        assert_eq!(read(&map, 39), Some(39.0));
+        let literal = AotCaptureMap::from([(1, number(1.0)), (2, number(2.0))]);
+        assert_eq!(literal.capacity(), 2);
+        assert_eq!(read(&literal.clone(), 2), Some(2.0));
     }
 
     #[test]
