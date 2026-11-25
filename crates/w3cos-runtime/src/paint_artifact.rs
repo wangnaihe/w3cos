@@ -479,6 +479,9 @@ pub struct PaintArtifact {
     persist_percent_padding: bool,
     /// The viewport that build adjusted its used styles for.
     persist_viewport: Option<(f32, f32)>,
+    /// `W3COS_PAINT_PERSIST_TABLE_SPANS`: that build's boxes in table
+    /// subtrees (sorted), for the next plan's ranged marks.
+    persist_tables: Option<std::sync::Arc<Vec<u32>>>,
     /// During `append_all_reusing` only: the boxes this frame's layout
     /// splice touched ([`paint_touched_mode`]).
     touched: Option<crate::incremental_layout::PaintChanges>,
@@ -550,6 +553,7 @@ impl Default for PaintArtifact {
             persist_trimmed: None,
             persist_percent_padding: false,
             persist_viewport: None,
+            persist_tables: None,
             touched: None,
             touched_gaps: false,
             volatile_nodes: None,
@@ -737,6 +741,8 @@ struct PersistPlan<'a> {
     /// `W3COS_PAINT_PERSIST_DIRTY_SCAN`: the boxes that are not clean, in
     /// order, so the per-box passes visit only them.
     dirty: Option<Vec<u32>>,
+    /// `W3COS_PAINT_PERSIST_TABLE_SPANS`: the boxes in table subtrees.
+    tables: Option<std::sync::Arc<Vec<u32>>>,
 }
 
 /// `W3COS_PAINT_PERSIST_DIRTY_SCAN=1|verify` (off by default; with the
@@ -778,6 +784,162 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn persist_dirty_scan_stats() -> (u64, u64) {
     PERSIST_DIRTY_SCAN_STATS.with(std::cell::Cell::get)
+}
+
+/// `W3COS_PAINT_PERSIST_TABLE_SPANS=1|verify` (off by default; with the
+/// persistent path on, and no boxes inserted or removed): the plan's
+/// table-subtree marks (table boxes always rebuild) come from the previous
+/// build's list, recomputed only over the splice-changed ranges and their
+/// descendants, instead of reading every box's style (Blink: invalidation
+/// walks only what layout marked). The plan's dirty list then comes from
+/// the same ranges. `verify` also marks every box and compares.
+fn persist_table_spans_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PERSIST_TABLE_SPANS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_PERSIST_TABLE_SPANS")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PERSIST_TABLE_SPANS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (plans that took the ranged marks, verify mismatches).
+    static PERSIST_TABLE_SPANS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn persist_table_spans_stats() -> (u64, u64) {
+    PERSIST_TABLE_SPANS_STATS.with(std::cell::Cell::get)
+}
+
+/// A table-internal or table box (the table passes add to its properties).
+#[inline]
+fn table_display(node: &PaintNode) -> bool {
+    matches!(
+        node.style.display,
+        Display::Table
+            | Display::InlineTable
+            | Display::TableRowGroup
+            | Display::TableHeaderGroup
+            | Display::TableFooterGroup
+            | Display::TableRow
+            | Display::TableColumnGroup
+            | Display::TableColumn
+            | Display::TableCell
+            | Display::TableCaption
+    )
+}
+
+/// The boxes in a table subtree (sorted), over every box.
+fn table_subtree_boxes(nodes: &[PaintNode]) -> Vec<u32> {
+    let mut in_table = vec![false; nodes.len()];
+    let mut list = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if table_display(node)
+            || node
+                .parent
+                .is_some_and(|parent| parent < index && in_table[parent])
+        {
+            in_table[index] = true;
+            list.push(index as u32);
+        }
+    }
+    list
+}
+
+/// `table_subtree_boxes` from the previous build's list: only the changed
+/// ranges are marked again, and the subtree of a box whose mark flipped
+/// (a box's mark depends only on its own display and its ancestors').
+fn table_subtree_boxes_ranged(
+    nodes: &[PaintNode],
+    previous: &[u32],
+    changed: &[(u32, u32)],
+) -> Vec<u32> {
+    let len = nodes.len();
+    let mut ranges: Vec<(usize, usize)> = changed
+        .iter()
+        .map(|&(a, b)| (a as usize, (b as usize).min(len)))
+        .filter(|(a, b)| a < b)
+        .collect();
+    ranges.sort_unstable();
+    let mut in_table = vec![false; len];
+    for &index in previous {
+        if let Some(slot) = in_table.get_mut(index as usize) {
+            *slot = true;
+        }
+    }
+    // The regions marked again (sorted, disjoint).
+    let mut redone: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    let mut flipped = false;
+    for (a, b) in ranges {
+        let start = redone.last().map_or(a, |last| a.max(last.1));
+        let mut until = b.max(start);
+        let mut index = start;
+        while index < until {
+            let node = &nodes[index];
+            let mark = table_display(node)
+                || node
+                    .parent
+                    .is_some_and(|parent| parent < index && in_table[parent]);
+            if mark != in_table[index] {
+                in_table[index] = mark;
+                flipped = true;
+                // Preorder: its subtree runs while parents are at or after it.
+                let mut end = index + 1;
+                while end < len && nodes[end].parent.is_some_and(|parent| parent >= index) {
+                    end += 1;
+                }
+                until = until.max(end);
+            }
+            index += 1;
+        }
+        match redone.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(until),
+            _ if start < until => redone.push((start, until)),
+            _ => {}
+        }
+    }
+    if !flipped {
+        return previous
+            .iter()
+            .copied()
+            .filter(|&index| (index as usize) < len)
+            .collect();
+    }
+    let mut list = Vec::with_capacity(previous.len());
+    let mut kept = previous.iter().map(|&index| index as usize).peekable();
+    for &(a, end) in &redone {
+        while let Some(&index) = kept.peek().filter(|&&index| index < a) {
+            list.push(index as u32);
+            kept.next();
+        }
+        while kept.peek().is_some_and(|&index| index < end) {
+            kept.next();
+        }
+        list.extend(
+            (a..end)
+                .filter(|&index| in_table[index])
+                .map(|index| index as u32),
+        );
+    }
+    list.extend(kept.filter(|&index| index < len).map(|index| index as u32));
+    list
 }
 
 fn persist_dirty_scan_mismatch(what: &str) {
@@ -912,7 +1074,7 @@ fn persistent_nodes_plan<'a>(
         return full("box count");
     }
     let mut clean = vec![true; nodes.len()];
-    for (a, b) in changed {
+    for &(a, b) in &changed {
         clean[a as usize..(b as usize).min(nodes.len())].fill(false);
     }
     // New index -> previous index, from the splices' pieces.
@@ -962,33 +1124,63 @@ fn persistent_nodes_plan<'a>(
     };
     // The table passes add to their boxes' properties (not idempotent on
     // an adjusted node): table subtrees always rebuild.
-    let mut in_table = vec![false; nodes.len()];
-    for (index, node) in nodes.iter().enumerate() {
-        let table = matches!(
-            node.style.display,
-            Display::Table
-                | Display::InlineTable
-                | Display::TableRowGroup
-                | Display::TableHeaderGroup
-                | Display::TableFooterGroup
-                | Display::TableRow
-                | Display::TableColumnGroup
-                | Display::TableColumn
-                | Display::TableCell
-                | Display::TableCaption
-        ) || node
-            .parent
-            .is_some_and(|parent| parent < index && in_table[parent]);
-        if table {
-            in_table[index] = true;
-            clean[index] = false;
+    let tables_mode = persist_table_spans_mode();
+    let ranged = (tables_mode != 0 && moved_from.is_none())
+        .then(|| previous.persist_tables.as_deref())
+        .flatten()
+        .map(|kept| table_subtree_boxes_ranged(nodes, kept, &changed));
+    let tables = match (ranged, tables_mode) {
+        (Some(ranged), 2) => {
+            let full = table_subtree_boxes(nodes);
+            let same = ranged == full;
+            PERSIST_TABLE_SPANS_STATS.with(|stats| {
+                let (plans, mismatches) = stats.get();
+                stats.set((plans + 1, mismatches + u64::from(!same)));
+            });
+            if !same {
+                eprintln!(
+                    "[paint-persist-table-spans-verify] mismatch: {} ranged vs {} full table boxes",
+                    ranged.len(),
+                    full.len()
+                );
+            }
+            (full, true)
         }
+        (Some(ranged), _) => {
+            PERSIST_TABLE_SPANS_STATS.with(|stats| {
+                let (plans, mismatches) = stats.get();
+                stats.set((plans + 1, mismatches));
+            });
+            (ranged, true)
+        }
+        (None, _) => (table_subtree_boxes(nodes), false),
+    };
+    let (tables, tables_ranged) = tables;
+    for &index in &tables {
+        clean[index as usize] = false;
     }
     clean[0] = false;
     if let Some(body) = body_index.filter(|body| *body < clean.len()) {
         clean[body] = false;
     }
-    let (clean_count, dirty) = if persist_dirty_scan_mode() != 0 {
+    let (clean_count, dirty) = if tables_ranged && tables_mode == 1 {
+        // Not clean: the changed ranges, table subtrees, the root and body.
+        let mut dirty: Vec<u32> = changed
+            .iter()
+            .flat_map(|&(a, b)| a..b.min(nodes.len() as u32))
+            .chain(tables.iter().copied())
+            .chain(std::iter::once(0))
+            .chain(
+                body_index
+                    .filter(|body| *body < clean.len())
+                    .map(|body| body as u32),
+            )
+            .collect();
+        dirty.sort_unstable();
+        dirty.dedup();
+        let count = clean.len() - dirty.len();
+        (count, (persist_dirty_scan_mode() != 0).then_some(dirty))
+    } else if persist_dirty_scan_mode() != 0 {
         let dirty: Vec<u32> = clean
             .iter()
             .enumerate()
@@ -1006,6 +1198,7 @@ fn persistent_nodes_plan<'a>(
         trimmed,
         moved_from,
         dirty,
+        tables: (tables_mode != 0).then(|| std::sync::Arc::new(tables)),
     })
 }
 
@@ -3904,6 +4097,12 @@ impl PaintArtifact {
         let plan = persist_on
             .then(|| persistent_nodes_plan(&nodes, previous, body_index, viewport))
             .flatten();
+        // The next plan's ranged table marks start from this build's.
+        let persist_tables = (persist_on && persist_table_spans_mode() != 0).then(|| {
+            plan.as_ref()
+                .and_then(|plan| plan.tables.clone())
+                .unwrap_or_else(|| std::sync::Arc::new(table_subtree_boxes(&nodes)))
+        });
         // In place: a recycled node stays only where the plan keeps the box
         // clean; elsewhere (and on a box whose recycled kind may hold text
         // trimmed two builds ago) the box takes its flat-tree node again.
@@ -4504,6 +4703,7 @@ impl PaintArtifact {
             persist_trimmed,
             persist_percent_padding: has_percentage_padding,
             persist_viewport: viewport,
+            persist_tables,
             ..Self::default()
         };
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
@@ -6686,6 +6886,69 @@ fn rank_paint_order(paint_order: &PaintOrderKeys) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranged_table_marks_match_the_full_marks() {
+        // A small deterministic generator (no rand dependency).
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let displays = [
+            Display::Block,
+            Display::Inline,
+            Display::Table,
+            Display::TableRow,
+            Display::TableCell,
+            Display::Flex,
+        ];
+        let node = |display: Display, parent: Option<usize>| PaintNode {
+            kind: ComponentKind::Column,
+            style: Style {
+                display,
+                ..Style::default()
+            }
+            .into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        for _ in 0..200 {
+            // Preorder: each box's parent is an earlier box on the current
+            // ancestor chain.
+            let len = 2 + next(60);
+            let mut nodes = vec![node(Display::Block, None)];
+            let mut chain = vec![0usize];
+            for index in 1..len {
+                chain.truncate(1 + next(chain.len()));
+                let parent = *chain.last().unwrap();
+                let display = if next(4) == 0 {
+                    displays[next(displays.len())]
+                } else {
+                    Display::Block
+                };
+                nodes.push(node(display, Some(parent)));
+                chain.push(index);
+            }
+            let previous = table_subtree_boxes(&nodes);
+            let mut changed = Vec::new();
+            for _ in 0..1 + next(3) {
+                let a = next(len);
+                let b = (a + 1 + next(6)).min(len);
+                for index in a..b {
+                    let parent = nodes[index].parent;
+                    nodes[index] = node(displays[next(displays.len())], parent);
+                }
+                changed.push((a as u32, b as u32));
+            }
+            assert_eq!(
+                table_subtree_boxes_ranged(&nodes, &previous, &changed),
+                table_subtree_boxes(&nodes)
+            );
+        }
+    }
 
     #[test]
     fn refilled_kinds_equal_their_source_and_reuse_text_buffers() {

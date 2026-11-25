@@ -3120,6 +3120,100 @@ mod tests {
         assert!(walk == full, "frames from the dirty list walk differ");
     }
 
+    #[test]
+    fn persist_table_spans_match_the_full_marks() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PERSIST_TABLE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PERSIST_TABLE_SPANS_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(200.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "180px");
+            crate::dom::append_child(body, log);
+            // A table before the streamed text, whose cells rebuild every
+            // build, and a message holding a table after it.
+            let table = crate::dom::create_element("div");
+            crate::dom::set_style_property(table, "display", "table");
+            let row = crate::dom::create_element("div");
+            crate::dom::set_style_property(row, "display", "table-row");
+            let mut cells = Vec::new();
+            for color in ["#cc3333", "#33cc33"] {
+                let cell = crate::dom::create_element("div");
+                crate::dom::set_style_property(cell, "display", "table-cell");
+                crate::dom::set_style_property(cell, "background", color);
+                let words = crate::dom::create_text_node("cell");
+                crate::dom::append_child(cell, words);
+                crate::dom::append_child(row, cell);
+                cells.push(words);
+            }
+            crate::dom::append_child(table, row);
+            crate::dom::append_child(log, table);
+            let mut texts = Vec::new();
+            for index in 0..3 {
+                let message = crate::dom::create_element("p");
+                let words = crate::dom::create_text_node(&format!("  message {index} words"));
+                crate::dom::append_child(message, words);
+                crate::dom::append_child(log, message);
+                texts.push((message, words));
+            }
+            assert!(crate::incremental_layout::flush());
+            let before = crate::paint_artifact::persist_table_spans_stats();
+            let persistent_before = persistent_paint_stats().0;
+            let mut frames = vec![render_document_rgba(200, 480).expect("first frame").rgba];
+            for step in 0..8 {
+                match step % 4 {
+                    0 => crate::dom::set_text_content(
+                        texts[2].1,
+                        &format!("  message 2 words and {step} more words that wrap"),
+                    ),
+                    1 => crate::dom::set_text_content(cells[1], &format!("cell {step}")),
+                    2 => crate::dom::set_style_property(
+                        texts[1].0,
+                        "display",
+                        if step % 8 == 2 { "table-cell" } else { "block" },
+                    ),
+                    _ => {
+                        let line = crate::dom::create_element("p");
+                        let words = crate::dom::create_text_node(&format!("   line {step}"));
+                        crate::dom::append_child(line, words);
+                        crate::dom::append_child(log, line);
+                    }
+                }
+                frames.push(render_document_rgba(200, 480).expect("stream frame").rgba);
+            }
+            let after = crate::paint_artifact::persist_table_spans_stats();
+            let persistent = persistent_paint_stats().0 - persistent_before;
+            (frames, (after.0 - before.0, after.1 - before.1), persistent)
+        };
+        let (verified, (plans, mismatched), persistent) = run(2);
+        // The ranged marks exist only on the persistent path
+        // (`W3COS_PAINT_PERSISTENT_NODES`, on in the gate's verify mode).
+        if persistent > 0 {
+            assert!(plans > 0, "persistent builds must take the ranged marks");
+        }
+        assert_eq!(
+            mismatched, 0,
+            "the ranged table marks differ from the full marks"
+        );
+        let (ranged, _, _) = run(1);
+        let (full, (off_plans, _), _) = run(0);
+        assert_eq!(off_plans, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(ranged == full, "frames from the ranged table marks differ");
+    }
+
     #[cfg(feature = "skia")]
     #[test]
     fn quiet_frames_match_a_full_paint() {
