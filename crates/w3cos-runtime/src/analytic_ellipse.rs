@@ -83,6 +83,166 @@ thread_local! {
     static OVAL: Option<RuntimeEffect> = RuntimeEffect::make_for_shader(OVAL_SHADER, None).ok();
 }
 
+/// The mesh triangles in `OVAL_SHADER`'s test order (vertex and edge indices).
+const OVAL_TRIANGLES: [[usize; 3]; 52] = [
+    [0, 4, 1],
+    [4, 1, 5],
+    [1, 5, 2],
+    [5, 2, 3],
+    [2, 3, 5],
+    [3, 5, 9],
+    [5, 9, 13],
+    [9, 13, 10],
+    [13, 10, 14],
+    [10, 14, 11],
+    [14, 11, 12],
+    [11, 12, 14],
+    [12, 14, 18],
+    [14, 18, 22],
+    [18, 22, 19],
+    [22, 19, 23],
+    [19, 23, 20],
+    [23, 20, 21],
+    [20, 21, 23],
+    [21, 23, 27],
+    [23, 27, 31],
+    [27, 31, 28],
+    [31, 28, 32],
+    [28, 32, 29],
+    [32, 29, 30],
+    [29, 30, 32],
+    [30, 32, 0],
+    [32, 0, 4],
+    [4, 6, 5],
+    [6, 5, 7],
+    [5, 7, 13],
+    [7, 13, 15],
+    [13, 15, 14],
+    [15, 14, 16],
+    [14, 16, 22],
+    [16, 22, 24],
+    [22, 24, 23],
+    [24, 23, 25],
+    [23, 25, 31],
+    [25, 31, 33],
+    [31, 33, 32],
+    [33, 32, 34],
+    [32, 34, 4],
+    [34, 4, 6],
+    [6, 8, 7],
+    [7, 17, 15],
+    [15, 17, 16],
+    [16, 26, 24],
+    [24, 26, 25],
+    [25, 35, 33],
+    [33, 35, 34],
+    [34, 8, 6],
+];
+
+/// `W3COS_PAINT_OVAL_LOOP`: `OVAL_SHADER` with its 52 unrolled triangle tests
+/// as one loop over per-triangle uniforms. Each draw builds the raster
+/// pipeline of the shader's program anew, and the unrolled program made that
+/// setup cost far more than the pixels; the loop runs the same arithmetic in
+/// the same order, stopping at the first hit as the chain of `if(!hit)` did.
+pub(super) const OVAL_LOOP_SHADER: &str = r#"
+uniform float4 bounds; uniform float4 rgba;
+uniform float4 ta[52]; uniform float4 tb[52]; uniform float4 tc[52];
+uniform float4 ea[52]; uniform float4 eb[52]; uniform float4 ec[52];
+float cross2(float2 a,float2 b){return a.x*b.y-a.y*b.x;}
+bool triangle(float2 p,float4 a,float4 b,float4 c,float4 ea,float4 eb,float4 ec,inout float4 distances,inout float outset){
+ float determinant=cross2(b.xy-a.xy,c.xy-a.xy);
+ if(abs(determinant)<1e-8)return false;
+ float wb=cross2(p-a.xy,c.xy-a.xy)/determinant,wc=cross2(b.xy-a.xy,p-a.xy)/determinant,wa=1-wb-wc;
+ if(min(wa,min(wb,wc))<-.000001)return false;
+ distances=wa*ea+wb*eb+wc*ec;outset=wa*a.z+wb*b.z+wc*c.z;return true;
+}
+half4 main(float2 p){
+ float4 distances=float4(p-bounds.xy,bounds.zw-p);float outset=0;
+ for(int i=0;i<52;i++){if(triangle(p,ta[i],tb[i],tc[i],ea[i],eb[i],ec[i],distances,outset))break;}
+ float2 r=(bounds.zw-bounds.xy)*.5,uv=r-min(distances.xy,distances.zw);
+ float2 invR2=1/(r*r),normUV=invR2*uv;
+ float invGradLength=inversesqrt(max(dot(normUV,normUV),1.1755e-38));
+ float ellipseDistance=-.5*invGradLength*(dot(uv,normUV)-1);
+ float d=min(min(distances.x,distances.y),min(distances.z,distances.w));
+ float coverage=clamp(.5+min(d,ellipseDistance)-outset,0,1);
+ return half4(rgba*coverage);
+}"#;
+
+thread_local! {
+    static OVAL_LOOP: Option<RuntimeEffect> = RuntimeEffect::make_for_shader(OVAL_LOOP_SHADER, None).ok();
+    /// (loop draws, verify mismatches).
+    static OVAL_LOOP_STATS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OVAL_LOOP_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// `W3COS_PAINT_OVAL_LOOP=1|verify` (off by default): draw analytic ovals
+/// with `OVAL_LOOP_SHADER`. `verify` also evaluates `OVAL_SHADER` over the
+/// draw and compares every shaded value (float32) before drawing.
+pub(crate) fn oval_loop_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = OVAL_LOOP_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_OVAL_LOOP").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+/// Ovals drawn with the loop shader on this thread: (draws, verify mismatches).
+pub(crate) fn oval_loop_stats() -> (u64, u64) {
+    OVAL_LOOP_STATS.with(std::cell::Cell::get)
+}
+
+/// `mesh_uniforms` regrouped per triangle for `OVAL_LOOP_SHADER`.
+fn loop_uniforms(mesh: &[f32]) -> Vec<f32> {
+    let (head, rest) = mesh.split_at(8);
+    let (vertices, edges) = rest.split_at(36 * 4);
+    let mut uniforms = Vec::with_capacity(8 + 6 * 52 * 4);
+    uniforms.extend_from_slice(head);
+    for table in [vertices, edges] {
+        for corner in 0..3 {
+            for triangle in OVAL_TRIANGLES {
+                let at = triangle[corner] * 4;
+                uniforms.extend_from_slice(&table[at..at + 4]);
+            }
+        }
+    }
+    uniforms
+}
+
+/// Every value `shader` yields over `rect` (device pixels), as float32 bits.
+fn shaded_values(shader: &skia_safe::Shader, rect: skia_safe::IRect) -> Option<Vec<u8>> {
+    let info = skia_safe::ImageInfo::new(
+        (rect.width(), rect.height()),
+        skia_safe::ColorType::RGBAF32,
+        skia_safe::AlphaType::Premul,
+        None,
+    );
+    let mut surface = skia_safe::surfaces::raster(&info, None, None)?;
+    let canvas = surface.canvas();
+    canvas.translate((-rect.left as f32, -rect.top as f32));
+    let mut paint = Paint::default();
+    paint
+        .set_color(Color::WHITE)
+        .set_shader(shader.clone())
+        .set_anti_alias(false)
+        .set_blend_mode(skia_safe::BlendMode::Src);
+    canvas.draw_rect(Rect::from(rect), &paint);
+    let mut bytes = vec![0u8; rect.width() as usize * rect.height() as usize * 16];
+    surface
+        .read_pixels(&info, &mut bytes, rect.width() as usize * 16, (0, 0))
+        .then_some(bytes)
+}
+
 fn mesh_uniforms(bounds: Rect, color: skia_safe::Color4f) -> Vec<f32> {
     let mut uniforms = vec![
         bounds.left,
@@ -190,15 +350,66 @@ pub(super) fn draw(canvas: &Canvas, oval: &RRect, paint: &Paint) -> bool {
     if !bounds.is_finite() || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
         return false;
     }
+    let device = Rect::new(
+        bounds.left.floor(),
+        bounds.top.floor(),
+        bounds.right.ceil(),
+        bounds.bottom.ceil(),
+    );
+    let mode = oval_loop_mode();
+    let make = |values: &[f32], effect: &RuntimeEffect| {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        effect.make_shader(Data::new_copy(&bytes), &[], None)
+    };
+    let looped = (mode != 0)
+        .then(|| {
+            OVAL_LOOP.with(|effect| {
+                let effect = effect.as_ref()?;
+                make(
+                    &loop_uniforms(&mesh_uniforms(bounds, paint.color4f())),
+                    effect,
+                )
+            })
+        })
+        .flatten();
     OVAL.with(|effect| {
         let Some(effect) = effect else {
             return false;
         };
-        let c = paint.color4f();
-        let values = mesh_uniforms(bounds, c);
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let Some(shader) = effect.make_shader(Data::new_copy(&bytes), &[], None) else {
-            return false;
+        let shader = match looped {
+            Some(looped) => {
+                let mut mismatch = false;
+                if mode == 2 {
+                    let unrolled = make(&mesh_uniforms(bounds, paint.color4f()), effect);
+                    let rect = skia_safe::IRect::new(
+                        device.left as i32,
+                        device.top as i32,
+                        device.right as i32,
+                        device.bottom as i32,
+                    );
+                    let same = unrolled.is_some_and(|unrolled| {
+                        let a = shaded_values(&unrolled, rect);
+                        a.is_some() && a == shaded_values(&looped, rect)
+                    });
+                    if !same {
+                        mismatch = true;
+                        eprintln!(
+                            "[paint-oval-loop-verify] mismatch: oval {bounds:?} shades differently"
+                        );
+                    }
+                }
+                OVAL_LOOP_STATS.with(|stats| {
+                    let (draws, mismatches) = stats.get();
+                    stats.set((draws + 1, mismatches + mismatch as u64));
+                });
+                looped
+            }
+            None => {
+                let Some(shader) = make(&mesh_uniforms(bounds, paint.color4f()), effect) else {
+                    return false;
+                };
+                shader
+            }
         };
         let mut analytic = paint.clone();
         // Alpha is already premultiplied in the shader; do not apply it twice.
@@ -208,15 +419,7 @@ pub(super) fn draw(canvas: &Canvas, oval: &RRect, paint: &Paint) -> bool {
             .set_anti_alias(false);
         let save = canvas.save();
         canvas.reset_matrix();
-        canvas.draw_rect(
-            Rect::new(
-                bounds.left.floor(),
-                bounds.top.floor(),
-                bounds.right.ceil(),
-                bounds.bottom.ceil(),
-            ),
-            &analytic,
-        );
+        canvas.draw_rect(device, &analytic);
         canvas.restore_to_count(save);
         true
     })
@@ -248,6 +451,60 @@ mod tests {
             &expected,
             "DEFAULT-browser oval {size}x{size} edge ({x},3)"
         );
+    }
+
+    #[test]
+    fn oval_loop_takes_the_loop_and_matches_the_unrolled_shader() {
+        let render = |mode: u8| {
+            OVAL_LOOP_OVERRIDE.with(|value| value.set(Some(mode)));
+            let mut surface = surfaces::raster_n32_premul((96, 64)).unwrap();
+            surface.canvas().clear(Color::from_rgb(255, 165, 0));
+            for (x, y, w, h, color) in [
+                (3.0, 3.0, 6.0, 6.0, w3cos_std::Color::rgba(0, 0, 0, 128)),
+                (12.25, 4.5, 8.0, 8.0, w3cos_std::Color::rgb(37, 99, 211)),
+                (24.0, 2.0, 18.0, 18.0, w3cos_std::Color::BLACK),
+                (
+                    44.5,
+                    3.75,
+                    40.0,
+                    22.5,
+                    w3cos_std::Color::rgba(200, 30, 90, 200),
+                ),
+                (2.0, 30.0, 3.0, 2.0, w3cos_std::Color::WHITE),
+                (
+                    10.0,
+                    28.0,
+                    60.0,
+                    33.0,
+                    w3cos_std::Color::rgba(20, 160, 60, 255),
+                ),
+            ] {
+                let paint = crate::render_skia::color_paint(color, 1.0);
+                let oval = RRect::new_oval(Rect::from_xywh(x, y, w, h));
+                surface.canvas().save();
+                surface.canvas().translate((0.375, 0.0));
+                assert!(draw(surface.canvas(), &oval, &paint));
+                surface.canvas().restore();
+                assert!(draw(surface.canvas(), &oval, &paint));
+            }
+            let info = ImageInfo::new((96, 64), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut bytes = vec![0u8; 96 * 64 * 4];
+            assert!(surface.read_pixels(&info, &mut bytes, 96 * 4, (0, 0)));
+            bytes
+        };
+        let unrolled = render(0);
+        let before = oval_loop_stats();
+        let verified = render(2);
+        let after = oval_loop_stats();
+        let looped = render(1);
+        OVAL_LOOP_OVERRIDE.with(|value| value.set(None));
+        assert_eq!(after.0 - before.0, 12, "every oval took the loop shader");
+        assert_eq!(
+            after.1, before.1,
+            "the loop shades every value as the unrolled one"
+        );
+        assert!(oval_loop_stats().0 >= after.0 + 12);
+        assert!(unrolled == verified && unrolled == looped, "same pixels");
     }
 
     #[test]
