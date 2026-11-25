@@ -1989,6 +1989,55 @@ impl SkiaRasterizer {
         );
         OFFSCREEN_SKIP_ALLOWED.with(|allowed| allowed.set(false));
         let offscreen = OFFSCREEN_FRAME.with(|slot| slot.replace(0));
+        if raster_rgba_surface_mode() == 2 {
+            let info = ImageInfo::new(
+                (width as i32, height as i32),
+                ColorType::RGBA8888,
+                AlphaType::Premul,
+                None,
+            );
+            let fresh = |rgba: bool| -> Option<Vec<u8>> {
+                let mut fresh = frame_surface(width, height, rgba)?;
+                replay_frame(
+                    fresh.canvas(),
+                    &self.typeface,
+                    ReplayFrame {
+                        nodes,
+                        metrics_font,
+                        scroll_info,
+                        text_input_values,
+                        focused_index,
+                        background,
+                        artifact,
+                        retained: None,
+                        compositor_overrides,
+                        scale_factor,
+                    },
+                );
+                let mut pixels = vec![0u8; expected];
+                fresh
+                    .read_pixels(&info, &mut pixels, width as usize * 4, (0, 0))
+                    .then_some(pixels)
+            };
+            let differing = match (fresh(false), fresh(true)) {
+                (Some(a), Some(b)) => a
+                    .chunks_exact(4)
+                    .zip(b.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count(),
+                _ => usize::MAX,
+            };
+            RASTER_RGBA_SURFACE_STATS.with(|stats| {
+                let (frames, differed) = stats.get();
+                stats.set((frames + 1, differed + u32::from(differing > 0)));
+            });
+            if differing > 0 {
+                eprintln!(
+                    "[raster-rgba-surface-verify] mismatch: {differing} pixels of {width}x{height}"
+                );
+            }
+        }
+        let surface = self.surface.as_mut()?;
         if offscreen == 1 {
             return Some(self.rgba.as_slice());
         }
@@ -2029,9 +2078,23 @@ impl SkiaRasterizer {
         if width == 0 || height == 0 {
             return None;
         }
-        if self.size != (width, height) {
-            self.surface = Surface::new_raster_n32_premul((width as i32, height as i32));
+        let rgba = raster_rgba_surface_mode() == 1;
+        let kind = if rgba {
+            ColorType::RGBA8888
+        } else {
+            ColorType::n32()
+        };
+        let retyped = self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.image_info().color_type() != kind);
+        if self.size != (width, height) || retyped {
+            self.surface = frame_surface(width, height, rgba);
             self.size = (width, height);
+            if retyped {
+                // The read-back no longer matches the surface.
+                self.rgba.clear();
+            }
         }
         self.surface.as_ref().map(|_| ())
     }
@@ -10368,6 +10431,58 @@ fn to_rect(rect: LayoutRect) -> Rect {
     Rect::from_xywh(rect.x, rect.y, rect.width.max(0.0), rect.height.max(0.0))
 }
 
+/// `W3COS_RASTER_RGBA_SURFACE=1` (off by default): the CPU frame surface
+/// is RGBA8888 (the read-back layout) instead of N32 (BGRA here), so the
+/// per-frame read-back is a copy, not a swizzle of every pixel. `=verify`
+/// keeps N32 and, per frame, also paints the frame fresh on both surfaces
+/// and compares the pixels (`[raster-rgba-surface-verify]`).
+pub(crate) fn raster_rgba_surface_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = RASTER_RGBA_SURFACE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_RASTER_RGBA_SURFACE").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RASTER_RGBA_SURFACE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (verify frames, frames whose two paints differed).
+    static RASTER_RGBA_SURFACE_STATS: std::cell::Cell<(u32, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn raster_rgba_surface_stats() -> (u32, u32) {
+    RASTER_RGBA_SURFACE_STATS.with(std::cell::Cell::get)
+}
+
+/// A raster surface for a frame: RGBA8888 or N32, premultiplied.
+fn frame_surface(width: u32, height: u32, rgba: bool) -> Option<Surface> {
+    if rgba {
+        let info = ImageInfo::new(
+            (width as i32, height as i32),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        Surface::new_raster(&info, None, None)
+    } else {
+        Surface::new_raster_n32_premul((width as i32, height as i32))
+    }
+}
+
 thread_local! {
     // Preserve the N32 framebuffer, but avoid its legacy 256-denominator
     // integer SrcOver shortcut. Browser compositing rounds the normalized
@@ -16548,6 +16663,65 @@ mod tests {
             &[255, 255, 255, 255],
             "separator must not expand beyond assigned advance"
         );
+    }
+
+    #[test]
+    fn raster_rgba_surface_paints_the_same_pixels_as_n32() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        let pages = [
+            "<div style='width:130.5px;height:33.3px;margin:2.25px;background:rgba(200,30,90,0.47);\
+             border:1.5px solid rgba(0,120,255,0.6);border-radius:7px;box-shadow:2px 3px 4px rgba(0,0,0,0.35)'>\
+             Blend text \u{c4}\u{d6}</div>",
+            "<p style='opacity:0.55;color:#3a7;font:italic 13.5px serif;margin:1.5px'>Half <b>opaque</b> glyphs</p>\
+             <p style='color:rgba(20,20,200,0.4);font:11px sans-serif'>Translucent text</p>",
+            "<div style='transform:rotate(7deg);width:60px;height:20px;border:2px dashed rgba(10,200,30,0.8);\
+             background:linear-gradient(90deg,red,rgba(0,0,255,0.3))'></div>\
+             <div style='width:50px;height:30px;background:radial-gradient(circle,#ff0 10%,rgba(0,128,0,0.5))'></div>",
+            "<div style='width:80px;height:40px;background:#123;filter:blur(1.5px)'></div>\
+             <div style='width:40px;height:40px;background:rgb(0,0,255);mix-blend-mode:multiply;margin-top:-20px'></div>",
+        ];
+        let frame = |mode: u8, body: &str| {
+            RASTER_RGBA_SURFACE_OVERRIDE.with(|slot| slot.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost),
+                "https://example.test/rgba-surface.html",
+            )
+            .unwrap();
+            parser
+                .write(&format!(
+                    "<!doctype html><body style='margin:3px'>{body}</body>"
+                ))
+                .unwrap();
+            parser.finish().unwrap();
+            let rgba = crate::headless::render_document_rgba(220, 140)
+                .unwrap()
+                .rgba;
+            RASTER_RGBA_SURFACE_OVERRIDE.with(|slot| slot.set(None));
+            rgba
+        };
+        for body in pages {
+            let n32 = frame(0, body);
+            let rgba = frame(1, body);
+            assert_eq!(n32.len(), rgba.len());
+            let differing = n32
+                .chunks_exact(4)
+                .zip(rgba.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(differing, 0, "RGBA surface differs from N32 on {body}");
+            assert!(
+                n32.chunks_exact(4)
+                    .any(|pixel| pixel != [255, 255, 255, 255]),
+                "the page painted something"
+            );
+            let (frames, differed) = raster_rgba_surface_stats();
+            assert_eq!(frame(2, body), n32, "=verify paints on N32");
+            assert_eq!(raster_rgba_surface_stats(), (frames + 1, differed));
+        }
     }
 
     #[test]
