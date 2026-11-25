@@ -5347,9 +5347,13 @@ impl PaintArtifact {
         root: PaintProperties,
         top: f32,
         bottom: f32,
+        cursor: Option<&mut CullSpanCursor>,
     ) -> Option<CullSpan> {
         let spans = &record.cull_spans;
-        let index = spans.partition_point(|span| (span.start as usize) < at);
+        let index = match cursor {
+            Some(cursor) => cursor.starting(spans, at),
+            None => spans.partition_point(|span| (span.start as usize) < at),
+        };
         let span = *spans.get(index).filter(|span| span.start as usize == at)?;
         let end = span.end as usize;
         if span.parent_count > 2 || span.root != root {
@@ -5439,6 +5443,7 @@ impl PaintArtifact {
         memo: &mut AppendMemo,
         marks: &mut Vec<AppendMark>,
         cull_spans: &mut Vec<CullSpan>,
+        span_cursor: &mut CullSpanCursor,
     ) -> usize {
         let Some((top, bottom)) = self.cull_band else {
             return start;
@@ -5483,10 +5488,21 @@ impl PaintArtifact {
         let spans_before = cull_spans.len();
         let mut segment = start;
         let (mut whole_spans, mut whole_boxes, mut whole_mismatch) = (0u64, 0u64, 0u64);
+        // `W3COS_PAINT_CULL_SPAN_CURSOR`: boxes only move forward.
+        let use_cursor = paint_cull_span_cursor_mode() != 0;
         while end < len {
             if let Some(changed) = whole
                 && let Some(span) = self.whole_culled_span(
-                    end, start, previous, record, same, changed, root, top, bottom,
+                    end,
+                    start,
+                    previous,
+                    record,
+                    same,
+                    changed,
+                    root,
+                    top,
+                    bottom,
+                    use_cursor.then_some(&mut *span_cursor),
                 )
             {
                 let span_end = span.end as usize;
@@ -5512,7 +5528,11 @@ impl PaintArtifact {
             }
             if let Some(changed) = changed {
                 if end >= span_end {
-                    let at = spans.partition_point(|span| span.end as usize <= end);
+                    let at = if use_cursor {
+                        span_cursor.ending(spans, end)
+                    } else {
+                        spans.partition_point(|span| span.end as usize <= end)
+                    };
                     span_end = spans
                         .get(at)
                         .filter(|span| span.start as usize <= end)
@@ -5688,6 +5708,7 @@ impl PaintArtifact {
         let mut volatile_ok = record_volatile && (base.is_none() || previous_volatile.is_some());
         let mut volatile = Vec::new();
         let mut url_memo = UrlMemo::default();
+        let mut span_cursor = CullSpanCursor::default();
         let mut index = 0;
         while index < len {
             if splice && let Some((previous, record)) = base {
@@ -5723,6 +5744,7 @@ impl PaintArtifact {
                     &mut memo,
                     &mut marks,
                     &mut cull_spans,
+                    &mut span_cursor,
                 );
                 if end > index {
                     if volatile_ok && let Some(old) = previous_volatile {
@@ -7681,6 +7703,56 @@ mod tests {
         assert!(!artifact.cull_band_covers(9000.0, 720.0, 0.0));
     }
 
+    #[test]
+    fn cull_span_cursor_matches_the_binary_search() {
+        PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let mut seed = 0x51ed_270b_27b6_37d1_u64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for _ in 0..200 {
+            let mut spans = Vec::new();
+            let mut at = next(4);
+            for _ in 0..next(12) {
+                let start = at + next(5);
+                let end = start + 1 + next(9);
+                spans.push(CullSpan {
+                    start: start as u32,
+                    end: end as u32,
+                    top: 0.0,
+                    bottom: 0.0,
+                    visible: 0,
+                    parents: [0; 2],
+                    parent_count: 0,
+                    root: PaintProperties::default(),
+                });
+                at = end;
+            }
+            let mut cursor = CullSpanCursor::default();
+            let mut box_index = 0usize;
+            for _ in 0..60 {
+                // Mostly forward, sometimes a few boxes back.
+                box_index = if next(5) == 0 {
+                    box_index.saturating_sub(next(8))
+                } else {
+                    box_index + next(4)
+                };
+                assert_eq!(
+                    cursor.starting(&spans, box_index),
+                    spans.partition_point(|span| (span.start as usize) < box_index)
+                );
+                assert_eq!(
+                    cursor.ending(&spans, box_index),
+                    spans.partition_point(|span| span.end as usize <= box_index)
+                );
+            }
+        }
+        PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(|mode| mode.set(None));
+    }
+
     /// `W3COS_PAINT_CULL_RUN_GAPS`: boxes far below the band shift down
     /// twice; in the second shift they sit in last build's culled spans and
     /// outside the layout's changed range, so the short check takes them.
@@ -7747,10 +7819,26 @@ mod tests {
         let second = build(16.0, Some(&first), 1);
         // `W3COS_PAINT_CULL_SUBTREES`: the moved span is culled whole by its
         // kept extent; verify checks every box agrees.
-        for mode in [2, 1] {
+        // `W3COS_PAINT_CULL_SPAN_CURSOR`: the spans are found by cursor
+        // (verify searches too and compares); the build is the same.
+        for (mode, cursor) in [(2, 0), (1, 0), (1, 2), (1, 1)] {
+            PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(|value| value.set(Some(cursor)));
             PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(Some(mode)));
             let before = PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get);
+            let lookups_before = PAINT_CULL_SPAN_CURSOR_STATS.with(std::cell::Cell::get);
             let whole = build(32.0, Some(&second), 1);
+            let lookups = PAINT_CULL_SPAN_CURSOR_STATS.with(std::cell::Cell::get);
+            PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(|value| value.set(None));
+            if cursor != 0 {
+                assert!(
+                    lookups.0 > lookups_before.0,
+                    "the spans are found by cursor"
+                );
+            }
+            assert_eq!(
+                lookups.1, lookups_before.1,
+                "a cursor span differs from the search"
+            );
             let after = PAINT_CULL_SUBTREE_STATS.with(std::cell::Cell::get);
             PAINT_CULL_SUBTREES_OVERRIDE.with(|value| value.set(Some(0)));
             assert!(after.0 > before.0, "the moved span is taken whole");
@@ -11816,6 +11904,100 @@ pub(crate) fn paint_cull_runs_mode() -> u8 {
             _ => 1,
         },
     )
+}
+
+/// `W3COS_PAINT_CULL_SPAN_CURSOR=1|verify` (off by default): the reusing
+/// build finds last frame's culled span at a box with cursors that follow
+/// the build through the boxes (in order, stepping back a few boxes after a
+/// failed run), instead of a binary search per box. `verify` also searches and compares.
+pub(crate) fn paint_cull_span_cursor_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_CULL_SPAN_CURSOR")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_CULL_SPAN_CURSOR_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// `(span lookups by cursor, verify mismatches)`.
+    pub(crate) static PAINT_CULL_SPAN_CURSOR_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Cursors into last frame's culled spans (sorted, disjoint) that follow
+/// the box being built: `.0` the first span starting at or after it, `.1`
+/// the first span ending after it.
+#[derive(Clone, Copy, Default)]
+struct CullSpanCursor(usize, usize);
+
+impl CullSpanCursor {
+    /// The first span starting at or after `at`. Boxes mostly move forward;
+    /// a failed run steps back a few boxes.
+    #[inline]
+    fn starting(&mut self, spans: &[CullSpan], at: usize) -> usize {
+        let mode = paint_cull_span_cursor_mode();
+        self.0 = self.0.min(spans.len());
+        while self.0 > 0 && (spans[self.0 - 1].start as usize) >= at {
+            self.0 -= 1;
+        }
+        while self.0 < spans.len() && (spans[self.0].start as usize) < at {
+            self.0 += 1;
+        }
+        if mode == 2 {
+            let full = spans.partition_point(|span| (span.start as usize) < at);
+            Self::count(full != self.0, "starting", at);
+            return full;
+        }
+        Self::count(false, "", 0);
+        self.0
+    }
+
+    /// The first span ending after `at` (see `starting`).
+    #[inline]
+    fn ending(&mut self, spans: &[CullSpan], at: usize) -> usize {
+        let mode = paint_cull_span_cursor_mode();
+        self.1 = self.1.min(spans.len());
+        while self.1 > 0 && (spans[self.1 - 1].end as usize) > at {
+            self.1 -= 1;
+        }
+        while self.1 < spans.len() && (spans[self.1].end as usize) <= at {
+            self.1 += 1;
+        }
+        if mode == 2 {
+            let full = spans.partition_point(|span| span.end as usize <= at);
+            Self::count(full != self.1, "ending", at);
+            return full;
+        }
+        Self::count(false, "", 0);
+        self.1
+    }
+
+    #[inline]
+    fn count(mismatch: bool, which: &str, at: usize) {
+        if mismatch {
+            eprintln!("[paint-cull-span-cursor-verify] mismatch: {which} span at box {at}");
+        }
+        PAINT_CULL_SPAN_CURSOR_STATS.with(|stats| {
+            let (lookups, mismatches) = stats.get();
+            stats.set((lookups + 1, mismatches + u64::from(mismatch)));
+        });
+    }
 }
 
 /// `W3COS_PAINT_CULL_RUN_GAPS` (on by default, `=0` turns it off): inside last frame's culled runs, and a
