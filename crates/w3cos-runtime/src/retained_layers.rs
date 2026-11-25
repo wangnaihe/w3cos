@@ -2412,10 +2412,71 @@ fn paint_diff_clients_inner(
         }
         dirty[index] = true;
     }
-    // Mark every descendant of a root; nodes are in tree order, so a node's
-    // parent is visited before it.
+    let spans_mode = paint_diff_root_spans_mode();
+    if spans_mode != 0 {
+        let full = (spans_mode == 2).then(|| {
+            let (mut dirty, mut moved) = (dirty.clone(), moved.clone());
+            mark_root_subtrees_full(cur, &roots, &mut dirty, &mut moved);
+            (dirty, moved)
+        });
+        // Blink invalidates a changed object's subtree, not the tree: in
+        // tree order a root's subtree is the run after it whose parents are
+        // at or after the root, and only dirty clients drop their move.
+        for &index in quiet_dirty
+            .iter()
+            .chain(changed.iter().map(|(index, _)| index))
+        {
+            moved[index] = None;
+        }
+        roots.sort_unstable();
+        let mut covered = 0usize;
+        for root in roots {
+            if root < covered {
+                continue;
+            }
+            dirty[root] = true;
+            moved[root] = None;
+            let mut index = root + 1;
+            while index < n && cur.nodes[index].parent.is_some_and(|parent| parent >= root) {
+                dirty[index] = true;
+                moved[index] = None;
+                index += 1;
+            }
+            covered = index;
+        }
+        PAINT_DIFF_ROOT_SPANS_STATS.with(|stats| {
+            let (used, mismatches) = stats.get();
+            let mismatch = full.as_ref().is_some_and(|(full_dirty, full_moved)| {
+                *full_dirty != dirty || *full_moved != moved
+            });
+            if mismatch {
+                eprintln!("[paint-diff-root-spans-verify] mismatch against the full marking");
+            }
+            stats.set((used + 1, mismatches + u64::from(mismatch)));
+        });
+        if let Some((full_dirty, full_moved)) = full {
+            return Some(PaintDiff {
+                dirty: full_dirty,
+                moved: full_moved,
+            });
+        }
+        return Some(PaintDiff { dirty, moved });
+    }
+    mark_root_subtrees_full(cur, &roots, &mut dirty, &mut moved);
+    Some(PaintDiff { dirty, moved })
+}
+
+/// Mark every descendant of a root dirty, then drop the move of every dirty
+/// client; nodes are in tree order, so a node's parent is visited before it.
+fn mark_root_subtrees_full(
+    cur: &PaintArtifact,
+    roots: &[usize],
+    dirty: &mut [bool],
+    moved: &mut [Option<(f32, f32)>],
+) {
+    let n = cur.nodes.len();
     let mut root_mark = vec![false; n];
-    for root in roots {
+    for &root in roots {
         root_mark[root] = true;
     }
     for index in 0..n {
@@ -2427,12 +2488,43 @@ fn paint_diff_clients_inner(
             dirty[index] = true;
         }
     }
-    for (moved, dirty) in moved.iter_mut().zip(&dirty) {
+    for (moved, dirty) in moved.iter_mut().zip(dirty.iter()) {
         if *dirty {
             *moved = None;
         }
     }
-    Some(PaintDiff { dirty, moved })
+}
+
+/// `W3COS_PAINT_DIFF_ROOT_SPANS=1|verify` (off by default): the paint diff
+/// marks each invalidation root's subtree as the contiguous run after it in
+/// tree order, and drops the moves of the dirty clients only, instead of
+/// two passes over every box. `verify` also runs the full passes and
+/// compares (and returns theirs).
+pub(crate) fn paint_diff_root_spans_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DIFF_ROOT_SPANS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_DIFF_ROOT_SPANS").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DIFF_ROOT_SPANS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (diffs marked by spans, verify mismatches).
+    pub(crate) static PAINT_DIFF_ROOT_SPANS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// `W3COS_PAINT_DIFF_CULLED_SPANS` (on by default, `=0` turns it off; with `W3COS_PAINT_CULL_RUNS`): the

@@ -3114,6 +3114,71 @@ mod tests {
         assert!(skip == full, "frames with the scan skipped differ");
     }
 
+    /// `W3COS_PAINT_DIFF_ROOT_SPANS`: text edits inside nested blocks
+    /// invalidate their containing blocks' subtrees by run; verify finds
+    /// the same dirty clients and moves as the full passes, and every mode
+    /// paints alike.
+    #[test]
+    fn diff_root_spans_match_the_full_marking() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::retained_layers::PAINT_DIFF_ROOT_SPANS_OVERRIDE
+                    .with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::retained_layers::PAINT_DIFF_ROOT_SPANS_OVERRIDE
+                .with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::append_child(body, log);
+            let mut texts = Vec::new();
+            for message in 0..4 {
+                let outer = crate::dom::create_element("div");
+                crate::dom::set_style_property(outer, "border", "1px solid #888");
+                let inner = crate::dom::create_element("p");
+                let span = crate::dom::create_element("span");
+                let text = crate::dom::create_text_node(&format!("message {message}"));
+                crate::dom::append_child(span, text);
+                crate::dom::append_child(inner, span);
+                crate::dom::append_child(outer, inner);
+                crate::dom::append_child(log, outer);
+                texts.push(text);
+            }
+            assert!(crate::incremental_layout::flush());
+            let before =
+                crate::retained_layers::PAINT_DIFF_ROOT_SPANS_STATS.with(std::cell::Cell::get);
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            for step in 0..6 {
+                let text = texts[step % texts.len()];
+                crate::dom::set_text_content(text, &format!("edited {step} words"));
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after =
+                crate::retained_layers::PAINT_DIFF_ROOT_SPANS_STATS.with(std::cell::Cell::get);
+            (frames, after.0 - before.0, after.1 - before.1)
+        };
+        let (verified, used, mismatched) = run(2);
+        assert!(used > 0, "the diff marks root subtrees by run");
+        assert_eq!(mismatched, 0, "the runs differ from the full marking");
+        let (spans, used_on, _) = run(1);
+        assert!(used_on > 0, "the fast path is taken");
+        let (full, used_off, _) = run(0);
+        assert_eq!(used_off, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(spans == full, "frames marked by runs differ");
+    }
+
     #[test]
     fn persist_dirty_scan_matches_the_full_scan() {
         struct Off;
