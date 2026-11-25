@@ -3179,6 +3179,97 @@ mod tests {
         assert!(spans == full, "frames marked by runs differ");
     }
 
+    /// `W3COS_PAINT_INLINE_BG_PRESENCE`: frames before a `::first-line`
+    /// background groups inline fragments skip the per-box group scan;
+    /// once a group exists the scan runs. Verify finds no group the superset
+    /// missed, and all modes paint alike.
+    #[test]
+    fn inline_bg_presence_skips_the_scan_and_matches_it() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(None));
+                crate::render_skia::PAINT_INLINE_BG_PRESENCE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(Some(1)));
+            crate::render_skia::PAINT_INLINE_BG_PRESENCE_OVERRIDE
+                .with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let style = crate::dom::create_element("style");
+            let rules =
+                crate::dom::create_text_node("p.first::first-line{background:#fd0;font-size:18px}");
+            crate::dom::append_child(style, rules);
+            crate::dom::append_child(body, style);
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::append_child(body, log);
+            let first = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("plain");
+            crate::dom::append_child(first, text);
+            crate::dom::append_child(log, first);
+            assert!(crate::incremental_layout::flush());
+            let before =
+                crate::render_skia::PAINT_INLINE_BG_PRESENCE_STATS.with(std::cell::Cell::get);
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut skipped_before_group = 0;
+            for step in 0..6 {
+                let line = crate::dom::create_element("p");
+                if step == 3 {
+                    skipped_before_group = crate::render_skia::PAINT_INLINE_BG_PRESENCE_STATS
+                        .with(std::cell::Cell::get)
+                        .0
+                        - before.0;
+                    crate::dom::set_attribute(line, "class", "first");
+                    let lead = crate::dom::create_text_node("lead ");
+                    let em = crate::dom::create_element("em");
+                    let words = crate::dom::create_text_node("emphasis and words");
+                    crate::dom::append_child(em, words);
+                    crate::dom::append_child(line, lead);
+                    crate::dom::append_child(line, em);
+                    let tail = crate::dom::create_text_node(" tail that wraps onto more lines");
+                    crate::dom::append_child(line, tail);
+                } else {
+                    let words = crate::dom::create_text_node(&format!("line {step}"));
+                    crate::dom::append_child(line, words);
+                }
+                crate::dom::append_child(log, line);
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after =
+                crate::render_skia::PAINT_INLINE_BG_PRESENCE_STATS.with(std::cell::Cell::get);
+            (
+                frames,
+                skipped_before_group,
+                after.0 - before.0,
+                after.1 - before.1,
+            )
+        };
+        let (verified, early, skipped, mismatched) = run(2);
+        assert!(early > 0, "frames without a group must skip the scan");
+        assert_eq!(
+            mismatched, 0,
+            "the superset missed an inline background group"
+        );
+        let (skip, early_on, skipped_on, _) = run(1);
+        assert!(early_on > 0, "the fast path is taken");
+        assert_eq!(skipped_on, early_on, "frames with a group scan");
+        assert_eq!(skipped, early, "verify skips the same frames");
+        let (full, _, off_skipped, _) = run(0);
+        assert_eq!(off_skipped, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(skip == full, "frames with the scan skipped differ");
+    }
+
     #[test]
     fn persist_dirty_scan_matches_the_full_scan() {
         struct Off;

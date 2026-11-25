@@ -3819,6 +3819,14 @@ impl PaintArtifact {
             .is_some_and(|bits| bits & FEATURE_RESIZE == 0)
     }
 
+    /// No box of this artifact carries an inline background group: the
+    /// kept feature superset lacks [`FEATURE_INLINE_BACKGROUND_GROUP`].
+    /// `false` when no superset was kept.
+    pub(crate) fn inline_background_groups_absent(&self) -> bool {
+        self.feature_presence
+            .is_some_and(|bits| bits & FEATURE_INLINE_BACKGROUND_GROUP == 0)
+    }
+
     /// Applied decoration belongs to the originating box, not the child's
     /// computed property. Atomic inline and out-of-flow boxes isolate their
     /// contents, but an isolating box's own decoration still reaches them.
@@ -6852,6 +6860,9 @@ const FEATURE_VIDEO_CONTROLS: u8 = 2;
 const FEATURE_TABLE: u8 = 4;
 /// A box carries a `resize` value (see [`PaintArtifact::resize_absent`]).
 const FEATURE_RESIZE: u8 = 8;
+/// A box carries an inline background group (see
+/// [`PaintArtifact::inline_background_groups_absent`]).
+const FEATURE_INLINE_BACKGROUND_GROUP: u8 = 16;
 
 /// `W3COS_PAINT_FEATURE_SKIP=1|verify` (off by default): the reusing build
 /// skips its whole-tree passes for percentage translates, media controls
@@ -6911,6 +6922,10 @@ fn node_features(node: &PaintNode) -> u8 {
         const RESIZE: &str = w3cos_dom::css_style::RESIZE_PROPERTY;
         if properties.may_contain(RESIZE) && properties.contains_key(RESIZE) {
             bits |= FEATURE_RESIZE;
+        }
+        const GROUP: &str = "--w3cos-internal-inline-background-group";
+        if properties.may_contain(GROUP) && properties.contains_key(GROUP) {
+            bits |= FEATURE_INLINE_BACKGROUND_GROUP;
         }
     }
     bits

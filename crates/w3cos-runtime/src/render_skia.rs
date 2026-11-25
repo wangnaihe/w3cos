@@ -5259,7 +5259,64 @@ impl SkiaMetalPresenter {
     }
 }
 
+/// `W3COS_PAINT_INLINE_BG_PRESENCE=1|verify` (off by default): the frame's
+/// inline background groups are empty without a scan of every box when the
+/// build's feature superset (`W3COS_PAINT_FEATURE_SKIP`) has no box in an
+/// inline background group. `verify` also scans and compares.
+pub(crate) fn paint_inline_bg_presence_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_INLINE_BG_PRESENCE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_INLINE_BG_PRESENCE")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_INLINE_BG_PRESENCE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (scans skipped, verify mismatches).
+    pub(crate) static PAINT_INLINE_BG_PRESENCE_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 fn inline_background_groups(
+    artifact: &crate::paint_artifact::PaintArtifact,
+) -> HashMap<usize, Vec<usize>> {
+    let mode = paint_inline_bg_presence_mode();
+    if mode != 0 && artifact.inline_background_groups_absent() {
+        let (skipped, mismatches) = PAINT_INLINE_BG_PRESENCE_STATS.with(std::cell::Cell::get);
+        if mode == 2 {
+            let scanned = scan_inline_background_groups(artifact);
+            if !scanned.is_empty() {
+                eprintln!(
+                    "[paint-inline-bg-presence-verify] mismatch: {} groups",
+                    scanned.len()
+                );
+                PAINT_INLINE_BG_PRESENCE_STATS.with(|stats| stats.set((skipped, mismatches + 1)));
+                return scanned;
+            }
+        }
+        PAINT_INLINE_BG_PRESENCE_STATS.with(|stats| stats.set((skipped + 1, mismatches)));
+        return HashMap::new();
+    }
+    scan_inline_background_groups(artifact)
+}
+
+fn scan_inline_background_groups(
     artifact: &crate::paint_artifact::PaintArtifact,
 ) -> HashMap<usize, Vec<usize>> {
     let mut sources: HashMap<(usize, &str), Vec<usize>> = HashMap::new();
