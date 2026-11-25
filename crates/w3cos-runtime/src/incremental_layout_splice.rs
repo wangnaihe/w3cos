@@ -1820,7 +1820,9 @@ pub(super) fn try_splice(
         return false;
     }
     if super::preorder_sizes_mode() == 0 {
-        return try_splice_with(cache, dirty, viewport_w, viewport_h, &mut None, &mut None);
+        return try_splice_with(
+            cache, dirty, viewport_w, viewport_h, &mut None, &mut None, &mut None,
+        );
     }
     // `W3COS_PREORDER_SIZES`: hold the retained tree's preorder sizes across
     // the splice (its solve swaps subtrees in and out, which would drop
@@ -1828,6 +1830,7 @@ pub(super) fn try_splice(
     // commit updates them; any other commit drops them.
     let mut preorder = Some(cache.component.take_preorder());
     let mut hosts = (super::preorder_hosts_mode() != 0).then(|| cache.component.take_hosts());
+    let mut owners = (super::cssom_owner_index_mode() != 0).then(|| cache.component.take_owners());
     let spliced = try_splice_with(
         cache,
         dirty,
@@ -1835,11 +1838,15 @@ pub(super) fn try_splice(
         viewport_h,
         &mut preorder,
         &mut hosts,
+        &mut owners,
     );
     if let Some(sizes) = preorder {
         cache.component.put_preorder(sizes);
         if let Some(hosts) = hosts {
             cache.component.put_hosts(hosts);
+        }
+        if let Some(owners) = owners {
+            cache.component.put_owners(owners);
         }
     }
     spliced
@@ -1852,6 +1859,7 @@ fn try_splice_with(
     viewport_h: f32,
     preorder: &mut Option<Vec<u32>>,
     hosts: &mut Option<Vec<u32>>,
+    owners: &mut Option<super::CssomOwnerIndex>,
 ) -> bool {
     if !cache.splice_owners_ok
         || cache.viewport_w_bits != viewport_w.to_bits()
@@ -2244,8 +2252,10 @@ fn try_splice_with(
         0
     };
     let mut shift_spans: Option<Vec<(usize, usize)>> = None;
-    let by_range = match (preorder.as_deref(), hosts.as_deref()) {
-        (Some(sizes), Some(ids)) if dh != 0.0 && ids.len() == sizes.len() => {
+    // The preorder ranges of the boxes the splice only moves (the tree here
+    // is still the one the sizes describe).
+    let moved_spans = match preorder.as_deref() {
+        Some(sizes) if dh != 0.0 && (hosts.is_some() || owners.is_some()) => {
             let (keep, removed) = match &commit {
                 PlanKind::Children { keep, removed, .. } => (*keep, *removed),
                 _ => (0, 0),
@@ -2263,21 +2273,43 @@ fn try_splice_with(
                     ranges.push((end(starts[depth + 1]), end(starts[depth])));
                 }
             }
-            let spans = merged_ranges(&ranges);
+            Some(merged_ranges(&ranges))
+        }
+        _ => None,
+    };
+    let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {
+        (Some(sizes), Some(ids), Some(spans)) if ids.len() == sizes.len() => {
             let mut out = Vec::new();
             if ranges_mode != 1 || super::preorder_hosts_mode() == 2 {
-                for &(a, b) in &spans {
+                for &(a, b) in spans {
                     out.extend(ids[a..b].iter().copied().filter(|&id| id != u32::MAX));
                 }
             }
             if ranges_mode != 0 {
-                shift_spans = Some(spans);
+                shift_spans = Some(spans.clone());
             }
             super::PREORDER_HOSTS_RANGED.with(|n| n.set(n.get() + 1));
             Some(out)
         }
         _ => None,
     };
+    // `W3COS_CSSOM_OWNER_INDEX`: the moved boxes' owners from the index.
+    let owners_by_range = match (preorder.as_deref(), owners.as_deref(), moved_spans.as_ref()) {
+        (Some(sizes), Some(index), Some(spans)) if !rebase && index.len() == sizes.len() => {
+            let mut counts = std::collections::HashMap::new();
+            for &(a, b) in spans {
+                for list in index[a..b].iter().flatten() {
+                    for &owner in list.iter() {
+                        *counts.entry(owner).or_insert(0u32) += 1;
+                    }
+                }
+            }
+            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));
+            Some(counts)
+        }
+        _ => None,
+    };
+    let walk_owners = owners_by_range.is_none() || super::cssom_owner_index_mode() == 2;
     let walk_hosts = by_range.is_none() || super::preorder_hosts_mode() == 2;
     if dh != 0.0 {
         if let PlanKind::Children { keep, removed, .. } = &commit {
@@ -2287,7 +2319,7 @@ fn try_splice_with(
                 if walk_hosts {
                     collect_hosts(item, &mut shifted);
                 }
-                if !rebase {
+                if !rebase && walk_owners {
                     super::collect_cssom_owners(item, &mut shifted_owners);
                 }
             }
@@ -2304,7 +2336,7 @@ fn try_splice_with(
                     if walk_hosts {
                         collect_hosts(sibling, &mut shifted);
                     }
-                    if !rebase {
+                    if !rebase && walk_owners {
                         super::collect_cssom_owners(sibling, &mut shifted_owners);
                     }
                 }
@@ -2336,6 +2368,20 @@ fn try_splice_with(
             }
         }
         shifted = ranged;
+    }
+    if let Some(ranged) = owners_by_range {
+        if super::cssom_owner_index_mode() == 2 {
+            if ranged != shifted_owners {
+                super::CSSOM_OWNER_INDEX_MISMATCHES.with(|n| n.set(n.get() + 1));
+                eprintln!(
+                    "[cssom-owner-index-verify] mismatch: {} ranged vs {} walked owners",
+                    ranged.len(),
+                    shifted_owners.len()
+                );
+            }
+        } else {
+            shifted_owners = ranged;
+        }
     }
     if shift_spans.is_none() || ranges_mode == 2 {
         dedup_hosts(&mut shifted);
@@ -2586,12 +2632,14 @@ fn try_splice_with(
                 Some((&at, parent)) if preorder_tail_keep() => {
                     if let Some(sizes) = preorder.as_mut() {
                         splice_hosts(hosts, sizes, parent, at, 1, std::slice::from_ref(&fresh));
+                        splice_owners(owners, sizes, parent, at, 1, std::slice::from_ref(&fresh));
                         splice_preorder(sizes, parent, at, 1, std::slice::from_ref(&fresh));
                     }
                 }
                 _ => {
                     *preorder = None;
                     *hosts = None;
+                    *owners = None;
                 }
             }
             *target = fresh;
@@ -2601,11 +2649,13 @@ fn try_splice_with(
                 if let Some(sizes) = preorder.as_mut() {
                     let removed = target.children.len() - keep;
                     splice_hosts(hosts, sizes, &plan.path, keep, removed, &tail);
+                    splice_owners(owners, sizes, &plan.path, keep, removed, &tail);
                     splice_preorder(sizes, &plan.path, keep, removed, &tail);
                 }
             } else {
                 *preorder = None;
                 *hosts = None;
+                *owners = None;
             }
             target.children.truncate(keep);
             target.children.extend(tail);
@@ -2618,6 +2668,7 @@ fn try_splice_with(
             CHILD_SPLICES.with(|count| count.set(count.get() + 1));
             if let Some(sizes) = preorder.as_mut() {
                 splice_hosts(hosts, sizes, &plan.path, keep, removed, &inserted);
+                splice_owners(owners, sizes, &plan.path, keep, removed, &inserted);
                 splice_preorder(sizes, &plan.path, keep, removed, &inserted);
             }
             target.children.splice(keep..keep + removed, inserted);
@@ -2625,6 +2676,15 @@ fn try_splice_with(
     }
     if preorder.is_none() {
         *hosts = None;
+        *owners = None;
+    }
+    if super::cssom_owner_index_mode() == 2
+        && let Some(kept) = owners.as_ref()
+        && *kept != super::preorder_owners_of(&cache.component)
+    {
+        super::CSSOM_OWNER_INDEX_MISMATCHES.with(|n| n.set(n.get() + 1));
+        eprintln!("[cssom-owner-index-verify] mismatch after commit");
+        *owners = None;
     }
     if super::preorder_hosts_mode() == 2
         && let Some(kept) = hosts.as_ref()
@@ -2763,6 +2823,30 @@ fn splice_hosts(
         fresh.extend(super::preorder_hosts_of(item));
     }
     ids.splice(removed_start..removed_end, fresh);
+}
+
+/// [`splice_hosts`] for the CSSOM owner index.
+fn splice_owners(
+    owners: &mut Option<super::CssomOwnerIndex>,
+    sizes: &[u32],
+    path: &[usize],
+    keep: usize,
+    removed: usize,
+    inserted: &[Component],
+) {
+    let Some(index) = owners.as_mut() else {
+        return;
+    };
+    if index.len() != sizes.len() {
+        *owners = None;
+        return;
+    }
+    let (_, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+    let mut fresh = Vec::new();
+    for item in inserted {
+        fresh.extend(super::preorder_owners_of(item));
+    }
+    index.splice(removed_start..removed_end, fresh);
 }
 
 fn preorder_span(
@@ -5166,6 +5250,45 @@ mod tests {
             12,
             "text edits under row messages must splice"
         );
+    }
+
+    /// `W3COS_CSSOM_OWNER_INDEX`: the shifted messages' fragment owners read
+    /// from the preorder index are the ones the walk finds, and the
+    /// published rects match a full layout, through streamed text edits.
+    #[test]
+    fn cssom_owner_index_matches_the_walk() {
+        use crate::incremental_layout::{
+            CSSOM_OWNER_INDEX_MISMATCHES, CSSOM_OWNER_INDEX_OVERRIDE, CSSOM_OWNER_INDEX_RANGED,
+        };
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                CSSOM_OWNER_INDEX_OVERRIDE.with(|m| m.set(None));
+            }
+        }
+        let _off = Off;
+        for mode in [0u8, 2, 1] {
+            CSSOM_OWNER_INDEX_OVERRIDE.with(|m| m.set(Some(mode)));
+            CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(0));
+            let streams = markdown_chat_page(32);
+            assert_client_rects_match_full(&format!("owner index mode {mode} initial"));
+            let (_p, tail) = streams[0];
+            for step in 0..8 {
+                crate::dom::set_text_content(tail, &" streamed tokens".repeat(step * 3 + 1));
+                assert!(crate::incremental_layout::flush());
+                assert_matches_full(&format!("owner index mode {mode} step {step}"));
+                assert_client_rects_match_full(&format!("owner index mode {mode} step {step}"));
+            }
+            let kept = crate::incremental_layout::preorder_sizes_mode() != 0;
+            assert!(
+                mode == 0 || !kept || CSSOM_OWNER_INDEX_RANGED.with(std::cell::Cell::get) > 0,
+                "mode {mode}: no splice read the owner index"
+            );
+            if mode == 0 {
+                assert_eq!(CSSOM_OWNER_INDEX_RANGED.with(std::cell::Cell::get), 0);
+            }
+        }
+        assert_eq!(CSSOM_OWNER_INDEX_MISMATCHES.with(std::cell::Cell::get), 0);
     }
 
     #[test]

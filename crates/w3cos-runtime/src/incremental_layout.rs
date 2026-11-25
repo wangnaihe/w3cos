@@ -65,7 +65,15 @@ struct RetainedTree {
     /// `W3COS_PREORDER_HOSTS`: the host id of each box by preorder index
     /// (`u32::MAX` for none), kept and dropped together with `preorder`.
     hosts: Option<Vec<u32>>,
+    /// `W3COS_CSSOM_OWNER_INDEX`: each box's own CSSOM fragment owners by
+    /// preorder index (what [`collect_cssom_owners`] counts for the box
+    /// alone), kept and dropped with `preorder`; also dropped by an
+    /// in-place restyle (the markers live in the style).
+    owners: Option<CssomOwnerIndex>,
 }
+
+/// Per preorder index, the box's own CSSOM fragment owners (with repeats).
+pub(super) type CssomOwnerIndex = Vec<Option<Box<[u32]>>>;
 
 impl RetainedTree {
     fn new(component: Component) -> Self {
@@ -74,6 +82,7 @@ impl RetainedTree {
             root: std::ptr::NonNull::from(Box::leak(Box::new(component))),
             preorder: None,
             hosts: None,
+            owners: None,
         }
     }
 
@@ -131,6 +140,18 @@ impl RetainedTree {
         self.hosts = Some(hosts);
     }
 
+    /// Take the preorder CSSOM owner index (built when missing).
+    fn take_owners(&mut self) -> CssomOwnerIndex {
+        match self.owners.take() {
+            Some(owners) => owners,
+            None => preorder_owners_of(self),
+        }
+    }
+
+    fn put_owners(&mut self, owners: CssomOwnerIndex) {
+        self.owners = Some(owners);
+    }
+
     /// Run `edit` on the box at `path` (child positions from the root),
     /// keeping the flat view. `edit` may change the box's own fields but
     /// not its children. The walk reaches the box through raw pointers and
@@ -161,6 +182,7 @@ impl RetainedTree {
             // lists decide them).
             let preorder = self.preorder.take();
             let hosts = self.hosts.take();
+            self.owners = None;
             let kept = component_at_mut(self, path).map(|node| {
                 let children = (node.children.as_ptr(), node.children.len());
                 edit(node);
@@ -185,6 +207,7 @@ impl RetainedTree {
                 nodes.push(node);
             }
             let children = ((*node).children.as_ptr(), (*node).children.len());
+            self.owners = None;
             edit(&mut *node);
             if children != ((*node).children.as_ptr(), (*node).children.len()) {
                 // (Not an in-place restyle: flatten again.)
@@ -223,6 +246,50 @@ pub(super) fn preorder_sizes_of(root: &Component) -> Vec<u32> {
     let mut sizes = Vec::new();
     walk(root, &mut sizes);
     sizes
+}
+
+/// [`CssomOwnerIndex`] of a tree.
+pub(super) fn preorder_owners_of(root: &Component) -> CssomOwnerIndex {
+    fn walk(component: &Component, owners: &mut CssomOwnerIndex) {
+        owners.push(node_cssom_owners(component));
+        for child in &component.children {
+            walk(child, owners);
+        }
+    }
+    let mut owners = Vec::new();
+    walk(root, &mut owners);
+    owners
+}
+
+/// `W3COS_CSSOM_OWNER_INDEX=1|verify` (off by default; only read under
+/// `W3COS_PREORDER_SIZES`): the CSSOM owners of the boxes a splice only
+/// moves are read from a preorder index kept with the retained tree
+/// instead of walking those subtrees and parsing their markers (Blink
+/// moves a shifted subtree's fragments as a whole). `verify` also walks
+/// and compares.
+pub(super) fn cssom_owner_index_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = CSSOM_OWNER_INDEX_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_CSSOM_OWNER_INDEX").as_deref() {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CSSOM_OWNER_INDEX_OVERRIDE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(super) static CSSOM_OWNER_INDEX_MISMATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static CSSOM_OWNER_INDEX_RANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The host id of each box by preorder index (`u32::MAX` for none).
@@ -293,6 +360,7 @@ impl std::ops::DerefMut for RetainedTree {
         self.flat = None;
         self.preorder = None;
         self.hosts = None;
+        self.owners = None;
         // SAFETY: the flat view (the only other borrow) was just dropped.
         unsafe { self.root.as_mut() }
     }
@@ -1714,6 +1782,29 @@ pub(super) fn collect_cssom_owners(component: &Component, counts: &mut HashMap<u
         }
         stack.extend(component.children.iter());
     }
+}
+
+/// The owners [`collect_cssom_owners`] counts for `component` alone (not
+/// its children), in its order; `None` for none.
+pub(super) fn node_cssom_owners(component: &Component) -> Option<Box<[u32]>> {
+    let style = &component.style;
+    let properties = style.custom_properties.as_ref()?;
+    let mut owners = Vec::new();
+    if let Some(owner) = properties
+        .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        owners.push(owner);
+    }
+    owners.extend(w3cos_std::inline_text::cssom_box_owners(style));
+    if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+        owners.extend(
+            w3cos_std::inline_text::cssom_owner_ranges(content, style)
+                .into_iter()
+                .map(|(owner, _, _)| owner),
+        );
+    }
+    (!owners.is_empty()).then(|| owners.into_boxed_slice())
 }
 
 /// Replace the published rects of the owners a splice rebuilt. `removed`
