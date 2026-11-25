@@ -1755,9 +1755,11 @@ fn emit_unboxed_bank(name: &str, ty: &str, zero: &str, n: usize) -> (String, Str
         )
     } else if n <= UNBOXED_ARRAY_MAX {
         // No panic location per constant-index site (see `Registers`).
+        // `Registers::from`, not `.into()`: the blanket `Into::into` is
+        // `#[track_caller]` and would add a location per frame type.
         (
             format!("    {name}: w3cos_core::aot_frame::Registers<{n}, {ty}>,\n"),
-            format!("        {name}: vec![{zero}; {n}].into(),\n"),
+            format!("        {name}: w3cos_core::aot_frame::Registers::from(vec![{zero}; {n}]),\n"),
         )
     } else {
         (
@@ -2205,7 +2207,9 @@ fn emit_registers_init(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
         format!("        registers: [const {{ w3cos_core::Value::Undefined }}; {n}],\n")
     } else {
-        format!("        registers: vec![w3cos_core::Value::Undefined; {n}].into(),\n")
+        format!(
+            "        registers: w3cos_core::aot_frame::Registers::from(vec![w3cos_core::Value::Undefined; {n}]),\n"
+        )
     }
 }
 
@@ -3135,15 +3139,22 @@ impl {type_name} {{
     let frame = format!(
         "{type_name} {{\n{registers_init}\n{num_init}        bindings,\n        capture_getters,\n        capture_setters,\n{num_cells_init}{block_initializer}\n    }}"
     );
+    // `match` instead of `.unwrap_or_else(..)`: the pinned std marks
+    // `Result::unwrap_or_else` `#[track_caller]`, so every generated entry
+    // carried its own panic location in `.data.rel.ro`. Fully qualified
+    // patterns: generated code may shadow `Ok`/`Err` (e.g. JS classes
+    // named after them in test262 NativeError subclass tests).
     let run = if typed_parameter_stores.is_empty() {
-        format!("    {frame}.run()")
+        format!(
+            "    match ({frame}).run() {{ ::std::result::Result::Ok(__w3cos_value) => __w3cos_value, ::std::result::Result::Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
+        )
     } else {
         format!(
-            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    __w3cos_frame.run()"
+            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    match __w3cos_frame.run() {{ ::std::result::Result::Ok(__w3cos_value) => __w3cos_value, ::std::result::Result::Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
         )
     };
     let entry = format!(
-        "{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}{run}.unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))\n"
+        "{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}{run}\n"
     );
     Ok(SyncVariant { items, entry })
 }
@@ -9976,6 +9987,41 @@ fn main() {{
     }
 
     #[test]
+    fn sync_entries_and_frame_banks_avoid_track_caller_adapters() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function wide() {
+                    return (1 + 2) * (3 + 4) - (5 + 6) / (7 + 8) + (9 + 10) * (11 + 12) - (13 + 14) / (15 + 16)
+                        + ((1 < 2) === (3 < 4) ? 1 : 0) + ((5 < 6) === (7 < 8) ? 1 : 0)
+                        + ((9 < 10) === (11 < 12) ? 1 : 0) + ((13 < 14) === (15 < 16) ? 1 : 0)
+                        + ((17 < 18) === (19 < 20) ? 1 : 0);
+                }
+                wide;
+            "#,
+            "app:///track-caller.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("wide"))
+            .unwrap();
+        let wide = generate_sync_function_from_module(&module, function, "wide_aot").unwrap();
+        // `Result::unwrap_or_else` and the blanket `Into::into` are
+        // `#[track_caller]`: each use would add a panic location.
+        assert!(
+            wide.contains("Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception)")
+                && !wide.contains(".unwrap_or_else(|__w3cos_exception|"),
+            "sync entry should match on run() instead of unwrap_or_else: {wide}"
+        );
+        assert!(
+            wide.contains("num_regs: w3cos_core::aot_frame::Registers::from(vec![")
+                && !wide.contains("].into(),"),
+            "Registers banks should be built with Registers::from: {wide}"
+        );
+    }
+
+    #[test]
     fn unboxed_banks_pick_array_registers_or_vec_by_width() {
         assert_eq!(
             emit_unboxed_bank("num_regs", "f64", "0.0_f64", 4),
@@ -9990,7 +10036,9 @@ fn main() {{
                 format!(
                     "    bool_regs: w3cos_core::aot_frame::Registers<{UNBOXED_ARRAY_MAX}, bool>,\n"
                 ),
-                format!("        bool_regs: vec![false; {UNBOXED_ARRAY_MAX}].into(),\n")
+                format!(
+                    "        bool_regs: w3cos_core::aot_frame::Registers::from(vec![false; {UNBOXED_ARRAY_MAX}]),\n"
+                )
             )
         );
         assert_eq!(
@@ -10375,6 +10423,82 @@ fn main() {{
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
+    #[test]
+    fn generated_sync_entry_compiles_when_err_is_shadowed() {
+        // test262 NativeError subclass tests declare a JS class named `Err`,
+        // which becomes a Rust item in the same module; the entry's `match`
+        // on `run()` must not resolve its `Err(..)` pattern against it.
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function read() {
+                    return "ok!";
+                }
+                read;
+            "#,
+            "app:///sync-aot-shadowed-result.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("read"))
+            .unwrap()
+            .clone();
+        let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_shadowed_result_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+#[allow(dead_code, non_snake_case)]
+fn Err() {{}}
+{generated}
+fn main() {{
+    println!(
+        "{{}}",
+        read_aot(
+            w3cos_core::Value::Undefined,
+            &[],
+            &w3cos_core::AotCaptureMap::new(),
+        )
+        .to_js_string(),
+    );
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated entry with shadowed Err failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok!");
     }
 
     #[test]
@@ -11021,13 +11145,27 @@ fn main() {{
         let ir_count = function.registers;
         let val_len = parse_undefined_vec_len(&generated);
         let num_len = parse_vec_len(&generated, "num_regs: vec![0.0_f64; ")
-            .or_else(|| parse_vec_len(&generated, "num_regs: [0.0_f64; "));
+            .or_else(|| parse_vec_len(&generated, "num_regs: [0.0_f64; "))
+            .or_else(|| {
+                parse_vec_len(
+                    &generated,
+                    "num_regs: w3cos_core::aot_frame::Registers::from(vec![0.0_f64; ",
+                )
+            });
         let bool_len = parse_vec_len(&generated, "bool_regs: vec![false; ")
             .or_else(|| parse_vec_len(&generated, "bool_regs: [false; "))
+            .or_else(|| {
+                parse_vec_len(
+                    &generated,
+                    "bool_regs: w3cos_core::aot_frame::Registers::from(vec![false; ",
+                )
+            })
             .unwrap_or(0);
         assert!(
             generated.contains("num_regs: vec![0.0_f64; ")
-                || generated.contains("num_regs: [0.0_f64; "),
+                || generated.contains("num_regs: [0.0_f64; ")
+                || generated
+                    .contains("num_regs: w3cos_core::aot_frame::Registers::from(vec![0.0_f64; "),
             "compact num_regs init should be emitted: {generated}"
         );
         if let (Some(val_len), Some(num_len)) = (val_len, num_len) {
@@ -12334,6 +12472,12 @@ fn main() {{
         parse_vec_len(generated, "registers: vec![w3cos_core::Value::Undefined; ")
             .or_else(|| parse_vec_len(generated, "registers: vec![Value::Undefined; "))
             .or_else(|| parse_vec_len(generated, "registers: [w3cos_core::Value; "))
+            .or_else(|| {
+                parse_vec_len(
+                    generated,
+                    "registers: w3cos_core::aot_frame::Registers::from(vec![w3cos_core::Value::Undefined; ",
+                )
+            })
     }
 
     fn parse_vec_len(generated: &str, prefix: &str) -> Option<u32> {
