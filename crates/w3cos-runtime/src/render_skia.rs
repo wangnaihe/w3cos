@@ -18824,6 +18824,16 @@ mod tests {
 
     #[test]
     fn canvas_snapshot_skia_image_reused_until_dirtied() {
+        // The upload/reuse counts are per paint: `W3COS_RASTER_RGBA_SURFACE`
+        // =verify paints each frame twice more.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RASTER_RGBA_SURFACE_OVERRIDE.with(|slot| slot.set(None));
+            }
+        }
+        let _restore = Restore;
+        RASTER_RGBA_SURFACE_OVERRIDE.with(|slot| slot.set(Some(0)));
         crate::image_loader::reset_cache_stats();
         super::clear_image_texture_cache();
         crate::canvas2d::remove_surface(11);
