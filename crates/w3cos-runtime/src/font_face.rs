@@ -470,14 +470,24 @@ struct FontKey {
 
 static GLOBAL_REGISTRY: OnceLock<FontRegistry> = OnceLock::new();
 
+/// Immutable font bytes shared between the parser, renderers and caches.
+/// The host UI face maps its installed file instead of copying it.
+pub(crate) type FontBytes = fontdue::FontBytes;
+
 pub(crate) struct HostUiFont {
     pub(crate) family: String,
-    pub(crate) data: Arc<Vec<u8>>,
+    pub(crate) data: FontBytes,
     pub(crate) index: u32,
     pub(crate) font: Arc<fontdue::Font>,
 }
 
 static HOST_UI_FONT: OnceLock<HostUiFont> = OnceLock::new();
+
+impl HostUiFont {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        (*self.data).as_ref()
+    }
+}
 
 /// Parsed face for a character the caller's font does not cover.
 pub(crate) fn parsed_fallback(character: char) -> Option<Arc<fontdue::Font>> {
@@ -596,15 +606,16 @@ pub(crate) fn font_box_metrics_for_text(
     (metrics.height().is_finite() && metrics.height() > 0.0).then_some(metrics)
 }
 
-fn finish_host_font(family: String, data: Arc<Vec<u8>>, index: u32) -> HostUiFont {
+fn finish_host_font(family: String, data: FontBytes, index: u32) -> HostUiFont {
     // Collection index 0 shares `cached_parsed_font` with `@font-face`,
     // so a page that names the host face does not parse those bytes twice.
+    // Both paths keep `data` instead of copying the face into the parser.
     let font = if index == 0 {
-        cached_parsed_font(data.as_slice()).expect("selected system font must be valid")
+        cached_parsed_shared_font(&data).expect("selected system font must be valid")
     } else {
         Arc::new(
-            fontdue::Font::from_bytes(
-                data.as_slice(),
+            fontdue::Font::from_shared(
+                data.clone(),
                 fontdue::FontSettings {
                     collection_index: index,
                     ..fontdue::FontSettings::default()
@@ -1432,6 +1443,23 @@ static PARSED_FONTS: std::sync::Mutex<Option<HashMap<u64, Arc<fontdue::Font>>>> 
     std::sync::Mutex::new(None);
 
 fn cached_parsed_font(data: &[u8]) -> Option<Arc<fontdue::Font>> {
+    cached_parsed(data, || {
+        fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
+    })
+}
+
+/// [`cached_parsed_font`] for bytes the caller already shares: the parsed
+/// face keeps `bytes` rather than a second copy.
+fn cached_parsed_shared_font(bytes: &FontBytes) -> Option<Arc<fontdue::Font>> {
+    cached_parsed((**bytes).as_ref(), || {
+        fontdue::Font::from_shared(bytes.clone(), fontdue::FontSettings::default())
+    })
+}
+
+fn cached_parsed(
+    data: &[u8],
+    parse: impl FnOnce() -> fontdue::FontResult<fontdue::Font>,
+) -> Option<Arc<fontdue::Font>> {
     use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
     use std::sync::Mutex;
@@ -1445,7 +1473,7 @@ fn cached_parsed_font(data: &[u8]) -> Option<Arc<fontdue::Font>> {
     if let Some(font) = map.get(&key) {
         return Some(Arc::clone(font));
     }
-    let font = Arc::new(fontdue::Font::from_bytes(data, fontdue::FontSettings::default()).ok()?);
+    let font = Arc::new(parse().ok()?);
     map.insert(key, Arc::clone(&font));
     Some(font)
 }
@@ -1849,10 +1877,33 @@ mod tests {
     }
 
     #[test]
+    fn host_ui_font_parser_shares_the_host_face_bytes() {
+        // The host face is usually a ~19 MB CJK collection: the parsed font
+        // must read the same bytes, not keep a second private copy.
+        let host = host_ui_font();
+        assert_eq!(host.font.bytes().as_ptr(), host.bytes().as_ptr());
+        assert_eq!(host.font.bytes().len(), host.bytes().len());
+    }
+
+    #[test]
+    fn shared_parse_reuses_the_cached_face_for_equal_bytes() {
+        // The parse cache is process-wide and other tests load Inter too, so
+        // pad the bytes to a content hash no other test produces. Trailing
+        // padding after the table data does not change the face.
+        let mut padded = include_bytes!("../assets/Inter-Regular.ttf").to_vec();
+        padded.extend_from_slice(b"w3cos-shared-parse-test\0");
+        let bytes: FontBytes = Arc::new(padded);
+        let shared = cached_parsed_shared_font(&bytes).expect("Inter parses");
+        let copied = cached_parsed_font((*bytes).as_ref()).expect("Inter parses from a slice");
+        assert!(Arc::ptr_eq(&shared, &copied));
+        assert_eq!(shared.bytes().as_ptr(), (*bytes).as_ref().as_ptr());
+    }
+
+    #[test]
     fn parsed_font_cache_reuses_one_face_for_the_same_bytes() {
         let host = host_ui_font();
-        let first = cached_parsed_font(host.data.as_slice()).expect("host font parses");
-        let second = cached_parsed_font(host.data.as_slice()).expect("host font parses again");
+        let first = cached_parsed_font(host.bytes()).expect("host font parses");
+        let second = cached_parsed_font(host.bytes()).expect("host font parses again");
         assert!(std::sync::Arc::ptr_eq(&first, &second));
         if host.index == 0 {
             assert!(std::sync::Arc::ptr_eq(&host.font, &first));
@@ -2460,12 +2511,16 @@ pub(crate) struct FontTally {
 }
 
 impl FontTally {
-    pub(crate) fn add(&mut self, data: &Arc<Vec<u8>>) {
+    pub(crate) fn add<T: AsRef<[u8]> + ?Sized>(&mut self, data: &Arc<T>) {
         use std::hash::{Hash, Hasher};
         self.stats.font_refs += 1;
-        if !self.allocations.insert(Arc::as_ptr(data) as usize) {
+        if !self
+            .allocations
+            .insert(Arc::as_ptr(data) as *const () as usize)
+        {
             return;
         }
+        let data: &[u8] = (**data).as_ref();
         self.stats.blobs += 1;
         self.stats.blob_bytes += data.len();
         // Length plus head and tail is enough to tell distinct fonts apart
