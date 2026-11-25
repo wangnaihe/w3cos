@@ -3811,6 +3811,14 @@ fn annotate_table_caption_paint_insets(
 }
 
 impl PaintArtifact {
+    /// No box of this artifact carries a `resize` value: the build kept a
+    /// feature superset (`W3COS_PAINT_FEATURE_SKIP`) without
+    /// [`FEATURE_RESIZE`]. `false` when no superset was kept.
+    pub(crate) fn resize_absent(&self) -> bool {
+        self.feature_presence
+            .is_some_and(|bits| bits & FEATURE_RESIZE == 0)
+    }
+
     /// Applied decoration belongs to the originating box, not the child's
     /// computed property. Atomic inline and out-of-flow boxes isolate their
     /// contents, but an isolating box's own decoration still reaches them.
@@ -6842,6 +6850,8 @@ pub(crate) fn paint_range_rebuild_mode() -> u8 {
 const FEATURE_TRANSLATE_PERCENT: u8 = 1;
 const FEATURE_VIDEO_CONTROLS: u8 = 2;
 const FEATURE_TABLE: u8 = 4;
+/// A box carries a `resize` value (see [`PaintArtifact::resize_absent`]).
+const FEATURE_RESIZE: u8 = 8;
 
 /// `W3COS_PAINT_FEATURE_SKIP=1|verify` (off by default): the reusing build
 /// skips its whole-tree passes for percentage translates, media controls
@@ -6897,6 +6907,10 @@ fn node_features(node: &PaintNode) -> u8 {
         }
         if properties.may_contain(VIDEO) && properties.contains_key(VIDEO) {
             bits |= FEATURE_VIDEO_CONTROLS;
+        }
+        const RESIZE: &str = w3cos_dom::css_style::RESIZE_PROPERTY;
+        if properties.may_contain(RESIZE) && properties.contains_key(RESIZE) {
+            bits |= FEATURE_RESIZE;
         }
     }
     bits

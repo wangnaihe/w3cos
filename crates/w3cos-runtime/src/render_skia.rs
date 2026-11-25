@@ -2283,9 +2283,63 @@ fn visible_resize(rect: LayoutRect, style: &Style) -> bool {
         && has_css_resize_indicator(style)
 }
 
+/// `W3COS_PAINT_RESIZE_PRESENCE=1|verify` (off by default): the frame's
+/// resize sample effects are empty without a scan of every box when the
+/// build's feature superset (`W3COS_PAINT_FEATURE_SKIP`) has no box with a
+/// `resize` value, as Blink keeps resizers in the scrollable areas it
+/// tracks rather than finding them per frame. `verify` also scans and
+/// compares.
+pub(crate) fn paint_resize_presence_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_RESIZE_PRESENCE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_RESIZE_PRESENCE").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_RESIZE_PRESENCE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (scans skipped, verify mismatches).
+    pub(crate) static PAINT_RESIZE_PRESENCE_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 fn artifact_resize_multisampled_effects(
     artifact: &PaintArtifact,
 ) -> std::collections::HashSet<usize> {
+    let mode = paint_resize_presence_mode();
+    if mode != 0 && artifact.resize_absent() {
+        let (skipped, mismatches) = PAINT_RESIZE_PRESENCE_STATS.with(std::cell::Cell::get);
+        if mode == 2 {
+            let scanned = scan_resize_multisampled_effects(artifact);
+            if !scanned.is_empty() {
+                eprintln!(
+                    "[paint-resize-presence-verify] mismatch: {} resize effects",
+                    scanned.len()
+                );
+                PAINT_RESIZE_PRESENCE_STATS.with(|stats| stats.set((skipped, mismatches + 1)));
+                return scanned;
+            }
+        }
+        PAINT_RESIZE_PRESENCE_STATS.with(|stats| stats.set((skipped + 1, mismatches)));
+        return Default::default();
+    }
+    scan_resize_multisampled_effects(artifact)
+}
+
+fn scan_resize_multisampled_effects(artifact: &PaintArtifact) -> std::collections::HashSet<usize> {
     // Picture recordings can split one raster effect into several chunks
     // (e.g. at a scroll clip). Its sample context must still see sibling
     // draws from that effect, not just this recording's client indices.

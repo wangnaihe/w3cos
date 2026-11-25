@@ -3033,6 +3033,87 @@ mod tests {
         assert!(skip == full, "frames with skipped passes differ");
     }
 
+    /// `W3COS_PAINT_RESIZE_PRESENCE`: frames before a box with `resize`
+    /// arrives skip the per-box resize scan; once it arrives the scan runs.
+    /// Verify finds no box the superset missed, and all modes paint alike.
+    #[test]
+    fn resize_presence_skips_the_scan_and_matches_it() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(None));
+                crate::render_skia::PAINT_RESIZE_PRESENCE_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(Some(1)));
+            crate::render_skia::PAINT_RESIZE_PRESENCE_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(160.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "150px");
+            crate::dom::append_child(body, log);
+            let first = crate::dom::create_element("p");
+            let text = crate::dom::create_text_node("plain");
+            crate::dom::append_child(first, text);
+            crate::dom::append_child(log, first);
+            assert!(crate::incremental_layout::flush());
+            let before = crate::render_skia::PAINT_RESIZE_PRESENCE_STATS.with(std::cell::Cell::get);
+            let mut frames = vec![render_document_rgba(160, 480).expect("first frame").rgba];
+            let mut skipped_before_resize = 0;
+            for step in 0..6 {
+                if step == 3 {
+                    skipped_before_resize = crate::render_skia::PAINT_RESIZE_PRESENCE_STATS
+                        .with(std::cell::Cell::get)
+                        .0
+                        - before.0;
+                    let resizable = crate::dom::create_element("div");
+                    for (name, value) in [
+                        ("width", "60px"),
+                        ("height", "40px"),
+                        ("overflow", "auto"),
+                        ("resize", "both"),
+                        ("border", "1px solid #333"),
+                    ] {
+                        crate::dom::set_style_property(resizable, name, value);
+                    }
+                    crate::dom::append_child(log, resizable);
+                } else {
+                    let line = crate::dom::create_element("p");
+                    let words = crate::dom::create_text_node(&format!("line {step}"));
+                    crate::dom::append_child(line, words);
+                    crate::dom::append_child(log, line);
+                }
+                frames.push(render_document_rgba(160, 480).expect("stream frame").rgba);
+            }
+            let after = crate::render_skia::PAINT_RESIZE_PRESENCE_STATS.with(std::cell::Cell::get);
+            (
+                frames,
+                skipped_before_resize,
+                after.0 - before.0,
+                after.1 - before.1,
+            )
+        };
+        let (verified, early, skipped, mismatched) = run(2);
+        assert!(early > 0, "frames without a resize box must skip the scan");
+        assert_eq!(mismatched, 0, "the superset missed a resize box");
+        let (skip, early_on, skipped_on, _) = run(1);
+        assert!(early_on > 0, "the fast path is taken");
+        assert_eq!(skipped_on, early_on, "frames with a resize box scan");
+        assert_eq!(skipped, early, "verify skips the same frames");
+        let (full, _, off_skipped, _) = run(0);
+        assert_eq!(off_skipped, 0);
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(skip == full, "frames with the scan skipped differ");
+    }
+
     #[test]
     fn persist_dirty_scan_matches_the_full_scan() {
         struct Off;
