@@ -1887,7 +1887,12 @@ mod tests {
 
     #[test]
     fn shared_parse_reuses_the_cached_face_for_equal_bytes() {
-        let bytes: FontBytes = Arc::new(include_bytes!("../assets/Inter-Regular.ttf").to_vec());
+        // The parse cache is process-wide and other tests load Inter too, so
+        // pad the bytes to a content hash no other test produces. Trailing
+        // padding after the table data does not change the face.
+        let mut padded = include_bytes!("../assets/Inter-Regular.ttf").to_vec();
+        padded.extend_from_slice(b"w3cos-shared-parse-test\0");
+        let bytes: FontBytes = Arc::new(padded);
         let shared = cached_parsed_shared_font(&bytes).expect("Inter parses");
         let copied = cached_parsed_font((*bytes).as_ref()).expect("Inter parses from a slice");
         assert!(Arc::ptr_eq(&shared, &copied));
