@@ -111,6 +111,39 @@ impl<const N: usize, T> std::ops::DerefMut for Registers<N, T> {
     }
 }
 
+/// `cell.borrow()` for generated code. `RefCell::borrow` is
+/// `#[track_caller]`, so calling it at every generated site emits one panic
+/// location (plus a relocation in `.data.rel.ro`) per site; going through
+/// this non-tracking helper keeps a single location here. A conflicting
+/// borrow still panics.
+#[inline]
+pub fn read_cell<T>(cell: &RefCell<T>) -> std::cell::Ref<'_, T> {
+    cell.borrow()
+}
+
+/// `cell.borrow_mut()` for generated code; see [`read_cell`].
+#[inline]
+pub fn write_cell<T>(cell: &RefCell<T>) -> std::cell::RefMut<'_, T> {
+    cell.borrow_mut()
+}
+
+/// `once.call_once(init)` for generated code. `Once::call_once` is
+/// `#[track_caller]`; taking a plain `fn()` keeps this helper
+/// non-generic, so there is one panic location for all call sites.
+#[inline]
+pub fn once(once: &std::sync::Once, init: fn()) {
+    once.call_once(init)
+}
+
+/// `vec![a, b, ..]` for generated call arguments and array literals.
+/// In debug builds each `vec![..]` expansion carries its own pointer
+/// alignment and null checks, each with a panic location; building the
+/// array at the site and converting here avoids them.
+#[inline]
+pub fn args<const N: usize>(values: [Value; N]) -> Vec<Value> {
+    Vec::from(values)
+}
+
 /// `slots[index] = Some(value)` for a frame's binding slots under
 /// construction. A call instead of indexing at the site keeps one panic
 /// location here rather than one per generated assignment; out-of-range
@@ -448,6 +481,41 @@ fn nest_capture_with<G, S, B>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn location_free_helpers_match_std() {
+        let cell = RefCell::new(1_u32);
+        assert_eq!(*read_cell(&cell), 1);
+        *write_cell(&cell) = 2;
+        assert_eq!(*cell.borrow(), 2);
+        let shared = Rc::new(RefCell::new(3_u32));
+        assert_eq!(*read_cell(&shared), 3);
+        *write_cell(&shared) += 1;
+        assert_eq!(*shared.borrow(), 4);
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        fn bump() {
+            HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        once(&ONCE, bump);
+        once(&ONCE, || bump());
+        assert_eq!(HITS.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        assert!(args([]).is_empty());
+        let built = args([Value::Number(1.0), Value::Undefined]);
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].as_number(), Some(1.0));
+        assert!(built[1].is_undefined());
+    }
+
+    #[test]
+    #[should_panic]
+    fn write_cell_still_rejects_conflicting_borrows() {
+        let cell = RefCell::new(0_u8);
+        let _held = read_cell(&cell);
+        let _ = write_cell(&cell);
+    }
+
     use super::*;
 
     #[test]
