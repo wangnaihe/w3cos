@@ -2,6 +2,11 @@
 use crate::{layout::LayoutRect, paint_artifact::PaintArtifact, render_skia, skia_text_run};
 use skia_safe::{Canvas, GlyphId, Point, Typeface};
 use std::collections::{HashMap, HashSet};
+use w3cos_std::fxhash::{FxBuildHasher, FxHashMap};
+
+/// Paint client sets: membership only (FxHash, like Blink's integer-keyed
+/// HashSet; std's SipHash dominated these per-frame sets).
+type ClientSet = HashSet<usize, FxBuildHasher>;
 use std::sync::Arc;
 use w3cos_std::style::{Display, TextDirection};
 use w3cos_std::{ComponentKind, Style};
@@ -566,7 +571,7 @@ pub(crate) fn build(
     artifact: &PaintArtifact,
     clients: impl Iterator<Item = usize>,
     face: &Typeface,
-) -> HashMap<usize, std::rc::Rc<Fragment>> {
+) -> FxHashMap<usize, std::rc::Rc<Fragment>> {
     build_with_index(artifact, clients, face, &index(artifact))
 }
 
@@ -575,8 +580,8 @@ pub(crate) fn build_with_index(
     clients: impl Iterator<Item = usize>,
     face: &Typeface,
     shaping_index: &ShapingIndex,
-) -> HashMap<usize, std::rc::Rc<Fragment>> {
-    let clients = clients.collect::<HashSet<_>>();
+) -> FxHashMap<usize, std::rc::Rc<Fragment>> {
+    let clients = clients.collect::<ClientSet>();
     let is_quote_word = |index: usize| shaping_index.is_quote_word(artifact, index);
     let inline_owner = |mut parent: usize| -> Option<usize> {
         while is_quote_word(parent) {
@@ -615,7 +620,7 @@ pub(crate) fn build_with_index(
     let parents = clients
         .iter()
         .filter_map(|index| inline_owner(artifact.nodes.get(*index)?.parent?))
-        .collect::<HashSet<_>>();
+        .collect::<ClientSet>();
     // Only an LTR inline formatting context shapes across its children:
     // test that before looking its children up.
     let shapes_children = |parent: usize| {
@@ -641,7 +646,7 @@ pub(crate) fn build_with_index(
         face_id: face.unique_id(),
         revision: crate::font_face::FontRegistry::global().revision(),
     });
-    let mut result = HashMap::new();
+    let mut result = FxHashMap::default();
     for (parent, children) in siblings {
         let cached = cache_frame
             .as_ref()
@@ -844,7 +849,7 @@ fn owner_shape_cache_get(
     artifact: &PaintArtifact,
     owner: usize,
     children: &[usize],
-    clients: &HashSet<usize>,
+    clients: &ClientSet,
     frame: &OwnerShapeFrame,
 ) -> Option<Vec<(u32, std::rc::Rc<Fragment>)>> {
     let key = owner_shape_key(artifact, owner, children);
@@ -899,7 +904,7 @@ fn owner_shape_cache_put(
     artifact: &PaintArtifact,
     owner: usize,
     children: &[usize],
-    clients: &HashSet<usize>,
+    clients: &ClientSet,
     frame: &OwnerShapeFrame,
     fragments: &[(usize, std::rc::Rc<Fragment>)],
     group_firsts: &[usize],
@@ -992,7 +997,7 @@ pub(crate) fn same_fragment(a: &Fragment, b: &Fragment) -> bool {
 fn share_source_decoration(
     fragments: &mut [(usize, Fragment)],
     artifact: &PaintArtifact,
-    clients: &HashSet<usize>,
+    clients: &ClientSet,
 ) {
     let Some((first_index, _)) = fragments.first() else {
         return;

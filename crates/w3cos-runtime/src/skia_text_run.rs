@@ -57,8 +57,10 @@ pub(crate) fn css_font_for_style(face: &Typeface, size: f32, style: &Style) -> F
 
 thread_local! {
     static FONT_TABLES: RefCell<HashMap<u32, Arc<Vec<u8>>>> = RefCell::new(HashMap::new());
-    static OUTLINE_BOUNDS: RefCell<HashMap<(u32, u32, u32, u32, bool, GlyphId), Option<Rect>>> =
-        RefCell::new(HashMap::new());
+    // FxHash: the key is hashed once per glyph per text run.
+    static OUTLINE_BOUNDS: RefCell<
+        w3cos_std::fxhash::FxHashMap<(u32, u32, u32, u32, bool, GlyphId), Option<Rect>>,
+    > = RefCell::new(Default::default());
 }
 
 #[derive(Clone, PartialEq)]
