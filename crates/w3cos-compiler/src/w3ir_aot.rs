@@ -1755,9 +1755,11 @@ fn emit_unboxed_bank(name: &str, ty: &str, zero: &str, n: usize) -> (String, Str
         )
     } else if n <= UNBOXED_ARRAY_MAX {
         // No panic location per constant-index site (see `Registers`).
+        // `Registers::from`, not `.into()`: the blanket `Into::into` is
+        // `#[track_caller]` and would add a location per frame type.
         (
             format!("    {name}: w3cos_core::aot_frame::Registers<{n}, {ty}>,\n"),
-            format!("        {name}: vec![{zero}; {n}].into(),\n"),
+            format!("        {name}: w3cos_core::aot_frame::Registers::from(vec![{zero}; {n}]),\n"),
         )
     } else {
         (
@@ -2205,7 +2207,9 @@ fn emit_registers_init(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
         format!("        registers: [const {{ w3cos_core::Value::Undefined }}; {n}],\n")
     } else {
-        format!("        registers: vec![w3cos_core::Value::Undefined; {n}].into(),\n")
+        format!(
+            "        registers: w3cos_core::aot_frame::Registers::from(vec![w3cos_core::Value::Undefined; {n}]),\n"
+        )
     }
 }
 
@@ -3135,15 +3139,20 @@ impl {type_name} {{
     let frame = format!(
         "{type_name} {{\n{registers_init}\n{num_init}        bindings,\n        capture_getters,\n        capture_setters,\n{num_cells_init}{block_initializer}\n    }}"
     );
+    // `match` instead of `.unwrap_or_else(..)`: the pinned std marks
+    // `Result::unwrap_or_else` `#[track_caller]`, so every generated entry
+    // carried its own panic location in `.data.rel.ro`.
     let run = if typed_parameter_stores.is_empty() {
-        format!("    {frame}.run()")
+        format!(
+            "    match ({frame}).run() {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
+        )
     } else {
         format!(
-            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    __w3cos_frame.run()"
+            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    match __w3cos_frame.run() {{ Ok(__w3cos_value) => __w3cos_value, Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception) }}"
         )
     };
     let entry = format!(
-        "{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}{run}.unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))\n"
+        "{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}{run}\n"
     );
     Ok(SyncVariant { items, entry })
 }
@@ -9976,6 +9985,41 @@ fn main() {{
     }
 
     #[test]
+    fn sync_entries_and_frame_banks_avoid_track_caller_adapters() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function wide() {
+                    return (1 + 2) * (3 + 4) - (5 + 6) / (7 + 8) + (9 + 10) * (11 + 12) - (13 + 14) / (15 + 16)
+                        + ((1 < 2) === (3 < 4) ? 1 : 0) + ((5 < 6) === (7 < 8) ? 1 : 0)
+                        + ((9 < 10) === (11 < 12) ? 1 : 0) + ((13 < 14) === (15 < 16) ? 1 : 0)
+                        + ((17 < 18) === (19 < 20) ? 1 : 0);
+                }
+                wide;
+            "#,
+            "app:///track-caller.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("wide"))
+            .unwrap();
+        let wide = generate_sync_function_from_module(&module, function, "wide_aot").unwrap();
+        // `Result::unwrap_or_else` and the blanket `Into::into` are
+        // `#[track_caller]`: each use would add a panic location.
+        assert!(
+            wide.contains("Err(__w3cos_exception) => w3cos_core::throw_value(__w3cos_exception)")
+                && !wide.contains(".unwrap_or_else(|__w3cos_exception|"),
+            "sync entry should match on run() instead of unwrap_or_else: {wide}"
+        );
+        assert!(
+            wide.contains("num_regs: w3cos_core::aot_frame::Registers::from(vec![")
+                && !wide.contains("].into(),"),
+            "Registers banks should be built with Registers::from: {wide}"
+        );
+    }
+
+    #[test]
     fn unboxed_banks_pick_array_registers_or_vec_by_width() {
         assert_eq!(
             emit_unboxed_bank("num_regs", "f64", "0.0_f64", 4),
@@ -9990,7 +10034,9 @@ fn main() {{
                 format!(
                     "    bool_regs: w3cos_core::aot_frame::Registers<{UNBOXED_ARRAY_MAX}, bool>,\n"
                 ),
-                format!("        bool_regs: vec![false; {UNBOXED_ARRAY_MAX}].into(),\n")
+                format!(
+                    "        bool_regs: w3cos_core::aot_frame::Registers::from(vec![false; {UNBOXED_ARRAY_MAX}]),\n"
+                )
             )
         );
         assert_eq!(
@@ -11021,13 +11067,27 @@ fn main() {{
         let ir_count = function.registers;
         let val_len = parse_undefined_vec_len(&generated);
         let num_len = parse_vec_len(&generated, "num_regs: vec![0.0_f64; ")
-            .or_else(|| parse_vec_len(&generated, "num_regs: [0.0_f64; "));
+            .or_else(|| parse_vec_len(&generated, "num_regs: [0.0_f64; "))
+            .or_else(|| {
+                parse_vec_len(
+                    &generated,
+                    "num_regs: w3cos_core::aot_frame::Registers::from(vec![0.0_f64; ",
+                )
+            });
         let bool_len = parse_vec_len(&generated, "bool_regs: vec![false; ")
             .or_else(|| parse_vec_len(&generated, "bool_regs: [false; "))
+            .or_else(|| {
+                parse_vec_len(
+                    &generated,
+                    "bool_regs: w3cos_core::aot_frame::Registers::from(vec![false; ",
+                )
+            })
             .unwrap_or(0);
         assert!(
             generated.contains("num_regs: vec![0.0_f64; ")
-                || generated.contains("num_regs: [0.0_f64; "),
+                || generated.contains("num_regs: [0.0_f64; ")
+                || generated
+                    .contains("num_regs: w3cos_core::aot_frame::Registers::from(vec![0.0_f64; "),
             "compact num_regs init should be emitted: {generated}"
         );
         if let (Some(val_len), Some(num_len)) = (val_len, num_len) {
@@ -12334,6 +12394,12 @@ fn main() {{
         parse_vec_len(generated, "registers: vec![w3cos_core::Value::Undefined; ")
             .or_else(|| parse_vec_len(generated, "registers: vec![Value::Undefined; "))
             .or_else(|| parse_vec_len(generated, "registers: [w3cos_core::Value; "))
+            .or_else(|| {
+                parse_vec_len(
+                    generated,
+                    "registers: w3cos_core::aot_frame::Registers::from(vec![w3cos_core::Value::Undefined; ",
+                )
+            })
     }
 
     fn parse_vec_len(generated: &str, prefix: &str) -> Option<u32> {
