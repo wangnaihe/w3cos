@@ -617,6 +617,9 @@ fn finish_headless_frame(
             sticky_counter_signal: node.sticky_counter_signal,
         }
     });
+    // The splice kept every recycled node outside the last two frames'
+    // change ranges (`W3COS_PAINT_PERSIST_PREFILL_SPANS`).
+    let spliced_path = spliced.is_some();
     let paint_nodes: Vec<PaintNode> = match spliced {
         Some(nodes) => nodes,
         None => paint_nodes.collect(),
@@ -650,6 +653,7 @@ fn finish_headless_frame(
                     moved: &moved,
                     raw: &raw,
                     stale_trimmed: stale_trimmed.clone(),
+                    spliced: spliced_path,
                 }),
             )
         })
@@ -3212,6 +3216,138 @@ mod tests {
         assert_eq!(off_plans, 0);
         assert!(verified == full, "verify-mode frames differ");
         assert!(ranged == full, "frames from the ranged table marks differ");
+    }
+
+    #[test]
+    fn table_pass_and_prefill_spans_match_the_full_passes() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PERSIST_TABLE_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::TABLE_PASS_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::PERSIST_PREFILL_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let run = |mode: u8| {
+            crate::paint_artifact::PERSIST_TABLE_SPANS_OVERRIDE
+                .with(|value| value.set(Some(mode.min(1))));
+            crate::paint_artifact::TABLE_PASS_SPANS_OVERRIDE.with(|value| value.set(Some(mode)));
+            crate::paint_artifact::PERSIST_PREFILL_SPANS_OVERRIDE
+                .with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(200.0, 480.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "180px");
+            crate::dom::append_child(body, log);
+            // A collapsed-border table (its passes read across cells), then
+            // streamed text after it.
+            let table = crate::dom::create_element("div");
+            crate::dom::set_style_property(table, "display", "table");
+            crate::dom::set_style_property(table, "border-collapse", "collapse");
+            let row = crate::dom::create_element("div");
+            crate::dom::set_style_property(row, "display", "table-row");
+            let mut cells = Vec::new();
+            for color in ["#cc3333", "#33cc33"] {
+                let cell = crate::dom::create_element("div");
+                crate::dom::set_style_property(cell, "display", "table-cell");
+                crate::dom::set_style_property(cell, "border", "2px solid #333");
+                crate::dom::set_style_property(cell, "background", color);
+                let words = crate::dom::create_text_node("cell");
+                crate::dom::append_child(cell, words);
+                crate::dom::append_child(row, cell);
+                cells.push(words);
+            }
+            crate::dom::append_child(table, row);
+            crate::dom::append_child(log, table);
+            let mut texts = Vec::new();
+            for index in 0..4 {
+                let message = crate::dom::create_element("p");
+                let words = crate::dom::create_text_node(&format!("  message {index} words"));
+                crate::dom::append_child(message, words);
+                crate::dom::append_child(log, message);
+                texts.push(words);
+            }
+            assert!(crate::incremental_layout::flush());
+            let tables_before = crate::paint_artifact::table_pass_spans_stats();
+            let prefill_before = crate::paint_artifact::persist_prefill_spans_stats();
+            let persistent_before = persistent_paint_stats().0;
+            let mut frames = vec![render_document_rgba(200, 480).expect("first frame").rgba];
+            for step in 0..10 {
+                match step % 5 {
+                    0 | 2 => crate::dom::set_text_content(
+                        texts[3],
+                        &format!("  message 3 words and {step} more words that wrap"),
+                    ),
+                    1 => crate::dom::set_text_content(cells[1], &format!("cell {step}")),
+                    3 => crate::dom::set_text_content(texts[1], &format!(" second {step}")),
+                    _ => {
+                        let line = crate::dom::create_element("p");
+                        let words = crate::dom::create_text_node(&format!("   line {step}"));
+                        crate::dom::append_child(line, words);
+                        crate::dom::append_child(log, line);
+                    }
+                }
+                frames.push(render_document_rgba(200, 480).expect("stream frame").rgba);
+            }
+            let tables = crate::paint_artifact::table_pass_spans_stats();
+            let prefill = crate::paint_artifact::persist_prefill_spans_stats();
+            let persistent = persistent_paint_stats().0 - persistent_before;
+            (
+                frames,
+                (tables.0 - tables_before.0, tables.1 - tables_before.1),
+                (prefill.0 - prefill_before.0, prefill.1 - prefill_before.1),
+                persistent,
+            )
+        };
+        let (
+            verified,
+            (table_passes, table_mismatches),
+            (prefills, prefill_mismatches),
+            persistent,
+        ) = run(2);
+        eprintln!(
+            "[table-prefill-spans-test] persistent {persistent} table passes {table_passes} prefills {prefills}"
+        );
+        // Both exist only on the persistent path (`W3COS_PAINT_PERSISTENT_NODES`,
+        // on in the gate's verify mode).
+        if persistent > 0 {
+            assert!(
+                table_passes > 0,
+                "persistent builds must take the listed tables"
+            );
+            // The ranged prefill needs spliced nodes and the dirty list.
+            if paint_nodes_splice_mode() != 0
+                && crate::paint_artifact::persist_dirty_scan_mode() != 0
+            {
+                assert!(
+                    prefills > 0,
+                    "spliced persistent builds must take the ranged prefill"
+                );
+            }
+        }
+        assert_eq!(
+            table_mismatches, 0,
+            "the listed tables differ from the full scan"
+        );
+        assert_eq!(
+            prefill_mismatches, 0,
+            "the ranged prefill differs from the full one"
+        );
+        let (fast, _, _, _) = run(1);
+        let (full, (off_tables, _), (off_prefills, _), _) = run(0);
+        assert_eq!((off_tables, off_prefills), (0, 0));
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(
+            fast == full,
+            "frames from the listed tables and ranged prefill differ"
+        );
     }
 
     #[cfg(feature = "skia")]

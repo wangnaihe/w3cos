@@ -482,6 +482,9 @@ pub struct PaintArtifact {
     /// `W3COS_PAINT_PERSIST_TABLE_SPANS`: that build's boxes in table
     /// subtrees (sorted), for the next plan's ranged marks.
     persist_tables: Option<std::sync::Arc<Vec<u32>>>,
+    /// `W3COS_PAINT_PERSIST_PREFILL_SPANS`: that build's boxes that were not
+    /// clean (sorted), when its plan kept every box's index.
+    persist_dirty: Option<std::sync::Arc<Vec<u32>>>,
     /// During `append_all_reusing` only: the boxes this frame's layout
     /// splice touched ([`paint_touched_mode`]).
     touched: Option<crate::incremental_layout::PaintChanges>,
@@ -554,6 +557,7 @@ impl Default for PaintArtifact {
             persist_percent_padding: false,
             persist_viewport: None,
             persist_tables: None,
+            persist_dirty: None,
             touched: None,
             touched_gaps: false,
             volatile_nodes: None,
@@ -716,6 +720,9 @@ pub(crate) struct PersistRaw<'a> {
     pub moved: &'a std::cell::RefCell<Vec<bool>>,
     pub raw: &'a dyn Fn(usize) -> PaintNode,
     pub stale_trimmed: Option<std::sync::Arc<Vec<u32>>>,
+    /// The nodes were spliced (`W3COS_PAINT_NODES_SPLICE`): every box
+    /// outside the last two frames' change ranges took its recycled node.
+    pub spliced: bool,
 }
 
 thread_local! {
@@ -751,7 +758,7 @@ struct PersistPlan<'a> {
 /// box (Blink: paint invalidation visits only the objects layout marked).
 /// `verify` also runs each pass over every box, skipping clean ones, and
 /// compares.
-fn persist_dirty_scan_mode() -> u8 {
+pub(crate) fn persist_dirty_scan_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PERSIST_DIRTY_SCAN_OVERRIDE.with(std::cell::Cell::get) {
         return mode;
@@ -826,6 +833,88 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn persist_table_spans_stats() -> (u64, u64) {
     PERSIST_TABLE_SPANS_STATS.with(std::cell::Cell::get)
+}
+
+/// `W3COS_PAINT_TABLE_PASS_SPANS=1|verify` (off by default; with the
+/// persistent plan's table list, `W3COS_PAINT_PERSIST_TABLE_SPANS`): the
+/// table passes find this frame's tables from the plan's list of boxes in
+/// table subtrees instead of reading every box's display. `verify` also
+/// scans every box and compares.
+fn table_pass_spans_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TABLE_PASS_SPANS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_TABLE_PASS_SPANS")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TABLE_PASS_SPANS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (table passes that took the plan's list, verify mismatches).
+    static TABLE_PASS_SPANS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn table_pass_spans_stats() -> (u64, u64) {
+    TABLE_PASS_SPANS_STATS.with(std::cell::Cell::get)
+}
+
+/// `W3COS_PAINT_PERSIST_PREFILL_SPANS=1|verify` (off by default; with the
+/// persistent path in place, spliced nodes and the dirty list): the clean
+/// boxes take last build's style by visiting only the boxes last build did
+/// not keep clean. A box clean in both builds holds the recycled node of the
+/// build before (outside the last two frames' change ranges), whose style
+/// last build took as it was. `verify` also visits every clean box and
+/// compares.
+fn persist_prefill_spans_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PERSIST_PREFILL_SPANS_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_PERSIST_PREFILL_SPANS")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PERSIST_PREFILL_SPANS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (prefills over last build's dirty list, verify mismatches).
+    static PERSIST_PREFILL_SPANS_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn persist_prefill_spans_stats() -> (u64, u64) {
+    PERSIST_PREFILL_SPANS_STATS.with(std::cell::Cell::get)
 }
 
 /// A table-internal or table box (the table passes add to its properties).
@@ -1003,12 +1092,29 @@ impl PersistPlan<'_> {
     }
 
     /// Clean boxes take last build's adjusted style, and its trimmed text.
-    fn prefill(&self, nodes: &mut [PaintNode]) {
-        for (index, (node, clean)) in nodes.iter_mut().zip(&self.clean).enumerate() {
-            if *clean {
-                let previous = &self.previous.nodes[self.previous_index(index)].style;
-                if !node.style.ptr_eq(previous) {
-                    node.style = previous.clone();
+    /// `visit`: the only boxes whose style may differ from last build's
+    /// (`W3COS_PAINT_PERSIST_PREFILL_SPANS`).
+    fn prefill(&self, nodes: &mut [PaintNode], visit: Option<&[u32]>) {
+        let take = |index: usize, node: &mut PaintNode| {
+            let previous = &self.previous.nodes[self.previous_index(index)].style;
+            if !node.style.ptr_eq(previous) {
+                node.style = previous.clone();
+            }
+        };
+        match visit {
+            Some(visit) => {
+                for &index in visit {
+                    let index = index as usize;
+                    if self.clean.get(index).copied().unwrap_or(false) {
+                        take(index, &mut nodes[index]);
+                    }
+                }
+            }
+            None => {
+                for (index, (node, clean)) in nodes.iter_mut().zip(&self.clean).enumerate() {
+                    if *clean {
+                        take(index, node);
+                    }
                 }
             }
         }
@@ -1650,7 +1756,7 @@ mod table_passes {
 
     /// Outermost tables as preorder ranges, or `None` when a table part
     /// sits outside every table (the passes then read across the tree).
-    fn tables(nodes: &[PaintNode]) -> Option<Vec<std::ops::Range<usize>>> {
+    pub(super) fn tables(nodes: &[PaintNode]) -> Option<Vec<std::ops::Range<usize>>> {
         let mut ranges = Vec::new();
         let mut index = 0;
         while index < nodes.len() {
@@ -1670,6 +1776,70 @@ mod table_passes {
             index += 1;
         }
         Some(ranges)
+    }
+
+    /// `tables` from the boxes in table subtrees (sorted): the outermost
+    /// tables are the listed table boxes outside an earlier table's range,
+    /// and a listed box outside every table range is a stray table part.
+    pub(super) fn tables_from_boxes(
+        nodes: &[PaintNode],
+        boxes: &[u32],
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for &index in boxes {
+            let index = index as usize;
+            if index >= nodes.len() {
+                return None;
+            }
+            if ranges.last().is_some_and(|last| index < last.end) {
+                continue;
+            }
+            let display = nodes[index].style.display;
+            if matches!(display, Display::Table | Display::InlineTable) {
+                let mut end = index + 1;
+                while end < nodes.len() && nodes[end].parent.is_some_and(|parent| parent >= index) {
+                    end += 1;
+                }
+                ranges.push(index..end);
+                continue;
+            }
+            // A table part, or a box under one, outside every table.
+            return None;
+        }
+        Some(ranges)
+    }
+
+    /// This frame's tables: from the plan's list when given
+    /// (`W3COS_PAINT_TABLE_PASS_SPANS`), else over every box.
+    fn frame_tables(
+        nodes: &[PaintNode],
+        boxes: Option<&[u32]>,
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        let mode = table_pass_spans_mode();
+        let Some(boxes) = boxes.filter(|_| mode != 0) else {
+            return tables(nodes);
+        };
+        let listed = tables_from_boxes(nodes, boxes);
+        let mut mismatch = false;
+        let listed = if mode == 2 {
+            let full = tables(nodes);
+            if full != listed {
+                mismatch = true;
+                eprintln!(
+                    "[paint-table-pass-spans-verify] mismatch: {:?} listed vs {:?} full tables",
+                    listed.as_ref().map(Vec::len),
+                    full.as_ref().map(Vec::len)
+                );
+            }
+            full
+        } else {
+            listed
+        };
+        TABLE_PASS_SPANS_STATS.with(|stats| {
+            let (passes, mismatches) = stats.get();
+            stats.set((passes + 1, mismatches + u64::from(mismatch)));
+        });
+        listed
     }
 
     struct Input {
@@ -1754,12 +1924,16 @@ mod table_passes {
             })
     }
 
-    pub(super) fn run(nodes: &mut [PaintNode], rects: &[Option<LayoutRect>]) {
+    pub(super) fn run(
+        nodes: &mut [PaintNode],
+        rects: &[Option<LayoutRect>],
+        boxes: Option<&[u32]>,
+    ) {
         if !enabled() {
             passes(nodes, rects);
             return;
         }
-        let Some(ranges) = tables(nodes) else {
+        let Some(ranges) = frame_tables(nodes, boxes) else {
             MEMO.with(|memo| memo.borrow_mut().clear());
             passes(nodes, rects);
             return;
@@ -4144,9 +4318,54 @@ impl PaintArtifact {
                 moved = aligned.then_some(taken);
             }
         }
+        // `W3COS_PAINT_PERSIST_PREFILL_SPANS`: in place on spliced nodes,
+        // with last build's dirty list (same indices as this build's).
+        let prefill_mode = persist_prefill_spans_mode();
+        let prefill_visit = (prefill_mode != 0
+            && moved.is_some()
+            && persist_raw.as_ref().is_some_and(|raw| raw.spliced)
+            && plan.as_ref().is_some_and(|plan| plan.moved_from.is_none()))
+        .then(|| previous.and_then(|previous| previous.persist_dirty.clone()))
+        .flatten();
+        let persist_dirty = (prefill_mode != 0)
+            .then(|| {
+                plan.as_ref()
+                    .filter(|plan| plan.moved_from.is_none())
+                    .and_then(|plan| plan.dirty.clone())
+                    .map(std::sync::Arc::new)
+            })
+            .flatten();
         let adjust = |mut nodes: Vec<PaintNode>, plan: Option<&PersistPlan>| {
             if let Some(plan) = plan {
-                plan.prefill(&mut nodes);
+                match prefill_visit.as_deref() {
+                    Some(visit) if prefill_mode == 2 => {
+                        let mut full = nodes.clone();
+                        plan.prefill(&mut full, None);
+                        plan.prefill(&mut nodes, Some(visit));
+                        let same = full.iter().zip(&nodes).all(|(a, b)| {
+                            a.style.ptr_eq(&b.style) || a.style.as_style() == b.style.as_style()
+                        });
+                        PERSIST_PREFILL_SPANS_STATS.with(|stats| {
+                            let (prefills, mismatches) = stats.get();
+                            stats.set((prefills + 1, mismatches + u64::from(!same)));
+                        });
+                        if !same {
+                            eprintln!(
+                                "[paint-persist-prefill-spans-verify] mismatch: {} visited",
+                                visit.len()
+                            );
+                            nodes = full;
+                        }
+                    }
+                    Some(visit) => {
+                        PERSIST_PREFILL_SPANS_STATS.with(|stats| {
+                            let (prefills, mismatches) = stats.get();
+                            stats.set((prefills + 1, mismatches));
+                        });
+                        plan.prefill(&mut nodes, Some(visit));
+                    }
+                    None => plan.prefill(&mut nodes, None),
+                }
             }
             // Clean boxes the per-box passes leave as they are.
             let skip = plan.map(|plan| plan.clean.as_slice());
@@ -4521,7 +4740,14 @@ impl PaintArtifact {
                 &mut nodes,
                 |a, b| same_paint_nodes(a, b),
                 Clone::clone,
-                |nodes| table_passes::run(nodes, &rect_by_index),
+                |nodes| {
+                    table_passes::run(
+                        nodes,
+                        &rect_by_index,
+                        plan.and_then(|plan| plan.tables.as_deref())
+                            .map(Vec::as_slice),
+                    )
+                },
                 "table",
             );
             {
@@ -4704,6 +4930,7 @@ impl PaintArtifact {
             persist_percent_padding: has_percentage_padding,
             persist_viewport: viewport,
             persist_tables,
+            persist_dirty,
             ..Self::default()
         };
         annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
@@ -6948,6 +7175,65 @@ mod tests {
                 table_subtree_boxes(&nodes)
             );
         }
+    }
+
+    #[test]
+    fn tables_from_listed_boxes_match_the_full_scan() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let displays = [
+            Display::Block,
+            Display::Inline,
+            Display::Table,
+            Display::InlineTable,
+            Display::TableRowGroup,
+            Display::TableRow,
+            Display::TableCell,
+            Display::TableCaption,
+        ];
+        let node = |display: Display, parent: Option<usize>| PaintNode {
+            kind: ComponentKind::Column,
+            style: Style {
+                display,
+                ..Style::default()
+            }
+            .into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let mut stray = 0;
+        let mut found = 0;
+        for _ in 0..300 {
+            let len = 2 + next(50);
+            let mut nodes = vec![node(Display::Block, None)];
+            let mut chain = vec![0usize];
+            for index in 1..len {
+                chain.truncate(1 + next(chain.len()));
+                let parent = *chain.last().unwrap();
+                let display = if next(3) == 0 {
+                    displays[next(displays.len())]
+                } else {
+                    Display::Block
+                };
+                nodes.push(node(display, Some(parent)));
+                chain.push(index);
+            }
+            let full = table_passes::tables(&nodes);
+            match &full {
+                None => stray += 1,
+                Some(ranges) => found += ranges.len(),
+            }
+            assert_eq!(
+                table_passes::tables_from_boxes(&nodes, &table_subtree_boxes(&nodes)),
+                full
+            );
+        }
+        assert!(stray > 0 && found > 0, "both outcomes must be covered");
     }
 
     #[test]
