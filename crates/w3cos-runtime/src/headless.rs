@@ -2679,10 +2679,14 @@ mod tests {
                 aligned > 0,
                 "spliced frames must reuse the previous build's record"
             );
-            assert!(
-                copied > 0,
-                "untouched boxes must take the previous trim decision"
-            );
+            // With `W3COS_PAINT_PERSISTENT_NODES=1` clean boxes take the
+            // persistent node instead, so no trim decision is copied.
+            if crate::paint_artifact::persistent_nodes_mode() != 1 {
+                assert!(
+                    copied > 0,
+                    "untouched boxes must take the previous trim decision"
+                );
+            }
         }
         assert_eq!(
             mismatched, 0,

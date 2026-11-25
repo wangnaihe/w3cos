@@ -668,7 +668,7 @@ pub(crate) struct CullSpan {
 /// full build, every box the layout splice did not change must have the
 /// same adjusted paint node as last frame; counts and reports the boxes
 /// that do not (the dependency rules the persistent path will need).
-fn persistent_nodes_mode() -> u8 {
+pub(crate) fn persistent_nodes_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_PERSISTENT_NODES").as_deref() {
