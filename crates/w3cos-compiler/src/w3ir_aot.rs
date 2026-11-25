@@ -3007,6 +3007,13 @@ fn contains_ident(haystack: &str, name: &str) -> bool {
     })
 }
 
+/// Identifier tokens of a (literal-stripped) line.
+fn ident_tokens(stripped: &str) -> impl Iterator<Item = &str> {
+    stripped
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| token.chars().next().is_some_and(|c| !c.is_ascii_digit()))
+}
+
 /// Names bound by `let` / `let mut` anywhere in a (literal-stripped) line.
 fn let_names(stripped: &str) -> Vec<String> {
     let mut names = Vec::new();
@@ -3094,34 +3101,57 @@ fn outline_straight_line_runs(tag: &str, body: &str, helpers: &mut String) -> St
             }
         }
     }
-    // unit_end[i]: last line that must share a helper with line i.
-    let mut unit_end: Vec<usize> = (0..n).collect();
-    for i in 0..n {
-        for name in let_names(&stripped[i]) {
-            let mut last = i;
-            for (j, line) in stripped.iter().enumerate().skip(i + 1) {
-                if !line.contains(name.as_str()) {
+    // unit_last[i]: for a `let` on line i, the last line that uses that
+    // binding before it is re-declared (one pass, linear in body size: giant
+    // esbuild/minified blocks have thousands of statements).
+    let mut unit_last: Vec<usize> = (0..n).collect();
+    let mut open: HashMap<String, usize> = HashMap::new();
+    for (j, line) in stripped.iter().enumerate() {
+        let declared = let_names(line);
+        // On a line that re-declares a name, only occurrences before its
+        // `let` read the old binding; later ones read the new one.
+        let before_let = line
+            .split_once("let ")
+            .map_or(line.as_str(), |(before, _)| before);
+        for token in ident_tokens(line) {
+            if let Some(&i) = open.get(token) {
+                if declared.iter().any(|declared| declared == token)
+                    && !contains_ident(before_let, token)
+                {
                     continue;
                 }
-                let redeclared = let_names(line).contains(&name);
-                let used_before_let = line
-                    .split_once("let ")
-                    .is_some_and(|(before, _)| contains_ident(before, &name));
-                if redeclared && !used_before_let {
-                    break;
-                }
-                if contains_ident(line, &name) {
-                    last = j;
-                }
+                unit_last[i] = unit_last[i].max(j);
             }
-            for j in i..=last {
-                unit_end[j] = unit_end[j].max(last);
-            }
-            if (i..=last).any(|j| !ok[j]) {
-                for flag in &mut ok[i..=last] {
+        }
+        for name in declared {
+            open.insert(name, j);
+        }
+    }
+    // unit_end[j]: last line that must share a helper with line j. Units that
+    // overlap form one group; a group with any non-outlinable line stays in
+    // `run` as a whole.
+    let mut unit_end: Vec<usize> = Vec::with_capacity(n);
+    let mut reach = 0usize;
+    let mut group_start = 0usize;
+    let mut group_ok = true;
+    for j in 0..n {
+        if j > reach || j == 0 {
+            if !group_ok {
+                for flag in &mut ok[group_start..j] {
                     *flag = false;
                 }
             }
+            group_start = j;
+            group_ok = true;
+            reach = j;
+        }
+        reach = reach.max(unit_last[j]);
+        unit_end.push(reach);
+        group_ok &= ok[j];
+    }
+    if !group_ok {
+        for flag in &mut ok[group_start..n] {
+            *flag = false;
         }
     }
     let mut out = String::with_capacity(body.len());
@@ -3141,10 +3171,12 @@ fn outline_straight_line_runs(tag: &str, body: &str, helpers: &mut String) -> St
         let mut start = i;
         while start < end {
             let mut stop = (start + OUTLINE_CHUNK_MAX).min(end);
-            while stop < end && unit_end[start..stop].iter().any(|last| *last >= stop) {
+            let mut reach = unit_end[start..stop].iter().copied().max().unwrap_or(start);
+            while stop < end && reach >= stop {
+                reach = reach.max(unit_end[stop]);
                 stop += 1;
             }
-            let escapes = unit_end[start..stop].iter().any(|last| *last >= stop);
+            let escapes = reach >= stop;
             if stop - start < OUTLINE_CHUNK_MIN || escapes {
                 for line in &lines[start..stop] {
                     out.push_str(line);
