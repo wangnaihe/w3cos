@@ -1181,7 +1181,7 @@ fn parse_impl(source: &str, warn: bool) -> Option<resvg::usvg::Tree> {
         options.font_family = "sans-serif".to_string();
         options
             .fontdb_mut()
-            .load_font_data(crate::font_face::host_ui_font().data.as_ref().clone());
+            .load_font_data(crate::font_face::host_ui_font().bytes().to_vec());
     }
     #[cfg(test)]
     {
