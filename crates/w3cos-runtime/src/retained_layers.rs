@@ -1730,6 +1730,46 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: take the map of item hashes whatever the item count.
+    pub(crate) static SPARSE_ITEM_HASHES_FORCE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Sparse diffs that hashed items into a map.
+    pub(crate) static SPARSE_ITEM_HASHES_USED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Per client, a hash of its display items relative to its box (0: none).
+enum ItemHashes {
+    Dense(Vec<u64>),
+    Sparse(w3cos_std::fxhash::FxHashMap<u32, u64>),
+}
+
+impl ItemHashes {
+    fn slot(&mut self, index: usize, n: usize) -> Option<&mut u64> {
+        match self {
+            ItemHashes::Dense(hashes) => hashes.get_mut(index),
+            ItemHashes::Sparse(hashes) => {
+                (index < n).then(|| hashes.entry(index as u32).or_insert(0))
+            }
+        }
+    }
+}
+
+impl std::ops::Index<usize> for ItemHashes {
+    type Output = u64;
+    fn index(&self, index: usize) -> &u64 {
+        match self {
+            ItemHashes::Dense(hashes) => &hashes[index],
+            ItemHashes::Sparse(hashes) => hashes.get(&(index as u32)).unwrap_or(&0),
+        }
+    }
+}
+
 fn paint_diff_clients_inner(
     prev: &PaintArtifact,
     cur: &PaintArtifact,
@@ -1771,8 +1811,32 @@ fn paint_diff_clients_inner(
         }
         item_spans.push((next, usize::MAX));
     }
+    // Sparse (copied runs): only the items outside the runs hash, so a map
+    // of their clients replaces the two per-box tables (zeroing them was
+    // most of the diff's allocation).
+    // A map only pays while few items fall outside the runs.
+    let span_items = |artifact: &PaintArtifact| {
+        let len = artifact.display_items.len();
+        item_spans
+            .iter()
+            .map(|&(a, b)| b.min(len).saturating_sub(a.min(len)))
+            .sum::<usize>()
+    };
+    #[cfg(test)]
+    let forced = SPARSE_ITEM_HASHES_FORCE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let forced = false;
+    let sparse_hashes =
+        sparse && runs.is_some() && (forced || span_items(prev).max(span_items(cur)) * 16 < n);
+    if sparse_hashes {
+        SPARSE_ITEM_HASHES_USED.with(|count| count.set(count.get() + 1));
+    }
     let item_hashes = |artifact: &PaintArtifact| {
-        let mut hashes = vec![0u64; n];
+        let mut hashes = if sparse_hashes {
+            ItemHashes::Sparse(Default::default())
+        } else {
+            ItemHashes::Dense(vec![0u64; n])
+        };
         let all = [(0usize, usize::MAX)];
         let spans: &[(usize, usize)] = if runs.is_some() { &item_spans } else { &all };
         let items = &artifact.display_items;
@@ -1782,7 +1846,7 @@ fn paint_diff_clients_inner(
                 .into_iter()
                 .flatten()
         }) {
-            if let Some(slot) = hashes.get_mut(item.client_index) {
+            if let Some(slot) = hashes.slot(item.client_index, n) {
                 let (ox, oy) = artifact
                     .rect_by_index
                     .get(item.client_index)

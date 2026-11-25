@@ -7629,11 +7629,20 @@ mod tests {
             "the image is in a run"
         );
         let sparse = paint_diff_clients(&first, &next).expect("sparse diff");
+        // The item hashes in a map (forced: few boxes here) give the same diff.
+        use crate::retained_layers::{SPARSE_ITEM_HASHES_FORCE, SPARSE_ITEM_HASHES_USED};
+        let used = SPARSE_ITEM_HASHES_USED.with(std::cell::Cell::get);
+        SPARSE_ITEM_HASHES_FORCE.with(|flag| flag.set(true));
+        let mapped = paint_diff_clients(&first, &next).expect("sparse diff, mapped hashes");
+        SPARSE_ITEM_HASHES_FORCE.with(|flag| flag.set(false));
+        assert!(SPARSE_ITEM_HASHES_USED.with(std::cell::Cell::get) > used);
         PAINT_DIFF_SPARSE_OVERRIDE.with(|mode| mode.set(Some(0)));
         let dense = paint_diff_clients(&first, &next).expect("dense diff");
         PAINT_DIFF_SPARSE_OVERRIDE.with(|mode| mode.set(None));
         assert_eq!(sparse.dirty, dense.dirty);
         assert_eq!(sparse.moved, dense.moved);
+        assert_eq!(mapped.dirty, dense.dirty);
+        assert_eq!(mapped.moved, dense.moved);
         assert!(dense.dirty[4], "the image repaints");
         assert!(
             dense.dirty[2 * (blocks / 2) + 2],
