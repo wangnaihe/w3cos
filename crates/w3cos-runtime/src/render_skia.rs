@@ -2120,6 +2120,93 @@ struct ArtifactFrameShared {
     multisampled_effects: std::rc::Rc<std::collections::HashSet<usize>>,
     backgrounds: std::rc::Rc<InlineBackgrounds>,
     shaping_index: std::rc::Rc<crate::inline_shaping::ShapingIndex>,
+    /// `W3COS_PAINT_LINE_ROW_MEMO`: per node, 0 unknown, 1 not an
+    /// anonymous line row, 2 a line row (filled as replay asks).
+    line_rows: RefCell<Vec<u8>>,
+}
+
+const ANONYMOUS_BLOCK_LINE: &str = "--w3cos-internal-anonymous-block-line";
+
+fn style_is_line_row(style: &Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|properties| properties.contains_key(ANONYMOUS_BLOCK_LINE))
+}
+
+/// `W3COS_PAINT_LINE_ROW_MEMO=1|verify` (off by default): replay's
+/// ancestor walks (inline text leading, nested inline decoration line
+/// boxes) ask whether a node is an anonymous line row once per node and
+/// frame, from a table on the frame's shared memo, instead of one custom
+/// property lookup per ancestor per text box (as Blink reads the line box
+/// from the fragment tree). `verify` also looks the property up and
+/// compares.
+pub(crate) fn paint_line_row_memo_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_LINE_ROW_MEMO_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_LINE_ROW_MEMO").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_LINE_ROW_MEMO_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (answers taken from the memo, verify mismatches).
+    pub(crate) static PAINT_LINE_ROW_MEMO_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Whether `artifact.nodes[index]` is an anonymous line row.
+fn node_is_line_row(
+    shared: Option<&ArtifactFrameShared>,
+    artifact: &PaintArtifact,
+    index: usize,
+    node: &crate::paint_artifact::PaintNode,
+) -> bool {
+    let mode = paint_line_row_memo_mode();
+    let Some(shared) = shared.filter(|_| mode != 0) else {
+        return style_is_line_row(&node.style);
+    };
+    let mut rows = shared.line_rows.borrow_mut();
+    if rows.len() != artifact.nodes.len() {
+        rows.clear();
+        rows.resize(artifact.nodes.len(), 0);
+    }
+    let Some(slot) = rows.get_mut(index) else {
+        return style_is_line_row(&node.style);
+    };
+    let answer = match *slot {
+        0 => {
+            let row = style_is_line_row(&node.style);
+            *slot = 1 + u8::from(row);
+            return row;
+        }
+        cached => cached == 2,
+    };
+    PAINT_LINE_ROW_MEMO_STATS.with(|stats| {
+        let (hits, mismatches) = stats.get();
+        stats.set((hits + 1, mismatches));
+    });
+    if mode == 2 && answer != style_is_line_row(&node.style) {
+        eprintln!("[paint-line-row-memo-verify] mismatch at node {index}");
+        PAINT_LINE_ROW_MEMO_STATS.with(|stats| {
+            let (hits, mismatches) = stats.get();
+            stats.set((hits, mismatches + 1));
+        });
+    }
+    answer
 }
 
 /// The frame scope of [`ArtifactFrameShared`]: active only while
@@ -2153,6 +2240,7 @@ impl ArtifactFrameMemo {
             multisampled_effects: std::rc::Rc::new(artifact_resize_multisampled_effects(artifact)),
             backgrounds: std::rc::Rc::new(InlineBackgrounds::new(Some(artifact))),
             shaping_index: std::rc::Rc::new(crate::inline_shaping::index(artifact)),
+            line_rows: RefCell::new(Vec::new()),
         });
         ARTIFACT_FRAME_MEMO.with(|memo| {
             if let Some((active, slot)) = &mut *memo.borrow_mut()
@@ -2581,13 +2669,7 @@ fn paint_display_list_with_suppressed_effects(
                 let mut ancestor = Some(parent);
                 while let Some(index) = ancestor {
                     let node = artifact.nodes.get(index)?;
-                    let is_line = node
-                        .style
-                        .custom_properties
-                        .as_ref()
-                        .is_some_and(|properties| {
-                            properties.contains_key("--w3cos-internal-anonymous-block-line")
-                        });
+                    let is_line = node_is_line_row(shared.as_deref(), artifact, index, node);
                     if is_line {
                         return artifact.rect_by_index.get(index).copied().flatten();
                     }
@@ -2627,14 +2709,7 @@ fn paint_display_list_with_suppressed_effects(
                         }
                         saw_inline = true;
                     }
-                    if node
-                        .style
-                        .custom_properties
-                        .as_ref()
-                        .is_some_and(|properties| {
-                            properties.contains_key("--w3cos-internal-anonymous-block-line")
-                        })
-                    {
+                    if node_is_line_row(shared.as_deref(), artifact, index, node) {
                         let text_rect = artifact.rect_by_index.get(idx).copied().flatten()?;
                         let line_rect = artifact.rect_by_index.get(index).copied().flatten()?;
                         let strut_height = crate::layout::inline_style_line_height(&node.style);
@@ -16721,6 +16796,71 @@ mod tests {
             let (frames, differed) = raster_rgba_surface_stats();
             assert_eq!(frame(2, body), n32, "=verify paints on N32");
             assert_eq!(raster_rgba_surface_stats(), (frames + 1, differed));
+        }
+    }
+
+    /// `W3COS_PAINT_LINE_ROW_MEMO`: inline text under anonymous line rows
+    /// (a block mixing block and inline children) and nested decorated
+    /// inlines answer the line-row walks from the frame memo; the pixels
+    /// equal the per-ancestor lookups, and verify finds no mismatch.
+    #[test]
+    fn line_row_memo_paints_the_same_pixels_as_the_lookups() {
+        use crate::html_parser_host::InertParserScriptHost;
+        use crate::html_parser_state::StreamingDocumentParser;
+        use std::rc::Rc;
+        let pages = [
+            "<div style='font:13px sans-serif'>lead <span style='background:#fd0;padding:2px'>pad\
+             <b style='background:#0af;border:1px solid red'>nested</b> tail</span> words\
+             <div>block child</div>after <i>inline <u>deep</u></i> text</div>",
+            "<p style='font:12px serif;line-height:1.6'><span>one <span>two <span \
+             style='border-bottom:2px solid blue'>three</span></span></span></p>\
+             <div><em>em</em><div style='margin:2px'>mid</div><strong>strong \
+             <small style='background:#cfc'>small</small></strong></div>",
+        ];
+        let frame = |mode: u8, body: &str| {
+            PAINT_LINE_ROW_MEMO_OVERRIDE.with(|slot| slot.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            let mut parser = StreamingDocumentParser::new_with_script_host(
+                Rc::new(InertParserScriptHost),
+                "https://example.test/line-row-memo.html",
+            )
+            .unwrap();
+            parser
+                .write(&format!(
+                    "<!doctype html><body style='margin:3px'>{body}</body>"
+                ))
+                .unwrap();
+            parser.finish().unwrap();
+            let rgba = crate::headless::render_document_rgba(260, 160)
+                .unwrap()
+                .rgba;
+            PAINT_LINE_ROW_MEMO_OVERRIDE.with(|slot| slot.set(None));
+            rgba
+        };
+        for body in pages {
+            let lookups = frame(0, body);
+            let before = PAINT_LINE_ROW_MEMO_STATS.with(std::cell::Cell::get);
+            assert_eq!(
+                frame(1, body),
+                lookups,
+                "the memo paints as the lookups on {body}"
+            );
+            let after = PAINT_LINE_ROW_MEMO_STATS.with(std::cell::Cell::get);
+            assert!(after.0 > before.0, "the memo answered on {body}");
+            assert_eq!(frame(2, body), lookups, "=verify paints as the lookups");
+            let verified = PAINT_LINE_ROW_MEMO_STATS.with(std::cell::Cell::get);
+            assert!(verified.0 > after.0, "verify took the memo on {body}");
+            assert_eq!(
+                verified.1, before.1,
+                "a memo answer differs from the lookup"
+            );
+            assert!(
+                lookups
+                    .chunks_exact(4)
+                    .any(|pixel| pixel != [255, 255, 255, 255]),
+                "the page painted something"
+            );
         }
     }
 
