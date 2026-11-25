@@ -4949,12 +4949,49 @@ impl PaintArtifact {
             persist_dirty,
             ..Self::default()
         };
-        annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
+        let presence_mode = paint_caption_column_presence_mode();
+        let absent = |bit: u8| {
+            presence_mode != 0
+                && artifact
+                    .feature_presence
+                    .is_some_and(|features| features & bit == 0)
+        };
+        let has_columns = |nodes: &[PaintNode]| {
+            nodes.iter().any(|node| {
+                node.style.column_count.is_some()
+                    || !matches!(node.style.column_width, w3cos_std::style::Dimension::Auto)
+            })
+        };
+        // A caption is a table part: without one, the caption pass would
+        // find no caption and annotate nothing.
+        let captions = if absent(FEATURE_TABLE) {
+            caption_column_presence_count(0);
+            presence_mode == 2
+                && artifact
+                    .nodes
+                    .iter()
+                    .any(|node| node.style.display == Display::TableCaption)
+                && {
+                    caption_column_presence_mismatch("table caption");
+                    true
+                }
+        } else {
+            true
+        };
+        if captions {
+            annotate_table_caption_paint_insets(&mut artifact.nodes, &artifact.rect_by_index);
+        }
 
-        if artifact.nodes.iter().any(|node| {
-            node.style.column_count.is_some()
-                || !matches!(node.style.column_width, w3cos_std::style::Dimension::Auto)
-        }) {
+        let columns = if absent(FEATURE_COLUMNS) {
+            caption_column_presence_count(1);
+            presence_mode == 2 && has_columns(&artifact.nodes) && {
+                caption_column_presence_mismatch("multicol");
+                true
+            }
+        } else {
+            has_columns(&artifact.nodes)
+        };
+        if columns {
             let column_nodes: Vec<_> = artifact
                 .nodes
                 .iter()
@@ -6858,6 +6895,60 @@ pub(crate) fn paint_range_rebuild_mode() -> u8 {
 const FEATURE_TRANSLATE_PERCENT: u8 = 1;
 const FEATURE_VIDEO_CONTROLS: u8 = 2;
 const FEATURE_TABLE: u8 = 4;
+/// A multicol box (`column-count` or a non-auto `column-width`).
+const FEATURE_COLUMNS: u8 = 32;
+
+/// `W3COS_PAINT_CAPTION_COLUMN_PRESENCE=1|verify` (default off; needs
+/// `W3COS_PAINT_FEATURE_SKIP`): when the kept feature superset has no table
+/// part, the build skips the table caption inset pass (its own full scan
+/// for a caption), and without a multicol box it skips the multicol scan.
+/// `verify` scans anyway and runs the pass on anything the superset missed.
+pub(crate) fn paint_caption_column_presence_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_CAPTION_COLUMN_PRESENCE")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (caption passes skipped, multicol scans skipped, verify mismatches).
+    pub(crate) static PAINT_CAPTION_COLUMN_PRESENCE_STATS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+fn caption_column_presence_count(field: usize) {
+    PAINT_CAPTION_COLUMN_PRESENCE_STATS.with(|stats| {
+        let mut value = stats.get();
+        match field {
+            0 => value.0 += 1,
+            1 => value.1 += 1,
+            _ => value.2 += 1,
+        }
+        stats.set(value);
+    });
+}
+
+fn caption_column_presence_mismatch(what: &str) {
+    eprintln!("[paint-caption-column-presence-verify] mismatch: {what} the superset missed");
+    caption_column_presence_count(2);
+}
 /// A box carries a `resize` value (see [`PaintArtifact::resize_absent`]).
 const FEATURE_RESIZE: u8 = 8;
 /// A box carries an inline background group (see
@@ -6909,6 +7000,11 @@ fn node_features(node: &PaintNode) -> u8 {
         || table_passes::is_table_part(style.display)
     {
         bits |= FEATURE_TABLE;
+    }
+    if style.column_count.is_some()
+        || !matches!(style.column_width, w3cos_std::style::Dimension::Auto)
+    {
+        bits |= FEATURE_COLUMNS;
     }
     if let Some(properties) = style.custom_properties.as_ref() {
         const TRANSLATE: &str = "--w3cos-internal-translate-percent";

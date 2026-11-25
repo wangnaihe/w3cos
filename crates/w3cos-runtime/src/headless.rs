@@ -3179,6 +3179,105 @@ mod tests {
         assert!(spans == full, "frames marked by runs differ");
     }
 
+    /// `W3COS_PAINT_CAPTION_COLUMN_PRESENCE`: frames before any table or
+    /// multicol box skip the caption pass and the multicol scan; once a
+    /// captioned table and a multicol box stream in, both run again. Verify
+    /// finds nothing the superset missed, and all modes paint alike.
+    #[test]
+    fn caption_column_presence_skips_the_scans_and_matches_them() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(None));
+                crate::paint_artifact::PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE
+                    .with(|value| value.set(None));
+                crate::incremental_layout::force_paint_splice(None);
+            }
+        }
+        let _off = Off;
+        let stats = || {
+            crate::paint_artifact::PAINT_CAPTION_COLUMN_PRESENCE_STATS.with(std::cell::Cell::get)
+        };
+        let run = |mode: u8| {
+            crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE.with(|value| value.set(Some(1)));
+            crate::paint_artifact::PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE
+                .with(|value| value.set(Some(mode)));
+            crate::dom::reset_document();
+            crate::jsdom::reset_bridge();
+            crate::incremental_layout::invalidate();
+            invalidate_retained_frame();
+            crate::incremental_layout::force_paint_splice(Some(true));
+            crate::jsdom::set_viewport(240.0, 600.0);
+            let body = crate::dom::body_id();
+            let log = crate::dom::create_element("div");
+            crate::dom::set_style_property(log, "width", "220px");
+            crate::dom::append_child(body, log);
+            let first = crate::dom::create_element("p");
+            crate::dom::append_child(first, crate::dom::create_text_node("plain"));
+            crate::dom::append_child(log, first);
+            assert!(crate::incremental_layout::flush());
+            let before = stats();
+            let mut frames = vec![render_document_rgba(240, 600).expect("first frame").rgba];
+            let mut early = (0, 0);
+            for step in 0..6 {
+                if step == 3 {
+                    let now = stats();
+                    early = (now.0 - before.0, now.1 - before.1);
+                    let table = crate::dom::create_element("table");
+                    let caption = crate::dom::create_element("caption");
+                    crate::dom::append_child(caption, crate::dom::create_text_node("caption"));
+                    crate::dom::append_child(table, caption);
+                    let row = crate::dom::create_element("tr");
+                    let cell = crate::dom::create_element("td");
+                    crate::dom::set_style_property(cell, "background-color", "#0a0");
+                    crate::dom::append_child(cell, crate::dom::create_text_node("cell"));
+                    crate::dom::append_child(row, cell);
+                    crate::dom::append_child(table, row);
+                    crate::dom::append_child(log, table);
+                    let columns = crate::dom::create_element("div");
+                    crate::dom::set_style_property(columns, "column-count", "2");
+                    crate::dom::append_child(
+                        columns,
+                        crate::dom::create_text_node("two columns of streamed words here"),
+                    );
+                    crate::dom::append_child(log, columns);
+                } else {
+                    let line = crate::dom::create_element("p");
+                    crate::dom::append_child(
+                        line,
+                        crate::dom::create_text_node(&format!("line {step}")),
+                    );
+                    crate::dom::append_child(log, line);
+                }
+                frames.push(render_document_rgba(240, 600).expect("stream frame").rgba);
+            }
+            let after = stats();
+            (
+                frames,
+                early,
+                (after.0 - before.0, after.1 - before.1),
+                after.2 - before.2,
+            )
+        };
+        let (verified, early, skipped, mismatched) = run(2);
+        assert!(
+            early.0 > 0 && early.1 > 0,
+            "frames without tables or columns skip both"
+        );
+        assert_eq!(
+            mismatched, 0,
+            "the superset missed a caption or a multicol box"
+        );
+        assert_eq!(skipped, early, "frames with a table and columns run both");
+        let (fast, early_on, skipped_on, _) = run(1);
+        assert_eq!(early_on, early, "the fast path is taken");
+        assert_eq!(skipped_on, early_on);
+        let (full, _, skipped_off, _) = run(0);
+        assert_eq!(skipped_off, (0, 0));
+        assert!(verified == full, "verify-mode frames differ");
+        assert!(fast == full, "frames with the scans skipped differ");
+    }
+
     /// `W3COS_PAINT_INLINE_BG_PRESENCE`: frames before a `::first-line`
     /// background groups inline fragments skip the per-box group scan;
     /// once a group exists the scan runs. Verify finds no group the superset
