@@ -998,22 +998,25 @@ fn reuse_retained_paint(
             && !force_cpu)
             .then(|| quiet_exit_frame(retained, width, height))
             .flatten();
+        // The kept pixels are already this frame's own copy: hand them over
+        // instead of copying the frame a second time.
         #[cfg(feature = "skia")]
-        if let Some(rgba) = exit_rgba.as_ref()
-            && exit_mode == 1
-        {
-            QUIET_EXIT_STATS.with(|stats| {
-                let mut value = stats.get();
-                value.0 += 1;
-                stats.set(value);
-            });
-            note_retained_reuse();
-            return Ok(Some(HeadlessFrame {
-                width,
-                height,
-                rgba: rgba.clone(),
-            }));
-        }
+        let exit_rgba = match exit_rgba {
+            Some(rgba) if exit_mode == 1 => {
+                QUIET_EXIT_STATS.with(|stats| {
+                    let mut value = stats.get();
+                    value.0 += 1;
+                    stats.set(value);
+                });
+                note_retained_reuse();
+                return Ok(Some(HeadlessFrame {
+                    width,
+                    height,
+                    rgba,
+                }));
+            }
+            other => other,
+        };
         let flat = layout::pre_flatten(root);
         // `W3COS_PAINT_QUIET_FRAME`: nothing was invalidated since the kept
         // recordings were made, so the paint diff is taken against the same
