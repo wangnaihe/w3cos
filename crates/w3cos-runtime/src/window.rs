@@ -11258,9 +11258,21 @@ mod scroll_physics_tests {
             viewport,
             viewport,
         );
-        if let ActiveAnimation::LayoutHeight { start, .. } = &mut animations[0] {
-            *start = now - std::time::Duration::from_millis(120);
-        }
+        let start_at = now - std::time::Duration::from_millis(120);
+        let (first_from, first_to) = match &mut animations[0] {
+            ActiveAnimation::LayoutHeight {
+                start, from, to, ..
+            } => {
+                *start = start_at;
+                (*from, *to)
+            }
+            _ => panic!("expected layout height animation"),
+        };
+        // The retarget samples the running animation at its own Instant::now(), so the
+        // exact progress depends on how long the test thread took to get there. Bound it
+        // by clocks read just before and after the call instead of assuming 120ms flat
+        // (a loaded machine used to land a couple of ms later and fail the old ±1px check).
+        let before = Instant::now();
         App::collect_layout_transition_animations(
             &mut animations,
             &flat,
@@ -11269,11 +11281,25 @@ mod scroll_physics_tests {
             viewport,
             viewport,
         );
+        let after = Instant::now();
+        let sample = |at: Instant| {
+            let progress = (at.duration_since(start_at).as_secs_f32() / 0.240).min(1.0);
+            first_from + progress * (first_to - first_from)
+        };
+        let (a, b) = (sample(before), sample(after));
+        let (lo, hi) = (a.min(b) - 0.01, a.max(b) + 0.01);
 
         assert_eq!(animations.len(), 1);
         match animations[0] {
             ActiveAnimation::LayoutHeight { from, to, .. } => {
-                assert!((from - 116.0).abs() < 1.0, "retargeted from={from}");
+                assert!(
+                    (lo..=hi).contains(&from),
+                    "retargeted from={from}, expected the running sample in {lo}..={hi}"
+                );
+                assert!(
+                    (from - 116.0).abs() < 1.0 || after.duration_since(start_at).as_millis() > 121,
+                    "retargeted from={from} on an unloaded run"
+                );
                 assert_eq!(to, 180.0);
             }
             _ => panic!("expected retargeted layout height animation"),
