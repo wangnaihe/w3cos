@@ -1,7 +1,9 @@
 #![allow(clippy::collapsible_if)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use crate::fast_hash::{FastMap, FastSet};
 use std::rc::Rc;
 
 use crate::heap::{HeapAllocation, HeapKind};
@@ -20,6 +22,39 @@ pub(crate) enum PrivateElement {
     },
 }
 
+/// Private brands stamped on one object, in insertion order. A class chain
+/// is a few levels deep, so lookups are a short linear scan and the buffer
+/// grows one slot at a time while small.
+#[derive(Clone, Default)]
+pub(crate) struct BrandSet(Vec<u64>);
+
+impl BrandSet {
+    /// Adds `brand`; `false` when it was already present.
+    pub(crate) fn insert(&mut self, brand: u64) -> bool {
+        if self.0.contains(&brand) {
+            return false;
+        }
+        if self.0.len() == self.0.capacity() && self.0.len() < 4 {
+            self.0.reserve_exact(1);
+        }
+        self.0.push(brand);
+        true
+    }
+
+    pub(crate) fn contains(&self, brand: &u64) -> bool {
+        self.0.contains(brand)
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Rare class / private / enumerability state. Almost every ordinary object
 /// never touches these; they live behind [`JsObject::rare`] so empty objects
 /// stay slab-dense.
@@ -36,12 +71,14 @@ pub(crate) struct RareObjectData {
     /// Opaque class brands and private elements are intentionally kept out of
     /// `properties`, so proxy traps and reflection cannot observe them.
     pub(crate) class_brand: Option<u64>,
-    pub(crate) private_brands: HashSet<u64>,
-    pub(crate) private_elements: HashMap<(u64, String), PrivateElement>,
+    /// Usually one brand per class in the instance's chain, so a short
+    /// vector instead of a `HashSet` (no hasher state, no bucket table).
+    pub(crate) private_brands: BrandSet,
+    pub(crate) private_elements: FastMap<(u64, String), PrivateElement>,
     /// Own keys that are not enumerable. Ordinary data properties default to
     /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
     /// `CopyDataProperties` skip them, matching ECMAScript.
-    non_enumerable: HashSet<String>,
+    non_enumerable: FastSet<String>,
     /// Integrity level recorded by `Object.preventExtensions` / `seal` /
     /// `freeze` so the matching `isExtensible` / `isSealed` / `isFrozen`
     /// predicates answer consistently (graph walkers such as Code-OSS
@@ -772,8 +809,8 @@ impl JsObject {
                 pending_class_initializers: Vec::new(),
                 construct_replacement: None,
                 class_brand: rare.class_brand,
-                private_brands: HashSet::new(),
-                private_elements: HashMap::new(),
+                private_brands: BrandSet::default(),
+                private_elements: FastMap::default(),
                 non_enumerable: rare.non_enumerable.clone(),
                 integrity: rare.integrity,
             })
@@ -984,6 +1021,32 @@ mod tests {
         assert!(
             empty.rare.is_none(),
             "ordinary empty objects must not allocate RareObjectData"
+        );
+    }
+
+    #[test]
+    fn brand_set_dedupes_and_keeps_small_buffers_exact() {
+        let mut brands = BrandSet::default();
+        assert!(brands.insert(7));
+        assert_eq!(brands.capacity(), 1);
+        assert!(!brands.insert(7), "a brand is stamped once");
+        assert!(brands.insert(3));
+        assert_eq!((brands.len(), brands.capacity()), (2, 2));
+        assert!(brands.contains(&7) && brands.contains(&3) && !brands.contains(&4));
+        for brand in 10..20 {
+            brands.insert(brand);
+        }
+        assert_eq!(brands.len(), 12);
+        assert!(brands.contains(&19));
+    }
+
+    #[test]
+    fn rare_object_data_stays_compact() {
+        // Every class instance with a private brand carries one of these.
+        assert!(
+            std::mem::size_of::<RareObjectData>() <= 160,
+            "RareObjectData grew to {} bytes",
+            std::mem::size_of::<RareObjectData>()
         );
     }
 

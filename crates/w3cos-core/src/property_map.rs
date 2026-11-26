@@ -22,8 +22,9 @@
 //! keys: canonical array-index keys first in ascending numeric order, then
 //! the remaining keys in insertion order.
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 
 use crate::fast_hash::FastMap;
 use std::rc::Rc;
@@ -73,6 +74,73 @@ fn index_key_value(key: &str) -> Option<u32> {
     (value < u32::MAX as u64).then_some(value as u32)
 }
 
+/// Append-only key storage shared along a transition chain.
+///
+/// Filling a wide object key by key (a class prototype, a constructor table)
+/// walks one chain root -> k1 -> k1,k2 -> ... and each of those shapes used
+/// to own a full copy of its key list, so the chain's key memory was
+/// quadratic in its width. A child that extends the chain's last key shares
+/// its parent's buffer and only records a longer length; a branch (a second
+/// child of a non-tip shape) or a full buffer starts a new buffer with a copy
+/// of the prefix. Buffers grow by doubling, so a chain of `n` keys stores at
+/// most ~`2n` keys.
+///
+/// Slots below `len` are written once and never changed or moved, so a
+/// shape's `&[JsString]` view of `slots[..its len]` stays valid while later
+/// shapes append past it.
+struct KeyBuf {
+    slots: Box<[UnsafeCell<MaybeUninit<JsString>>]>,
+    len: Cell<usize>,
+}
+
+impl KeyBuf {
+    fn with_prefix(prefix: &[JsString], capacity: usize) -> Rc<Self> {
+        debug_assert!(capacity >= prefix.len());
+        let slots: Box<[UnsafeCell<MaybeUninit<JsString>>]> = (0..capacity)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect();
+        let buf = Self {
+            slots,
+            len: Cell::new(0),
+        };
+        for key in prefix {
+            buf.try_push(key.clone())
+                .unwrap_or_else(|_| unreachable!("capacity covers the prefix"));
+        }
+        Rc::new(buf)
+    }
+
+    /// Writes the next slot. `Err` when the buffer is full.
+    fn try_push(&self, key: JsString) -> Result<(), JsString> {
+        let len = self.len.get();
+        let Some(slot) = self.slots.get(len) else {
+            return Err(key);
+        };
+        // Safety: slot `len` has never been written and no view covers it
+        // (views only cover `..len`).
+        unsafe { (*slot.get()).write(key) };
+        self.len.set(len + 1);
+        Ok(())
+    }
+
+    #[inline]
+    fn prefix(&self, len: usize) -> &[JsString] {
+        assert!(len <= self.len.get(), "key view past the written slots");
+        // Safety: `UnsafeCell<MaybeUninit<T>>` has `T`'s layout, slots below
+        // `self.len` are initialised and are never written again.
+        unsafe { std::slice::from_raw_parts(self.slots.as_ptr().cast::<JsString>(), len) }
+    }
+}
+
+impl Drop for KeyBuf {
+    fn drop(&mut self) {
+        for slot in &mut self.slots[..self.len.get()] {
+            // Safety: every slot below `len` was initialised exactly once.
+            unsafe { slot.get_mut().assume_init_drop() };
+        }
+    }
+}
+
 enum Transitions {
     Few(Vec<(JsString, Rc<Shape>)>),
     Many(FastMap<JsString, Rc<Shape>>),
@@ -81,8 +149,10 @@ enum Transitions {
 /// A hidden class: an ordered own-key list shared by many objects.
 pub(crate) struct Shape {
     id: ShapeId,
-    /// Insertion-ordered own keys; slot `i` of an object holds `keys[i]`.
-    keys: Box<[JsString]>,
+    /// Insertion-ordered own keys are `key_buf[..key_len]`; slot `i` of an
+    /// object holds key `i`. The buffer may be shared with descendants.
+    key_buf: Rc<KeyBuf>,
+    key_len: usize,
     /// Key -> slot for shapes wider than [`LINEAR_SCAN`], built on first use.
     index: OnceCell<FastMap<JsString, u32>>,
     /// Linear lookups served while `index` is still unbuilt.
@@ -98,7 +168,8 @@ impl Shape {
     fn root() -> Self {
         Self {
             id: ROOT_SHAPE_ID,
-            keys: Box::new([]),
+            key_buf: KeyBuf::with_prefix(&[], 0),
+            key_len: 0,
             index: OnceCell::new(),
             linear_scans: Cell::new(0),
             has_index_key: false,
@@ -107,9 +178,15 @@ impl Shape {
         }
     }
 
+    /// Insertion-ordered own keys.
+    #[inline]
+    pub(crate) fn keys(&self) -> &[JsString] {
+        self.key_buf.prefix(self.key_len)
+    }
+
     #[inline]
     pub(crate) fn lookup(&self, key: &str) -> Option<usize> {
-        if self.keys.len() <= LINEAR_SCAN {
+        if self.key_len <= LINEAR_SCAN {
             return self.linear_lookup(key);
         }
         if let Some(index) = self.index.get() {
@@ -131,7 +208,7 @@ impl Shape {
         }
         self.index
             .get_or_init(|| {
-                self.keys
+                self.keys()
                     .iter()
                     .enumerate()
                     .map(|(i, k)| (k.clone(), i as u32))
@@ -143,7 +220,7 @@ impl Shape {
 
     #[inline]
     fn linear_lookup(&self, key: &str) -> Option<usize> {
-        self.keys.iter().position(|k| k.as_str() == key)
+        self.keys().iter().position(|k| k.as_str() == key)
     }
 
     /// `key` names an existing child transition (so it is not an own key).
@@ -172,7 +249,7 @@ impl Shape {
                 return found;
             }
         }
-        if self.keys.len() >= MAX_SHAPE_KEYS {
+        if self.key_len >= MAX_SHAPE_KEYS {
             return None;
         }
         let count = SHAPE_COUNT.with(|count| {
@@ -184,14 +261,27 @@ impl Shape {
             return None;
         }
         let key = JsString::heap(key);
-        let mut keys = Vec::with_capacity(self.keys.len() + 1);
-        keys.extend(self.keys.iter().cloned());
-        keys.push(key.clone());
+        // Extend this chain's buffer when this shape is its tip; otherwise
+        // (a branch, or a full buffer) copy the prefix into a new one.
+        let shares =
+            self.key_buf.len.get() == self.key_len && self.key_buf.try_push(key.clone()).is_ok();
+        let key_buf = if shares {
+            Rc::clone(&self.key_buf)
+        } else {
+            let capacity = (self.key_len + 1)
+                .next_power_of_two()
+                .clamp(4, MAX_SHAPE_KEYS);
+            let buf = KeyBuf::with_prefix(self.keys(), capacity);
+            buf.try_push(key.clone())
+                .unwrap_or_else(|_| unreachable!("a new buffer has room for the key"));
+            buf
+        };
         let child = Rc::new(Shape {
             id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
             has_index_key: self.has_index_key || is_index_key(key.as_str()),
             has_marker_key: self.has_marker_key || key.as_str().starts_with(MARKER_PREFIX),
-            keys: keys.into_boxed_slice(),
+            key_buf,
+            key_len: self.key_len + 1,
             index: OnceCell::new(),
             linear_scans: Cell::new(0),
             transitions: RefCell::new(Transitions::Few(Vec::new())),
@@ -536,7 +626,7 @@ impl PropertyMap {
     pub(crate) fn keys(&self) -> PropertyMapKeys<'_> {
         let (base, has_index): (&[JsString], bool) = match self.inner.as_deref() {
             None => (&[], false),
-            Some(PropertyStore::Shaped { shape, .. }) => (&shape.keys, shape.has_index_key),
+            Some(PropertyStore::Shaped { shape, .. }) => (shape.keys(), shape.has_index_key),
             Some(PropertyStore::Dict(dict)) => (dict.order.as_slice(), dict.has_index_key),
         };
         if !has_index {
@@ -570,7 +660,7 @@ impl PropertyMap {
     pub(crate) fn any_key(&self, mut f: impl FnMut(&JsString) -> bool) -> bool {
         match self.inner.as_deref() {
             None => false,
-            Some(PropertyStore::Shaped { shape, .. }) => shape.keys.iter().any(&mut f),
+            Some(PropertyStore::Shaped { shape, .. }) => shape.keys().iter().any(&mut f),
             Some(PropertyStore::Dict(dict)) => dict.order.iter().any(f),
         }
     }
@@ -582,7 +672,7 @@ impl PropertyStore {
             let slots = std::mem::take(slots);
             let mut map = FastMap::with_capacity_and_hasher(slots.len() + 1, Default::default());
             let mut order = Vec::with_capacity(slots.len() + 1);
-            for (key, value) in shape.keys.iter().zip(slots) {
+            for (key, value) in shape.keys().iter().zip(slots) {
                 order.push(key.clone());
                 map.insert(key.clone(), value);
             }
@@ -660,6 +750,44 @@ mod tests {
     }
 
     #[test]
+    fn transition_chains_share_one_key_buffer_and_branches_copy() {
+        let names: Vec<String> = (0..20).map(|i| format!("chain_share_key_{i}")).collect();
+        let mut chain = vec![root_shape()];
+        for name in &names {
+            let next = chain.last().unwrap().transition(name).expect("budget");
+            chain.push(next);
+        }
+        // Every shape sees exactly its own prefix of keys.
+        for (len, shape) in chain.iter().enumerate() {
+            let keys: Vec<&str> = shape.keys().iter().map(JsString::as_str).collect();
+            let expected: Vec<&str> = names[..len].iter().map(String::as_str).collect();
+            assert_eq!(keys, expected);
+            assert_eq!(shape.lookup(&names[0]), (len > 0).then_some(0));
+        }
+        // Shapes 4..=4 share a buffer of capacity 4, 5..=8 one of 8, 9..=16
+        // one of 16: a chain of n keys stores under 2n keys, not n^2/2.
+        assert!(Rc::ptr_eq(&chain[3].key_buf, &chain[4].key_buf));
+        assert!(Rc::ptr_eq(&chain[5].key_buf, &chain[8].key_buf));
+        assert!(Rc::ptr_eq(&chain[9].key_buf, &chain[16].key_buf));
+        assert!(!Rc::ptr_eq(&chain[4].key_buf, &chain[5].key_buf));
+        // A second child of a non-tip shape gets its own copy of the prefix
+        // and leaves the original chain untouched.
+        let branch = chain[2].transition("chain_share_branch").expect("budget");
+        assert!(!Rc::ptr_eq(&branch.key_buf, &chain[2].key_buf));
+        let branch_keys: Vec<&str> = branch.keys().iter().map(JsString::as_str).collect();
+        assert_eq!(
+            branch_keys,
+            vec![names[0].as_str(), names[1].as_str(), "chain_share_branch"]
+        );
+        assert_eq!(chain[3].keys()[2].as_str(), names[2]);
+        // Re-walking finds the same shapes.
+        assert!(Rc::ptr_eq(
+            &chain[2].transition(&names[2]).unwrap(),
+            &chain[3]
+        ));
+    }
+
+    #[test]
     fn wide_shapes_index_only_once_they_keep_being_searched() {
         let keys: Vec<String> = (0..40).map(|i| format!("wide_index_key_{i}")).collect();
         let mut map = PropertyMap::new();
@@ -675,7 +803,7 @@ mod tests {
         let mut prefix = root_shape();
         for key in &keys {
             prefix = prefix.transition(key).expect("existing transition");
-            assert!(prefix.index.get().is_none(), "{} keys", prefix.keys.len());
+            assert!(prefix.index.get().is_none(), "{} keys", prefix.keys().len());
         }
         assert!(Rc::ptr_eq(&prefix, &shape));
         // Lookups stay correct before and after the index exists.
