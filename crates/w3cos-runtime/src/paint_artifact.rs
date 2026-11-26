@@ -1612,7 +1612,8 @@ impl AppendMemo {
     }
 }
 
-/// `W3COS_PAINT_SPLIT_OWNER_REUSE=1|verify` (default off): the append memo
+/// `W3COS_PAINT_SPLIT_OWNER_REUSE` (on by default, `=0` turns it off,
+/// `=verify` checks it): the append memo
 /// takes last build's split positioned-inline owner flags for boxes the
 /// layout did not touch instead of reading every box's custom properties.
 pub(crate) fn paint_split_owner_reuse_mode() -> u8 {
@@ -1626,9 +1627,9 @@ pub(crate) fn paint_split_owner_reuse_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
