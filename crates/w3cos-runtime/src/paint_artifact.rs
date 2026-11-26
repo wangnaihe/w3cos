@@ -4748,7 +4748,29 @@ impl PaintArtifact {
             if float_bands_full.is_some_and(|full| full != float_bands_seen) {
                 persist_dirty_scan_mismatch("float line bands");
             }
-            if let Some((width, height)) = viewport {
+            let float_mode = paint_float_presence_mode();
+            // `W3COS_PAINT_FLOAT_PRESENCE`: no box can float (the kept feature
+            // superset lacks `FEATURE_FLOAT`), so there are no float bands to
+            // resolve and the whole-tree float walk is skipped.
+            let floats_absent = viewport.is_some()
+                && float_mode != 0
+                && features.is_some_and(|features| features & FEATURE_FLOAT == 0);
+            if floats_absent {
+                float_presence_count(0);
+                if float_mode == 2
+                    && nodes
+                        .iter()
+                        .any(|node| node.style.float != w3cos_std::style::Float::None)
+                {
+                    eprintln!(
+                        "[paint-float-presence-verify] mismatch: a floating box the superset missed"
+                    );
+                    float_presence_count(1);
+                }
+            }
+            if let Some((width, height)) = viewport
+                && (!floats_absent || float_mode == 2)
+            {
                 let refs: Vec<_> = nodes
                     .iter()
                     .map(|node| (&node.kind, node.style.as_style(), node.parent))
@@ -7055,6 +7077,51 @@ const FEATURE_RESIZE: u8 = 8;
 /// A box carries an inline background group (see
 /// [`PaintArtifact::inline_background_groups_absent`]).
 const FEATURE_INLINE_BACKGROUND_GROUP: u8 = 16;
+/// A box floats (see `W3COS_PAINT_FLOAT_PRESENCE`).
+const FEATURE_FLOAT: u8 = 64;
+
+/// `W3COS_PAINT_FLOAT_PRESENCE=1|verify` (default off; needs
+/// `W3COS_PAINT_FEATURE_SKIP`): when the kept feature superset has no
+/// floating box, the build skips resolving float line bands (a walk over
+/// every box). `verify` checks no box floats and resolves anyway.
+pub(crate) fn paint_float_presence_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_FLOAT_PRESENCE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_FLOAT_PRESENCE").ok().as_deref() {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_FLOAT_PRESENCE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (float walks skipped, verify mismatches).
+    pub(crate) static PAINT_FLOAT_PRESENCE_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+fn float_presence_count(field: usize) {
+    PAINT_FLOAT_PRESENCE_STATS.with(|stats| {
+        let mut value = stats.get();
+        if field == 0 {
+            value.0 += 1;
+        } else {
+            value.1 += 1;
+        }
+        stats.set(value);
+    });
+}
 
 /// `W3COS_PAINT_FEATURE_SKIP=1|verify` (off by default): the reusing build
 /// skips its whole-tree passes for percentage translates, media controls
@@ -7106,6 +7173,9 @@ fn node_features(node: &PaintNode) -> u8 {
         || !matches!(style.column_width, w3cos_std::style::Dimension::Auto)
     {
         bits |= FEATURE_COLUMNS;
+    }
+    if style.float != w3cos_std::style::Float::None {
+        bits |= FEATURE_FLOAT;
     }
     if let Some(properties) = style.custom_properties.as_ref() {
         const TRANSLATE: &str = "--w3cos-internal-translate-percent";
@@ -7977,6 +8047,95 @@ mod tests {
             }
         }
         PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(|mode| mode.set(None));
+    }
+
+    /// `W3COS_PAINT_FLOAT_PRESENCE`: with no floating box the reusing build
+    /// skips the float band walk (verify agrees) and equals the build that
+    /// walks; a floating box keeps the walk.
+    #[test]
+    fn float_presence_skips_the_float_walk_without_floats() {
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(Some(1)));
+        PAINT_FEATURE_SKIP_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let mut block = Style::default();
+        block.display = Display::Block;
+        let mut floating = block.clone();
+        floating.float = w3cos_std::style::Float::Left;
+        let nodes = |float_at: Option<usize>| {
+            (0..12)
+                .map(|index| PaintNode {
+                    kind: ComponentKind::Column,
+                    style: if Some(index) == float_at {
+                        floating.clone()
+                    } else {
+                        block.clone()
+                    }
+                    .into(),
+                    parent: (index > 0).then_some(0),
+                    sticky_counter_signal: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let layouts = |grow: f32| {
+            (0..12)
+                .map(|index| {
+                    let rect = LayoutRect {
+                        x: 0.0,
+                        y: if index == 0 {
+                            0.0
+                        } else {
+                            30.0 * index as f32 + grow
+                        },
+                        width: 100.0,
+                        height: if index == 0 { 1000.0 } else { 20.0 },
+                    };
+                    (rect, index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let build = |float_at, grow: f32, previous: Option<&PaintArtifact>| {
+            set_paint_touched(Some(crate::incremental_layout::PaintChanges {
+                len: 12,
+                changed: vec![(0, 2)],
+                moved: vec![(2, 12)],
+                ..Default::default()
+            }));
+            let artifact = PaintArtifact::build_reusing(
+                nodes(float_at),
+                &layouts(grow),
+                1,
+                None,
+                Some((400.0, 800.0)),
+                previous,
+            );
+            set_paint_touched(None);
+            artifact
+        };
+        for float_at in [None, Some(5)] {
+            PAINT_FLOAT_PRESENCE_OVERRIDE.with(|mode| mode.set(Some(0)));
+            let first = build(float_at, 0.0, None);
+            let full = build(float_at, 8.0, Some(&first));
+            for mode in [2, 1] {
+                PAINT_FLOAT_PRESENCE_OVERRIDE.with(|value| value.set(Some(mode)));
+                let before = PAINT_FLOAT_PRESENCE_STATS.with(std::cell::Cell::get);
+                let fast = build(float_at, 8.0, Some(&first));
+                let after = PAINT_FLOAT_PRESENCE_STATS.with(std::cell::Cell::get);
+                assert_eq!(
+                    after.0 > before.0,
+                    float_at.is_none(),
+                    "the walk is skipped exactly when no box floats"
+                );
+                assert_eq!(
+                    after.1, before.1,
+                    "verify finds a float the superset missed"
+                );
+                assert!(fast.append_output_eq(&full));
+            }
+        }
+        PAINT_FLOAT_PRESENCE_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_FEATURE_SKIP_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(None));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
     /// `W3COS_PAINT_SPLIT_OWNER_REUSE`: a second build over the same boxes
