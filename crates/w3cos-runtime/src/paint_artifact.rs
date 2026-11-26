@@ -796,7 +796,8 @@ pub(crate) fn persist_dirty_scan_stats() -> (u64, u64) {
     PERSIST_DIRTY_SCAN_STATS.with(std::cell::Cell::get)
 }
 
-/// `W3COS_PAINT_PERSIST_TABLE_SPANS=1|verify` (off by default; with the
+/// `W3COS_PAINT_PERSIST_TABLE_SPANS` (on by default, `=0` turns it off,
+/// `=verify` checks it; with the
 /// persistent path on, and no boxes inserted or removed): the plan's
 /// table-subtree marks (table boxes always rebuild) come from the previous
 /// build's list, recomputed only over the splice-changed ranges and their
@@ -814,9 +815,9 @@ fn persist_table_spans_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
