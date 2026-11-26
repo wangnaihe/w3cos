@@ -1237,6 +1237,7 @@ fn persistent_nodes_plan<'a>(
         .map(|kept| table_subtree_boxes_ranged(nodes, kept, &changed));
     let tables = match (ranged, tables_mode) {
         (Some(ranged), 2) => {
+            w3cos_dom::verify_hit!("W3COS_PAINT_PERSIST_TABLE_SPANS");
             let full = table_subtree_boxes(nodes);
             let same = ranged == full;
             PERSIST_TABLE_SPANS_STATS.with(|stats| {
@@ -1578,8 +1579,8 @@ impl AppendMemo {
         }
         split_owner_reuse_count(0);
         if mode == 2 {
-            verify_hit(
-                "paint-split-owner-reuse",
+            w3cos_dom::verify_hit!(
+                "W3COS_PAINT_SPLIT_OWNER_REUSE",
                 overridden!(PAINT_SPLIT_OWNER_REUSE_OVERRIDE),
             );
             let full: Vec<bool> = nodes
@@ -1922,6 +1923,7 @@ mod table_passes {
         let listed = tables_from_boxes(nodes, boxes);
         let mut mismatch = false;
         let listed = if mode == 2 {
+            w3cos_dom::verify_hit!("W3COS_PAINT_TABLE_PASS_SPANS");
             let full = tables(nodes);
             if full != listed {
                 mismatch = true;
@@ -2222,6 +2224,7 @@ fn adjust_used_styles(
                 && known.source.ptr_eq(&node.style)
             {
                 if mode == 2 {
+                    w3cos_dom::verify_hit!("W3COS_STYLE_ADJUST_MEMO");
                     let mut fresh = node.clone();
                     let percent = adjust_used_style(&mut fresh, viewport);
                     let adjusted = known.adjusted.as_ref().unwrap_or(&known.source);
@@ -4455,6 +4458,7 @@ impl PaintArtifact {
             if let Some(plan) = plan {
                 match prefill_visit.as_deref() {
                     Some(visit) if prefill_mode == 2 => {
+                        w3cos_dom::verify_hit!("W3COS_PAINT_PERSIST_PREFILL_SPANS");
                         let mut full = nodes.clone();
                         plan.prefill(&mut full, None);
                         plan.prefill(&mut nodes, Some(visit));
@@ -4492,6 +4496,7 @@ impl PaintArtifact {
             let dirty_verify = dirty.is_some() && persist_dirty_scan_mode() == 2;
             if let Some(dirty) = dirty {
                 if dirty_verify {
+                    w3cos_dom::verify_hit!("W3COS_PAINT_PERSIST_DIRTY_SCAN");
                     // Coverage line for the multi-frame checks (verify only).
                     eprintln!(
                         "[paint-persist-dirty-scan-verify] walked {} of {}",
@@ -4762,8 +4767,8 @@ impl PaintArtifact {
             if floats_absent {
                 float_presence_count(0);
                 if float_mode == 2 {
-                    verify_hit(
-                        "paint-float-presence",
+                    w3cos_dom::verify_hit!(
+                        "W3COS_PAINT_FLOAT_PRESENCE",
                         overridden!(PAINT_FLOAT_PRESENCE_OVERRIDE, PAINT_FEATURE_SKIP_OVERRIDE),
                     );
                 }
@@ -4862,6 +4867,7 @@ impl PaintArtifact {
                 trimmed = full_trimmed;
             }
             if let Some(mut fresh) = verify_nodes {
+                w3cos_dom::verify_hit!("W3COS_PAINT_RANGE_REBUILD");
                 trim_collapsible_inline_whitespace_at_line_start(&mut fresh, &rect_by_index);
                 let same = fresh
                     .iter()
@@ -5026,6 +5032,8 @@ impl PaintArtifact {
             let fast = adjust(nodes, plan.as_ref());
             match source_nodes {
                 Some(source) => {
+                    w3cos_dom::verify_hit!("W3COS_PAINT_PERSIST_INPLACE");
+                    w3cos_dom::verify_hit!("W3COS_PAINT_PERSISTENT_NODES");
                     let full = adjust(source, None);
                     if persistent_nodes_same(&fast, &full) {
                         // Coverage line for the WPT check (verify only).
@@ -5095,8 +5103,8 @@ impl PaintArtifact {
         let captions = if absent(FEATURE_TABLE) {
             caption_column_presence_count(0);
             if presence_mode == 2 {
-                verify_hit(
-                    "paint-caption-column-presence",
+                w3cos_dom::verify_hit!(
+                    "W3COS_PAINT_CAPTION_COLUMN_PRESENCE",
                     overridden!(
                         PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE,
                         PAINT_FEATURE_SKIP_OVERRIDE
@@ -5122,8 +5130,8 @@ impl PaintArtifact {
         let columns = if absent(FEATURE_COLUMNS) {
             caption_column_presence_count(1);
             if presence_mode == 2 {
-                verify_hit(
-                    "paint-caption-column-presence",
+                w3cos_dom::verify_hit!(
+                    "W3COS_PAINT_CAPTION_COLUMN_PRESENCE",
                     overridden!(
                         PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE,
                         PAINT_FEATURE_SKIP_OVERRIDE
@@ -5705,6 +5713,7 @@ impl PaintArtifact {
                 )
             {
                 let span_end = span.end as usize;
+                w3cos_dom::verify_hit!("W3COS_PAINT_CULL_SUBTREES");
                 let agrees = subtrees != 2
                     || (end..span_end).all(|index| {
                         self.culled_box_check(
@@ -5745,6 +5754,7 @@ impl PaintArtifact {
                         end, start, previous, record, same, root, top, bottom,
                     );
                     if gaps == 2 {
+                        w3cos_dom::verify_hit!("W3COS_PAINT_CULL_RUN_GAPS");
                         let full = self.culled_box_check(
                             end, start, previous, record, same, tail, root, top, bottom,
                         );
@@ -5881,6 +5891,7 @@ impl PaintArtifact {
         });
         let verify = base.is_some() && paint_append_reuse_verify();
         let fresh = verify.then(|| {
+            w3cos_dom::verify_hit!("W3COS_PAINT_ARTIFACT_SPLICE");
             let mut fresh = self.clone();
             let mut memo = AppendMemo::new(&fresh.nodes);
             for index in 0..len {
@@ -6039,6 +6050,7 @@ impl PaintArtifact {
         if let Some(touched) = self.touched.as_ref()
             && !crate::incremental_layout::ranges_contain(&touched.changed, index)
         {
+            w3cos_dom::verify_hit!("W3COS_PAINT_TOUCHED");
             if paint_touched_mode() == 2 && !self.inputs_match_compared(index, previous) {
                 eprintln!("[paint-touched-verify] mismatch: untouched box {index} changed inputs");
                 PAINT_TOUCHED_MISMATCHES.with(|count| count.set(count.get() + 1));
@@ -7096,27 +7108,6 @@ fn caption_column_presence_count(field: usize) {
     });
 }
 
-/// Verify modes: the first time a switch's verify actually runs in this
-/// process, say so once (`[verify-hit] <switch>`), so a gate log proves the
-/// verify was exercised and not left inert by a missing prerequisite.
-/// Only verifies whose modes came from the environment count: a unit test
-/// that forces a mode by its override does not prove the gate's env set.
-pub(crate) fn verify_hit(name: &'static str, overridden: bool) {
-    if overridden {
-        return;
-    }
-    static HIT: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-    let mut hit = HIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !hit.contains(&name) {
-        hit.push(name);
-        // One write: a separate stdout progress dot must not split the line.
-        use std::io::Write as _;
-        let _ = std::io::stderr().write_all(format!("[verify-hit] {name}\n").as_bytes());
-    }
-}
-
 /// A switch's mode was forced by its test override (always false outside
 /// unit tests).
 macro_rules! overridden {
@@ -7305,8 +7296,8 @@ fn run_feature_pass<T>(
     let mut stats = PAINT_FEATURE_SKIP_STATS.with(std::cell::Cell::get);
     stats.0 += 1;
     if mode == 2 {
-        verify_hit(
-            "paint-feature-skip",
+        w3cos_dom::verify_hit!(
+            "W3COS_PAINT_FEATURE_SKIP",
             overridden!(PAINT_FEATURE_SKIP_OVERRIDE),
         );
         let mut fresh = copy(nodes);
@@ -12517,6 +12508,7 @@ impl CullSpanCursor {
             self.1 += 1;
         }
         if mode == 2 {
+            w3cos_dom::verify_hit!("W3COS_PAINT_CULL_SPAN_CURSOR");
             let full = spans.partition_point(|span| span.end as usize <= at);
             Self::count(full != self.1, "ending", at);
             return full;

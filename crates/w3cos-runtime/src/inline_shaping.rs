@@ -476,6 +476,7 @@ impl ShapingIndex {
         }
         let found = lazy.borrow_mut().children_of(artifact, owner);
         if let Some(eager) = eager {
+            w3cos_dom::verify_hit!("W3COS_SHAPING_INDEX_LAZY");
             if eager.unwrap_or(&[]) != &found[..] {
                 eprintln!("[shaping-index-lazy] mismatch: children of {owner}");
                 SHAPING_INDEX_LAZY_MISMATCHES.with(|count| count.set(count.get() + 1));
@@ -730,6 +731,7 @@ pub(crate) fn build_with_index(
         }
         if let Some(frame) = &cache_frame {
             if let Some(cached) = cached {
+                w3cos_dom::verify_hit!("W3COS_OWNER_SHAPE_CACHE");
                 // verify: the reused fragments must be the ones just shaped.
                 let same = cached.len() == owner_fragments.len()
                     && cached

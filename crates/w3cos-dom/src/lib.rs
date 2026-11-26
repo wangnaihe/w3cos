@@ -4835,3 +4835,36 @@ mod tests {
         assert_eq!(p2.children(&doc).len(), 1);
     }
 }
+
+/// Verify modes: the first time a switch's verify branch actually runs in
+/// this process with its env var set to `verify`, say so once on stderr
+/// (`[verify-hit] W3COS_...`). Gate scripts require one such line for every
+/// switch of their verify set, so a verify that never executes (a missing
+/// prerequisite switch, a dropped stderr) fails the gate instead of passing
+/// silently. An optional second argument is true when a unit test forced the
+/// mode (or a prerequisite's) by an override; those runs do not count.
+#[macro_export]
+macro_rules! verify_hit {
+    ($var:literal $(,)?) => {
+        $crate::verify_hit!($var, false)
+    };
+    ($var:literal, $forced:expr $(,)?) => {{
+        static SEEN: ::std::sync::atomic::AtomicBool = ::std::sync::atomic::AtomicBool::new(false);
+        if !SEEN.load(::std::sync::atomic::Ordering::Relaxed) && !$forced {
+            $crate::verify_hit_note(&SEEN, $var);
+        }
+    }};
+}
+
+#[doc(hidden)]
+#[cold]
+pub fn verify_hit_note(seen: &std::sync::atomic::AtomicBool, var: &'static str) {
+    if seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var(var).is_ok_and(|value| value == "verify") {
+        // One write: a stdout progress dot must not split the line.
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(format!("[verify-hit] {var}\n").as_bytes());
+    }
+}

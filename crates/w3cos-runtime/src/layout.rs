@@ -21447,6 +21447,7 @@ pub(crate) fn scroll_containers_after_paint_splice(
     let kept = match kept {
         Some(kept) => {
             stats.0 += 1;
+            w3cos_dom::verify_hit!("W3COS_PAINT_SCROLL_PLAN");
             if paint_scroll_plan_mode() == 2 && build_scroll_plan(flat) != *kept.plan {
                 stats.2 += 1;
                 eprintln!(

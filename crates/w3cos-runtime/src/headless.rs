@@ -335,6 +335,7 @@ fn finish_headless_frame(
     let flat: &[layout::FlatNodeInfo<'_>] = match known_flat {
         Some(known) => {
             if crate::incremental_layout::shared_paint_flat_mode() == 2 {
+                w3cos_dom::verify_hit!("W3COS_SHARED_PAINT_FLAT");
                 let fresh = layout::pre_flatten(root);
                 if !layout::same_flat(known, &fresh) {
                     SHARED_FLAT_MISMATCHES.with(|count| count.set(count.get() + 1));
@@ -510,6 +511,7 @@ fn finish_headless_frame(
                     {
                         at += 1;
                     }
+                    w3cos_dom::verify_hit!("W3COS_PAINT_NODES_SPLICE");
                     let keep = ranges
                         .get(at)
                         .is_none_or(|&(start, _)| index < start as usize);
@@ -596,6 +598,9 @@ fn finish_headless_frame(
                 .get(cursor)
                 .is_none_or(|&(start, _)| index < start as usize)
         });
+        if keep && slot.is_some() {
+            w3cos_dom::verify_hit!("W3COS_PAINT_KIND_KEEP");
+        }
         let kind = match slot {
             Some(slot) if keep && (keep_mode == 1 || *slot == *node.kind) => {
                 kept += 1;
@@ -928,6 +933,7 @@ fn headless_cull_band(height: f32) -> (f32, f32) {
 /// viewport at the scroll this frame paints with.
 fn verify_paint_cull(artifact: &PaintArtifact, width: u32, height: u32) {
     let reaching = artifact.culled_in_viewport(width as f32, height as f32);
+    w3cos_dom::verify_hit!("W3COS_PAINT_CULL_RECT");
     if reaching > 0 {
         crate::paint_artifact::PAINT_CULL_DIFFS.with(|count| count.set(count.get() + 1));
         eprintln!(
@@ -1052,6 +1058,7 @@ fn reuse_retained_paint(
                 stats.set(value);
             });
             if quiet_mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_PAINT_QUIET_FRAME");
                 // A frame painted without the diff re-records every layer
                 // and composites in full.
                 crate::render_skia::set_pending_paint_invalidation(None);
@@ -1089,6 +1096,7 @@ fn reuse_retained_paint(
         #[cfg(feature = "skia")]
         {
             if let Some(rgba) = exit_rgba {
+                w3cos_dom::verify_hit!("W3COS_PAINT_QUIET_EXIT");
                 QUIET_EXIT_STATS.with(|stats| {
                     let mut value = stats.get();
                     value.0 += 1;
@@ -1265,6 +1273,7 @@ fn quiet_frame_invalidation(
                 moved: moved.clone(),
             };
             if mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_PAINT_QUIET_FRAME");
                 let fresh = crate::retained_layers::paint_diff_clients(artifact, artifact);
                 if fresh
                     .as_ref()
@@ -1512,6 +1521,7 @@ fn verify_skip_culled_paint_nodes(
         )
     }));
     let skipped = drawn(&mut kept.iter().copied());
+    w3cos_dom::verify_hit!("W3COS_PAINT_SKIP_CULLED_NODES");
     if full != skipped {
         eprintln!(
             "[skip-culled-paint-nodes-verify] mismatch: {} boxes reach the layers, {} without the skip",

@@ -380,6 +380,7 @@ pub(super) fn draw(canvas: &Canvas, oval: &RRect, paint: &Paint) -> bool {
             Some(looped) => {
                 let mut mismatch = false;
                 if mode == 2 {
+                    w3cos_dom::verify_hit!("W3COS_PAINT_OVAL_LOOP");
                     let unrolled = make(&mesh_uniforms(bounds, paint.color4f()), effect);
                     let rect = skia_safe::IRect::new(
                         device.left as i32,

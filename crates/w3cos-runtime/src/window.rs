@@ -7797,6 +7797,7 @@ fn build_scroll_info_fast<T: PaintNodeView>(
         out.push(value);
     }
     if shared == 2 {
+        w3cos_dom::verify_hit!("W3COS_SCROLL_INFO_SHARED");
         for (idx, ancestor) in scroll_ancestor.iter().enumerate() {
             let fresh = entry(ancestor, sticky_from_tables(idx));
             if fresh != out[idx] {

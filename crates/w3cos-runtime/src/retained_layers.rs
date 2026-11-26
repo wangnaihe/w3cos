@@ -174,6 +174,7 @@ impl RetainedLayerTree {
                 && keys == self.partition_keys
                 && clients == self.partition_clients;
             if keys_mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_LAYER_PARTITION_KEYS");
                 let checked =
                     partition_still_holds(artifact, &order, &self.chunk_order, &self.layers, runs);
                 if holds && !checked {
@@ -205,6 +206,7 @@ impl RetainedLayerTree {
             refresh_layers(artifact, &mut layers);
             reused = true;
             if reuse_mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_LAYER_REUSE");
                 let full = build_layers_in_order(artifact, &order);
                 if !layers_equal(&layers, &full) {
                     eprintln!("[layer-reuse] mismatch against the full layer build");
@@ -233,6 +235,7 @@ impl RetainedLayerTree {
                 self.content_fingerprint
             }
         } else if known_changed {
+            w3cos_dom::verify_hit!("W3COS_LAYER_SYNC_FAST");
             if layer_sync_fast_verify()
                 && content_fingerprint(artifact, &layers) | 1 == self.content_fingerprint
                 && self.recordings_valid
@@ -262,6 +265,7 @@ impl RetainedLayerTree {
         let global_same = |tree: &Self| {
             let same = global == tree.global_fingerprint
                 && (self_clip_mode == 0 || artifact.self_clip == tree.self_clip);
+            w3cos_dom::verify_hit!("W3COS_LAYER_SELF_CLIP_EQ");
             if self_clip_mode == 2 && same != (global_with_self_clip == tree.global_with_self_clip)
             {
                 eprintln!("[layer-self-clip-eq-verify] mismatch: compared {same}");
@@ -1045,6 +1049,7 @@ pub(crate) fn paint_damage_cached(
                 ink: vec![None; prev.nodes.len()],
             });
         if mode == 2 {
+            w3cos_dom::verify_hit!("W3COS_PAINT_DAMAGE_INK_CACHE");
             let mut bad = 0;
             for (index, ink) in cache.ink.iter_mut().enumerate() {
                 let measured = client_ink_bounds(prev, index);
@@ -1644,6 +1649,7 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
     }
     let diff = paint_diff_clients_with(prev, cur, Some(runs), sparse);
     if sparse && sparse_mode == 2 {
+        w3cos_dom::verify_hit!("W3COS_PAINT_DIFF_SPARSE");
         let dense = paint_diff_clients_with(prev, cur, Some(runs), false);
         if !diffs_equal(&diff, &dense) {
             eprintln!("[paint-diff-sparse] mismatch against the dense diff");
@@ -1656,6 +1662,7 @@ pub fn paint_diff_clients(prev: &PaintArtifact, cur: &PaintArtifact) -> Option<P
         stats.set((used + 1, mismatched));
     });
     if mode == 2 {
+        w3cos_dom::verify_hit!("W3COS_PAINT_DIFF_RUNS");
         let full = paint_diff_clients_with(prev, cur, None, false);
         let equal = diffs_equal(&diff, &full);
         if !equal {
@@ -1679,6 +1686,7 @@ fn paint_diff_clients_with(
     let quiet = crate::paint_artifact::paint_cull_runs_mode();
     let diff = paint_diff_clients_inner(prev, cur, runs, sparse, quiet != 0);
     if quiet == 2 && cur.cull_band.is_some() {
+        w3cos_dom::verify_hit!("W3COS_PAINT_CULL_RUNS");
         let full = paint_diff_clients_inner(prev, cur, runs, sparse, false);
         if !quiet_diffs_equal(prev, cur, &diff, &full) {
             eprintln!("[paint-cull-runs-verify] diff mismatch against the unskipped diff");
@@ -1911,6 +1919,7 @@ fn paint_diff_clients_inner(
         };
         if memo != 0 {
             let found = properties.memo_flag(PROPERTY_MEMO_URL, scan);
+            w3cos_dom::verify_hit!("W3COS_PAINT_PROPERTY_MEMO");
             if memo == 2 && found != scan(properties) {
                 eprintln!("[paint-property-memo-verify] mismatch: url");
                 PAINT_PROPERTY_MEMO_MISMATCHES.with(|count| count.set(count.get() + 1));
@@ -2171,6 +2180,7 @@ fn paint_diff_clients_inner(
                     cur.rect_by_index.get(index).copied().flatten(),
                 );
                 if spans_mode == 2 {
+                    w3cos_dom::verify_hit!("W3COS_PAINT_DIFF_CULLED_SPANS");
                     let full_quiet = prev_items[index] == 0
                         && cur_items[index] == 0
                         && prev.column_fragments.get(index).is_none_or(Vec::is_empty)
@@ -2322,6 +2332,7 @@ fn paint_diff_clients_inner(
                     && style.custom_properties.as_ref().is_none_or(|properties| {
                         if memo != 0 {
                             let own = properties.memo_flag(PROPERTY_MEMO_CLIENT_ONLY, client_only_names);
+                            w3cos_dom::verify_hit!("W3COS_PAINT_PROPERTY_MEMO");
                             if memo == 2 && own != client_only_names(properties) {
                                 eprintln!("[paint-property-memo-verify] mismatch: client-only names");
                                 PAINT_PROPERTY_MEMO_MISMATCHES
@@ -2415,6 +2426,7 @@ fn paint_diff_clients_inner(
     let spans_mode = paint_diff_root_spans_mode();
     if spans_mode != 0 {
         let full = (spans_mode == 2).then(|| {
+            w3cos_dom::verify_hit!("W3COS_PAINT_DIFF_ROOT_SPANS");
             let (mut dirty, mut moved) = (dirty.clone(), moved.clone());
             mark_root_subtrees_full(cur, &roots, &mut dirty, &mut moved);
             (dirty, moved)

@@ -1420,6 +1420,7 @@ fn paint_node_reusing<'a, 'b: 'a>(
     };
     let mut mismatch = false;
     if let Some((cached, cached_decisions)) = &cached {
+        w3cos_dom::verify_hit!("W3COS_NODE_PAINT_REUSE");
         mismatch = picture_ops_bytes(cached) != picture_ops_bytes(&picture)
             || cached_decisions.len() != decisions.len()
             || cached_decisions
@@ -1778,6 +1779,7 @@ impl<'a> CullIndex<'a> {
             None => Self::build(artifact),
         };
         if mode == 2 {
+            w3cos_dom::verify_hit!("W3COS_CULL_INCREMENTAL");
             let full = Self::build(artifact);
             let lookup = |e: &CullExtents, i: usize| e.key_extent[e.key_of[i] as usize];
             let bad = (0..artifact.nodes.len())
@@ -1799,6 +1801,7 @@ impl<'a> CullIndex<'a> {
                 .then(|| frame.get(&Self::key_walk(&artifact.nodes, index)).copied())
                 .flatten();
             if cull_frame_extents_mode() == 2 {
+                w3cos_dom::verify_hit!("W3COS_PAINT_CULL_FRAME_EXTENTS");
                 let extents = self
                     .extents
                     .get_or_insert_with(|| Self::build_for_frame(artifact));
@@ -1990,6 +1993,7 @@ impl SkiaRasterizer {
         OFFSCREEN_SKIP_ALLOWED.with(|allowed| allowed.set(false));
         let offscreen = OFFSCREEN_FRAME.with(|slot| slot.replace(0));
         if raster_rgba_surface_mode() == 2 {
+            w3cos_dom::verify_hit!("W3COS_RASTER_RGBA_SURFACE");
             let info = ImageInfo::new(
                 (width as i32, height as i32),
                 ColorType::RGBA8888,
@@ -2051,6 +2055,7 @@ impl SkiaRasterizer {
         );
         let read = surface.read_pixels(&info, &mut self.rgba, width as usize * 4, (0, 0));
         if let Some(previous) = previous {
+            w3cos_dom::verify_hit!("W3COS_PAINT_OFFSCREEN_SKIP");
             let differing = previous
                 .chunks_exact(4)
                 .zip(self.rgba.chunks_exact(4))
@@ -2199,6 +2204,7 @@ fn node_is_line_row(
         let (hits, mismatches) = stats.get();
         stats.set((hits + 1, mismatches));
     });
+    w3cos_dom::verify_hit!("W3COS_PAINT_LINE_ROW_MEMO");
     if mode == 2 && answer != style_is_line_row(&node.style) {
         eprintln!("[paint-line-row-memo-verify] mismatch at node {index}");
         PAINT_LINE_ROW_MEMO_STATS.with(|stats| {
@@ -2323,6 +2329,7 @@ fn artifact_resize_multisampled_effects(
     if mode != 0 && artifact.resize_absent() {
         let (skipped, mismatches) = PAINT_RESIZE_PRESENCE_STATS.with(std::cell::Cell::get);
         if mode == 2 {
+            w3cos_dom::verify_hit!("W3COS_PAINT_RESIZE_PRESENCE");
             let scanned = scan_resize_multisampled_effects(artifact);
             if !scanned.is_empty() {
                 eprintln!(
@@ -3163,6 +3170,7 @@ pub(crate) fn replay_frame(canvas: &Canvas, typeface: &Typeface, mut frame: Repl
                 let mut stats = PAINT_DAMAGE_EARLY_OUT_STATS.with(std::cell::Cell::get);
                 stats.0 += 1;
                 if paint_damage_early_out_mode() == 2 {
+                    w3cos_dom::verify_hit!("W3COS_PAINT_DAMAGE_EARLY_OUT");
                     // The whole damage, measured without the cache.
                     let whole =
                         crate::headless::lazy_damage(artifact, (dirty, moved), false, |_| false);
@@ -4520,6 +4528,7 @@ fn blit_count(
         stats.set(value);
     });
     if crate::retained_layers::paint_damage_blit_mode() == 2 || paint_damage_verify() {
+        w3cos_dom::verify_hit!("W3COS_PAINT_DAMAGE_BLIT");
         let differing = verify_damage_composite(canvas, full);
         if differing > 0 {
             PAINT_DAMAGE_BLIT_STATS.with(|stats| {
@@ -5300,8 +5309,8 @@ fn inline_background_groups(
     if mode != 0 && artifact.inline_background_groups_absent() {
         let (skipped, mismatches) = PAINT_INLINE_BG_PRESENCE_STATS.with(std::cell::Cell::get);
         if mode == 2 {
-            crate::paint_artifact::verify_hit(
-                "paint-inline-bg-presence",
+            w3cos_dom::verify_hit!(
+                "W3COS_PAINT_INLINE_BG_PRESENCE",
                 crate::paint_artifact::overridden!(
                     PAINT_INLINE_BG_PRESENCE_OVERRIDE,
                     crate::paint_artifact::PAINT_FEATURE_SKIP_OVERRIDE
@@ -9901,6 +9910,7 @@ fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(
             let mut stats = LAYOUT_WRAP_ESTIMATE_STATS.with(std::cell::Cell::get);
             stats.0 += 1;
             if mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_LAYOUT_WRAP_ESTIMATE");
                 let exact = wrap(false);
                 if exact != lines {
                     stats.1 += 1;
@@ -10074,6 +10084,7 @@ fn fallback_font_runs<'a>(
                 typeface: primary.clone(),
             }];
             if mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_GLYPH_PAGE");
                 let walked = fallback_font_runs_by_character(text, primary, font_weight);
                 let same = walked.len() == 1
                     && walked[0].text.len() == text.len()

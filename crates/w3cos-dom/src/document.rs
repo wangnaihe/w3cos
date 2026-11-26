@@ -2823,6 +2823,7 @@ impl Document {
             return;
         }
         if mode == 2 {
+            crate::verify_hit!("W3COS_CLASS_INVALIDATION");
             self.verify_class_restyle(id, class);
         } else {
             self.narrow_class_restyle(id);

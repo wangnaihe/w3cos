@@ -398,6 +398,7 @@ fn dedup_hosts(ids: &mut Vec<u32>) {
         fresh
     });
     if let Some(reference) = reference {
+        w3cos_dom::verify_hit!("W3COS_TAIL_SHIFT_FAST");
         let mut got = ids.clone();
         got.sort_unstable();
         if got != reference {
@@ -1637,6 +1638,7 @@ fn spliced_skip_projections(cache: &Cache, removed: &[Component], inserted: &[Co
         }
         let walked = can_skip_projections(&cache.component);
         if mode == 2 && !clean(inserted) {
+            w3cos_dom::verify_hit!("W3COS_SKIP_PROJ_INSERTED");
             SKIP_PROJ_INSERTED_HITS.with(|n| n.set(n.get() + 1));
             if walked {
                 SKIP_PROJ_INSERTED_MISMATCHES.with(|n| n.set(n.get() + 1));
@@ -2352,6 +2354,7 @@ fn try_splice_with(
     }
     if let Some(ranged) = by_range {
         if super::preorder_hosts_mode() == 2 {
+            w3cos_dom::verify_hit!("W3COS_PREORDER_HOSTS");
             let mut walked = shifted.clone();
             walked.sort_unstable();
             walked.dedup();
@@ -2371,6 +2374,7 @@ fn try_splice_with(
     }
     if let Some(ranged) = owners_by_range {
         if super::cssom_owner_index_mode() == 2 {
+            w3cos_dom::verify_hit!("W3COS_CSSOM_OWNER_INDEX");
             if ranged != shifted_owners {
                 super::CSSOM_OWNER_INDEX_MISMATCHES.with(|n| n.set(n.get() + 1));
                 eprintln!(
@@ -2503,6 +2507,7 @@ fn try_splice_with(
                 .collect();
             let moved = document.shift_layout_rects_y_spans(ids, spans, dh);
             if ranges_mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_TAIL_SHIFT_RANGES");
                 let bad = moved as usize != shifted.len()
                     || shifted.iter().zip(&before).any(|(&id, &y)| {
                         document.get_layout_rect(NodeId::from_u32(id)).y.to_bits()
@@ -2677,6 +2682,12 @@ fn try_splice_with(
     if preorder.is_none() {
         *hosts = None;
         *owners = None;
+    }
+    if super::cssom_owner_index_mode() == 2 && owners.is_some() {
+        w3cos_dom::verify_hit!("W3COS_CSSOM_OWNER_INDEX");
+    }
+    if super::preorder_hosts_mode() == 2 && hosts.is_some() {
+        w3cos_dom::verify_hit!("W3COS_PREORDER_HOSTS");
     }
     if super::cssom_owner_index_mode() == 2
         && let Some(kept) = owners.as_ref()
@@ -2908,6 +2919,7 @@ fn rebase_pending_client_rects(
     let root = &*cache.component;
     if let Some(sizes) = preorder {
         if super::preorder_sizes_mode() == 2 {
+            w3cos_dom::verify_hit!("W3COS_PREORDER_SIZES");
             let counted = super::preorder_sizes_of(root);
             if counted.as_slice() != sizes {
                 eprintln!(
@@ -3045,6 +3057,9 @@ fn rebase_with_spans(
         if sorted && keep_mode != 0 {
             super::REBASE_SORTED_KEEP_SKIPS.with(|n| n.set(n.get() + 1));
         }
+        if keep_mode == 2 && sorted {
+            w3cos_dom::verify_hit!("W3COS_REBASE_SORTED_KEEP");
+        }
         if keep_mode == 2
             && sorted
             && !(old_layouts.is_sorted_by_key(|entry| entry.1)
@@ -3090,6 +3105,7 @@ fn rebase_with_spans(
         }
         let ranges = rebase_ranges_mode().then(|| merged_ranges(&shifted));
         let check = (rebase_ranges_mode_verify()).then(|| {
+            w3cos_dom::verify_hit!("W3COS_REBASE_RANGES");
             let mut copy = old_layouts[lo + fresh_len..].to_vec();
             for entry in &mut copy {
                 if in_shift(entry.1) {

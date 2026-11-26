@@ -1368,6 +1368,7 @@ fn patch_and_compute(
             Some(path) => {
                 let root = style_local_root_at(&cache.component, styles[0].0, own_width, path);
                 if root_mode == 2 {
+                    w3cos_dom::verify_hit!("W3COS_STYLE_ROOT_PATH");
                     let full = style_local_root_for(&cache.component, styles[0].0, own_width);
                     if full != root {
                         eprintln!(
@@ -1398,6 +1399,7 @@ fn patch_and_compute(
         crate::layout_ng::forget_patch_memo();
         restore_style_paths(paths, (cache.structure, cache.source_structure));
         if style_local_mode() == 2 {
+            w3cos_dom::verify_hit!("W3COS_STYLE_LOCAL");
             settle_client_rects(&cache.component);
             splice::verify(viewport_w, viewport_h, styles[0].0);
         }
@@ -2896,6 +2898,7 @@ fn style_path(key: (u64, u64), component: &Component, id: u32) -> Option<Vec<u32
         && component_at(component, &path).is_some_and(|found| host_id(found) == Some(id))
     {
         if style_paths_keep_mode() == 2 {
+            w3cos_dom::verify_hit!("W3COS_STYLE_PATHS_KEEP");
             let mut found = Vec::new();
             if !find_path(component, id, &mut found) || found != path {
                 eprintln!(
@@ -3614,6 +3617,7 @@ where
                 Some(flat) => {
                     stats.0 += 1;
                     if flat_keep == 2 {
+                        w3cos_dom::verify_hit!("W3COS_PAINT_FLAT_KEEP");
                         let fresh = pre_flatten(&cache.component);
                         if crate::layout::same_flat(&flat, &fresh) {
                             flat

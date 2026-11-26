@@ -511,6 +511,7 @@ fn shape_visual_run_impl(
     {
         let run = strip(run);
         if share == 2 {
+            w3cos_dom::verify_hit!("W3COS_SHAPE_CLUSTER_SHARE");
             let direct = shape_visual_run_uncached(text, face, style, false, None);
             if direct != run {
                 eprintln!("[shape-cluster-share-verify] mismatch for {text:?}");
@@ -541,6 +542,7 @@ fn shape_visual_run_impl(
     }
     let run = strip(shaped);
     if share == 2 {
+        w3cos_dom::verify_hit!("W3COS_SHAPE_CLUSTER_SHARE");
         let direct = shape_visual_run_uncached(text, face, style, false, None);
         if direct != run {
             eprintln!("[shape-cluster-share-verify] mismatch for {text:?}");
@@ -1630,6 +1632,7 @@ fn shape_raw_reusing(
         Some(glyphs) => {
             SHAPE_REUSE_HITS.with(|n| n.set(n.get() + 1));
             if mode == 2 {
+                w3cos_dom::verify_hit!("W3COS_SHAPE_REUSE");
                 let whole = raw_glyphs(&shape_with_cached_plan(
                     face_id,
                     shaping_face,
@@ -1729,6 +1732,7 @@ fn shape_with_cached_plan(
         fresh.guess_segment_properties();
         fresh.set_direction(rustybuzz::Direction::LeftToRight);
         if fresh.len() == length && fresh.script() == script && fresh.language() == language {
+            w3cos_dom::verify_hit!("W3COS_SHAPE_PLAN_CACHE");
             let expected = rustybuzz::shape(shaping_face, features, fresh);
             let same = expected.len() == shaped.len()
                 && expected

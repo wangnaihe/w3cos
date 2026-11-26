@@ -551,6 +551,7 @@ pub(super) fn layout(
                 return Some(result);
             }
             TABLE_BLOCK_FREE_CHECKS.with(|n| n.set(n.get() + 1));
+            w3cos_dom::verify_hit!("W3COS_TABLE_BLOCK_FREE");
             let fresh = compute()?;
             if format!("{fresh:?}") != format!("{result:?}") {
                 TABLE_BLOCK_FREE_MISMATCHES.with(|n| n.set(n.get() + 1));
@@ -562,6 +563,7 @@ pub(super) fn layout(
             let reused = stretch_reuse(flat, index, space, &key, force_bfc_root, sized);
             let result = match (reused, stretch_reuse_mode()) {
                 (Some(reused), 2) => {
+                    w3cos_dom::verify_hit!("W3COS_STRETCH_REUSE");
                     let fresh = compute()?;
                     if format!("{fresh:?}") != format!("{reused:?}") {
                         STRETCH_REUSE_MISMATCHES.with(|n| n.set(n.get() + 1));
@@ -1661,6 +1663,7 @@ pub(super) fn unsupported_tree_retained(
             if IFC_DESC_OK.with(|ok| ok.borrow().contains(&key)) {
                 IFC_SKIP_HITS.with(|n| n.set(n.get() + 1));
                 if ifc_skip == 2 {
+                    w3cos_dom::verify_hit!("W3COS_ELIG_IFC_SKIP");
                     let now = descendants_reason(flat, index, end.min(flat.len()), &node_reason);
                     if now.is_some() {
                         IFC_SKIP_MISMATCHES.with(|n| n.set(n.get() + 1));
@@ -2017,6 +2020,7 @@ pub(super) fn ifc_container_reason(
         if mode == 1 {
             return kept;
         }
+        w3cos_dom::verify_hit!("W3COS_ELIG_IFC_MEMO");
         let now = reason();
         if now != kept {
             IFC_MEMO_MISMATCHES.with(|n| n.set(n.get() + 1));

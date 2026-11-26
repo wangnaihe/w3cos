@@ -818,10 +818,13 @@ impl ParagraphWidths {
         match self.by_byte.as_ref().and_then(|by_byte| by_byte.get(byte)) {
             Some(&count) => {
                 let count = count as usize;
-                if paragraph_index_mode() == 2 && count != searched() {
-                    PARAGRAPH_INDEX_MISMATCHES.with(|n| n.set(n.get() + 1));
-                    eprintln!("[paragraph-index-verify] mismatch at byte {byte}");
-                    return searched();
+                if paragraph_index_mode() == 2 {
+                    w3cos_dom::verify_hit!("W3COS_PARAGRAPH_INDEX");
+                    if count != searched() {
+                        PARAGRAPH_INDEX_MISMATCHES.with(|n| n.set(n.get() + 1));
+                        eprintln!("[paragraph-index-verify] mismatch at byte {byte}");
+                        return searched();
+                    }
                 }
                 count
             }
@@ -952,6 +955,7 @@ fn wrap_greedy_with_line_width_estimated(
             }
             Some(fits) => {
                 WRAP_FIT_ESTIMATE_HITS.with(|n| n.set(n.get() + 1));
+                w3cos_dom::verify_hit!("W3COS_WRAP_FIT_ESTIMATE");
                 let exact = run_width(text) <= limit;
                 if exact != fits {
                     WRAP_FIT_ESTIMATE_MISMATCHES.with(|n| n.set(n.get() + 1));
