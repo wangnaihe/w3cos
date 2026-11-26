@@ -134,14 +134,15 @@ thread_local! {
     pub(crate) static PAINT_KIND_KEEP_OVERRIDE: Cell<Option<u8>> = const { Cell::new(None) };
 }
 
-/// `W3COS_PAINT_NODES_SPLICE=1|verify` (off by default; with
-/// `W3COS_PAINT_PERSIST_INPLACE`): the paint nodes of the artifact two
-/// frames back are kept as one array and updated in place over the boxes
-/// either of the last two layout splices touched, as Blink keeps its paint
-/// chunks and invalidates only the dirty ones, instead of a node array
-/// rebuilt box by box every frame. A box outside those ranges takes its
-/// recycled node exactly as the per-box path does. `verify` also recomputes
-/// each box's keep decision the per-box way and reports a difference.
+/// `W3COS_PAINT_NODES_SPLICE` (on by default with
+/// `W3COS_PAINT_PERSIST_INPLACE`; `=0` turns it off, `=verify` checks it):
+/// the paint nodes of the artifact two frames back are kept as one array
+/// and updated in place over the boxes either of the last two layout
+/// splices touched, as Blink keeps its paint chunks and invalidates only
+/// the dirty ones, instead of a node array rebuilt box by box every frame.
+/// A box outside those ranges takes its recycled node exactly as the
+/// per-box path does. `verify` also recomputes each box's keep decision the
+/// per-box way and reports a difference.
 fn paint_nodes_splice_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -149,9 +150,9 @@ fn paint_nodes_splice_mode() -> u8 {
             return 0;
         }
         match std::env::var("W3COS_PAINT_NODES_SPLICE").as_deref() {
-            Ok("1" | "true") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
@@ -2785,8 +2786,9 @@ mod tests {
                 aligned > 0,
                 "spliced frames must reuse the previous build's record"
             );
-            // With `W3COS_PAINT_PERSISTENT_NODES=1` clean boxes take the
-            // persistent node instead, so no trim decision is copied.
+            // With the persistent path (`W3COS_PAINT_PERSISTENT_NODES`, on by
+            // default) clean boxes take the persistent node instead, so no
+            // trim decision is copied.
             if crate::paint_artifact::persistent_nodes_mode() != 1 {
                 assert!(
                     copied > 0,

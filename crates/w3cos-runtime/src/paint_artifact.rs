@@ -464,8 +464,8 @@ pub struct PaintArtifact {
     /// (`TextFragment::vertical`); paint rotates them a quarter turn.
     pub vertical_text: Vec<bool>,
     pub generation: u64,
-    /// What `append_node` decided per node, kept (with
-    /// `W3COS_PAINT_APPEND_REUSE=1`) so the next frame's build can copy the
+    /// What `append_node` decided per node, kept (with append reuse,
+    /// `W3COS_PAINT_APPEND_REUSE`) so the next frame's build can copy the
     /// nodes whose inputs and context did not change.
     append_record: Option<std::sync::Arc<AppendRecord>>,
     /// Identifies this build for the next frame's `append_record.base`.
@@ -669,9 +669,11 @@ pub(crate) struct CullSpan {
     root: PaintProperties,
 }
 
-/// `W3COS_PAINT_APPEND_REUSE=1`: copy `append_node` output for nodes whose
-/// inputs and ancestors' output are unchanged since the previous frame.
-/// `W3COS_PAINT_PERSISTENT_NODES` (off by default; design in
+/// `W3COS_PAINT_APPEND_REUSE` (on by default; `=0` turns it off together
+/// with `W3COS_PAINT_ARTIFACT_SPLICE=0`, since the splice needs it): copy
+/// `append_node` output for nodes whose inputs and ancestors' output are
+/// unchanged since the previous frame.
+/// `W3COS_PAINT_PERSISTENT_NODES` (on by default, `=0` turns it off; design in
 /// ngtools/design-persistent-paint-nodes.md). Step P1, `=probe`: after the
 /// full build, every box the layout splice did not change must have the
 /// same adjusted paint node as last frame; counts and reports the boxes
@@ -680,10 +682,10 @@ pub(crate) fn persistent_nodes_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_PERSISTENT_NODES").as_deref() {
-            Ok("1" | "true") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
             Ok("probe") => 3,
-            _ => 0,
+            _ => 1,
         },
     )
 }
@@ -694,7 +696,8 @@ thread_local! {
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
-/// `W3COS_PAINT_PERSIST_INPLACE=1|verify` (with the persistent path on):
+/// `W3COS_PAINT_PERSIST_INPLACE` (on by default with the persistent path;
+/// `=0` turns it off, `=verify` checks it):
 /// a box clean in this splice and the last one keeps the whole node of the
 /// artifact the last frame replaced (its kind and adjusted style) instead of
 /// a node made from the flat tree; `=verify` also builds the nodes in full
@@ -706,9 +709,9 @@ pub(crate) fn persist_inplace_mode() -> u8 {
             return 0;
         }
         match std::env::var("W3COS_PAINT_PERSIST_INPLACE").as_deref() {
-            Ok("1" | "true") => 1,
+            Ok("0" | "false") => 0,
             Ok("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
@@ -1454,8 +1457,9 @@ pub(crate) fn paint_append_reuse_enabled() -> bool {
         return enabled;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "1"))
-        || artifact_splice_enabled()
+    *ON.get_or_init(|| {
+        !std::env::var_os("W3COS_PAINT_APPEND_REUSE").is_some_and(|v| v == "0" || v == "false")
+    }) || artifact_splice_enabled()
 }
 
 /// `W3COS_PAINT_ARTIFACT_SPLICE`: with append reuse, copy each run of
@@ -8969,7 +8973,7 @@ mod tests {
     #[test]
     fn paint_class_carry_takes_last_frames_classes_only_when_keys_held() {
         PAINT_CLASS_CARRY_OVERRIDE.with(|mode| mode.set(Some(2)));
-        // Carrying rides the reusing build (off under `W3COS_PAINT_ARTIFACT_SPLICE=0`).
+        // Carrying rides the reusing build (off without append reuse).
         APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
         let mut plain = Style::default();
         plain.display = Display::Block;

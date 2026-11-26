@@ -10835,7 +10835,8 @@ mod tests {
         let first = PaintArtifact::build_reusing(nodes(), &layouts(0.0), 1, None, None, None);
         let next =
             PaintArtifact::build_reusing(nodes(), &layouts(30.0), 2, None, None, Some(&first));
-        // Without append reuse (`W3COS_PAINT_ARTIFACT_SPLICE=0`) the artifact
+        // Without append reuse (`W3COS_PAINT_APPEND_REUSE=0` and
+        // `W3COS_PAINT_ARTIFACT_SPLICE=0`) the artifact
         // copies no runs, so there are no extents to carry over.
         let Some(runs) = next.append_runs_since(first.serial()) else {
             assert!(!crate::paint_artifact::paint_append_reuse_enabled());
