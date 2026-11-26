@@ -5924,6 +5924,9 @@ impl PaintArtifact {
         let mut volatile = Vec::new();
         let mut url_memo = UrlMemo::default();
         let mut span_cursor = CullSpanCursor::default();
+        // Every copied node keeps last frame's key at its index; an appended
+        // one compares its fresh key (see `W3COS_PAINT_CLASS_CARRY`).
+        let mut keys_same = base.is_some() && paint_class_carry_mode() != 0;
         let mut index = 0;
         while index < len {
             if splice && let Some((previous, record)) = base {
@@ -5988,6 +5991,8 @@ impl PaintArtifact {
                 mark.self_scroll = self.append_node_with_scroll(index, &mut memo) as u32;
                 appended += 1;
                 if let Some((previous, record)) = base {
+                    keys_same =
+                        keys_same && self.paint_order.key(index) == previous.paint_order.key(index);
                     unchanged[index] = self.inputs_match(index, previous)
                         && self.output_matches(index, previous, &memo, &record.memo);
                     same[index] = unchanged[index]
@@ -6029,6 +6034,9 @@ impl PaintArtifact {
             *self = fresh;
             self.serial = next_artifact_serial();
             return;
+        }
+        if keys_same && let Some((previous, _)) = base {
+            self.carry_paint_classes(previous);
         }
         self.serial = next_artifact_serial();
         let base = base.map_or(0, |(previous, _)| previous.serial);
@@ -6219,6 +6227,43 @@ impl PaintArtifact {
         let properties = self.node_properties[index];
         self.append_display_items(index, properties, old_mark.self_scroll as usize);
         true
+    }
+
+    /// Every node's paint-order key equals last frame's at the same index,
+    /// so the ranking is last frame's: takes its classes instead of comparing
+    /// all keys against the remembered ones (Blink keeps a paint layer's
+    /// z-order lists until a stacking change dirties them).
+    fn carry_paint_classes(&mut self, previous: &PaintArtifact) {
+        let Some(classes) = previous.paint_classes.get() else {
+            return;
+        };
+        if classes.len() != self.paint_order.len() || previous.paint_order.len() != classes.len() {
+            return;
+        }
+        let mut classes = classes.clone();
+        if paint_class_carry_mode() == 2 {
+            w3cos_dom::verify_hit!(
+                "W3COS_PAINT_CLASS_CARRY",
+                overridden!(PAINT_CLASS_CARRY_OVERRIDE)
+            );
+            let fresh = rank_paint_order(&self.paint_order);
+            if fresh != classes {
+                eprintln!(
+                    "[paint-class-carry-verify] mismatch: {} nodes; using the fresh ranking",
+                    classes.len()
+                );
+                PAINT_CLASS_CARRY_STATS.with(|stats| {
+                    let (c, m) = stats.get();
+                    stats.set((c, m + 1));
+                });
+                classes = fresh;
+            }
+        }
+        PAINT_CLASS_CARRY_STATS.with(|stats| {
+            let (c, m) = stats.get();
+            stats.set((c + 1, m));
+        });
+        self.paint_classes = std::sync::OnceLock::from(classes);
     }
 
     fn append_output_eq(&self, other: &PaintArtifact) -> bool {
@@ -7440,6 +7485,38 @@ thread_local! {
     /// layer's z-order lists are dirtied).
     static PAINT_CLASS_MEMO: std::cell::RefCell<(PaintOrderKeys, Vec<u32>)> =
         const { std::cell::RefCell::new((PaintOrderKeys::new(), Vec::new())) };
+}
+
+/// `W3COS_PAINT_CLASS_CARRY=1|verify` (default off): when a reusing build
+/// kept every node's paint-order key at its index (copied nodes by
+/// construction, appended ones compared), the artifact takes last frame's
+/// paint-order classes instead of comparing every key against the
+/// remembered ones. `=verify` also ranks the keys afresh and compares.
+pub(crate) fn paint_class_carry_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_CLASS_CARRY_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("W3COS_PAINT_CLASS_CARRY").ok().as_deref() {
+            Some("1" | "true") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAINT_CLASS_CARRY_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Builds that carried last frame's classes, and verify mismatches.
+    static PAINT_CLASS_CARRY_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 fn paint_class_memo_enabled() -> bool {
@@ -8887,6 +8964,97 @@ mod tests {
         assert_eq!(full.moved, skipped.moved);
         assert!(full.dirty[2 * (blocks / 2) + 2], "the edited text is dirty");
         assert_eq!(full.dirty.iter().filter(|&&d| d).count() >= 1, true);
+    }
+
+    #[test]
+    fn paint_class_carry_takes_last_frames_classes_only_when_keys_held() {
+        PAINT_CLASS_CARRY_OVERRIDE.with(|mode| mode.set(Some(2)));
+        let mut plain = Style::default();
+        plain.display = Display::Block;
+        let node = |kind: ComponentKind, style: &Style, parent: Option<usize>| PaintNode {
+            kind,
+            style: style.clone().into(),
+            parent,
+            sticky_counter_signal: None,
+        };
+        let text = |content: &str| ComponentKind::Text {
+            content: content.into(),
+        };
+        let rect = |y: f32| LayoutRect {
+            x: 0.0,
+            y,
+            width: 200.0,
+            height: 20.0,
+        };
+        // Block 3 is positioned with `z` as its z-index: changing it restacks.
+        let nodes = |last: &str, z: i32| {
+            let mut nodes = vec![node(ComponentKind::Root, &plain, None)];
+            for index in 0..6 {
+                let mut style = plain.clone();
+                if index == 3 {
+                    style.position = Position::Relative;
+                    style.z_index = z;
+                }
+                nodes.push(node(ComponentKind::Root, &style, Some(0)));
+                let content = if index == 5 {
+                    last.to_string()
+                } else {
+                    format!("block {index}")
+                };
+                nodes.push(node(text(&content), &plain, Some(2 * index + 1)));
+            }
+            nodes
+        };
+        let layouts = || {
+            let mut layouts = vec![(rect(0.0), 0)];
+            for index in 0..6 {
+                layouts.push((rect(20.0 * index as f32), 2 * index + 1));
+                layouts.push((rect(20.0 * index as f32), 2 * index + 2));
+            }
+            layouts
+        };
+        let stats = || PAINT_CLASS_CARRY_STATS.with(std::cell::Cell::get);
+        let first = PaintArtifact::build_reusing(nodes("last", 1), &layouts(), 1, None, None, None);
+        first.paint_order_class(0);
+        let before = stats();
+        let next = PaintArtifact::build_reusing(
+            nodes("last, longer", 1),
+            &layouts(),
+            2,
+            None,
+            None,
+            Some(&first),
+        );
+        let after = stats();
+        assert_eq!(
+            after.0 - before.0,
+            1,
+            "an unrestacked frame carries the classes"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "the carried classes match a fresh ranking"
+        );
+        assert_eq!(
+            next.paint_classes.get(),
+            Some(&rank_paint_order(&next.paint_order))
+        );
+        // A z-index change restacks: the build ranks afresh.
+        let restacked = PaintArtifact::build_reusing(
+            nodes("last, longer", -1),
+            &layouts(),
+            3,
+            None,
+            None,
+            Some(&next),
+        );
+        assert_eq!(stats().0, after.0, "a restacked frame does not carry");
+        assert!(restacked.paint_classes.get().is_none());
+        assert_ne!(
+            rank_paint_order(&restacked.paint_order),
+            *next.paint_classes.get().unwrap()
+        );
+        PAINT_CLASS_CARRY_OVERRIDE.with(|mode| mode.set(None));
     }
 
     #[test]
