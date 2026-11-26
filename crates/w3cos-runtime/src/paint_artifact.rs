@@ -8969,6 +8969,8 @@ mod tests {
     #[test]
     fn paint_class_carry_takes_last_frames_classes_only_when_keys_held() {
         PAINT_CLASS_CARRY_OVERRIDE.with(|mode| mode.set(Some(2)));
+        // Carrying rides the reusing build (off under `W3COS_PAINT_ARTIFACT_SPLICE=0`).
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
         let mut plain = Style::default();
         plain.display = Display::Block;
         let node = |kind: ComponentKind, style: &Style, parent: Option<usize>| PaintNode {
@@ -9055,6 +9057,7 @@ mod tests {
             *next.paint_classes.get().unwrap()
         );
         PAINT_CLASS_CARRY_OVERRIDE.with(|mode| mode.set(None));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
     #[test]
