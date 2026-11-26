@@ -1548,6 +1548,102 @@ impl AppendMemo {
             ancestor_phase: vec![ANCESTOR_PHASE_NONE; len],
         }
     }
+
+    /// [`AppendMemo::new`] on top of last build's memo: with
+    /// `W3COS_PAINT_SPLIT_OWNER_REUSE`, a box outside the layout's `changed`
+    /// ranges kept its inputs (the same rule as `inputs_match`), so its split
+    /// positioned-inline owner flag is last build's and only the changed
+    /// boxes look at their custom properties. Taken only when the boxes kept
+    /// their indices (no splice offset). `verify` scans every box too.
+    fn new_reusing(
+        nodes: &[PaintNode],
+        previous: &AppendMemo,
+        touched: Option<&crate::incremental_layout::PaintChanges>,
+    ) -> Self {
+        let mode = paint_split_owner_reuse_mode();
+        let len = nodes.len();
+        let Some(touched) = touched.filter(|touched| {
+            mode != 0
+                && touched.len == len
+                && previous.split_owner.len() == len
+                && touched.segments.iter().all(|&(_, offset)| offset == 0)
+        }) else {
+            return Self::new(nodes);
+        };
+        let mut split_owner = previous.split_owner.clone();
+        for &(start, end) in &touched.changed {
+            for index in start as usize..(end as usize).min(len) {
+                split_owner[index] = split_positioned_inline_owner(&nodes[index]).is_some();
+            }
+        }
+        split_owner_reuse_count(0);
+        if mode == 2 {
+            let full: Vec<bool> = nodes
+                .iter()
+                .map(|node| split_positioned_inline_owner(node).is_some())
+                .collect();
+            if full != split_owner {
+                eprintln!(
+                    "[paint-split-owner-reuse-verify] mismatch: an untouched box changed its split owner"
+                );
+                split_owner_reuse_count(1);
+                split_owner = full;
+            }
+        }
+        Self {
+            fixed_owner: vec![None; len],
+            context_owner: vec![None; len],
+            split_owner,
+            owns_context: vec![false; len],
+            stacking: vec![false; len],
+            ancestor_phase: vec![ANCESTOR_PHASE_NONE; len],
+        }
+    }
+}
+
+/// `W3COS_PAINT_SPLIT_OWNER_REUSE=1|verify` (default off): the append memo
+/// takes last build's split positioned-inline owner flags for boxes the
+/// layout did not touch instead of reading every box's custom properties.
+pub(crate) fn paint_split_owner_reuse_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_SPLIT_OWNER_REUSE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_SPLIT_OWNER_REUSE")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_SPLIT_OWNER_REUSE_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// (memos built on last build's flags, verify mismatches).
+    pub(crate) static PAINT_SPLIT_OWNER_REUSE_STATS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+fn split_owner_reuse_count(field: usize) {
+    PAINT_SPLIT_OWNER_REUSE_STATS.with(|stats| {
+        let mut value = stats.get();
+        if field == 0 {
+            value.0 += 1;
+        } else {
+            value.1 += 1;
+        }
+        stats.set(value);
+    });
 }
 
 // Inlined: almost every node has no custom properties, so the check is a
@@ -5742,7 +5838,12 @@ impl PaintArtifact {
             }
             fresh
         });
-        let mut memo = AppendMemo::new(&self.nodes);
+        let mut memo = match base {
+            Some((_, record)) => {
+                AppendMemo::new_reusing(&self.nodes, &record.memo, self.touched.as_ref())
+            }
+            None => AppendMemo::new(&self.nodes),
+        };
         let mut marks = Vec::with_capacity(len);
         // Per node: its inputs (other than the rect) and its output equal
         // last frame's, so a descendant reading them may be copied.
@@ -7876,6 +7977,92 @@ mod tests {
             }
         }
         PAINT_CULL_SPAN_CURSOR_OVERRIDE.with(|mode| mode.set(None));
+    }
+
+    /// `W3COS_PAINT_SPLIT_OWNER_REUSE`: a second build over the same boxes
+    /// with only the first row changed takes last build's split owner flags
+    /// (verify agrees), and its output equals the build without it.
+    #[test]
+    fn split_owner_reuse_takes_last_flags_and_matches() {
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(Some(true)));
+        PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(Some(1)));
+        let mut block = Style::default();
+        block.display = Display::Block;
+        let mut owner = block.clone();
+        owner
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-positioned-inline-owner".into(),
+                "inline:7".into(),
+            );
+        let nodes = || {
+            (0..20)
+                .map(|index| PaintNode {
+                    kind: ComponentKind::Column,
+                    style: if index == 9 {
+                        owner.clone()
+                    } else {
+                        block.clone()
+                    }
+                    .into(),
+                    parent: (index > 0).then_some(0),
+                    sticky_counter_signal: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let layouts = |grow: f32| {
+            (0..20)
+                .map(|index| {
+                    let height = if index == 0 { 1000.0 } else { 20.0 };
+                    let y = if index == 0 {
+                        0.0
+                    } else {
+                        30.0 * index as f32 + grow
+                    };
+                    let rect = LayoutRect {
+                        x: 0.0,
+                        y,
+                        width: 100.0,
+                        height: if index == 1 { height + grow } else { height },
+                    };
+                    (rect, index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let build = |grow: f32, previous: Option<&PaintArtifact>| {
+            set_paint_touched(Some(crate::incremental_layout::PaintChanges {
+                len: 20,
+                changed: vec![(0, 2)],
+                moved: vec![(2, 20)],
+                ..Default::default()
+            }));
+            let artifact =
+                PaintArtifact::build_reusing(nodes(), &layouts(grow), 1, None, None, previous);
+            set_paint_touched(None);
+            artifact
+        };
+        PAINT_SPLIT_OWNER_REUSE_OVERRIDE.with(|mode| mode.set(Some(0)));
+        let first = build(0.0, None);
+        let full = build(8.0, Some(&first));
+        for mode in [2, 1] {
+            PAINT_SPLIT_OWNER_REUSE_OVERRIDE.with(|value| value.set(Some(mode)));
+            let before = PAINT_SPLIT_OWNER_REUSE_STATS.with(std::cell::Cell::get);
+            let reused = build(8.0, Some(&first));
+            let after = PAINT_SPLIT_OWNER_REUSE_STATS.with(std::cell::Cell::get);
+            assert!(after.0 > before.0, "the memo takes last build's flags");
+            assert_eq!(after.1, before.1, "verify finds an untouched flag changed");
+            assert!(reused.append_output_eq(&full));
+            let record = reused.append_record.as_deref().expect("append record");
+            assert!(record.memo.split_owner[9], "the owner box keeps its flag");
+            assert_eq!(
+                record.memo.split_owner.iter().filter(|flag| **flag).count(),
+                1
+            );
+        }
+        PAINT_SPLIT_OWNER_REUSE_OVERRIDE.with(|mode| mode.set(None));
+        PAINT_TOUCHED_OVERRIDE.with(|mode| mode.set(None));
+        APPEND_REUSE_OVERRIDE.with(|flag| flag.set(None));
     }
 
     /// `W3COS_PAINT_CULL_RUN_GAPS`: boxes far below the band shift down
