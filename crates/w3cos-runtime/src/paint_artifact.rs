@@ -1578,6 +1578,7 @@ impl AppendMemo {
         }
         split_owner_reuse_count(0);
         if mode == 2 {
+            verify_hit("paint-split-owner-reuse");
             let full: Vec<bool> = nodes
                 .iter()
                 .map(|node| split_positioned_inline_owner(node).is_some())
@@ -4757,6 +4758,9 @@ impl PaintArtifact {
                 && features.is_some_and(|features| features & FEATURE_FLOAT == 0);
             if floats_absent {
                 float_presence_count(0);
+                if float_mode == 2 {
+                    verify_hit("paint-float-presence");
+                }
                 if float_mode == 2
                     && nodes
                         .iter()
@@ -5084,6 +5088,9 @@ impl PaintArtifact {
         // find no caption and annotate nothing.
         let captions = if absent(FEATURE_TABLE) {
             caption_column_presence_count(0);
+            if presence_mode == 2 {
+                verify_hit("paint-caption-column-presence");
+            }
             presence_mode == 2
                 && artifact
                     .nodes
@@ -5102,6 +5109,9 @@ impl PaintArtifact {
 
         let columns = if absent(FEATURE_COLUMNS) {
             caption_column_presence_count(1);
+            if presence_mode == 2 {
+                verify_hit("paint-caption-column-presence");
+            }
             presence_mode == 2 && has_columns(&artifact.nodes) && {
                 caption_column_presence_mismatch("multicol");
                 true
@@ -7068,6 +7078,20 @@ fn caption_column_presence_count(field: usize) {
     });
 }
 
+/// Verify modes: the first time a switch's verify actually runs in this
+/// process, say so once (`[verify-hit] <switch>`), so a gate log proves the
+/// verify was exercised and not left inert by a missing prerequisite.
+pub(crate) fn verify_hit(name: &'static str) {
+    static HIT: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut hit = HIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !hit.contains(&name) {
+        hit.push(name);
+        eprintln!("[verify-hit] {name}");
+    }
+}
+
 fn caption_column_presence_mismatch(what: &str) {
     eprintln!("[paint-caption-column-presence-verify] mismatch: {what} the superset missed");
     caption_column_presence_count(2);
@@ -7243,6 +7267,7 @@ fn run_feature_pass<T>(
     let mut stats = PAINT_FEATURE_SKIP_STATS.with(std::cell::Cell::get);
     stats.0 += 1;
     if mode == 2 {
+        verify_hit("paint-feature-skip");
         let mut fresh = copy(nodes);
         pass(&mut fresh);
         if !same(&fresh, nodes) {

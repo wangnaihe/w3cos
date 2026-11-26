@@ -5300,6 +5300,7 @@ fn inline_background_groups(
     if mode != 0 && artifact.inline_background_groups_absent() {
         let (skipped, mismatches) = PAINT_INLINE_BG_PRESENCE_STATS.with(std::cell::Cell::get);
         if mode == 2 {
+            crate::paint_artifact::verify_hit("paint-inline-bg-presence");
             let scanned = scan_inline_background_groups(artifact);
             if !scanned.is_empty() {
                 eprintln!(
