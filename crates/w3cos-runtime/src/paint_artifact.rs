@@ -1578,7 +1578,10 @@ impl AppendMemo {
         }
         split_owner_reuse_count(0);
         if mode == 2 {
-            verify_hit("paint-split-owner-reuse");
+            verify_hit(
+                "paint-split-owner-reuse",
+                overridden!(PAINT_SPLIT_OWNER_REUSE_OVERRIDE),
+            );
             let full: Vec<bool> = nodes
                 .iter()
                 .map(|node| split_positioned_inline_owner(node).is_some())
@@ -4759,7 +4762,10 @@ impl PaintArtifact {
             if floats_absent {
                 float_presence_count(0);
                 if float_mode == 2 {
-                    verify_hit("paint-float-presence");
+                    verify_hit(
+                        "paint-float-presence",
+                        overridden!(PAINT_FLOAT_PRESENCE_OVERRIDE, PAINT_FEATURE_SKIP_OVERRIDE),
+                    );
                 }
                 if float_mode == 2
                     && nodes
@@ -5089,7 +5095,13 @@ impl PaintArtifact {
         let captions = if absent(FEATURE_TABLE) {
             caption_column_presence_count(0);
             if presence_mode == 2 {
-                verify_hit("paint-caption-column-presence");
+                verify_hit(
+                    "paint-caption-column-presence",
+                    overridden!(
+                        PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE,
+                        PAINT_FEATURE_SKIP_OVERRIDE
+                    ),
+                );
             }
             presence_mode == 2
                 && artifact
@@ -5110,7 +5122,13 @@ impl PaintArtifact {
         let columns = if absent(FEATURE_COLUMNS) {
             caption_column_presence_count(1);
             if presence_mode == 2 {
-                verify_hit("paint-caption-column-presence");
+                verify_hit(
+                    "paint-caption-column-presence",
+                    overridden!(
+                        PAINT_CAPTION_COLUMN_PRESENCE_OVERRIDE,
+                        PAINT_FEATURE_SKIP_OVERRIDE
+                    ),
+                );
             }
             presence_mode == 2 && has_columns(&artifact.nodes) && {
                 caption_column_presence_mismatch("multicol");
@@ -7081,16 +7099,36 @@ fn caption_column_presence_count(field: usize) {
 /// Verify modes: the first time a switch's verify actually runs in this
 /// process, say so once (`[verify-hit] <switch>`), so a gate log proves the
 /// verify was exercised and not left inert by a missing prerequisite.
-pub(crate) fn verify_hit(name: &'static str) {
+/// Only verifies whose modes came from the environment count: a unit test
+/// that forces a mode by its override does not prove the gate's env set.
+pub(crate) fn verify_hit(name: &'static str, overridden: bool) {
+    if overridden {
+        return;
+    }
     static HIT: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
     let mut hit = HIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !hit.contains(&name) {
         hit.push(name);
-        eprintln!("[verify-hit] {name}");
+        // One write: a separate stdout progress dot must not split the line.
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(format!("[verify-hit] {name}\n").as_bytes());
     }
 }
+
+/// A switch's mode was forced by its test override (always false outside
+/// unit tests).
+macro_rules! overridden {
+    ($($key:path),+) => {{
+        #[cfg(test)]
+        let forced = false $(|| $key.with(|value| value.get().is_some()))+;
+        #[cfg(not(test))]
+        let forced = false;
+        forced
+    }};
+}
+pub(crate) use overridden;
 
 fn caption_column_presence_mismatch(what: &str) {
     eprintln!("[paint-caption-column-presence-verify] mismatch: {what} the superset missed");
@@ -7267,7 +7305,10 @@ fn run_feature_pass<T>(
     let mut stats = PAINT_FEATURE_SKIP_STATS.with(std::cell::Cell::get);
     stats.0 += 1;
     if mode == 2 {
-        verify_hit("paint-feature-skip");
+        verify_hit(
+            "paint-feature-skip",
+            overridden!(PAINT_FEATURE_SKIP_OVERRIDE),
+        );
         let mut fresh = copy(nodes);
         pass(&mut fresh);
         if !same(&fresh, nodes) {
