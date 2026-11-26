@@ -839,7 +839,8 @@ pub(crate) fn persist_table_spans_stats() -> (u64, u64) {
     PERSIST_TABLE_SPANS_STATS.with(std::cell::Cell::get)
 }
 
-/// `W3COS_PAINT_TABLE_PASS_SPANS=1|verify` (off by default; with the
+/// `W3COS_PAINT_TABLE_PASS_SPANS` (on by default, `=0` turns it off,
+/// `=verify` checks it; with the
 /// persistent plan's table list, `W3COS_PAINT_PERSIST_TABLE_SPANS`): the
 /// table passes find this frame's tables from the plan's list of boxes in
 /// table subtrees instead of reading every box's display. `verify` also
@@ -855,9 +856,9 @@ fn table_pass_spans_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
