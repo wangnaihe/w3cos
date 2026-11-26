@@ -7455,7 +7455,8 @@ pub(crate) fn build_headless_scroll_info(
     )
 }
 
-/// `W3COS_SCROLL_INFO_SHARED=1|verify` (off by default): compute each scroll
+/// `W3COS_SCROLL_INFO_SHARED` (on by default, `=0` turns it off, `=verify`
+/// checks it): compute each scroll
 /// container's scroll offset and clip once and share it with every
 /// descendant that is not under a sticky box, like the scroll translation
 /// and clip nodes Blink's paint property trees keep per scroller
@@ -7469,9 +7470,9 @@ pub(crate) fn scroll_info_shared_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_SCROLL_INFO_SHARED").ok().as_deref() {
-            Some("1" | "true") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
