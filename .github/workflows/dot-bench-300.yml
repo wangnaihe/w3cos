@@ -25,7 +25,7 @@ jobs:
       - name: Record revision and install prerequisites
         run: |
           git rev-parse HEAD
-          git rev-parse HEAD^
+          printf 'Engine revision: %s\n' 9c07e1161378886a2d14efbf1bcb67b5eb2c0114
           printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
           lscpu
           sudo apt-get update
