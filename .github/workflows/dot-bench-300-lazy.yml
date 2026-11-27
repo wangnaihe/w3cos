@@ -1,0 +1,216 @@
+name: 300-card lazy host-index vs Chrome
+
+on:
+  push:
+    branches: [dot/bench-300-geometry-20261127]
+    paths:
+      - '.github/workflows/dot-bench-300-lazy.yml'
+      - 'scripts/dot-layout-growth-lazy-ab.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  adaptive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      W3COS_LAYOUT_NG: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record revision and install prerequisites
+        run: |
+          git rev-parse HEAD
+          printf 'Engine revision: %s\n' 9c07e1161378886a2d14efbf1bcb67b5eb2c0114
+          printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          rustc --version
+      - name: Pin the test font
+        run: |
+          mkdir -p "$RUNNER_TEMP/growth-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Gate the draft's Skia-only diagnostic for this CPU build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/retained_layers.rs")
+          s = p.read_text()
+          old = "        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })"
+          assert s.count(old) == 1, "unexpected change to the pinned trace site"
+          p.write_text(s.replace(old, '        #[cfg(feature = "skia")]\n' + old))
+          PY
+          git diff --check
+          git diff -- crates/w3cos-runtime/src/retained_layers.rs | tee "$RUNNER_TEMP/growth-evidence/cpu-trace-guard.diff"
+      - name: Reuse the original successful run's locked dependencies
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45951212053
+          name: growth-geometry
+          path: ${{ runner.temp }}/baseline-artifact
+      - name: Stage the opt-in adaptive cutoff in this checkout
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          def one(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+
+          one("""    let ranges_mode = if tail_shift_fast_mode() != 0 && super::preorder_hosts_mode() != 0 {
+                  tail_shift_ranges_mode()
+              } else {
+                  0
+              };
+          """, "")
+          one("    let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {", """    // Experiment only. Width is in layout boxes, not unique DOM hosts.
+              static DOT_ADAPTIVE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+              let adaptive = *DOT_ADAPTIVE.get_or_init(|| {
+                  (std::env::var("DOT_LAYOUT_ADAPTIVE_SHIFT").as_deref() == Ok("1"))
+                      .then(|| std::env::var_os("W3COS_SPLICE_VERIFY").is_some())
+              });
+              let use_index = adaptive.is_none_or(|audit| {
+                  let width: usize = moved_spans
+                      .as_ref()
+                      .map_or(0, |spans| spans.iter().map(|&(a, b)| b - a).sum());
+                  let selected = matches!(commit, PlanKind::Subtree(_)) && width >= 64;
+                  if audit {
+                      eprintln!("[dot-adaptive-shift] width={width} selected={selected}");
+                  }
+                  selected
+              });
+              let shift_fast = use_index && tail_shift_fast_mode() != 0;
+              let ranges_mode = if shift_fast && super::preorder_hosts_mode() != 0 {
+                  tail_shift_ranges_mode()
+              } else {
+                  0
+              };
+              let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {""")
+          one("(Some(sizes), Some(ids), Some(spans)) if ids.len() == sizes.len() => {",
+              "(Some(sizes), Some(ids), Some(spans)) if use_index && ids.len() == sizes.len() => {")
+          one("""    if shift_spans.is_none() || ranges_mode == 2 {
+                  dedup_hosts(&mut shifted);
+              }""", """    if shift_spans.is_none() || ranges_mode == 2 {
+                  if use_index {
+                      dedup_hosts(&mut shifted);
+                  } else {
+                      shifted.sort_unstable();
+                      shifted.dedup();
+                  }
+              }""")
+          one("} else if tail_shift_fast_mode() != 0 {\n            document.shift_layout_rects_y(&shifted, dh);",
+              "} else if shift_fast {\n            document.shift_layout_rects_y(&shifted, dh);")
+          one("pub(super) fn try_splice(\n", """fn dot_lazy_host_index() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| {
+                  std::env::var("DOT_LAYOUT_LAZY_HOSTS").as_deref() == Ok("1")
+                      && std::env::var("DOT_LAYOUT_ADAPTIVE_SHIFT").as_deref() == Ok("1")
+              })
+          }
+
+          pub(super) fn try_splice(
+          """)
+          one("    let mut hosts = (super::preorder_hosts_mode() != 0).then(|| cache.component.take_hosts());",
+              """    let mut hosts = if super::preorder_hosts_mode() == 0 {
+                  None
+              } else if dot_lazy_host_index() {
+                  cache.component.hosts.take()
+              } else {
+                  Some(cache.component.take_hosts())
+              };""")
+          one("(hosts.is_some() || owners.is_some())",
+              "(hosts.is_some() || owners.is_some() || dot_lazy_host_index())")
+          one("    let shift_fast = use_index && tail_shift_fast_mode() != 0;", """    if use_index && hosts.is_none() && dot_lazy_host_index() && super::preorder_hosts_mode() != 0 {
+                  *hosts = Some(cache.component.take_hosts());
+                  if adaptive == Some(true) {
+                      eprintln!("[dot-lazy-hosts] constructed");
+                  }
+              }
+              let shift_fast = use_index && tail_shift_fast_mode() != 0;""")
+          p.write_text(s)
+          f = Path("crates/w3cos-runtime/examples/dot_layout_growth.rs")
+          s = f.read_text()
+          one("    assert!([0, 149, 299].contains(&pos));", "    assert!(pos < N);")
+          f.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/adaptive-shift.diff"
+      - name: Verify the lock and build the CPU fixture
+        run: |
+          cp "$RUNNER_TEMP/baseline-artifact/Cargo.lock" Cargo.lock
+          printf '%s  %s\n' 6a19e74d791979e02f90742dc9163686d65c1e083a23bf47e6bd124686229ee4 Cargo.lock | sha256sum --check
+          cp Cargo.lock "$RUNNER_TEMP/growth-evidence/Cargo.lock"
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth --no-default-features --features cpu-render
+      - name: Verify adaptive decisions and fresh geometry
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/Ahem.ttf" "$RUNNER_TEMP/growth-evidence" <<'PY'
+          import json, os, pathlib, re, subprocess, sys
+          out = pathlib.Path(sys.argv[2])
+          exe = "target/runtime-bench/examples/dot_layout_growth"
+          modes = {"default": ("0", "0", "0", "0"), "adaptive": ("1", "1", "1", "1"),
+                   "lazy": ("1", "1", "1", "1"), "lazy-verify": ("1", "1", "verify", "1")}
+          for mode, switches in modes.items():
+              env = dict(os.environ, W3COS_SPLICE_VERIFY="1", W3COS_CSSOM_OWNER_INDEX="0")
+              env["DOT_LAYOUT_LAZY_HOSTS"] = "1" if mode.startswith("lazy") else "0"
+              env.update(zip(("W3COS_TAIL_SHIFT_FAST", "W3COS_PREORDER_HOSTS", "W3COS_TAIL_SHIFT_RANGES",
+                              "DOT_LAYOUT_ADAPTIVE_SHIFT"), switches))
+              for pos in (0, 149, 270, 295, 299):
+                  r = subprocess.run([exe, sys.argv[1], str(pos), "check"], env=env,
+                                     capture_output=True, text=True, timeout=45)
+                  (out / f"{mode}-{pos}.json").write_text(r.stdout)
+                  (out / f"{mode}-{pos}.stderr").write_text(r.stderr)
+                  if r.returncode:
+                      print(r.stderr, file=sys.stderr, flush=True)
+                      raise SystemExit(r.returncode)
+                  result = json.loads(r.stdout)
+                  assert result["cold_parity"] and result["position"] == pos, result
+                  parts = re.split(r"(?m)^\[growth-phase\] (grow|shrink)$", r.stderr)
+                  assert parts[1::2] == ["grow", "shrink"], r.stderr
+                  for phase, receipt in zip(parts[1::2], parts[2::2]):
+                      assert result[phase] == {"kind": "splice", "solved": 2, "shifted": 4 * (299-pos) + 1}, result
+                      rects = re.findall(r"(?m)^\[splice-verify\] root (\d+): \d+ rects, 0 mismatched$", receipt)
+                      owners = re.findall(r"(?m)^\[splice-verify\] root (\d+): \d+ owners, 0 mismatched, 0 extra$", receipt)
+                      assert len(rects) == 1 and owners == rects, receipt
+                      assert not re.search(r"full layout failed|[1-9]\d* mismatched|[1-9]\d* extra|\[tail-shift-ranges-verify\] mismatch", receipt), receipt
+                      if mode == "adaptive" or mode.startswith("lazy"):
+                          choices = re.findall(r"\[dot-adaptive-shift\] width=(\d+) selected=(true|false)", receipt)
+                          assert len(choices) == 1, receipt
+                          width, used = choices[0]
+                          expected = pos <= 270
+                          assert (used == "true") == (int(width) >= 64) == expected, (pos, receipt)
+                          print(json.dumps(dict(phase="choice", mode=mode, position=pos,
+                                                direction=phase, width=int(width), adaptive_used=expected)), flush=True)
+                  if mode.startswith("lazy"):
+                      assert r.stderr.count("[dot-lazy-hosts] constructed") == int(pos <= 270), r.stderr
+                  if mode == "lazy-verify":
+                      assert ("[verify-hit] W3COS_TAIL_SHIFT_RANGES" in r.stderr) == (pos <= 270), r.stderr
+          PY
+      - name: Pair the three W3COS arms with isolated Chrome
+        shell: bash
+        run: |
+          node --version
+          google-chrome --version
+          node scripts/dot-layout-growth-lazy-ab.mjs target/runtime-bench/examples/dot_layout_growth "$RUNNER_TEMP/Ahem.ttf" google-chrome \
+            > "$RUNNER_TEMP/growth-evidence/lazy-ab.jsonl" || { tail -20 "$RUNNER_TEMP/growth-evidence/lazy-ab.jsonl"; exit 1; }
+          grep -E '"phase":"(chrome-geometry|summary)"' "$RUNNER_TEMP/growth-evidence/lazy-ab.jsonl"
+      - name: Archive adaptive run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lazy-host-ab
+          path: ${{ runner.temp }}/growth-evidence
+          if-no-files-found: ignore
