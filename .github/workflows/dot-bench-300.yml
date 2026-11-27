@@ -40,7 +40,11 @@ jobs:
             --output "$RUNNER_TEMP/Ahem.ttf"
           printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
       - name: Build the isolated CPU fixture
-        run: cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth --no-default-features --features cpu-render
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+          cp Cargo.lock "$RUNNER_TEMP/growth-evidence/Cargo.lock"
+          sha256sum Cargo.lock
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth --no-default-features --features cpu-render
       - name: Compare fresh and retained geometry in both directions
         env:
           W3COS_SPLICE_VERIFY: '1'
@@ -67,7 +71,14 @@ jobs:
                   assert len(rects) == 1 and owners == rects, (pos, phase, receipt)
                   assert not re.search(r"full layout failed|[1-9]\d* mismatched|[1-9]\d* extra", receipt), receipt
           PY
-      - name: Save geometry receipts
+      - name: Compare W3COS and Chrome after the geometry gate
+        shell: bash
+        run: |
+          node --version
+          google-chrome --version
+          node scripts/dot-layout-growth-ab.mjs target/runtime-bench/examples/dot_layout_growth "$RUNNER_TEMP/Ahem.ttf" google-chrome \
+            | tee "$RUNNER_TEMP/growth-evidence/paired.jsonl"
+      - name: Save geometry and timing receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
