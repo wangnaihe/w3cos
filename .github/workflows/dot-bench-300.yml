@@ -1,0 +1,76 @@
+name: 300-card geometry experiment
+
+on:
+  push:
+    branches: [dot/bench-300-geometry-20261127]
+    paths:
+      - '.github/workflows/dot-bench-300.yml'
+      - 'crates/w3cos-runtime/examples/dot_layout_growth.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  geometry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      W3COS_LAYOUT_NG: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record revision and install prerequisites
+        run: |
+          git rev-parse HEAD
+          git rev-parse HEAD^
+          printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          rustc --version
+      - name: Pin the test font
+        run: |
+          mkdir -p "$RUNNER_TEMP/growth-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Build the isolated CPU fixture
+        run: cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth --no-default-features --features cpu-render
+      - name: Compare fresh and retained geometry in both directions
+        env:
+          W3COS_SPLICE_VERIFY: '1'
+        run: |
+          out="$RUNNER_TEMP/growth-evidence"
+          for p in 0 149 299; do
+            target/runtime-bench/examples/dot_layout_growth "$RUNNER_TEMP/Ahem.ttf" "$p" check \
+              >"$out/$p.json" 2>"$out/$p.stderr" || { cat "$out/$p.stderr"; exit 1; }
+            cat "$out/$p.json" "$out/$p.stderr"
+          done
+          python3 - "$out" <<'PY'
+          import json, pathlib, re, sys
+          base = pathlib.Path(sys.argv[1])
+          for pos in (0, 149, 299):
+              result = json.loads((base / f"{pos}.json").read_text())
+              assert result["position"] == pos and result["cold_parity"], result
+              assert [result[p]["kind"] for p in ("grow", "shrink")] == ["splice", "splice"], result
+              log = (base / f"{pos}.stderr").read_text()
+              phases = re.split(r"(?m)^\[growth-phase\] (grow|shrink)$", log)
+              assert phases[1::2] == ["grow", "shrink"], log
+              for phase, receipt in zip(phases[1::2], phases[2::2]):
+                  rects = re.findall(r"(?m)^\[splice-verify\] root (\d+): \d+ rects, 0 mismatched$", receipt)
+                  owners = re.findall(r"(?m)^\[splice-verify\] root (\d+): \d+ owners, 0 mismatched, 0 extra$", receipt)
+                  assert len(rects) == 1 and owners == rects, (pos, phase, receipt)
+                  assert not re.search(r"full layout failed|[1-9]\d* mismatched|[1-9]\d* extra", receipt), receipt
+          PY
+      - name: Save geometry receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: growth-geometry
+          path: ${{ runner.temp }}/growth-evidence
+          if-no-files-found: ignore
