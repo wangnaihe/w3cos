@@ -5,6 +5,7 @@ on:
     branches: [dot/bench-300-geometry-20261127]
     paths:
       - '.github/workflows/dot-bench-300-adaptive.yml'
+      - 'scripts/dot-layout-growth-adaptive-ab.mjs'
   workflow_dispatch:
 
 permissions:
