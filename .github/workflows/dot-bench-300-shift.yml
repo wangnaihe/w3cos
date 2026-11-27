@@ -1,0 +1,161 @@
+name: 300-card follower-shift diagnosis
+
+on:
+  push:
+    branches: [dot/bench-300-geometry-20261127]
+    paths:
+      - '.github/workflows/dot-bench-300-shift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  follower-shift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      W3COS_LAYOUT_NG: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record revision and install prerequisites
+        run: |
+          git rev-parse HEAD
+          printf 'Engine revision: %s\n' 9c07e1161378886a2d14efbf1bcb67b5eb2c0114
+          printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          rustc --version
+      - name: Pin the test font
+        run: |
+          mkdir -p "$RUNNER_TEMP/growth-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Gate the draft's Skia-only diagnostic for this CPU build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/retained_layers.rs")
+          s = p.read_text()
+          old = "        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })"
+          assert s.count(old) == 1, "unexpected change to the pinned trace site"
+          p.write_text(s.replace(old, '        #[cfg(feature = "skia")]\n' + old))
+          PY
+          git diff --check
+          git diff -- crates/w3cos-runtime/src/retained_layers.rs | tee "$RUNNER_TEMP/growth-evidence/cpu-trace-guard.diff"
+      - name: Reuse the original successful run's locked dependencies
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45951212053
+          name: growth-geometry
+          path: ${{ runner.temp }}/baseline-artifact
+      - name: Verify the lock and build the CPU fixture
+        run: |
+          cp "$RUNNER_TEMP/baseline-artifact/Cargo.lock" Cargo.lock
+          printf '%s  %s\n' 6a19e74d791979e02f90742dc9163686d65c1e083a23bf47e6bd124686229ee4 Cargo.lock | sha256sum --check
+          cp Cargo.lock "$RUNNER_TEMP/growth-evidence/Cargo.lock"
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth --no-default-features --features cpu-render
+      - name: Check every variant and compare clean timings
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/Ahem.ttf" "$RUNNER_TEMP/growth-evidence" <<'PY'
+          import json, os, pathlib, re, statistics, subprocess, sys
+
+          font, out = sys.argv[1], pathlib.Path(sys.argv[2])
+          exe = "target/runtime-bench/examples/dot_layout_growth"
+          positions = (0, 149, 299)
+          expected_shifts = {0: 1197, 149: 601, 299: 1}
+          modes = {
+              "default": ("0", "0", "0"),
+              "fast": ("1", "0", "0"),
+              "preorder": ("1", "1", "0"),
+              "ranges": ("1", "1", "1"),
+          }
+          def process(mode, pos, check=False):
+              flags = modes[mode] if mode != "range-verify" else ("1", "1", "verify")
+              env = dict(os.environ, W3COS_CSSOM_OWNER_INDEX="0")
+              env.update(zip(("W3COS_TAIL_SHIFT_FAST", "W3COS_PREORDER_HOSTS", "W3COS_TAIL_SHIFT_RANGES"), flags))
+              env.pop("W3COS_SPLICE_VERIFY", None)
+              if check:
+                  env["W3COS_SPLICE_VERIFY"] = "1"
+              p = subprocess.run([exe, font, str(pos)] + (["check"] if check else []),
+                                 env=env, capture_output=True, text=True, timeout=45)
+              if check or p.returncode:
+                  (out / f"{mode}-{pos}.stdout").write_text(p.stdout)
+                  (out / f"{mode}-{pos}.stderr").write_text(p.stderr)
+              if p.returncode:
+                  print(p.stdout, p.stderr, file=sys.stderr, flush=True)
+                  raise SystemExit(p.returncode)
+              return json.loads(p.stdout), p.stderr
+
+          def verify_geometry(j, pos):
+              assert j["cold_parity"] and j["position"] == pos, j
+              for direction in ("grow", "shrink"):
+                  assert j[direction] == {"kind": "splice", "solved": 2, "shifted": expected_shifts[pos]}, j
+
+          for mode in [*modes, "range-verify"]:
+              for pos in positions:
+                  j, log = process(mode, pos, check=True)
+                  verify_geometry(j, pos)
+                  parts = re.split(r"(?m)^\[growth-phase\] (grow|shrink)$", log)
+                  assert parts[1::2] == ["grow", "shrink"], log
+                  for receipt in parts[2::2]:
+                      rects = re.findall(r"(?m)^\[splice-verify\] root (\d+): \d+ rects, 0 mismatched$", receipt)
+                      owners = re.findall(r"(?m)^\[splice-verify\] root (\d+): \d+ owners, 0 mismatched, 0 extra$", receipt)
+                      assert len(rects) == 1 and owners == rects, receipt
+                  assert not re.search(r"full layout failed|[1-9]\d* mismatched|[1-9]\d* extra|\[tail-shift-ranges-verify\] mismatch", log), log
+                  if mode == "range-verify":
+                      assert "[verify-hit] W3COS_TAIL_SHIFT_RANGES" in log, log
+                  print(json.dumps(dict(phase="check", mode=mode, **j)), flush=True)
+
+          # Four cyclic schedules plus their reverse, so each variant starts
+          # twice at each position. Fresh native process for every cell.
+          schedule = [tuple(modes)[i:] + tuple(modes)[:i] for i in range(4)]
+          schedule += [p[::-1] for p in schedule]
+          rows = []
+          with (out / "shift-ab.jsonl").open("w", buffering=1) as report:
+              for trial, order in enumerate(schedule):
+                  positions_order = positions[trial % 3:] + positions[:trial % 3]
+                  for pos in positions_order:
+                      for mode in order:
+                          j, _ = process(mode, pos)
+                          verify_geometry(j["check"], pos)
+                          assert j["ops_per_batch"] == 128 and len(j["samples"]) == 20, j
+                          assert all(s["wall_ns"] > 0 and s["thread_cpu_ns"] > 0 for s in j["samples"]), j
+                          row = {
+                              "trial": trial, "position": pos, "mode": mode,
+                              "wall_us": statistics.median(s["wall_ns"] for s in j["samples"]) / 128000,
+                              "cpu_us": statistics.median(s["thread_cpu_ns"] for s in j["samples"]) / 128000,
+                              "samples": j["samples"],
+                          }
+                          rows.append(row)
+                          report.write(json.dumps(row) + "\n")
+          for pos in positions:
+              baseline = [r for r in rows if r["position"] == pos and r["mode"] == "default"]
+              for mode in modes:
+                  arm = [r for r in rows if r["position"] == pos and r["mode"] == mode]
+                  assert len(arm) == len(baseline) == 8
+                  summary = dict(phase="summary", position=pos, mode=mode,
+                                 wall_us=statistics.median(r["wall_us"] for r in arm),
+                                 cpu_us=statistics.median(r["cpu_us"] for r in arm),
+                                 paired_wall_delta_us=[r["wall_us"] - b["wall_us"] for r, b in zip(arm, baseline)])
+                  print(json.dumps(summary), flush=True)
+                  with (out / "shift-summary.jsonl").open("a") as f:
+                      f.write(json.dumps(summary) + "\n")
+          PY
+      - name: Archive all evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: follower-shift-ab
+          path: ${{ runner.temp }}/growth-evidence
+          if-no-files-found: ignore
