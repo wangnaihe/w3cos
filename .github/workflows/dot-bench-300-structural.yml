@@ -528,7 +528,7 @@ jobs:
                       emit(f, dict(phase="verified", variant=variant, edit=i, path=paths[0],
                                    events=events, shared=bool(seen), exact=exact, tail_rect=result["edits"][i]["tail_rect"]))
 
-            PY
+          PY
       - name: Run published, consecutive unread deferred, and forced fallback fixture lanes
         shell: bash
         run: |
