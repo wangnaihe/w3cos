@@ -1,0 +1,594 @@
+name: Qualify layout insertions, removals and fallback
+
+on:
+  push:
+    branches: [dot/bench-300-geometry-20261127]
+    paths:
+      - '.github/workflows/dot-bench-300-structural.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  structural:
+    runs-on: ubuntu-latest
+    timeout-minutes: 38
+    env:
+      CARGO_INCREMENTAL: '0'
+      W3COS_LAYOUT_NG: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record revision and install prerequisites
+        run: |
+          git rev-parse HEAD
+          printf 'Engine revision: %s\n' 9c07e1161378886a2d14efbf1bcb67b5eb2c0114
+          printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          rustc --version
+      - name: Pin the test font
+        run: |
+          mkdir -p "$RUNNER_TEMP/growth-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Gate the draft's Skia-only diagnostic for this CPU build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/retained_layers.rs")
+          s = p.read_text()
+          old = "        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })"
+          assert s.count(old) == 1, "unexpected change to the pinned trace site"
+          p.write_text(s.replace(old, '        #[cfg(feature = "skia")]\n' + old))
+          PY
+          git diff --check
+          git diff -- crates/w3cos-runtime/src/retained_layers.rs | tee "$RUNNER_TEMP/growth-evidence/cpu-trace-guard.diff"
+      - name: Reuse the original successful run's locked dependencies
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45951212053
+          name: growth-geometry
+          path: ${{ runner.temp }}/baseline-artifact
+      - name: Stage the opt-in adaptive cutoff in this checkout
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          def one(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+
+          one("""    let ranges_mode = if tail_shift_fast_mode() != 0 && super::preorder_hosts_mode() != 0 {
+                  tail_shift_ranges_mode()
+              } else {
+                  0
+              };
+          """, "")
+          one("    let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {", """    // Experiment only. Width is in layout boxes, not unique DOM hosts.
+              static DOT_ADAPTIVE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+              let adaptive = *DOT_ADAPTIVE.get_or_init(|| {
+                  (std::env::var("DOT_LAYOUT_ADAPTIVE_SHIFT").as_deref() == Ok("1"))
+                      .then(|| std::env::var_os("W3COS_SPLICE_VERIFY").is_some())
+              });
+              let use_index = adaptive.is_none_or(|audit| {
+                  let width: usize = moved_spans
+                      .as_ref()
+                      .map_or(0, |spans| spans.iter().map(|&(a, b)| b - a).sum());
+                  let selected = matches!(commit, PlanKind::Subtree(_)) && width >= 64;
+                  if audit {
+                      eprintln!("[dot-adaptive-shift] width={width} selected={selected}");
+                  }
+                  selected
+              });
+              let shift_fast = use_index && tail_shift_fast_mode() != 0;
+              let ranges_mode = if shift_fast && super::preorder_hosts_mode() != 0 {
+                  tail_shift_ranges_mode()
+              } else {
+                  0
+              };
+              let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {""")
+          one("(Some(sizes), Some(ids), Some(spans)) if ids.len() == sizes.len() => {",
+              "(Some(sizes), Some(ids), Some(spans)) if use_index && ids.len() == sizes.len() => {")
+          one("""    if shift_spans.is_none() || ranges_mode == 2 {
+                  dedup_hosts(&mut shifted);
+              }""", """    if shift_spans.is_none() || ranges_mode == 2 {
+                  if use_index {
+                      dedup_hosts(&mut shifted);
+                  } else {
+                      shifted.sort_unstable();
+                      shifted.dedup();
+                  }
+              }""")
+          one("} else if tail_shift_fast_mode() != 0 {\n            document.shift_layout_rects_y(&shifted, dh);",
+              "} else if shift_fast {\n            document.shift_layout_rects_y(&shifted, dh);")
+          one("pub(super) fn try_splice(\n", """fn dot_lazy_host_index() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| {
+                  std::env::var("DOT_LAYOUT_LAZY_HOSTS").as_deref() == Ok("1")
+                      && std::env::var("DOT_LAYOUT_ADAPTIVE_SHIFT").as_deref() == Ok("1")
+              })
+          }
+
+          pub(super) fn try_splice(
+          """)
+          one("    let mut hosts = (super::preorder_hosts_mode() != 0).then(|| cache.component.take_hosts());",
+              """    let mut hosts = if super::preorder_hosts_mode() == 0 {
+                  None
+              } else if dot_lazy_host_index() {
+                  cache.component.hosts.take()
+              } else {
+                  Some(cache.component.take_hosts())
+              };""")
+          one("(hosts.is_some() || owners.is_some())",
+              "(hosts.is_some() || owners.is_some() || dot_lazy_host_index())")
+          one("    let shift_fast = use_index && tail_shift_fast_mode() != 0;", """    if use_index && hosts.is_none() && dot_lazy_host_index() && super::preorder_hosts_mode() != 0 {
+                  *hosts = Some(cache.component.take_hosts());
+                  if adaptive == Some(true) {
+                      eprintln!("[dot-lazy-hosts] constructed");
+                  }
+              }
+              let shift_fast = use_index && tail_shift_fast_mode() != 0;""")
+          one("            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));",
+              """            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));
+                      if super::cssom_owner_index_mode() == 2 {
+                          eprintln!("[dot-cssom-owner-range] used");
+                      }""")
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/adaptive-shift.diff"
+      - name: Trace native commits only during the untimed geometry check
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout.rs")
+          s = p.read_text()
+          entry = "fn note_flush(kind: &'static str, solved_nodes: u32, shifted_nodes: u32) {"
+          assert s.count(entry) == 1
+          s = s.replace(entry, """fn dot_stable_trace() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| std::env::var_os("DOT_STABLE_TRACE").is_some())
+          }
+
+          """ + entry + """
+              if dot_stable_trace() {
+                  eprintln!("[dot-stable-path] {kind} solved={solved_nodes} shifted={shifted_nodes}");
+              }""")
+          definite = "    if crate::definite_layout::try_apply() {"
+          assert s.count(definite) == 1
+          s = s.replace(definite, definite + """
+                  if dot_stable_trace() {
+                      eprintln!("[dot-stable-path] definite solved=0 shifted=0");
+                  }""")
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/stable-height.diff"
+      - name: Defer the owner index in the opt-in arm and trace its life cycle
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          def one(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+
+          one("pub(super) fn try_splice(\n", """fn dot_lazy_owner_index() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| std::env::var("DOT_LAYOUT_LAZY_OWNER").as_deref() == Ok("1"))
+          }
+
+          pub(super) fn try_splice(
+          """)
+          one("    let mut owners = (super::cssom_owner_index_mode() != 0).then(|| cache.component.take_owners());", """    let mut owners = if super::cssom_owner_index_mode() == 0 {
+                  None
+              } else if dot_lazy_owner_index() {
+                  cache.component.owners.take()
+              } else {
+                  let present = cache.component.owners.is_some();
+                  let kept = cache.component.take_owners();
+                  if !present && super::dot_stable_trace() {
+                      eprintln!("[dot-owner] build-eager");
+                  }
+                  Some(kept)
+              };
+              if super::dot_stable_trace() {
+                  eprintln!("[dot-owner] entry-present={}", owners.is_some());
+              }""")
+          one("(hosts.is_some() || owners.is_some() || dot_lazy_host_index())",
+              "(hosts.is_some() || owners.is_some() || dot_lazy_host_index() || (dot_lazy_owner_index() && super::cssom_owner_index_mode() != 0))")
+          one("    let owners_by_range = match (preorder.as_deref(), owners.as_deref(), moved_spans.as_ref()) {",
+              """    // The speculative subtree solve has restored the retained component
+              // tree. Both its preorder sizes and its old owner list are still
+              // valid for these moved spans, before the commit below.
+              if dot_lazy_owner_index() && super::cssom_owner_index_mode() != 0 && owners.is_none()
+                  && !rebase && matches!(commit, PlanKind::Subtree(_))
+              {
+                  let width: usize = moved_spans.as_ref()
+                      .map_or(0, |spans| spans.iter().map(|&(a, b)| b - a).sum());
+                  if width >= 64 {
+                      *owners = Some(cache.component.take_owners());
+                      if super::dot_stable_trace() {
+                          eprintln!("[dot-owner] build-late width={width}");
+                      }
+                  }
+              }
+              let owners_by_range = match (preorder.as_deref(), owners.as_deref(), moved_spans.as_ref()) {""")
+          one("            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));",
+              """            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));
+                      if super::dot_stable_trace() {
+                          eprintln!("[dot-owner] range");
+                      }""")
+          one("    index.splice(removed_start..removed_end, fresh);", """    index.splice(removed_start..removed_end, fresh);
+              if super::dot_stable_trace() {
+                  eprintln!("[dot-owner] update");
+              }""")
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/lazy-owner.diff"
+      - name: Resolve the old preorder span once in the experimental Subtree arm
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          def one(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+
+          one("    match commit {\n        PlanKind::Subtree(fresh) => {\n            // A subtree swap", "    match commit {\n        PlanKind::Subtree(fresh) => {\n            // A subtree swap")
+          old = """                        splice_hosts(hosts, sizes, parent, at, 1, std::slice::from_ref(&fresh));
+                                  splice_owners(owners, sizes, parent, at, 1, std::slice::from_ref(&fresh));
+                                  splice_preorder(sizes, parent, at, 1, std::slice::from_ref(&fresh));"""
+          one(old, """                        let inserted = std::slice::from_ref(&fresh);
+                                  if dot_share_span() {
+                                      // The sizes still describe the old tree. Do not mutate
+                                      // them until both companion indexes use this old range.
+                                      let (starts, begin, end) = preorder_span(sizes, parent, at, 1);
+                                      splice_hosts_at(hosts, sizes.len(), begin, end, inserted);
+                                      splice_owners_at(owners, sizes.len(), begin, end, inserted);
+                                      splice_preorder_at(sizes, (starts, begin, end), inserted);
+                                      if super::dot_stable_trace() {
+                                          eprintln!("[dot-shared-span] subtree");
+                                      }
+                                  } else {
+                                      splice_hosts(hosts, sizes, parent, at, 1, inserted);
+                                      splice_owners(owners, sizes, parent, at, 1, inserted);
+                                      splice_preorder(sizes, parent, at, 1, inserted);
+                                  }""")
+          one("/// Update preorder \x60sizes\x60 (still describing the old tree)", """fn dot_share_span() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| std::env::var("DOT_LAYOUT_SHARED_SPAN").as_deref() == Ok("1"))
+          }
+
+          /// Update preorder \x60sizes\x60 (still describing the old tree)""")
+          one("""    let (starts, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+              let mut fresh = Vec::new();""", """    let span = preorder_span(sizes, path, keep, removed);
+              splice_preorder_at(sizes, span, inserted);
+          }
+
+          fn splice_preorder_at(
+              sizes: &mut Vec<u32>,
+              (starts, removed_start, removed_end): (Vec<usize>, usize, usize),
+              inserted: &[Component],
+          ) {
+              let mut fresh = Vec::new();""")
+          for field, var, ty, make in [
+              ("hosts", "ids", "Vec<u32>", "preorder_hosts_of"),
+              ("owners", "index", "super::CssomOwnerIndex", "preorder_owners_of"),
+          ]:
+              one(f"""    let Some({var}) = {field}.as_mut() else {{
+                  return;
+              }};
+              if {var}.len() != sizes.len() {{
+                  *{field} = None;
+                  return;
+              }}
+              let (_, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+              let mut fresh = Vec::new();
+              for item in inserted {{
+                  fresh.extend(super::{make}(item));
+              }}""", f"""    match {field}.as_ref() {{
+                  Some(kept) if kept.len() == sizes.len() => {{}}
+                  Some(_) => {{
+                      *{field} = None;
+                      return;
+                  }}
+                  None => return,
+              }}
+              let (_, removed_start, removed_end) = preorder_span(sizes, path, keep, removed);
+              splice_{field}_at({field}, sizes.len(), removed_start, removed_end, inserted);
+          }}
+
+          fn splice_{field}_at(
+              {field}: &mut Option<{ty}>,
+              old_len: usize,
+              removed_start: usize,
+              removed_end: usize,
+              inserted: &[Component],
+          ) {{
+              let Some({var}) = {field}.as_mut() else {{
+                  return;
+              }};
+              if {var}.len() != old_len {{
+                  *{field} = None;
+                  return;
+              }}
+              let mut fresh = Vec::new();
+              for item in inserted {{
+                  fresh.extend(super::{make}(item));
+              }}""")
+          one("    if preorder.is_none() {\n        *hosts = None;", """    if dot_share_span() && super::dot_stable_trace() && let Some(kept) = preorder.as_ref() {
+                  assert_eq!(*kept, super::preorder_sizes_of(&cache.component));
+                  if let Some(kept) = hosts.as_ref() {
+                      assert_eq!(*kept, super::preorder_hosts_of(&cache.component));
+                  }
+                  if let Some(kept) = owners.as_ref() {
+                      assert_eq!(*kept, super::preorder_owners_of(&cache.component));
+                  }
+                  eprintln!("[dot-shared-index-compare] sizes=true hosts={} owners={}", hosts.is_some(), owners.is_some());
+              }
+              if preorder.is_none() {
+                  *hosts = None;""")
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/shared-span.diff"
+      - name: Add structural branch receipts and seed exact old indexes in candidate fixtures
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          def one(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+
+          one("    let root = &*cache.component;\n    if let Some(sizes) = preorder {",
+              """    if super::dot_stable_trace() {
+                  eprintln!("[dot-structural] consumed-pending-rebase");
+              }
+              let root = &*cache.component;
+              if let Some(sizes) = preorder {""")
+          one("    fn check(label: &str) {",
+              """    // Independent structural test setup: populate exactly the three
+              // production caches, without settling any deferred rectangles.
+              fn dot_structural_seed() {
+                  if dot_share_span() {
+                      super::super::CACHE.with(|slot| {
+                          let mut slot = slot.borrow_mut();
+                          let tree = &mut slot.as_mut().expect("initial layout").component;
+                          let sizes = tree.take_preorder();
+                          let hosts = tree.take_hosts();
+                          let owners = tree.take_owners();
+                          tree.put_preorder(sizes);
+                          tree.put_hosts(hosts);
+                          tree.put_owners(owners);
+                      });
+                      eprintln!("[dot-structural] seeded-exact-indexes");
+                  }
+              }
+
+              fn dot_structural_kept() {
+                  if dot_share_span() {
+                      super::super::CACHE.with(|slot| {
+                          let slot = slot.borrow();
+                          let tree = &slot.as_ref().expect("incremental cache").component;
+                          assert_eq!(tree.preorder.as_ref().expect("sizes"), &super::super::preorder_sizes_of(tree));
+                          assert_eq!(tree.hosts.as_ref().expect("hosts"), &super::super::preorder_hosts_of(tree));
+                          assert_eq!(tree.owners.as_ref().expect("owners"), &super::super::preorder_owners_of(tree));
+                      });
+                      eprintln!("[dot-structural] all-kept-indexes-exact");
+                  }
+              }
+
+              fn check(label: &str) {""")
+
+          def fixture(name, fn):
+              global s
+              at = s.index(f"    fn {name}() {{")
+              end = s.index("\n    }", at) + len("\n    }")
+              s = s[:at] + fn(s[at:end]) + s[end:]
+
+          def published(t):
+              t = t.replace('        check("initial");', '        check("initial");\n        dot_structural_seed();')
+              for step in ["remove middle", "reinsert middle", "move last up", "insert new", "remove tail two"]:
+                  old = f'        check("{step}");'
+                  assert t.count(old) == 1
+                  t = t.replace(old, old + f'\n        dot_structural_kept();\n        eprintln!("[dot-structural] published {step}");')
+              return t
+          fixture("column_flex_child_list_edits_keep_untouched_items", published)
+
+          def deferred(t):
+              t = t.replace("        let before = child_splices();", """        assert!(super::super::client_rects_pending(), "initial fragment payload");
+                  dot_structural_seed();
+                  let before = child_splices();
+                  eprintln!("[dot-structural] deferred-window-start");""")
+              start = t.index('        check("remove then prepend, deferred");')
+              head, finish = t[:start], t[start:]
+              head = head.replace("        assert!(crate::incremental_layout::flush());",
+                                  """        assert!(crate::incremental_layout::flush());
+                  assert!(super::super::client_rects_pending(), "do not settle between flushes");
+                  dot_structural_kept();
+                  eprintln!("[dot-structural] pending-after-flush");""")
+              return head + '        eprintln!("[dot-structural] deferred-window-end");\n' + finish
+          fixture("column_flex_child_list_edits_move_deferred_client_rects", deferred)
+
+          def fallback(t):
+              old = "        let before = child_splices();"
+              t = t.replace(old, "        dot_structural_seed();\n" + old)
+              old = '        check("remove list item");'
+              assert t.count(old) == 1
+              return t.replace(old, """        assert_eq!(crate::incremental_layout::last_flush_stats().kind, "rebuild");
+                  eprintln!("[dot-structural] actual-counter-rebuild");
+                  check("remove list item");""")
+          fixture("column_flex_child_list_edit_with_counters_rebuilds", fallback)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/structural-qualification.diff"
+      - name: Verify the lock and build the CPU fixture
+        run: |
+          cp "$RUNNER_TEMP/baseline-artifact/Cargo.lock" Cargo.lock
+          printf '%s  %s\n' 6a19e74d791979e02f90742dc9163686d65c1e083a23bf47e6bd124686229ee4 Cargo.lock | sha256sum --check
+          cp Cargo.lock "$RUNNER_TEMP/growth-evidence/Cargo.lock"
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth_lazy_owner --no-default-features --features cpu-render
+      - name: Reconfirm actual wide and narrow shared index parity
+        run: |
+          python3 - "$RUNNER_TEMP/Ahem.ttf" "$RUNNER_TEMP/growth-evidence" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from statistics import median
+          import subprocess
+          import sys
+
+          font, evidence_dir = sys.argv[1:]
+          out = Path(evidence_dir)
+          exe = "target/runtime-bench/examples/dot_layout_growth_lazy_owner"
+          variants = ("default", "lazy-owner", "shared-span")
+          modes = ("cold-tail", "primed-tail", "wide")
+          flags = ("W3COS_TAIL_SHIFT_FAST", "W3COS_PREORDER_HOSTS", "W3COS_TAIL_SHIFT_RANGES",
+                   "DOT_LAYOUT_ADAPTIVE_SHIFT", "DOT_LAYOUT_LAZY_HOSTS")
+
+          def proc(variant, mode, round_name):
+              env = os.environ.copy()
+              candidate = variant != "default"
+              verify = mode == "check"
+              env.update(dict.fromkeys(flags, "1" if candidate else "0"))
+              env["DOT_LAYOUT_LAZY_OWNER"] = str(int(candidate))
+              env["DOT_LAYOUT_SHARED_SPAN"] = str(int(variant == "shared-span"))
+              env["W3COS_PREORDER_SIZES"] = "verify" if verify else "1"
+              if verify and candidate:
+                  env["W3COS_PREORDER_HOSTS"] = "verify"
+              env["W3COS_CSSOM_OWNER_INDEX"] = ("verify" if verify else "1") if candidate else "0"
+              env.pop("DOT_STABLE_TRACE", None)
+              env.pop("W3COS_SPLICE_VERIFY", None)
+              if verify:
+                  env["DOT_STABLE_TRACE"] = "1"
+              p = subprocess.run([exe, font, mode], env=env, capture_output=True, text=True, timeout=120)
+              if verify or p.returncode:
+                  (out / f"{variant}-{mode}-{round_name}.stderr").write_text(p.stderr)
+              if p.returncode:
+                  print(f"{variant}: {mode}: {p.stdout}\n{p.stderr}", file=sys.stderr)
+                  raise SystemExit(p.returncode)
+              return json.loads(p.stdout), p.stderr
+
+          def emit(f, obj):
+              line = json.dumps(obj, separators=(",", ":"))
+              print(line, file=f, flush=True)
+              if obj["phase"] != "trial":
+                  print(line, flush=True)
+
+          with (out / "shared-span.jsonl").open("w") as f:
+              for variant in variants:
+                  result, log = proc(variant, "check", "geometry")
+                  assert result["fresh_parity"] and len(result["edits"]) == 6, result
+                  assert not re.search(r"\[(?:cssom-owner-index|preorder-(?:hosts|sizes))-verify\] mismatch", log), log
+                  phases = re.split(r"(?m)^\[mixed-phase\] edit=(\d+)$", log)
+                  assert phases[1::2] == list("012345"), log
+                  for phase, receipt in zip(phases[1::2], phases[2::2]):
+                      i = int(phase)
+                      wide = i in (1, 3)
+                      paths = re.findall(r"(?m)^\[dot-stable-path\] (\w+) solved=(\d+) shifted=(\d+)$", receipt)
+                      assert paths == [("splice", "2", "4797" if wide else "0")], receipt
+                      events = re.findall(r"(?m)^\[dot-owner\] (.*)$", receipt)
+                      if variant == "default":
+                          expected = ["entry-present=false"]
+                      else:
+                          expected = ["entry-present=" + ("true" if i > 1 else "false")]
+                          if i == 1:
+                              expected += ["build-late width=4797"]
+                      if variant != "default" and wide:
+                          expected.append("range")
+                      if variant != "default" and i >= 1:
+                          expected.append("update")
+                      assert events == expected, (variant, i, expected, events, receipt)
+                      seen = re.findall(r"(?m)^\[dot-shared-span\] subtree$", receipt)
+                      assert len(seen) == int(variant == "shared-span"), receipt
+                      exact = re.findall(r"(?m)^\[dot-shared-index-compare\] sizes=true hosts=(\w+) owners=(\w+)$", receipt)
+                      present = "false" if i == 0 else "true"
+                      assert exact == ([(present,present)] if variant == "shared-span" else []), receipt
+                      emit(f, dict(phase="verified", variant=variant, edit=i, path=paths[0],
+                                   events=events, shared=bool(seen), exact=exact, tail_rect=result["edits"][i]["tail_rect"]))
+
+            PY
+      - name: Run published, consecutive unread deferred, and forced fallback fixture lanes
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset W3COS_SPLICE_VERIFY W3COS_RETAIN_LOWERING_VERIFY
+          export W3COS_PREORDER_SIZES=verify DOT_STABLE_TRACE=1
+          cargo test --locked --profile runtime-bench -p w3cos-runtime --lib --no-default-features --features cpu-render --no-run
+          for lane in published deferred counters; do
+            case "$lane" in
+              published) name=column_flex_child_list_edits_keep_untouched_items ;;
+              deferred) name=column_flex_child_list_edits_move_deferred_client_rects ;;
+              counters) name=column_flex_child_list_edit_with_counters_rebuilds ;;
+            esac
+            for mode in default candidate; do
+              if [ "$mode" = candidate ]; then
+                export W3COS_TAIL_SHIFT_FAST=1 W3COS_PREORDER_HOSTS=verify W3COS_TAIL_SHIFT_RANGES=1
+                export W3COS_CSSOM_OWNER_INDEX=verify DOT_LAYOUT_ADAPTIVE_SHIFT=1 DOT_LAYOUT_LAZY_HOSTS=1
+                export DOT_LAYOUT_LAZY_OWNER=1 DOT_LAYOUT_SHARED_SPAN=1
+              else
+                export W3COS_TAIL_SHIFT_FAST=0 W3COS_PREORDER_HOSTS=0 W3COS_TAIL_SHIFT_RANGES=0
+                export W3COS_CSSOM_OWNER_INDEX=0 DOT_LAYOUT_ADAPTIVE_SHIFT=0 DOT_LAYOUT_LAZY_HOSTS=0
+                export DOT_LAYOUT_LAZY_OWNER=0 DOT_LAYOUT_SHARED_SPAN=0
+              fi
+              log="$RUNNER_TEMP/growth-evidence/$lane-$mode.log"
+              cargo test --locked --profile runtime-bench -p w3cos-runtime --lib --no-default-features --features cpu-render "$name" -- --nocapture --test-threads=1 2>&1 | tee "$log"
+              grep -F '1 passed; 0 failed;' "$log"
+              if grep -E '\[(cssom-owner-index|preorder-(hosts|sizes))-verify\] mismatch' "$log"; then
+                echo "index mismatch in $lane/$mode" >&2
+                exit 1
+              fi
+            done
+          done
+          python3 - "$RUNNER_TEMP/growth-evidence" <<'PY'
+          from pathlib import Path
+          import json
+          import sys
+          out = Path(sys.argv[1])
+          for mode in ("default", "candidate"):
+              pub = (out / f"published-{mode}.log").read_text()
+              df = (out / f"deferred-{mode}.log").read_text()
+              count = (out / f"counters-{mode}.log").read_text()
+              begin = "[dot-structural] deferred-window-start"
+              end = "[dot-structural] deferred-window-end"
+              assert df.count(begin) == df.count(end) == 1, df
+              window = df.split(begin)[1].split(end)[0]
+              assert pub.count("[dot-structural] published ") == 5, pub
+              assert "[dot-structural] actual-counter-rebuild" in count, count
+              assert window.count("[dot-structural] consumed-pending-rebase") == 2, window
+              assert window.count("[dot-structural] pending-after-flush") == 2, window
+              assert pub.count("[dot-structural] all-kept-indexes-exact") == (5 if mode == "candidate" else 0), pub
+              assert window.count("[dot-structural] all-kept-indexes-exact") == (2 if mode == "candidate" else 0), window
+              assert pub.count("[dot-structural] consumed-pending-rebase") == 0, pub
+              print(json.dumps(dict(phase="structural", mode=mode, published=5,
+                                    consecutive_pending_rebases=2, fallback="rebuild",
+                                    exact_kept_checks=7 if mode == "candidate" else 0)), flush=True)
+          PY
+      - name: Archive same-height evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: structural-layout-evidence
+          path: ${{ runner.temp }}/growth-evidence
+          if-no-files-found: ignore
