@@ -1,0 +1,231 @@
+name: Same-height text layout comparison
+
+on:
+  push:
+    branches: [dot/bench-300-geometry-20261127]
+    paths:
+      - '.github/workflows/dot-bench-300-stable.yml'
+      - 'scripts/dot-layout-growth-stable-ab.mjs'
+      - 'crates/w3cos-runtime/examples/dot_layout_growth_stable.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      W3COS_LAYOUT_NG: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record revision and install prerequisites
+        run: |
+          git rev-parse HEAD
+          printf 'Engine revision: %s\n' 9c07e1161378886a2d14efbf1bcb67b5eb2c0114
+          printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          rustc --version
+      - name: Pin the test font
+        run: |
+          mkdir -p "$RUNNER_TEMP/growth-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Gate the draft's Skia-only diagnostic for this CPU build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/retained_layers.rs")
+          s = p.read_text()
+          old = "        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })"
+          assert s.count(old) == 1, "unexpected change to the pinned trace site"
+          p.write_text(s.replace(old, '        #[cfg(feature = "skia")]\n' + old))
+          PY
+          git diff --check
+          git diff -- crates/w3cos-runtime/src/retained_layers.rs | tee "$RUNNER_TEMP/growth-evidence/cpu-trace-guard.diff"
+      - name: Reuse the original successful run's locked dependencies
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45951212053
+          name: growth-geometry
+          path: ${{ runner.temp }}/baseline-artifact
+      - name: Stage the opt-in adaptive cutoff in this checkout
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          def one(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+
+          one("""    let ranges_mode = if tail_shift_fast_mode() != 0 && super::preorder_hosts_mode() != 0 {
+                  tail_shift_ranges_mode()
+              } else {
+                  0
+              };
+          """, "")
+          one("    let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {", """    // Experiment only. Width is in layout boxes, not unique DOM hosts.
+              static DOT_ADAPTIVE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+              let adaptive = *DOT_ADAPTIVE.get_or_init(|| {
+                  (std::env::var("DOT_LAYOUT_ADAPTIVE_SHIFT").as_deref() == Ok("1"))
+                      .then(|| std::env::var_os("W3COS_SPLICE_VERIFY").is_some())
+              });
+              let use_index = adaptive.is_none_or(|audit| {
+                  let width: usize = moved_spans
+                      .as_ref()
+                      .map_or(0, |spans| spans.iter().map(|&(a, b)| b - a).sum());
+                  let selected = matches!(commit, PlanKind::Subtree(_)) && width >= 64;
+                  if audit {
+                      eprintln!("[dot-adaptive-shift] width={width} selected={selected}");
+                  }
+                  selected
+              });
+              let shift_fast = use_index && tail_shift_fast_mode() != 0;
+              let ranges_mode = if shift_fast && super::preorder_hosts_mode() != 0 {
+                  tail_shift_ranges_mode()
+              } else {
+                  0
+              };
+              let by_range = match (preorder.as_deref(), hosts.as_deref(), moved_spans.as_ref()) {""")
+          one("(Some(sizes), Some(ids), Some(spans)) if ids.len() == sizes.len() => {",
+              "(Some(sizes), Some(ids), Some(spans)) if use_index && ids.len() == sizes.len() => {")
+          one("""    if shift_spans.is_none() || ranges_mode == 2 {
+                  dedup_hosts(&mut shifted);
+              }""", """    if shift_spans.is_none() || ranges_mode == 2 {
+                  if use_index {
+                      dedup_hosts(&mut shifted);
+                  } else {
+                      shifted.sort_unstable();
+                      shifted.dedup();
+                  }
+              }""")
+          one("} else if tail_shift_fast_mode() != 0 {\n            document.shift_layout_rects_y(&shifted, dh);",
+              "} else if shift_fast {\n            document.shift_layout_rects_y(&shifted, dh);")
+          one("pub(super) fn try_splice(\n", """fn dot_lazy_host_index() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| {
+                  std::env::var("DOT_LAYOUT_LAZY_HOSTS").as_deref() == Ok("1")
+                      && std::env::var("DOT_LAYOUT_ADAPTIVE_SHIFT").as_deref() == Ok("1")
+              })
+          }
+
+          pub(super) fn try_splice(
+          """)
+          one("    let mut hosts = (super::preorder_hosts_mode() != 0).then(|| cache.component.take_hosts());",
+              """    let mut hosts = if super::preorder_hosts_mode() == 0 {
+                  None
+              } else if dot_lazy_host_index() {
+                  cache.component.hosts.take()
+              } else {
+                  Some(cache.component.take_hosts())
+              };""")
+          one("(hosts.is_some() || owners.is_some())",
+              "(hosts.is_some() || owners.is_some() || dot_lazy_host_index())")
+          one("    let shift_fast = use_index && tail_shift_fast_mode() != 0;", """    if use_index && hosts.is_none() && dot_lazy_host_index() && super::preorder_hosts_mode() != 0 {
+                  *hosts = Some(cache.component.take_hosts());
+                  if adaptive == Some(true) {
+                      eprintln!("[dot-lazy-hosts] constructed");
+                  }
+              }
+              let shift_fast = use_index && tail_shift_fast_mode() != 0;""")
+          one("            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));",
+              """            super::CSSOM_OWNER_INDEX_RANGED.with(|n| n.set(n.get() + 1));
+                      if super::cssom_owner_index_mode() == 2 {
+                          eprintln!("[dot-cssom-owner-range] used");
+                      }""")
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/adaptive-shift.diff"
+      - name: Trace native commits only during the untimed geometry check
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout.rs")
+          s = p.read_text()
+          entry = "fn note_flush(kind: &'static str, solved_nodes: u32, shifted_nodes: u32) {"
+          assert s.count(entry) == 1
+          s = s.replace(entry, """fn dot_stable_trace() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| std::env::var_os("DOT_STABLE_TRACE").is_some())
+          }
+
+          """ + entry + """
+              if dot_stable_trace() {
+                  eprintln!("[dot-stable-path] {kind} solved={solved_nodes} shifted={shifted_nodes}");
+              }""")
+          definite = "    if crate::definite_layout::try_apply() {"
+          assert s.count(definite) == 1
+          s = s.replace(definite, definite + """
+                  if dot_stable_trace() {
+                      eprintln!("[dot-stable-path] definite solved=0 shifted=0");
+                  }""")
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/stable-height.diff"
+      - name: Verify the lock and build the CPU fixture
+        run: |
+          cp "$RUNNER_TEMP/baseline-artifact/Cargo.lock" Cargo.lock
+          printf '%s  %s\n' 6a19e74d791979e02f90742dc9163686d65c1e083a23bf47e6bd124686229ee4 Cargo.lock | sha256sum --check
+          cp Cargo.lock "$RUNNER_TEMP/growth-evidence/Cargo.lock"
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_layout_growth_stable --no-default-features --features cpu-render
+      - name: Verify changed inline width and no outer-geometry change
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/Ahem.ttf" "$RUNNER_TEMP/growth-evidence" <<'PY'
+          import json, os, pathlib, re, subprocess, sys
+          out = pathlib.Path(sys.argv[2])
+          exe = "target/runtime-bench/examples/dot_layout_growth_stable"
+          flags = ("W3COS_TAIL_SHIFT_FAST", "W3COS_PREORDER_HOSTS", "W3COS_TAIL_SHIFT_RANGES",
+                   "W3COS_CSSOM_OWNER_INDEX", "DOT_LAYOUT_ADAPTIVE_SHIFT", "DOT_LAYOUT_LAZY_HOSTS")
+          for name, on in [("default", "0"), ("candidate", "1")]:
+              env = dict(os.environ, DOT_STABLE_TRACE="1")
+              env.update(dict.fromkeys(flags, on))
+              env.pop("W3COS_SPLICE_VERIFY", None)
+              for count, pos in [(300,0),(300,299),(1200,0),(1200,1199)]:
+                  p = subprocess.run([exe, sys.argv[1], str(count), str(pos), "check"],
+                                     env=env, capture_output=True, text=True, timeout=60)
+                  (out / f"{name}-{count}-{pos}.json").write_text(p.stdout)
+                  (out / f"{name}-{count}-{pos}.stderr").write_text(p.stderr)
+                  if p.returncode:
+                      print(p.stdout + p.stderr, file=sys.stderr, flush=True)
+                      raise SystemExit(p.returncode)
+                  j = json.loads(p.stdout)
+                  assert j["cold_parity"] and j["count"] == count and j["position"] == pos, j
+                  parts = re.split(r"(?m)^\[growth-phase\] (grow|shrink)$", p.stderr)
+                  assert parts[1::2] == ["grow", "shrink"], p.stderr
+                  for phase, receipt in zip(parts[1::2], parts[2::2]):
+                      paths = re.findall(r"(?m)^\[dot-stable-path\] (\w+) solved=(\d+) shifted=(\d+)$", receipt)
+                      assert all(int(shifted) == 0 for _, _, shifted in paths), receipt
+                      print(json.dumps(dict(phase="stable-check", variant=name, count=count,
+                                            position=pos, edit=phase, paths=paths)), flush=True)
+          PY
+      - name: Compare no-wrap text edits with isolated Chrome
+        shell: bash
+        run: |
+          node --version
+          google-chrome --version
+          node scripts/dot-layout-growth-stable-ab.mjs target/runtime-bench/examples/dot_layout_growth_stable "$RUNNER_TEMP/Ahem.ttf" google-chrome \
+            > "$RUNNER_TEMP/growth-evidence/stable-ab.jsonl" || { tail -12 "$RUNNER_TEMP/growth-evidence/stable-ab.jsonl"; exit 1; }
+          grep -E '"phase":"(chrome-geometry|summary)"' "$RUNNER_TEMP/growth-evidence/stable-ab.jsonl"
+      - name: Archive same-height evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-height-growth-evidence
+          path: ${{ runner.temp }}/growth-evidence
+          if-no-files-found: ignore
