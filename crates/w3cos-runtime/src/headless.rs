@@ -3967,6 +3967,8 @@ mod tests {
                 crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(None));
                 crate::paint_artifact::PAINT_CULL_RUNS_OVERRIDE.with(|value| value.set(None));
                 crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DIFF_QUIET_MOVES_OVERRIDE
+                    .with(|value| value.set(None));
             }
         }
         let _off = Off;
@@ -3975,9 +3977,13 @@ mod tests {
         crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(Some(1)));
         crate::paint_artifact::PAINT_CULL_RUNS_OVERRIDE.with(|value| value.set(Some(1)));
         crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
-        for quiet in [false, true] {
+        // `W3COS_PAINT_DIFF_QUIET_MOVES`: the diff leaves the culled moved
+        // cards out, so the damage never sees them; the frames still match.
+        for (quiet, quiet_moves) in [(false, 0), (true, 0), (true, 1)] {
             crate::retained_layers::PAINT_DAMAGE_QUIET_OVERRIDE
                 .with(|value| value.set(Some(quiet)));
+            crate::retained_layers::PAINT_DIFF_QUIET_MOVES_OVERRIDE
+                .with(|value| value.set(Some(quiet_moves)));
             crate::dom::reset_document();
             crate::jsdom::reset_bridge();
             invalidate_retained_frame();
@@ -4048,7 +4054,9 @@ mod tests {
                 "quiet {quiet}: no frame composited under damage"
             );
             assert_eq!(blit_diff, 0, "quiet {quiet}: a blitted frame differs");
-            if quiet {
+            if quiet_moves != 0 {
+                assert_eq!(skipped, 0, "the diff already left the culled cards out");
+            } else if quiet {
                 assert!(skipped > 0, "culled moved cards must be left out");
             } else {
                 assert_eq!(skipped, 0);

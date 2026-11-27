@@ -2113,6 +2113,11 @@ fn paint_diff_clients_inner(
         .then(|| cur.culled_spans_against(prev))
         .flatten()
         .unwrap_or(&[]);
+    let quiet_moves = if spans.is_empty() {
+        0
+    } else {
+        paint_diff_quiet_moves_mode()
+    };
     let (mut span_at, mut span_start, mut span_end) = (0usize, usize::MAX, 0usize);
     let (mut span_boxes, mut span_mismatch) = (0u64, 0u64);
     // The per-box diff after the span test; a macro so the loop without
@@ -2175,6 +2180,39 @@ fn paint_diff_clients_inner(
                     });
             }
             if index >= span_start && !in_run.get(index).copied().unwrap_or(false) {
+                if quiet_moves != 0 {
+                    // `W3COS_PAINT_DIFF_QUIET_MOVES`: the build copied this
+                    // box as culled in both frames with its inputs, size and
+                    // inline position (only its block position may differ),
+                    // and it pushed no display item and no property node:
+                    // nothing it paints or owns changed, so it is not marked
+                    // (Blink does not invalidate an object outside the cull
+                    // rect that only moved).
+                    let skip = quiet_moves == 1
+                        || {
+                            w3cos_dom::verify_hit!("W3COS_PAINT_DIFF_QUIET_MOVES");
+                            let full_quiet = prev_items[index] == 0
+                                && cur_items[index] == 0
+                                && prev.column_fragments.get(index).is_none_or(Vec::is_empty)
+                                && cur.column_fragments.get(index).is_none_or(Vec::is_empty)
+                                && prev.pushed_no_property_nodes(index)
+                                && cur.pushed_no_property_nodes(index);
+                            let same_inputs =
+                                paint_inputs_equal(index, &prev.nodes[index], &cur.nodes[index]);
+                            if !(full_quiet && same_inputs) {
+                                eprintln!(
+                                    "[paint-diff-quiet-moves-verify] mismatch: box {index} quiet {full_quiet} inputs {same_inputs}"
+                                );
+                                PAINT_DIFF_QUIET_MOVES_MISMATCHES
+                                    .with(|count| count.set(count.get() + 1));
+                            }
+                            full_quiet && same_inputs
+                        };
+                    if skip {
+                        span_boxes += 1;
+                        continue;
+                    }
+                }
                 let moved_rect = !rect_equal(
                     prev.rect_by_index.get(index).copied().flatten(),
                     cur.rect_by_index.get(index).copied().flatten(),
@@ -2572,6 +2610,44 @@ thread_local! {
     /// `(boxes taken by span, verify mismatches)`.
     pub(crate) static PAINT_DIFF_CULLED_SPANS_STATS: std::cell::Cell<(u64, u64)> =
         const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `W3COS_PAINT_DIFF_QUIET_MOVES=1|verify` (off by default; with
+/// `W3COS_PAINT_DIFF_CULLED_SPANS`): a box in the build's culled spans is
+/// left out of the diff altogether instead of being marked dirty when its
+/// rect moved. The build copied it as culled in both frames with its
+/// inputs, size and inline position, and it pushed no display item and no
+/// property node, so no recording, layer or damage depends on it (Blink
+/// does not invalidate an object outside the cull rect that only moved).
+/// `=verify` re-tests each such box in full and marks it as before when
+/// the test fails.
+pub(crate) fn paint_diff_quiet_moves_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = PAINT_DIFF_QUIET_MOVES_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("W3COS_PAINT_DIFF_QUIET_MOVES")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => 1,
+            Some("verify") => 2,
+            _ => 0,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PAINT_DIFF_QUIET_MOVES_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    pub(crate) static PAINT_DIFF_QUIET_MOVES_MISMATCHES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Whether a custom property map holds only text-run and font bookkeeping:

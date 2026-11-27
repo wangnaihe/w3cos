@@ -8490,6 +8490,8 @@ mod tests {
                 PAINT_DIFF_CULLED_SPANS_OVERRIDE, PAINT_DIFF_CULLED_SPANS_STATS, paint_diff_clients,
             };
             let third = build(32.0, Some(&second), 1);
+            crate::retained_layers::PAINT_DIFF_QUIET_MOVES_OVERRIDE
+                .with(|value| value.set(Some(0)));
             let diff = |mode: u8| {
                 PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(|value| value.set(Some(mode)));
                 let diff = paint_diff_clients(&second, &third).expect("paint diff");
@@ -8511,6 +8513,64 @@ mod tests {
             assert!(verified == full);
             assert!(diff(1) == full);
             assert!(full.0[39], "a moved culled box is still marked");
+            // `W3COS_PAINT_DIFF_QUIET_MOVES`: those culled boxes are left
+            // out of the diff; every other client is marked as before and the
+            // damage is the same.
+            use crate::retained_layers::{
+                PAINT_DIFF_QUIET_MOVES_MISMATCHES, PAINT_DIFF_QUIET_MOVES_OVERRIDE, paint_damage,
+            };
+            let quiet = |mode: u8| {
+                PAINT_DIFF_QUIET_MOVES_OVERRIDE.with(|value| value.set(Some(mode)));
+                let diff = paint_diff_clients(&second, &third).expect("paint diff");
+                let damage = paint_damage(&second, &third, &diff);
+                PAINT_DIFF_QUIET_MOVES_OVERRIDE.with(|value| value.set(None));
+                (diff.dirty, diff.moved, damage)
+            };
+            let (base_dirty, base_moved, base_damage) = quiet(0);
+            assert!(base_dirty == full.0 && base_moved == full.1);
+            let mismatches = PAINT_DIFF_QUIET_MOVES_MISMATCHES.with(std::cell::Cell::get);
+            let verified = quiet(2);
+            assert_eq!(
+                PAINT_DIFF_QUIET_MOVES_MISMATCHES.with(std::cell::Cell::get),
+                mismatches,
+                "a culled span box fails the full test"
+            );
+            let fast = quiet(1);
+            assert!(fast.0 == verified.0 && fast.1 == verified.1);
+            assert!(!fast.0[39], "the moved culled box is left out");
+            assert!(fast.1 == base_moved);
+            let paints = |artifact: &PaintArtifact, index: usize| {
+                artifact
+                    .display_items
+                    .iter()
+                    .any(|item| item.client_index == index)
+            };
+            let mut skipped = 0;
+            for index in 0..base_dirty.len() {
+                if fast.0[index] != base_dirty[index] {
+                    assert!(base_dirty[index], "box {index} newly marked");
+                    assert!(!paints(&second, index) && !paints(&third, index));
+                    skipped += 1;
+                }
+            }
+            assert!(skipped > 0);
+            let rects = |damage: Option<Vec<crate::retained_layers::ClientDamage>>| {
+                let mut rects: Vec<[u32; 4]> = damage
+                    .expect("bounded damage")
+                    .into_iter()
+                    .map(|(_, _, r)| {
+                        [
+                            r.x.to_bits(),
+                            r.y.to_bits(),
+                            r.width.to_bits(),
+                            r.height.to_bits(),
+                        ]
+                    })
+                    .collect();
+                rects.sort_unstable();
+                rects
+            };
+            assert_eq!(rects(fast.2), rects(base_damage));
         }
         let before = PAINT_CULL_RUN_GAPS_STATS.with(std::cell::Cell::get);
         let verified = build(32.0, Some(&second), 2);
