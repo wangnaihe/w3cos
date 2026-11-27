@@ -610,6 +610,11 @@ pub(super) fn resolve(
     let mut placed = Vec::new();
     let mut rest = Vec::new();
     for candidate in candidates {
+        let candidate = if all && crate::layout::is_top_layer(flat[candidate.index].style) {
+            top_layer_candidate(flat, candidate, cb)
+        } else {
+            candidate
+        };
         if all || flat[candidate.index].style.position == Position::Absolute {
             placed.push(
                 layout_out_of_flow(flat, &candidate, cb, viewport_w, viewport_h)
@@ -620,6 +625,27 @@ pub(super) fn resolve(
         }
     }
     Some((placed, rest))
+}
+
+/// A top-layer box's static position is the initial containing block's
+/// start corner for the root's writing mode and direction (CSS Position 3
+/// §3.5.1), not its place in flow.
+fn top_layer_candidate(
+    flat: &[FlatNodeInfo],
+    candidate: OofCandidate,
+    cb: &ContainingBlock,
+) -> OofCandidate {
+    let root = crate::layout::root_style_of(flat, candidate.index);
+    let (right, bottom) = crate::layout::top_layer_static_corner(root);
+    let end = |at_end: bool| if at_end { Anchor::End } else { Anchor::Start };
+    OofCandidate {
+        static_inline: cb.x + if right { cb.width } else { 0.0 },
+        static_block: cb.y + if bottom { cb.height } else { 0.0 },
+        static_rtl: false,
+        inline_anchor: end(right),
+        block_anchor: end(bottom),
+        ..candidate
+    }
 }
 
 /// A fixed box's containing block is the viewport unless an ancestor

@@ -415,6 +415,16 @@ pub fn invalidate_animated_style(node: u32) {
     mark_dom_dirty();
 }
 
+/// Put an element in (or take it out of) the top layer: an open popover.
+pub fn set_top_layer(node: u32, open: bool) {
+    with_document_mut(|doc| doc.set_top_layer(NodeId::from_u32(node), open));
+    mark_dom_dirty();
+}
+
+pub fn in_top_layer(node: u32) -> bool {
+    with_document(|doc| doc.in_top_layer(NodeId::from_u32(node)))
+}
+
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
     // CSSOM writes notify attribute observers with the previous style
     // attribute. With no observers, serializing that attribute on every

@@ -198,6 +198,9 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // algorithm breaks the lines evenly.
             | "flex-balance"
             | "flex-line-count"
+            // An open popover: OOF resolution reads it for the static
+            // position (the ICB corner).
+            | "top-layer"
             // Flex reads this as a column wrap's definite block size.
             // Height stays auto, so legacy layout ignores the ratio.
             | "aspect-ratio"
