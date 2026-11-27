@@ -39,6 +39,18 @@ jobs:
             https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
             --output "$RUNNER_TEMP/Ahem.ttf"
           printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Gate the draft's Skia-only diagnostic for this CPU build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/retained_layers.rs")
+          s = p.read_text()
+          old = "        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })"
+          assert s.count(old) == 1, "unexpected change to the pinned trace site"
+          p.write_text(s.replace(old, '        #[cfg(feature = "skia")]\n' + old))
+          PY
+          git diff --check
+          git diff -- crates/w3cos-runtime/src/retained_layers.rs | tee "$RUNNER_TEMP/growth-evidence/cpu-trace-guard.diff"
       - name: Build the isolated CPU fixture
         run: |
           if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
