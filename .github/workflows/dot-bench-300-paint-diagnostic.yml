@@ -1,0 +1,150 @@
+name: Isolate pinned paint replay geometry divergence
+
+on:
+  push:
+    branches: [dot/bench-300-geometry-20261127]
+    paths:
+      - '.github/workflows/dot-bench-300-paint-diagnostic.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paint-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 38
+    env:
+      CARGO_INCREMENTAL: '0'
+      W3COS_LAYOUT_NG: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record revision and install prerequisites
+        run: |
+          git rev-parse HEAD
+          printf 'Engine revision: %s\n' 9c07e1161378886a2d14efbf1bcb67b5eb2c0114
+          printf '%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          rustc --version
+      - name: Pin the test font
+        run: |
+          mkdir -p "$RUNNER_TEMP/growth-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+      - name: Gate the draft's Skia-only diagnostic for this CPU build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/retained_layers.rs")
+          s = p.read_text()
+          old = "        if crate::render_skia::paint_damage_trace() && !matches!(b.kind, ComponentKind::Text { .. })"
+          assert s.count(old) == 1, "unexpected change to the pinned trace site"
+          p.write_text(s.replace(old, '        #[cfg(feature = "skia")]\n' + old))
+          PY
+          git diff --check
+          git diff -- crates/w3cos-runtime/src/retained_layers.rs | tee "$RUNNER_TEMP/growth-evidence/cpu-trace-guard.diff"
+      - name: Reuse the original successful run's locked dependencies
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45951212053
+          name: growth-geometry
+          path: ${{ runner.temp }}/baseline-artifact
+      - name: Verify the lock and build the CPU lib test executable
+        run: |
+          cp "$RUNNER_TEMP/baseline-artifact/Cargo.lock" Cargo.lock
+          printf '%s  %s\n' 6a19e74d791979e02f90742dc9163686d65c1e083a23bf47e6bd124686229ee4 Cargo.lock | sha256sum --check
+          cp Cargo.lock "$RUNNER_TEMP/growth-evidence/Cargo.lock"
+          cargo test --locked --profile runtime-bench -p w3cos-runtime --lib --no-default-features --features cpu-render --no-run --message-format=json > "$RUNNER_TEMP/growth-evidence/cargo-test-build.jsonl"
+      - name: Reproduce in the original pinned runtime before adding diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$W3COS_LAYOUT_NG" = 1
+          export W3COS_PREORDER_SIZES=1
+          name=incremental_layout::paint_layout_tests::paint_splice_replays_flush_splices_and_matches_full_layout
+          set +e
+          cargo test --locked --profile runtime-bench -p w3cos-runtime --lib --no-default-features --features cpu-render "$name" -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/growth-evidence/paint-original.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > "$RUNNER_TEMP/growth-evidence/paint-original.status"
+          grep -E '^(running 1 test|test result:)' "$RUNNER_TEMP/growth-evidence/paint-original.log"
+          [ "$rc" -eq 0 ] || grep -F 'a spliced paint layout differs from a full one' "$RUNNER_TEMP/growth-evidence/paint-original.log"
+      - name: Record every differing row without changing the original assertion
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cat "$RUNNER_TEMP/growth-evidence/paint-original.status")" -ne 0 || exit 0
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout.rs")
+          s = p.read_text()
+          start = s.index("    let mut max_diff = 0f32;", s.index("fn verify_paint_splice("))
+          end = s.index("    let texts_same", start)
+          s = s[:start] + """    let mut max_diff = 0f32;
+              let mut differing_rows = 0usize;
+              let mut changed_fields = [0usize; 4];
+              let mut index_mismatches = 0usize;
+              for ((a, i), (b, j)) in kept.layout_cache.iter().zip(&fresh.layout_cache) {
+                  if i != j {
+                      index_mismatches += 1;
+                  }
+                  if i != j || a != b {
+                      differing_rows += 1;
+                  }
+                  for (slot, field, x, y) in [
+                      (0, "x", a.x, b.x), (1, "y", a.y, b.y),
+                      (2, "width", a.width, b.width), (3, "height", a.height, b.height),
+                  ] {
+                      max_diff = max_diff.max((x - y).abs());
+                      if x != y {
+                          changed_fields[slot] += 1;
+                          let host = flat.get(*j).and_then(|node| match node.on_click {
+                              EventAction::NativeHost { id, .. } => Some(*id as u32),
+                              _ => None,
+                          });
+                          let dom_rect = host.map(|host| crate::dom::with_document(|document|
+                              document.get_layout_rect(NodeId::from_u32(host))));
+                          if differing_rows <= 8 {
+                              eprintln!("[paint-exhaustive-row] kept={i} fresh={j} host={host:?} field={field} a={x} b={y} kept_bits={:08x} fresh_bits={:08x} cssom={dom_rect:?}", x.to_bits(), y.to_bits());
+                          }
+                      }
+                  }
+              }
+              let layouts_same = kept.layout_cache.len() == fresh.layout_cache.len() && differing_rows == 0;
+              eprintln!("[paint-exhaustive-summary] differing_rows={differing_rows} changed_fields={changed_fields:?} index_mismatches={index_mismatches} full_max_delta={max_diff}");
+          """ + s[end:]
+          p.write_text(s)
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          old = "                record_paint_splice(PaintSplice {"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, """                eprintln!("[paint-journal-diagnostic] path={:?} node={} dx={dx} dy={dy} dh={dh} first={first} len={len} levels={levels}", plan.path, plan.node);
+          """ + old))
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/growth-evidence/paint-exhaustive.diff"
+          export W3COS_PREORDER_SIZES=1
+          name=incremental_layout::paint_layout_tests::paint_splice_replays_flush_splices_and_matches_full_layout
+          set +e
+          cargo test --locked --profile runtime-bench -p w3cos-runtime --lib --no-default-features --features cpu-render "$name" -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/growth-evidence/paint-exhaustive.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" -ne 0
+          grep -F 'a spliced paint layout differs from a full one' "$RUNNER_TEMP/growth-evidence/paint-exhaustive.log"
+          grep -F '[paint-exhaustive-summary]' "$RUNNER_TEMP/growth-evidence/paint-exhaustive.log"
+      - name: Archive the regression matrix and complete test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pinned-native-paint-diagnostic
+          path: ${{ runner.temp }}/growth-evidence
+          if-no-files-found: ignore
