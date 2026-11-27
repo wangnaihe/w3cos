@@ -95,6 +95,9 @@ async function cdp(socket) {
     ws.addEventListener('error',()=>{clearTimeout(timeout);bad(Error('CDP open error'));},{once:true});
   });
   return {
+    requestShutdown:()=>{
+      if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({id:++id,method:'Browser.close'}));
+    },
     close:()=>ws.close(),
     call:(method,params={},sessionId)=>new Promise((ok,bad)=>{
       const req=++id;
@@ -138,14 +141,18 @@ async function chromeRun(chrome,font64,pos,checkOnly) {
   } catch(e) {
     throw Error((spawnError??e).message+'\n'+stderr,{cause:e});
   } finally {
-    proto?.close();
     if(child.pid && child.exitCode===null && child.signalCode===null) {
-      const stopped=once(child,'exit');
-      child.kill('SIGTERM');
-      const outcome=await Promise.race([stopped.then(()=>true),delay(2000,false,{ref:false})]);
-      if(!outcome) {child.kill('SIGKILL');await stopped;}
+      const stopped=once(child,'exit').then(()=>true);
+      const waitForExit=(ms)=>Promise.race([stopped,delay(ms,false,{ref:false})]);
+      if(proto) proto.requestShutdown();
+      if(!proto || !await waitForExit(2000)) {
+        child.kill('SIGTERM');
+        if(!await waitForExit(2000)) {child.kill('SIGKILL');await stopped;}
+      }
     }
-    await rm(profile,{recursive:true,force:true});
+    proto?.close();
+    // A Chrome helper can finish writing after its parent exits.
+    await rm(profile,{recursive:true,force:true,maxRetries:12,retryDelay:150});
   }
 }
 
