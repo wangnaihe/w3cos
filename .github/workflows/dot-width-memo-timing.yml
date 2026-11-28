@@ -1,0 +1,166 @@
+name: Time verified width memo and deferred legacy layout
+
+on:
+  push:
+    branches: [dot/width-memo-current-main-20261128]
+    paths:
+      - '.github/workflows/dot-width-memo-timing.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      W3COS_LAYOUT_NG: '1'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 9
+      - name: Install baseline dependencies
+        run: |
+          git rev-parse HEAD
+          git diff --exit-code 3dd00a81fbdd559adab1719541b2ff8f22db778e HEAD -- . ':!.github/workflows/dot-width-memo-timing.yml' ':!crates/w3cos-runtime/examples/dot_width_memo_correctness.rs' ':!.github/workflows/dot-main-width-memo.yml' ':!crates/w3cos-runtime/examples/dot_width_memo_timing.rs'
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          mkdir -p "$RUNNER_TEMP/width-memo-evidence"
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+          cp Cargo.lock "$RUNNER_TEMP/width-memo-evidence/"
+          sha256sum Cargo.lock
+      - name: Stage opt-in width memo eligibility and retention guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout.rs")
+          s = p.read_text()
+          old = "    let memo_hit = single_px_width(&styles).and_then(|(node, bits)| {"
+          new = """    let guarded = dot_width_memo_fix_enabled();
+              static NO_MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              let no_memo = *NO_MEMO.get_or_init(|| std::env::var("DOT_WIDTH_MEMO_DISABLE").as_deref() == Ok("1"));
+              let memo_key = if no_memo {
+                  None
+              } else if guarded {
+                  single_px_width(&styles).and_then(|key| {
+                      let old = previous.as_ref()?;
+                      let new = &styles[0].1;
+                      if old.width == new.width {
+                          return None;
+                      }
+                      let mut only_width = old.clone();
+                      only_width.width = new.width;
+                      (only_width == *new).then_some(key)
+                  })
+              } else {
+                  single_px_width(&styles)
+              };
+              // Each memo is a whole-document snapshot. After a width-only
+              // change it can still describe the same host at another width,
+              // but never describes a different host under the new geometry.
+              // Any other geometry or layout change ends that family of memos.
+              if guarded && !paint_only {
+                  if let Some((node, _)) = memo_key {
+                      cache.width_memos.retain(|memo| memo.node == node);
+                  } else {
+                      cache.width_memos.clear();
+                  }
+              }
+              let memo_hit = memo_key.and_then(|(node, bits)| {"""
+          assert s.count(old) == 1
+          s = s.replace(old,new)
+          old = "    if let Some((node, bits)) = single_px_width(&styles) {"
+          assert s.count(old) == 1
+          s = s.replace(old,"    if let Some((node, bits)) = memo_key {")
+          anchor = "fn single_px_width(styles:"
+          assert s.count(anchor) == 1
+          s = s.replace(anchor, """fn dot_width_memo_fix_enabled() -> bool {
+              static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ENABLED.get_or_init(|| std::env::var("DOT_WIDTH_MEMO_FIX").as_deref() == Ok("1"))
+          }
+
+          """ + anchor)
+          old = "    if let Some((rects, client_rects)) = memo_hit {"
+          assert s.count(old) == 1
+          s = s.replace(old, """    if let Some((rects, client_rects)) = memo_hit {
+                  let audit = dot_width_memo_audit_enabled();
+                  let engine_before = audit && cache.engine.tree_valid();
+                  if guarded {
+                      // Replay publishes a coherent DOM snapshot but does not update
+                      // the legacy tree. Retire that tree without doing layout now.
+                      cache.engine.invalidate();
+                  }
+                  if audit {
+                      eprintln!("[memo-engine-replay] guard={guarded} tree_before={engine_before} tree_after={}", cache.engine.tree_valid());
+                  }""")
+          old = "    let compute_started = std::time::Instant::now();"
+          assert s.count(old) == 1
+          s = s.replace(old, """    let audit = dot_width_memo_audit_enabled();
+              let engine_before = audit && cache.engine.tree_valid();
+              let compute_started = std::time::Instant::now();""")
+          old = '    note_flush("retained", flat.len() as u32, 0);'
+          assert s.count(old) == 1
+          s = s.replace(old, """    if audit {
+                  eprintln!("[memo-engine-retained] guard={guarded} tree_before={engine_before} tree_after={}", cache.engine.tree_valid());
+              }
+          """ + old)
+          anchor = "fn dot_width_memo_fix_enabled()"
+          assert s.count(anchor) == 1
+          s = s.replace(anchor, """fn dot_width_memo_audit_enabled() -> bool {
+              static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ENABLED.get_or_init(|| std::env::var_os("DOT_WIDTH_MEMO_AUDIT").is_some())
+          }
+
+          """ + anchor)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/width-memo-evidence/candidate.diff"
+      - name: Build exact comparison arms in one optimized binary
+        run: |
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --example dot_width_memo_timing --no-default-features --features cpu-render
+      - name: Run paired route-gated phase timing
+        run: |
+          lscpu
+          python3 - "$RUNNER_TEMP/width-memo-evidence" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess, sys
+          root=Path(sys.argv[1])
+          exe="target/runtime-bench/examples/dot_width_memo_timing"
+          config={
+            "width-stock":("width","0","0"),
+            "width-guard":("width","1","0"),
+            "mixed-reference":("mixed","1","1"),
+            "mixed-guard":("mixed","1","0"),
+          }
+          for round_id in range(6):
+              arms=list(config) if round_id%2==0 else list(reversed(config))
+              for name in arms:
+                  trial,guard,disable=config[name]
+                  env=dict(os.environ,W3COS_LAYOUT_NG="0",W3COS_LAYOUT_NG_VERIFY="0",W3COS_SUBTREE_RELAYOUT="0",
+                           DOT_WIDTH_MEMO_FIX=guard,DOT_WIDTH_MEMO_DISABLE=disable)
+                  env.pop("DOT_WIDTH_MEMO_AUDIT",None)
+                  p=subprocess.run([exe,trial],env=env,text=True,capture_output=True,timeout=150)
+                  if p.returncode!=0:
+                      (root/f"{round_id}-{name}.failure").write_text(p.stdout+p.stderr)
+                      print(p.stdout+p.stderr,flush=True)
+                      raise SystemExit(f"{round_id} {name}: {p.returncode}")
+                  result=json.loads(p.stdout.strip().splitlines()[-1])
+                  assert result["trial"]==trial and result["width_control_wraps"]
+                  assert result["counts"]==([48,0,0,0] if trial=="width" else [24]*4)
+                  rec=dict(round=round_id,arm=name,**result)
+                  print(json.dumps(rec),flush=True)
+                  with (root/"samples.ndjson").open("a") as f: f.write(json.dumps(rec)+"\n")
+          PY
+      - name: Archive same-run raw summaries and exact scratch patch
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: width-memo-deferred-timing
+          path: ${{ runner.temp }}/width-memo-evidence
+          if-no-files-found: ignore
