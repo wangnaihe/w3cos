@@ -499,7 +499,10 @@ struct PropertyStore(std::ptr::NonNull<u8>);
 const DICT_TAG: usize = 1;
 
 enum StoreRef<'a> {
-    Shaped { shape: &'a Rc<Shape>, slots: &'a [Value] },
+    Shaped {
+        shape: &'a Rc<Shape>,
+        slots: &'a [Value],
+    },
     Dict(&'a DictStore),
 }
 
@@ -579,7 +582,10 @@ impl PropertyStore {
         for (key, value) in shape.keys().iter().zip(slots) {
             entries.push((key.clone(), value));
         }
-        let dict = Self::dict(Box::new(DictStore::from_entries(entries, shape.has_index_key)));
+        let dict = Self::dict(Box::new(DictStore::from_entries(
+            entries,
+            shape.has_index_key,
+        )));
         unsafe { std::ptr::write(self, dict) };
     }
 
@@ -679,7 +685,9 @@ impl DictStore {
             return self.entries.iter().position(|(k, _)| k.as_str() == key);
         }
         self.index
-            .find(key_hash(key), |&i| self.entries[i as usize].0.as_str() == key)
+            .find(key_hash(key), |&i| {
+                self.entries[i as usize].0.as_str() == key
+            })
             .map(|&i| i as usize)
     }
 
@@ -702,7 +710,9 @@ impl DictStore {
         self.entries.push((key, value));
         if !self.index.is_empty() {
             let Self { entries, index, .. } = self;
-            index.insert_unique(hash, i as u32, |&j| key_hash(entries[j as usize].0.as_str()));
+            index.insert_unique(hash, i as u32, |&j| {
+                key_hash(entries[j as usize].0.as_str())
+            });
         } else if self.entries.len() > DICT_LINEAR {
             self.rebuild_index();
         }
@@ -812,7 +822,10 @@ impl PropertyMap {
     #[inline]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_compact(&self) -> bool {
-        !matches!(self.inner.as_ref().map(PropertyStore::view), Some(StoreRef::Dict(_)))
+        !matches!(
+            self.inner.as_ref().map(PropertyStore::view),
+            Some(StoreRef::Dict(_))
+        )
     }
 
     /// True once the map has left the shape tree.
@@ -870,9 +883,7 @@ impl PropertyMap {
     pub(crate) fn get(&self, key: &str) -> Option<&Value> {
         match self.inner.as_ref().map(PropertyStore::view) {
             None => None,
-            Some(StoreRef::Shaped { shape, slots }) => {
-                shape.lookup(key).and_then(|i| slots.get(i))
-            }
+            Some(StoreRef::Shaped { shape, slots }) => shape.lookup(key).and_then(|i| slots.get(i)),
             Some(StoreRef::Dict(dict)) => dict.get(key),
         }
     }
@@ -943,10 +954,11 @@ impl PropertyMap {
                     self.inner = Some(PropertyStore::shaped(buf));
                     return;
                 }
-                self.inner.insert(PropertyStore::dict(Box::new(DictStore::from_entries(
-                    Vec::new(),
-                    false,
-                ))))
+                self.inner
+                    .insert(PropertyStore::dict(Box::new(DictStore::from_entries(
+                        Vec::new(),
+                        false,
+                    ))))
             }
         };
         if let StoreMut::Shaped(buf) = store.view_mut() {
@@ -993,15 +1005,18 @@ impl PropertyMap {
     }
 
     pub(crate) fn keys(&self) -> PropertyMapKeys<'_> {
-        let (base, has_index): (PropertyMapKeys<'_>, bool) = match self.inner.as_ref().map(PropertyStore::view) {
-            None => (PropertyMapKeys::Plain([].iter()), false),
-            Some(StoreRef::Shaped { shape, .. }) => {
-                (PropertyMapKeys::Plain(shape.keys().iter()), shape.has_index_key)
-            }
-            Some(StoreRef::Dict(dict)) => {
-                (PropertyMapKeys::Entries(dict.entries.iter()), dict.has_index_key)
-            }
-        };
+        let (base, has_index): (PropertyMapKeys<'_>, bool) =
+            match self.inner.as_ref().map(PropertyStore::view) {
+                None => (PropertyMapKeys::Plain([].iter()), false),
+                Some(StoreRef::Shaped { shape, .. }) => (
+                    PropertyMapKeys::Plain(shape.keys().iter()),
+                    shape.has_index_key,
+                ),
+                Some(StoreRef::Dict(dict)) => (
+                    PropertyMapKeys::Entries(dict.entries.iter()),
+                    dict.has_index_key,
+                ),
+            };
         if !has_index {
             return base;
         }
@@ -1372,7 +1387,11 @@ mod tests {
         assert!(map.is_dictionary());
         assert_eq!(map.len(), 40);
         for (i, name) in names.iter().enumerate() {
-            assert_eq!(map.get(name).map(Value::to_number), Some(i as f64), "{name}");
+            assert_eq!(
+                map.get(name).map(Value::to_number),
+                Some(i as f64),
+                "{name}"
+            );
         }
         // Remove from the middle, the front and the back; positions shift.
         for gone in ["k20", "k1", "k39"] {
@@ -1384,7 +1403,11 @@ mod tests {
             if ["k20", "k1", "k39"].contains(&name.as_str()) {
                 continue;
             }
-            assert_eq!(map.get(name).map(Value::to_number), Some(i as f64), "{name}");
+            assert_eq!(
+                map.get(name).map(Value::to_number),
+                Some(i as f64),
+                "{name}"
+            );
         }
         let order = keys(&map);
         assert_eq!(order[0], "k2");
@@ -1402,7 +1425,10 @@ mod tests {
     fn wide_literal_dictionaries_keep_sorted_key_order() {
         let mut source = HashMap::new();
         for i in 0..(MAX_SHAPE_KEYS + 10) {
-            source.insert(JsString::intern(&format!("p{i:03}")), Value::Number(i as f64));
+            source.insert(
+                JsString::intern(&format!("p{i:03}")),
+                Value::Number(i as f64),
+            );
         }
         let map = PropertyMap::from_interned_hashmap(source);
         assert!(map.is_dictionary());
@@ -1413,7 +1439,6 @@ mod tests {
         assert_eq!(order.len(), MAX_SHAPE_KEYS + 10);
         assert_eq!(map.get("p070").map(Value::to_number), Some(70.0));
     }
-
 
     #[test]
     fn shaped_buffers_grow_clone_and_convert_without_losing_values() {
@@ -1435,13 +1460,22 @@ mod tests {
         map.remove("sb_key_0");
         assert!(map.is_dictionary());
         assert_eq!(map.get("sb_key_3").map(Value::to_number), Some(3.0));
-        assert_eq!(map.get("sb_key_39").map(|v| v.to_js_string()), Some("v39".to_string()));
+        assert_eq!(
+            map.get("sb_key_39").map(|v| v.to_js_string()),
+            Some("v39".to_string())
+        );
         assert!(map.get("sb_key_0").is_none());
         // The clone kept its own slots.
         assert!(copy.is_compact());
         assert_eq!(copy.len(), 40);
-        assert_eq!(copy.get("sb_key_3").map(|v| v.to_js_string()), Some("v3".to_string()));
-        assert_eq!(copy.get("sb_key_0").map(|v| v.to_js_string()), Some("v0".to_string()));
+        assert_eq!(
+            copy.get("sb_key_3").map(|v| v.to_js_string()),
+            Some("v3".to_string())
+        );
+        assert_eq!(
+            copy.get("sb_key_0").map(|v| v.to_js_string()),
+            Some("v0".to_string())
+        );
         // Removing the only key empties the map.
         let mut one = PropertyMap::new();
         one.insert_str("only", Value::Number(7.0));
@@ -1449,5 +1483,4 @@ mod tests {
         assert!(one.is_empty());
         assert_eq!(one.heap_bytes(), 0);
     }
-
 }
