@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 5
+          fetch-depth: 7
       - name: Install baseline dependencies and pin the test font
         run: |
           git rev-parse HEAD
@@ -160,7 +160,15 @@ jobs:
             DOT_MAIN_RECT_BATCH=$mode target/runtime-bench/examples/dot_main_rect_style --observe-cssom \
               | tee "$RUNNER_TEMP/main-rect-evidence/cssom-observed-$mode.log"
           done
-      - name: Prove style-subtree, exact epoch deltas, zero-scroll geometry and clamping
+      - name: Observe stock fixed-width height edit against a fresh oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in 0 1; do
+            DOT_MAIN_RECT_BATCH=$mode target/runtime-bench/examples/dot_main_rect_style --observe-width-memo \
+              | tee "$RUNNER_TEMP/main-rect-evidence/memo-observed-$mode.log"
+          done
+      - name: Prove style-subtree, exact epochs, zero-scroll geometry and clamping
         run: |
           python3 - "$RUNNER_TEMP/main-rect-evidence" <<'PY'
           from pathlib import Path
@@ -195,6 +203,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: main-rect-partitioned-style-evidence
+          name: main-rect-style-and-memo-evidence
           path: ${{ runner.temp }}/main-rect-evidence
           if-no-files-found: ignore
