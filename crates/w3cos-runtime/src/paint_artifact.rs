@@ -755,7 +755,8 @@ struct PersistPlan<'a> {
     tables: Option<std::sync::Arc<Vec<u32>>>,
 }
 
-/// `W3COS_PAINT_PERSIST_DIRTY_SCAN=1|verify` (off by default; with the
+/// `W3COS_PAINT_PERSIST_DIRTY_SCAN` (on by default, `=0` turns it off; `=verify`
+/// checks it; with the
 /// persistent path on): the per-box passes of the reusing build that skip
 /// clean boxes walk the list of boxes that are not clean instead of every
 /// box (Blink: paint invalidation visits only the objects layout marked).
@@ -772,9 +773,9 @@ pub(crate) fn persist_dirty_scan_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
