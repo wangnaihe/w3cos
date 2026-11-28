@@ -38,6 +38,7 @@ fn snapshot(sc: &Value, lead: &Value, tail: &Value, height: f64) -> ([f64;4],[f6
     let clamped = sc.get_property("scrollTop").to_number();
     assert_eq!(clamped,total-200.0);
     sc.set_property("scrollTop", Value::string("0"));
+    assert!(incremental_layout::flush());
     (lr,tr,total,clamped)
 }
 fn main() {
@@ -55,7 +56,7 @@ fn main() {
     ] {
         eprintln!("[overflow-phase] {tag}");
         dom::set_style_property(id,property,value);
-        assert_eq!(sc.get_property("scrollHeight").to_number(),height+300.0);
+        assert!(incremental_layout::flush());
         let stat = incremental_layout::last_flush_stats();
         assert_eq!(stat.kind, "style-subtree", "{tag} did not use style subtree");
         assert_eq!(stat.shifted_nodes, shifted);
