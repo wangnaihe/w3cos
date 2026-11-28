@@ -1,0 +1,188 @@
+name: Qualify main batch style and scrolling behavior
+
+on:
+  push:
+    branches: [dot/main-rect-batch-20261127]
+    paths:
+      - '.github/workflows/dot-main-rect-overflow.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      W3COS_LAYOUT_NG: '1'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 5
+      - name: Install baseline dependencies and pin the test font
+        run: |
+          git rev-parse HEAD
+          git diff --name-only 0d713996f8ecf520b84b26797f0710cc41f7a1d8 HEAD
+          git diff --exit-code 0d713996f8ecf520b84b26797f0710cc41f7a1d8 HEAD -- . ':!.github/workflows/dot-main-rect-overflow.yml' ':!.github/workflows/dot-main-rect-batch.yml' ':!crates/w3cos-runtime/examples/dot_main_batch_rect.rs' ':!crates/w3cos-runtime/examples/dot_main_batch_overflow.rs'
+          printf '%s\n' "$ImageOS $ImageVersion"
+          lscpu
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          mkdir -p "$RUNNER_TEMP/main-rect-evidence"
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/web-platform-tests/wpt/fa5393bb9f5f7d41cc16d1aeede1809ccd378ac0/fonts/Ahem.ttf \
+            --output "$RUNNER_TEMP/Ahem.ttf"
+          printf '%s  %s\n' b719ecb31c5b21fc573c03f6421c74ac63c271a5a3ff841e34f9705fb94b8448 "$RUNNER_TEMP/Ahem.ttf" | sha256sum --check
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+          cp Cargo.lock "$RUNNER_TEMP/main-rect-evidence/Cargo.lock"
+          sha256sum Cargo.lock
+      - name: Stage the opt-in equivalent batch consumer in the runner checkout
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-dom/src/document.rs")
+          s = p.read_text()
+          place = "    fn mark_extent_dirty(&mut self, id: NodeId) {"
+          assert s.count(place) == 1
+          p.write_text(s.replace(place, """    /// Experimental batch consumer preserving main's per-valid-write epoch
+              /// values and full rectangle equality for extent invalidation.
+              pub fn dot_batch_shift_layout_rects_y(&mut self, ids: &[u32], dy: f32) -> u64 {
+                  let mut writes = 0u64;
+                  for &id in ids {
+                      let Some(rect) = self.layout_rects.get_mut(id as usize) else {
+                          continue;
+                      };
+                      let before = *rect;
+                      rect.y += dy;
+                      let moved = *rect != before;
+                      writes = writes.wrapping_add(1);
+                      if moved {
+                          self.mark_extent_dirty(NodeId(id));
+                      }
+                  }
+                  // This exclusive borrow covers all writes. No epoch consumer
+                  // runs inside the loop; mark_extent_dirty itself does not read it.
+                  self.geometry_epoch = self.geometry_epoch.wrapping_add(writes);
+                  writes
+              }
+          """ + place))
+
+          p = Path("crates/w3cos-runtime/src/incremental_layout_splice.rs")
+          s = p.read_text()
+          old = """        for id in shifted {
+                      let id = NodeId::from_u32(id);
+                      let mut rect = document.get_layout_rect(id);
+                      rect.y += dh;
+                      document.set_layout_rect(id, rect);
+                  }"""
+          assert s.count(old) == 2
+          s = s.replace(old, """        if dot_main_batch() {
+                      let audit = dot_main_batch_audit();
+                      let before = if audit { document.geometry_epoch() } else { 0 };
+                      let writes = document.dot_batch_shift_layout_rects_y(&shifted, dh);
+                      if audit {
+                          let delta = document.geometry_epoch().wrapping_sub(before);
+                          assert_eq!(delta, writes);
+                          eprintln!("[dot-main-batch] ids={} writes={writes} epoch={delta}", shifted.len());
+                      }
+                  } else {
+                      let audit = dot_main_batch_audit();
+                      let before = if audit { document.geometry_epoch() } else { 0 };
+                      let count = shifted.len();
+                      for id in shifted {
+                          let id = NodeId::from_u32(id);
+                          let mut rect = document.get_layout_rect(id);
+                          rect.y += dh;
+                          document.set_layout_rect(id, rect);
+                      }
+                      if audit {
+                          let delta = document.geometry_epoch().wrapping_sub(before);
+                          eprintln!("[dot-main-walk] ids={count} writes={delta} epoch={delta}");
+                      }
+                  }""")
+          entry = "pub(super) fn try_splice(\n"
+          assert s.count(entry) == 1
+          s = s.replace(entry, """fn dot_main_batch() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| std::env::var("DOT_MAIN_RECT_BATCH").as_deref() == Ok("1"))
+          }
+
+          fn dot_main_batch_audit() -> bool {
+              static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ON.get_or_init(|| std::env::var_os("DOT_MAIN_RECT_AUDIT").is_some())
+          }
+
+          """ + entry)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/main-rect-evidence/batch.diff"
+      - name: Build baseline and candidate switches in a single CPU executable
+        run: |
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --example dot_main_batch_overflow --no-default-features --features cpu-render
+      - name: Run existing CPU app harness in both arms and compare checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in 0 1; do
+            DOT_MAIN_RECT_BATCH=$mode target/runtime-bench/w3cos-runtime-bench --output "$RUNNER_TEMP/main-rect-evidence/runtime-$mode.json" --samples 3
+            python3 scripts/check-runtime-bench.py --expect-layout-ng on "$RUNNER_TEMP/main-rect-evidence/runtime-$mode.json"
+          done
+          python3 - "$RUNNER_TEMP/main-rect-evidence" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          out = Path(sys.argv[1])
+          baseline, candidate = [json.loads((out / f"runtime-{m}.json").read_text()) for m in (0,1)]
+          selected = [
+              ("style_layout", "layout_checksum"),
+              ("startup", "child", "layout_checksum"),
+              ("startup", "child", "checksum"),
+              ("paint_scroll", "checksum"),
+          ]
+          def lookup(value, path):
+              for key in path:
+                  value = value[key]
+              return value
+          for path in selected:
+              a,b = (lookup(v,path) for v in (baseline,candidate))
+              assert a == b, (path,a,b)
+              print(json.dumps(dict(phase="equal-checksum", path=".".join(path), value=a)), flush=True)
+          PY
+      - name: Prove style-subtree, exact epoch deltas, and public scrolling parity
+        run: |
+          python3 - "$RUNNER_TEMP/main-rect-evidence" <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          exe = "target/runtime-bench/examples/dot_main_batch_overflow"
+          out = Path(sys.argv[1])
+          for mode, name in enumerate(("walk","batch")):
+              env = dict(os.environ, DOT_MAIN_RECT_BATCH=str(mode), DOT_MAIN_RECT_AUDIT="1")
+              p = subprocess.run([exe], env=env, capture_output=True, text=True, timeout=60)
+              log = p.stderr
+              (out / f"{name}-overflow.log").write_text(log + p.stdout)
+              print(log, flush=True)
+              assert p.returncode == 0, log
+              phases = re.split(r"(?m)^\[overflow-phase\] (grow|shrink|width)$", log)
+              assert phases[1::2] == ["grow", "shrink", "width"], log
+              for tag, wanted, height, receipt in zip(phases[1::2], (1,1,0), (440,400,400), phases[2::2]):
+                  writes = re.findall(r"\[dot-main-" + name + r"\] ids=(\d+) writes=(\d+) epoch=(\d+)", receipt)
+                  assert writes == [tuple([str(wanted)]*3)], receipt
+                  assert f"[overflow-result] {tag} shifted={wanted} height={height}" in receipt, receipt
+                  print(json.dumps(dict(phase="verified-overflow", mode=name, tag=tag, moved=wanted,
+                                        scrollHeight=height, maxScrollTop=height-200)), flush=True)
+          PY
+      - name: Archive results and exact patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-rect-overflow-evidence
+          path: ${{ runner.temp }}/main-rect-evidence
+          if-no-files-found: ignore
