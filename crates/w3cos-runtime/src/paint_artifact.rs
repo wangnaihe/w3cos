@@ -7113,7 +7113,7 @@ const FEATURE_TABLE: u8 = 4;
 /// A multicol box (`column-count` or a non-auto `column-width`).
 const FEATURE_COLUMNS: u8 = 32;
 
-/// `W3COS_PAINT_CAPTION_COLUMN_PRESENCE=1|verify` (default off; needs
+/// `W3COS_PAINT_CAPTION_COLUMN_PRESENCE` (on by default, `=0` turns it off; needs
 /// `W3COS_PAINT_FEATURE_SKIP`): when the kept feature superset has no table
 /// part, the build skips the table caption inset pass (its own full scan
 /// for a caption), and without a multicol box it skips the multicol scan.
@@ -7129,9 +7129,9 @@ pub(crate) fn paint_caption_column_presence_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
@@ -7185,7 +7185,7 @@ const FEATURE_INLINE_BACKGROUND_GROUP: u8 = 16;
 /// A box floats (see `W3COS_PAINT_FLOAT_PRESENCE`).
 const FEATURE_FLOAT: u8 = 64;
 
-/// `W3COS_PAINT_FLOAT_PRESENCE=1|verify` (default off; needs
+/// `W3COS_PAINT_FLOAT_PRESENCE` (on by default, `=0` turns it off; needs
 /// `W3COS_PAINT_FEATURE_SKIP`): when the kept feature superset has no
 /// floating box, the build skips resolving float line bands (a walk over
 /// every box). `verify` checks no box floats and resolves anyway.
@@ -7197,9 +7197,9 @@ pub(crate) fn paint_float_presence_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_FLOAT_PRESENCE").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
