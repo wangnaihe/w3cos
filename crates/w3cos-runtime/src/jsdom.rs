@@ -3062,6 +3062,7 @@ fn ensure_popover_can_toggle(node: u32) {
 fn set_popover_open(node: u32, open: bool) {
     ensure_popover_can_toggle(node);
     set_expando(node, POPOVER_OPEN_EXPANDO, Value::Bool(open));
+    dom::set_top_layer(node, open);
 }
 
 fn dialog_is_modal(node: u32) -> bool {
@@ -29083,6 +29084,55 @@ mod tests {
         new_parent.call_method("moveBefore", vec![popover.clone(), Value::Null]);
         assert!(
             document.call_method("querySelector", vec![Value::string(":popover-open")]) == popover
+        );
+    }
+
+    #[test]
+    fn show_and_hide_popover_toggle_the_top_layer_marker() {
+        setup();
+        let document = document_value();
+        let body = document.get_property("body");
+        let popover = document.call_method("createElement", vec![Value::string("div")]);
+        popover.call_method(
+            "setAttribute",
+            vec![Value::string("popover"), Value::string("")],
+        );
+        body.call_method("appendChild", vec![popover.clone()]);
+        let node = node_id_of(&popover).expect("popover node");
+        let marked = || {
+            dom::with_document(|doc| {
+                let style = doc.computed_style_for(NodeId::from_u32(node));
+                (
+                    style.position,
+                    style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|p| p.contains_key(w3cos_dom::document::TOP_LAYER_MARKER)),
+                )
+            })
+        };
+        assert_eq!(marked(), (w3cos_std::style::Position::Static, false));
+        popover.call_method("showPopover", vec![]);
+        assert!(dom::in_top_layer(node));
+        assert_eq!(marked(), (w3cos_std::style::Position::Fixed, true));
+        assert!(
+            document.call_method("querySelector", vec![Value::string(":popover-open")]) == popover
+        );
+        // The marker is style-only: no attribute is added.
+        assert_eq!(
+            popover
+                .call_method("getAttributeNames", vec![])
+                .get_property("length")
+                .to_number(),
+            1.0
+        );
+        popover.call_method("hidePopover", vec![]);
+        assert!(!dom::in_top_layer(node));
+        assert_eq!(marked(), (w3cos_std::style::Position::Static, false));
+        assert!(
+            document
+                .call_method("querySelector", vec![Value::string(":popover-open")])
+                .is_null()
         );
     }
 

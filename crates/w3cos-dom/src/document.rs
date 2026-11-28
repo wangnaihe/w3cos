@@ -464,6 +464,8 @@ pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
 /// the page back, and flex layout uses it to leave `display:flex` on the
 /// root element to the legacy engine.
 pub const DOCUMENT_ELEMENT_MARKER: &str = "--w3cos-internal-document-element";
+/// Carried by a box in the top layer (see [`Document::set_top_layer`]).
+pub const TOP_LAYER_MARKER: &str = "--w3cos-internal-top-layer";
 /// Set on a block whose first line is styled by `::first-line`.
 pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
 pub const FIRST_LETTER_STYLE_MARKER: &str = "--w3cos-internal-first-letter-style";
@@ -971,6 +973,8 @@ pub struct Document {
     html_document: bool,
     // Quirks mode changes percentage-height containing-block traversal.
     quirks_mode: bool,
+    /// Elements rendered in the top layer (open popovers), in order.
+    top_layer: Vec<NodeId>,
 }
 
 #[path = "document/table_mutation.rs"]
@@ -1201,6 +1205,7 @@ impl Document {
             selection: Selection::new(),
             html_document: true,
             quirks_mode: false,
+            top_layer: Vec::new(),
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -1289,6 +1294,27 @@ impl Document {
         }
         self.html_document = html_document;
         self.mark_dirty(NodeId::ROOT);
+    }
+
+    /// Add or remove an element from the top layer (an open popover). Its
+    /// UA style becomes `position: fixed` and it carries
+    /// [`TOP_LAYER_MARKER`] so layout uses the initial containing block as
+    /// its static-position rectangle (CSS Position 3).
+    pub fn set_top_layer(&mut self, id: NodeId, open: bool) {
+        let present = self.top_layer.contains(&id);
+        if present == open {
+            return;
+        }
+        if open {
+            self.top_layer.push(id);
+        } else {
+            self.top_layer.retain(|node| *node != id);
+        }
+        self.mark_inline_style_dirty(id);
+    }
+
+    pub fn in_top_layer(&self, id: NodeId) -> bool {
+        !self.top_layer.is_empty() && self.top_layer.contains(&id)
     }
 
     pub fn set_quirks_mode(&mut self, quirks_mode: bool) {
@@ -3480,6 +3506,27 @@ impl Document {
             merged.set_property("color", "#0000ee");
             merged.set_property("text-decoration", "underline");
         }
+        // `[popover]:popover-open` UA rule (HTML §15.3.x, Blink html.css):
+        // below user and author declarations.
+        let top_layer = node.node_type == NodeType::Element
+            && self.in_top_layer(id)
+            && node.get_attribute("popover").is_some();
+        if top_layer {
+            for (property, value) in [
+                ("position", "fixed"),
+                ("inset", "0"),
+                ("margin", "auto"),
+                ("width", "fit-content"),
+                ("height", "fit-content"),
+                ("overflow", "auto"),
+                ("border", "solid"),
+                ("padding", "0.25em"),
+                ("background-color", "white"),
+                ("color", "black"),
+            ] {
+                merged.set_property(property, value);
+            }
+        }
         // The legacy HTML `text` presentational hint participates before
         // author declarations and supplies the body's inherited color. CSS2
         // generated-content tests still exercise this behavior for XHTML
@@ -3867,6 +3914,12 @@ impl Document {
                 .custom_properties
                 .get_or_insert_with(Default::default)
                 .insert(user_agent::BUTTON_PROPERTY.into(), "1".into());
+        }
+        if top_layer {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(TOP_LAYER_MARKER.into(), "1".into());
         }
 
         if let Some(parent) = inherited {
@@ -5583,6 +5636,9 @@ impl Document {
     ) -> Option<MatchedPropertiesKey> {
         let node = self.get_node(id);
         let inherited = inherited?;
+        if self.in_top_layer(id) {
+            return None;
+        }
         // Text nodes have no own declarations: like Blink's LayoutText, which
         // shares its parent's ComputedStyle, their style is a function of the
         // parent style alone, so every text run under an equal parent shares

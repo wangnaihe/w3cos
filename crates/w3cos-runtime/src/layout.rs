@@ -25498,6 +25498,10 @@ fn collect_layouts_fast(
                         | ComponentKind::SvgDocument { .. }
                 ) || marked_replaced_element;
                 rect = compute_fixed_rect(info.style, viewport_w, viewport_h, rect, replaced);
+                if is_top_layer(info.style) {
+                    let root = root_style_of(flat, ctx);
+                    rect = top_layer_fixed_rect(info.style, root, viewport_w, viewport_h, rect);
+                }
                 fixed_out.push((rect, ctx));
             } else {
                 if matches!(info.style.position, WPos::Absolute) {
@@ -26292,6 +26296,72 @@ fn compute_absolute_rect(
         width,
         height,
     }
+}
+
+/// Whether a box is in the top layer (an open popover): the DOM marks it.
+pub(crate) fn is_top_layer(style: &w3cos_std::style::Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|p| p.contains_key("--w3cos-internal-top-layer"))
+}
+
+/// The root element's style, whose writing mode and direction are the
+/// initial containing block's.
+pub(crate) fn root_style_of<'a>(
+    flat: &[FlatNodeInfo<'a>],
+    index: usize,
+) -> &'a w3cos_std::style::Style {
+    let mut at = index;
+    while let Some(parent) = flat[at].parent {
+        if flat[at]
+            .style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|p| p.contains_key("--w3cos-internal-document-element"))
+        {
+            break;
+        }
+        at = parent;
+    }
+    flat[at].style
+}
+
+/// A top-layer box's static-position rectangle is the initial containing
+/// block (CSS Position 3 §3.5.1), so with auto insets it sits in the ICB's
+/// block-start / inline-start corner for the root's writing mode and
+/// direction. Returns whether that corner is (right, bottom).
+pub(crate) fn top_layer_static_corner(root: &w3cos_std::style::Style) -> (bool, bool) {
+    use w3cos_std::style::WritingMode as Wm;
+    let rtl = root.direction == w3cos_std::style::TextDirection::Rtl;
+    match root.writing_mode {
+        Wm::HorizontalTb => (rtl, false),
+        Wm::VerticalRl | Wm::SidewaysRl => (true, rtl),
+        Wm::VerticalLr => (false, rtl),
+        Wm::SidewaysLr => (false, !rtl),
+    }
+}
+
+/// Move a fixed top-layer box whose insets are auto to the ICB corner.
+fn top_layer_fixed_rect(
+    style: &w3cos_std::style::Style,
+    root: &w3cos_std::style::Style,
+    viewport_w: f32,
+    viewport_h: f32,
+    mut rect: LayoutRect,
+) -> LayoutRect {
+    let (right, bottom) = top_layer_static_corner(root);
+    if matches!(style.left, WDim::Auto) && matches!(style.right, WDim::Auto) {
+        rect.x = if right { viewport_w - rect.width } else { 0.0 };
+    }
+    if matches!(style.top, WDim::Auto) && matches!(style.bottom, WDim::Auto) {
+        rect.y = if bottom {
+            viewport_h - rect.height
+        } else {
+            0.0
+        };
+    }
+    rect
 }
 
 fn compute_fixed_rect(
@@ -32284,6 +32354,53 @@ mod tests {
             false,
         );
         assert_eq!((fixed_margin.x, fixed_margin.y), (58.0, 50.0));
+    }
+
+    #[test]
+    fn top_layer_fixed_rect_uses_the_icb_start_corner() {
+        use w3cos_std::style::{TextDirection as Dir, WritingMode as Wm};
+        let popover = Style {
+            position: WPos::Fixed,
+            width: WDim::Px(100.0),
+            height: WDim::Px(100.0),
+            ..Style::default()
+        };
+        let in_flow = LayoutRect {
+            x: 8.0,
+            y: 100.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        for (writing_mode, direction, want) in [
+            (Wm::HorizontalTb, Dir::Ltr, (0.0, 0.0)),
+            (Wm::HorizontalTb, Dir::Rtl, (700.0, 0.0)),
+            (Wm::SidewaysLr, Dir::Ltr, (0.0, 500.0)),
+            (Wm::SidewaysLr, Dir::Rtl, (0.0, 0.0)),
+            (Wm::SidewaysRl, Dir::Ltr, (700.0, 0.0)),
+            (Wm::SidewaysRl, Dir::Rtl, (700.0, 500.0)),
+            (Wm::VerticalLr, Dir::Ltr, (0.0, 0.0)),
+            (Wm::VerticalLr, Dir::Rtl, (0.0, 500.0)),
+            (Wm::VerticalRl, Dir::Ltr, (700.0, 0.0)),
+            (Wm::VerticalRl, Dir::Rtl, (700.0, 500.0)),
+        ] {
+            let root = Style {
+                writing_mode,
+                direction,
+                ..Style::default()
+            };
+            let rect = compute_fixed_rect(&popover, 800.0, 600.0, in_flow, false);
+            let rect = top_layer_fixed_rect(&popover, &root, 800.0, 600.0, rect);
+            assert_eq!((rect.x, rect.y), want, "{writing_mode:?} {direction:?}");
+        }
+        // Specified insets win over the static position.
+        let inset = Style {
+            left: WDim::Px(10.0),
+            top: WDim::Px(20.0),
+            ..popover
+        };
+        let rect = compute_fixed_rect(&inset, 800.0, 600.0, in_flow, false);
+        let rect = top_layer_fixed_rect(&inset, &Style::default(), 800.0, 600.0, rect);
+        assert_eq!((rect.x, rect.y), (10.0, 20.0));
     }
 
     #[test]

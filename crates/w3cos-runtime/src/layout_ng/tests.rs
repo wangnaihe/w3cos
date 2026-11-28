@@ -17580,3 +17580,72 @@ fn wpt_flex_svg_no_intrinsic_column_is_a_square() {
     ));
     assert_eq!(legacy, uncached_legacy, "flex svg column legacy");
 }
+
+/// An open popover (top layer) with auto insets sits in the initial
+/// containing block's block-start / inline-start corner for the root's
+/// writing mode and direction, not at its in-flow place
+/// (css-position/static-position/top-layer-box-uses-icb-*).
+#[test]
+fn top_layer_box_uses_the_icb_start_corner() {
+    use w3cos_std::style::{Position, TextDirection, WritingMode};
+    let cases = [
+        (WritingMode::HorizontalTb, TextDirection::Ltr, (0.0, 0.0)),
+        (WritingMode::HorizontalTb, TextDirection::Rtl, (700.0, 0.0)),
+        (WritingMode::VerticalRl, TextDirection::Ltr, (700.0, 0.0)),
+        (WritingMode::VerticalLr, TextDirection::Rtl, (0.0, 500.0)),
+        (WritingMode::SidewaysRl, TextDirection::Rtl, (700.0, 500.0)),
+    ];
+    for (writing_mode, direction, want) in cases {
+        let popover = Style {
+            position: Position::Fixed,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(100.0),
+            margin: Edges {
+                top: Spacing::Auto,
+                right: Spacing::Auto,
+                bottom: Spacing::Auto,
+                left: Spacing::Auto,
+            },
+            writing_mode,
+            direction,
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
+                "--w3cos-internal-top-layer".to_string(),
+                "1".to_string(),
+            )])),
+            ..block()
+        };
+        let root_style = Style {
+            writing_mode,
+            direction,
+            ..block()
+        };
+        let root = node(
+            root_style.clone(),
+            vec![node(
+                Style {
+                    writing_mode,
+                    direction,
+                    ..block()
+                },
+                vec![node(sized(100.0), vec![]), node(popover, vec![])],
+            )],
+        );
+        assert_eq!(
+            crate::layout::top_layer_static_corner(&root_style),
+            (want.0 > 0.0, want.1 > 0.0)
+        );
+        let flat = pre_flatten(&root);
+        let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
+        let r = legacy.iter().find(|(_, i)| *i == 3).expect("legacy rect").0;
+        assert_eq!((r.x, r.y), want, "legacy {writing_mode:?} {direction:?}");
+        if writing_mode == WritingMode::HorizontalTb {
+            assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+            let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+            let r = ng.iter().find(|(_, i)| *i == 3).expect("ng rect").0;
+            assert_eq!(
+                (r.x, r.y, r.width, r.height),
+                (want.0, want.1, 100.0, 100.0)
+            );
+        }
+    }
+}
