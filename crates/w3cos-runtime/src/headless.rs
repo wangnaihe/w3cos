@@ -3977,6 +3977,8 @@ mod tests {
         crate::paint_artifact::PAINT_CULL_RECT_OVERRIDE.with(|value| value.set(Some(1)));
         crate::paint_artifact::PAINT_CULL_RUNS_OVERRIDE.with(|value| value.set(Some(1)));
         crate::incremental_layout::WARM_REBUILD_OVERRIDE.with(|value| value.set(Some(true)));
+        // Quiet moves ride the diff's culled spans.
+        crate::retained_layers::PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(|value| value.set(Some(1)));
         // `W3COS_PAINT_DIFF_QUIET_MOVES`: the diff leaves the culled moved
         // cards out, so the damage never sees them; the frames still match.
         for (quiet, quiet_moves) in [(false, 0), (true, 0), (true, 1)] {

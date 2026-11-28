@@ -8519,11 +8519,18 @@ mod tests {
             use crate::retained_layers::{
                 PAINT_DIFF_QUIET_MOVES_MISMATCHES, PAINT_DIFF_QUIET_MOVES_OVERRIDE, paint_damage,
             };
+            // Under `W3COS_PAINT_DAMAGE_QUIET` the damage already leaves
+            // those boxes out.
             let quiet = |mode: u8| {
+                PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(|value| value.set(Some(1)));
+                crate::retained_layers::PAINT_DAMAGE_QUIET_OVERRIDE
+                    .with(|value| value.set(Some(true)));
                 PAINT_DIFF_QUIET_MOVES_OVERRIDE.with(|value| value.set(Some(mode)));
                 let diff = paint_diff_clients(&second, &third).expect("paint diff");
                 let damage = paint_damage(&second, &third, &diff);
                 PAINT_DIFF_QUIET_MOVES_OVERRIDE.with(|value| value.set(None));
+                PAINT_DIFF_CULLED_SPANS_OVERRIDE.with(|value| value.set(None));
+                crate::retained_layers::PAINT_DAMAGE_QUIET_OVERRIDE.with(|value| value.set(None));
                 (diff.dirty, diff.moved, damage)
             };
             let (base_dirty, base_moved, base_damage) = quiet(0);
