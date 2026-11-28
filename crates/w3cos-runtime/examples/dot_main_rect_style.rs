@@ -35,7 +35,6 @@ struct Snapshot {
     boxes: [[f64; 4]; 4],
     total: f64,
     clamped: f64,
-    clamped_tail_offset: f64,
 }
 fn snapshot(sc: &Value, lead: &Value, tail: &Value, control: &Value, height: f64) -> Snapshot {
     let total = sc.get_property("scrollHeight").to_number();
@@ -45,28 +44,47 @@ fn snapshot(sc: &Value, lead: &Value, tail: &Value, control: &Value, height: f64
     assert_eq!(sc.get_property("clientHeight").to_number(), 200.0);
     assert_eq!(sc.get_property("clientWidth").to_number(), 240.0);
     assert_eq!(boxes[3][0], 1.0);
+    assert_eq!(boxes[2][1] - boxes[0][1], height);
+    assert_eq!(boxes[2][3], 300.0);
     sc.set_property("scrollTop", Value::string("10000"));
     let clamped = sc.get_property("scrollTop").to_number();
     assert_eq!(clamped,total-200.0);
-    let clamped_tail_offset = rect(tail)[1] - rect(sc)[1];
-    assert_eq!(clamped_tail_offset, -100.0);
     sc.set_property("scrollTop", Value::string("0"));
     assert!(incremental_layout::flush());
-    Snapshot { boxes, total, clamped, clamped_tail_offset }
+    Snapshot { boxes, total, clamped }
 }
+// Independent, non-gating CSSOM observation; the layout receipt test does
+// not reinterpret browser-relative getBoundingClientRect semantics.
+fn observe_cssom() {
+    let (_,sc,_,tail,_) = setup(false,false);
+    assert!(incremental_layout::flush());
+    assert_eq!(incremental_layout::last_flush_stats().kind,"rebuild");
+    let before = rect(&tail)[1] - rect(&sc)[1];
+    let height = sc.get_property("scrollHeight").to_number();
+    let page = sc.get_property("clientHeight").to_number();
+    sc.set_property("scrollTop",Value::string("10000"));
+    let scroll = sc.get_property("scrollTop").to_number();
+    assert_eq!((height,page,scroll,before),(400.0,200.0,200.0,100.0));
+    let observed = rect(&tail)[1] - rect(&sc)[1];
+    let expected = before - scroll;
+    println!("[cssom-ancestor-scroll] scroll={scroll} before={before} expected={expected} observed={observed} matches={}",observed == expected);
+}
+
 fn main() {
-    // The last-flush receipt is thread-local and is not cleared by invalidate.
-    // Never let a fresh-layout oracle leave its receipt on the measured thread.
-    let oracle = std::thread::spawn(|| {
-        let make = |tall,narrow| {
+    if std::env::args().nth(1).as_deref() == Some("--observe-cssom") {
+        observe_cssom();
+        return;
+    }
+    // Each oracle and the measured fixture have independent last-flush slots.
+    let oracle = [(false,false), (true,false), (false,true)].map(|(tall,narrow)| {
+        std::thread::spawn(move || {
             let (_,sc,lead,tail,control) = setup(tall,narrow);
+            assert_eq!(incremental_layout::last_flush_stats().kind,"none");
             assert!(incremental_layout::flush());
-            let initial = incremental_layout::last_flush_stats();
-            assert_eq!(initial.kind, "rebuild");
+            assert_eq!(incremental_layout::last_flush_stats().kind,"rebuild");
             snapshot(&sc,&lead,&tail,&control, if tall {140.0} else {100.0})
-        };
-        [make(false,false),make(true,false),make(false,true)]
-    }).join().expect("fresh oracles");
+        }).join().expect("fresh oracle")
+    });
     let (id,sc,lead,tail,control) = setup(false,false);
     assert_eq!(incremental_layout::last_flush_stats().kind, "none");
     assert!(incremental_layout::flush());
@@ -89,6 +107,6 @@ fn main() {
         let observed = snapshot(&sc,&lead,&tail,&control,height);
         assert_eq!(observed,oracle[state],"{tag}");
         assert_eq!(observed.boxes[3],oracle[0].boxes[3],"{tag} moved unrelated sibling");
-        eprintln!("[overflow-result] {tag} shifted={} height={} clamp={} tail={}",stat.shifted_nodes,observed.total,observed.clamped,observed.clamped_tail_offset);
+        eprintln!("[overflow-result] {tag} shifted={} height={} clamp={}",stat.shifted_nodes,observed.total,observed.clamped);
     }
 }
