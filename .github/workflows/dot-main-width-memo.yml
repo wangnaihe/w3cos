@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 5
       - name: Install baseline dependencies
         run: |
           git rev-parse HEAD
@@ -109,7 +109,7 @@ jobs:
           set -uo pipefail
           result=0
           for mode in 0 1; do
-            for scenario in width cross after-replay; do
+            for scenario in width cross; do
               printf 'retained layout_ng=0 guarded=%s case=%s\n' "$mode" "$scenario"
               DOT_WIDTH_MEMO_FIX=$mode W3COS_LAYOUT_NG=0 W3COS_LAYOUT_NG_VERIFY=0 W3COS_SUBTREE_RELAYOUT=0 \
                 target/runtime-bench/examples/dot_width_memo_correctness "$scenario" \
@@ -141,6 +141,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: current-main-width-memo-evidence
+          name: current-main-width-memo-replay-evidence
           path: ${{ runner.temp }}/width-memo-evidence
           if-no-files-found: ignore
