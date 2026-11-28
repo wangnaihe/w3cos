@@ -7228,7 +7228,8 @@ fn float_presence_count(field: usize) {
     });
 }
 
-/// `W3COS_PAINT_FEATURE_SKIP=1|verify` (off by default): the reusing build
+/// `W3COS_PAINT_FEATURE_SKIP` (on by default, `=0` turns it off; `=verify`
+/// checks it): the reusing build
 /// skips its whole-tree passes for percentage translates, media controls
 /// and tables when no box can carry them: the previous build's set plus
 /// the boxes this frame's layout splice touched (every other box kept its
@@ -7241,9 +7242,9 @@ pub(crate) fn paint_feature_skip_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_FEATURE_SKIP").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
