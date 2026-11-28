@@ -2654,7 +2654,11 @@ fn string_char_code_at(string: &crate::JsString, index: Option<&Value>) -> Value
         return Value::Number(f64::from(bytes[index]));
     }
     if value.len() >= UTF16_CURSOR_MIN_LEN {
-        return Value::Number(utf16_unit_at(string, index).map(f64::from).unwrap_or(f64::NAN));
+        return Value::Number(
+            utf16_unit_at(string, index)
+                .map(f64::from)
+                .unwrap_or(f64::NAN),
+        );
     }
     Value::Number(
         value
@@ -3809,7 +3813,6 @@ pub(crate) fn utf16_len(value: &crate::JsString) -> usize {
     UTF16_LEN.with(|cache| *cache.borrow_mut() = Some((value.clone(), len)));
     len
 }
-
 
 fn string_index_to_byte(value: &str, index: usize) -> usize {
     // An ASCII prefix maps chars to bytes one-to-one; checking it is a
