@@ -1304,8 +1304,148 @@ pub enum AotCapture {
 
 /// Capture environment for an AOT-emitted nested function factory.
 ///
-/// Keys are W3IR binding ids.
-pub type AotCaptureMap = HashMap<u32, AotCapture>;
+/// Keys are W3IR binding ids. A closure captures only a handful of
+/// bindings, so this is a small vector searched linearly instead of a
+/// `HashMap`: no `RandomState`, no power-of-two bucket table and no rehash as
+/// it fills. The first few inserts grow the buffer one slot at a time so a
+/// closure that captures one binding holds exactly one entry.
+#[derive(Clone, Default)]
+pub struct AotCaptureMap {
+    entries: Vec<(u32, AotCapture)>,
+}
+
+impl AotCaptureMap {
+    /// Entries up to this count grow the buffer by exactly one slot.
+    const EXACT_GROWTH: usize = 4;
+
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    fn position(&self, key: u32) -> Option<usize> {
+        self.entries.iter().position(|(id, _)| *id == key)
+    }
+
+    /// Same contract as `HashMap::insert`: returns the replaced capture.
+    pub fn insert(&mut self, key: u32, capture: AotCapture) -> Option<AotCapture> {
+        if let Some(index) = self.position(key) {
+            return Some(std::mem::replace(&mut self.entries[index].1, capture));
+        }
+        let len = self.entries.len();
+        if len == self.entries.capacity() && len < Self::EXACT_GROWTH {
+            self.entries.reserve_exact(1);
+        }
+        self.entries.push((key, capture));
+        None
+    }
+
+    pub fn get(&self, key: &u32) -> Option<&AotCapture> {
+        self.entries
+            .iter()
+            .find(|(id, _)| id == key)
+            .map(|(_, capture)| capture)
+    }
+
+    pub fn get_mut(&mut self, key: &u32) -> Option<&mut AotCapture> {
+        self.entries
+            .iter_mut()
+            .find(|(id, _)| id == key)
+            .map(|(_, capture)| capture)
+    }
+
+    pub fn contains_key(&self, key: &u32) -> bool {
+        self.position(*key).is_some()
+    }
+
+    pub fn remove(&mut self, key: &u32) -> Option<AotCapture> {
+        let index = self.position(*key)?;
+        Some(self.entries.swap_remove(index).1)
+    }
+
+    /// Iterates in insertion order. Callers must not rely on any order,
+    /// as with the `HashMap` this replaced.
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &AotCapture)> {
+        self.entries.iter().map(|(id, capture)| (id, capture))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &u32> {
+        self.entries.iter().map(|(id, _)| id)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &AotCapture> {
+        self.entries.iter().map(|(_, capture)| capture)
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+    }
+}
+
+impl std::ops::Index<&u32> for AotCaptureMap {
+    type Output = AotCapture;
+
+    fn index(&self, key: &u32) -> &AotCapture {
+        self.get(key)
+            .expect("AotCaptureMap: no capture for binding id")
+    }
+}
+
+impl<const N: usize> From<[(u32, AotCapture); N]> for AotCaptureMap {
+    fn from(entries: [(u32, AotCapture); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+
+impl FromIterator<(u32, AotCapture)> for AotCaptureMap {
+    fn from_iter<I: IntoIterator<Item = (u32, AotCapture)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let mut map = Self::with_capacity(iter.size_hint().0);
+        for (key, capture) in iter {
+            map.insert(key, capture);
+        }
+        map
+    }
+}
+
+impl Extend<(u32, AotCapture)> for AotCaptureMap {
+    fn extend<I: IntoIterator<Item = (u32, AotCapture)>>(&mut self, iter: I) {
+        for (key, capture) in iter {
+            self.insert(key, capture);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a AotCaptureMap {
+    type Item = (&'a u32, &'a AotCapture);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (u32, AotCapture)>,
+        fn(&'a (u32, AotCapture)) -> (&'a u32, &'a AotCapture),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(id, capture)| (id, capture))
+    }
+}
 
 static FAST_DOM_DISPATCH: OnceLock<fn(u32, &Value) -> Option<bool>> = OnceLock::new();
 
@@ -2208,7 +2348,7 @@ impl Value {
         if key == "length"
             && let Some(string) = self.as_js_string()
         {
-            return Value::Number(utf16_length(string.as_str()) as f64);
+            return Value::Number(utf16_len(&string) as f64);
         }
         if let Some(value) = fast_known_collection_key(self, key) {
             return value;
@@ -2283,13 +2423,12 @@ impl Value {
             _ if self.is_string() => {
                 let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
-                    s.encode_utf16()
-                        .nth(idx)
+                    utf16_unit_at(&s, idx)
                         .and_then(|unit| String::from_utf16(&[unit]).ok())
                         .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(utf16_length(&s) as f64)
+                    Value::Number(utf16_len(&s) as f64)
                 } else {
                     Value::Undefined
                 }
@@ -2501,28 +2640,25 @@ impl Value {
     }
 }
 
-/// UTF-16 length of a UTF-8 string: one unit per scalar below U+10000, two
-/// above. ASCII (the common case) is the byte length.
-#[inline]
-fn utf16_length(value: &str) -> usize {
-    if value.is_ascii() {
-        value.len()
-    } else {
-        value.encode_utf16().count()
-    }
-}
-
 /// `String.prototype.charCodeAt` with an ASCII-prefix fast path.
 #[inline]
-fn string_char_code_at(value: &str, index: Option<&Value>) -> Value {
+fn string_char_code_at(string: &crate::JsString, index: Option<&Value>) -> Value {
     let index = index.map(Value::to_number).unwrap_or(0.0);
     if !index.is_finite() || index < 0.0 {
         return Value::Number(f64::NAN);
     }
     let index = index as usize;
+    let value = string.as_str();
     let bytes = value.as_bytes();
-    if index < bytes.len() && bytes[..=index].is_ascii() {
+    if index < bytes.len() && index < UTF16_CURSOR_MIN_LEN && bytes[..=index].is_ascii() {
         return Value::Number(f64::from(bytes[index]));
+    }
+    if value.len() >= UTF16_CURSOR_MIN_LEN {
+        return Value::Number(
+            utf16_unit_at(string, index)
+                .map(f64::from)
+                .unwrap_or(f64::NAN),
+        );
     }
     Value::Number(
         value
@@ -2531,6 +2667,59 @@ fn string_char_code_at(value: &str, index: Option<&Value>) -> Value {
             .map(f64::from)
             .unwrap_or(f64::NAN),
     )
+}
+
+/// Strings shorter than this are indexed by re-encoding from the start.
+const UTF16_CURSOR_MIN_LEN: usize = 256;
+
+thread_local! {
+    /// The last long string indexed by UTF-16 unit, with a char-boundary
+    /// cursor into it: `(string, unit index, byte offset)`. Holding the
+    /// `JsString` keeps its storage alive, so `ptr_eq` cannot see a reused
+    /// allocation. Scanners walk `charCodeAt(i)` forward one unit at a
+    /// time; without the cursor every call re-scans the prefix and a
+    /// parse is quadratic in the text length.
+    static UTF16_CURSOR: RefCell<Option<(crate::JsString, usize, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// The UTF-16 code unit at `index` (`String.prototype.charCodeAt`), or
+/// `None` past the end. Amortized O(1) for nearby indices on long strings.
+fn utf16_unit_at(value: &crate::JsString, index: usize) -> Option<u16> {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().nth(index);
+    }
+    let (mut unit, mut byte) = UTF16_CURSOR.with(|cursor| match &*cursor.borrow() {
+        Some((cached, unit, byte))
+            if cached.ptr_eq(value) && cached.as_str().len() == text.len() =>
+        {
+            (*unit, *byte)
+        }
+        _ => (0, 0),
+    });
+    if index < unit {
+        if index < unit / 2 {
+            (unit, byte) = (0, 0);
+        } else {
+            while unit > index {
+                let ch = text[..byte].chars().next_back()?;
+                byte -= ch.len_utf8();
+                unit -= ch.len_utf16();
+            }
+        }
+    }
+    let ch = loop {
+        let ch = text[byte..].chars().next()?;
+        if unit + ch.len_utf16() > index {
+            break ch;
+        }
+        byte += ch.len_utf8();
+        unit += ch.len_utf16();
+    };
+    UTF16_CURSOR.with(|cursor| *cursor.borrow_mut() = Some((value.clone(), unit, byte)));
+    let mut units = [0u16; 2];
+    Some(ch.encode_utf16(&mut units)[index - unit])
 }
 
 // ── Constructors ───────────────────────────────────────────────────────
@@ -2560,7 +2749,7 @@ impl Value {
     /// so the trap can read them without re-entering.
     pub fn proxied_object(entries: &[(&str, Value)], handler: crate::proxy::ProxyHandler) -> Self {
         let mut object = crate::JsObject::new();
-        object.proxy_handler = Some(handler);
+        object.proxy_handler = Some(Box::new(handler));
         for (key, value) in entries {
             object.set_direct(key, value.clone());
         }
@@ -2576,7 +2765,7 @@ impl Value {
         handler: crate::proxy::ProxyHandler,
     ) -> Self {
         let mut object = crate::JsObject::new();
-        object.proxy_handler = Some(handler);
+        object.proxy_handler = Some(Box::new(handler));
         for (key, value) in entries {
             object.set_direct(key, value.clone());
         }
@@ -2906,8 +3095,9 @@ impl Value {
             }
             (this, "slice") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let ascii = value.is_ascii();
-                // ASCII: UTF-16 units are bytes, so skip re-encoding the string.
+                // ASCII: UTF-16 units are bytes, so slice the text directly
+                // instead of re-encoding it on every call.
+                let ascii = is_ascii_js_string(&value);
                 let units = if ascii {
                     Vec::new()
                 } else {
@@ -2935,8 +3125,13 @@ impl Value {
             }
             (this, "substr") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                let ascii = is_ascii_js_string(&value);
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let raw_start = args
                     .first()
                     .map(Value::to_number)
@@ -2953,8 +3148,11 @@ impl Value {
                     .map(Value::to_number)
                     .filter(|number| number.is_finite())
                     .map(|number| number.trunc().max(0.0) as usize)
-                    .unwrap_or(units.len() - start);
-                let end = start.saturating_add(count).min(units.len());
+                    .unwrap_or(length as usize - start);
+                let end = start.saturating_add(count).min(length as usize);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "startsWith") if this.is_string() => {
@@ -2975,13 +3173,17 @@ impl Value {
                 let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start_byte = string_index_to_byte(&value, start);
+                let ascii = is_ascii_js_string(&value);
+                let start_byte = if ascii {
+                    start.min(value.len())
+                } else {
+                    string_index_to_byte(&value, start)
+                };
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
                     .map(|byte| {
-                        let prefix = &value.as_bytes()[..byte];
-                        if prefix.is_ascii() {
+                        if ascii || value.as_bytes()[..byte].is_ascii() {
                             byte as f64
                         } else {
                             value[..byte].chars().count() as f64
@@ -3031,7 +3233,7 @@ impl Value {
             }
             (this, "charCodeAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                return string_char_code_at(value.as_str(), args.first());
+                return string_char_code_at(&value, args.first());
             }
             (this, "charAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -3040,6 +3242,9 @@ impl Value {
                     return Value::from(String::new());
                 }
                 let index = index as usize;
+                if is_ascii_js_string(&value) {
+                    return Value::from(value.get(index..index + 1).unwrap_or(""));
+                }
                 if index < value.len() && value.as_bytes()[..=index].is_ascii() {
                     return Value::from(&value[index..=index]);
                 }
@@ -3053,7 +3258,12 @@ impl Value {
             }
             (this, "substring") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let len = value.chars().count();
+                let ascii = is_ascii_js_string(&value);
+                let len = if ascii {
+                    value.len()
+                } else {
+                    value.chars().count()
+                };
                 let mut start = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
                 let mut end = args
                     .get(1)
@@ -3064,6 +3274,9 @@ impl Value {
                 end = end.min(len);
                 if start > end {
                     std::mem::swap(&mut start, &mut end);
+                }
+                if ascii {
+                    return Value::from(&value[start..end]);
                 }
                 let start = string_index_to_byte(&value, start);
                 let end = string_index_to_byte(&value, end);
@@ -3265,7 +3478,7 @@ impl Value {
         if key == "charCodeAt"
             && let Some(string) = self.as_js_string()
         {
-            return string_char_code_at(string.as_str(), args.first());
+            return string_char_code_at(&string, args.first());
         }
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
@@ -3558,6 +3771,47 @@ fn array_index(value: Option<&Value>, len: usize, default: usize) -> usize {
     } else {
         (n as usize).min(len)
     }
+}
+
+thread_local! {
+    /// The last long string whose UTF-16 length was measured. `s.length`
+    /// in a scanner loop (`while (i < s.length)`) reads it once per step;
+    /// re-encoding the whole text each time makes the loop quadratic.
+    /// Holding a clone keeps the `Rc` shared, so the text cannot be
+    /// mutated in place while cached.
+    static UTF16_LEN: RefCell<Option<(crate::JsString, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// Whether every character is ASCII (UTF-16 units, chars and bytes then
+/// coincide). Amortized O(1) for long strings via the [`utf16_len`] cache:
+/// the UTF-16 length equals the byte length only for all-ASCII text.
+pub(crate) fn is_ascii_js_string(value: &crate::JsString) -> bool {
+    utf16_len(value) == value.as_str().len()
+}
+
+/// `String.prototype.length`: the UTF-16 length, amortized O(1) for
+/// repeated reads of the same long string.
+pub(crate) fn utf16_len(value: &crate::JsString) -> usize {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().count();
+    }
+    if let Some(len) = UTF16_LEN.with(|cache| match &*cache.borrow() {
+        Some((cached, len)) if cached.ptr_eq(value) && cached.as_str().len() == text.len() => {
+            Some(*len)
+        }
+        _ => None,
+    }) {
+        return len;
+    }
+    let len = if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    };
+    UTF16_LEN.with(|cache| *cache.borrow_mut() = Some((value.clone(), len)));
+    len
 }
 
 fn string_index_to_byte(value: &str, index: usize) -> usize {
@@ -3919,6 +4173,10 @@ impl From<&str> for Value {
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
+        if value.len() >= LONG_STRING_HEAP_BYTES {
+            // Already owned: keep the buffer, free it with the last value.
+            return Value::from_js_string(JsString::heap_owned(value));
+        }
         Value::from_js_string(JsString::from(value))
     }
 }
@@ -4106,6 +4364,12 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
 /// Concatenations up to this many bytes are interned (cheap equality and
 /// property-key reuse); longer ones are plain heap strings.
 const CONCAT_INTERN_LIMIT: usize = 256;
+
+/// Owned `String` values (file contents, decoded buffers, JSON text) at least
+/// this long are heap (`Rc`) strings rather than page-interned ones: interned
+/// strings are never freed before a page reset, which a long-running app never
+/// does. See `From<String> for Value`.
+pub(crate) const LONG_STRING_HEAP_BYTES: usize = 1024;
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
@@ -5004,6 +5268,162 @@ mod tests {
     }
 
     #[test]
+    fn long_string_char_code_at_matches_utf16_in_any_order() {
+        // Long enough for the UTF-16 cursor; mixes 1-, 2-, 3- and 4-byte
+        // characters so unit and byte offsets diverge (astral = 2 units).
+        let text: String = "a\u{e9}\u{20ac}\u{1f600}x".repeat(200);
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let value = Value::from(text.as_str());
+        let other = Value::from("z".repeat(300).as_str());
+        let char_code =
+            |v: &Value, i: usize| v.call_method("charCodeAt", vec![Value::Number(i as f64)]);
+        // Forward, backward, random jumps, and interleaved with another
+        // long string (which takes over the cursor).
+        let mut order: Vec<usize> = (0..units.len()).collect();
+        order.extend((0..units.len()).rev());
+        order.extend((0..units.len()).map(|i| (i * 7919) % units.len()));
+        for (step, &index) in order.iter().enumerate() {
+            assert_eq!(
+                char_code(&value, index),
+                Value::Number(f64::from(units[index])),
+                "index {index}"
+            );
+            if step % 97 == 0 {
+                assert_eq!(
+                    char_code(&other, step % 300),
+                    Value::Number(f64::from(b'z'))
+                );
+            }
+        }
+        assert!(char_code(&value, units.len()).to_number().is_nan());
+    }
+
+    #[test]
+    fn long_string_char_code_at_scan_is_linear() {
+        // 2 MB scanned unit by unit: quadratic re-encoding would take
+        // minutes; the cursor makes it a single pass.
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let started = std::time::Instant::now();
+        let mut sum = 0.0;
+        for index in 0..text.len() {
+            sum += value
+                .call_method("charCodeAt", vec![Value::Number(index as f64)])
+                .to_number();
+        }
+        assert_eq!(sum, text.bytes().map(f64::from).sum::<f64>());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_owned_strings_are_freed_with_their_values() {
+        let before = crate::page_arena::allocated_bytes();
+        for index in 0..50 {
+            // Like file contents read as UTF-8: distinct, long, short-lived.
+            let text = Value::from(format!("{index:04}{}", "f".repeat(4000)));
+            assert_eq!(text.to_js_string().len(), 4004);
+            assert!(text.is_string());
+        }
+        let retained = crate::page_arena::allocated_bytes() - before;
+        assert!(
+            retained < 4000,
+            "{retained} bytes interned for 50 dropped 4 KB strings"
+        );
+        let short = Value::from("short".to_string());
+        assert!(
+            short.as_immediate().is_some(),
+            "short strings stay interned"
+        );
+    }
+
+    #[test]
+    fn long_string_length_and_index_scan_is_linear() {
+        // `for (i = 0; i < s.length; i++) s[i]` over a 2 MB string: each
+        // step reads `length` and an index; both must be amortized O(1).
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let other = Value::from("\u{e9}\u{1f600}".repeat(200).as_str());
+        let started = std::time::Instant::now();
+        let mut index = 0usize;
+        let mut bytes = 0usize;
+        while (index as f64) < value.get_property("length").to_number() {
+            bytes += value.get_property(&index.to_string()).to_js_string().len();
+            if index % 50_000 == 0 {
+                // Another long string takes over the caches; non-ASCII
+                // lengths count UTF-16 units (astral = 2).
+                assert_eq!(other.get_property("length"), Value::Number(600.0));
+                assert_eq!(other.get_property("0"), Value::from("\u{e9}"));
+            }
+            index += 1;
+        }
+        assert_eq!((index, bytes), (text.len(), text.len()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_ascii_string_slicing_is_linear_and_matches_unicode_path() {
+        // hexBytes-style `s.substr(i, 2)` / `s.slice(i, i + 2)` scans over
+        // a 2 MB string: each call used to re-encode the whole text.
+        let text = "0123456789abcdef".repeat(130_000);
+        let value = Value::from(text.as_str());
+        let started = std::time::Instant::now();
+        let mut i = 0usize;
+        while i + 1 < text.len() {
+            let expected = Value::from(&text[i..i + 2]);
+            let n = |x: usize| Value::Number(x as f64);
+            assert_eq!(value.call_method("substr", vec![n(i), n(2)]), expected);
+            assert_eq!(value.call_method("slice", vec![n(i), n(i + 2)]), expected);
+            assert_eq!(
+                value.call_method("substring", vec![n(i + 2), n(i)]),
+                expected
+            );
+            assert_eq!(
+                value.call_method("charAt", vec![n(i)]),
+                Value::from(&text[i..i + 1])
+            );
+            i += 2_001;
+        }
+        for i in (0..text.len()).step_by(3) {
+            let _ = value.call_method("substr", vec![Value::Number(i as f64), Value::Number(2.0)]);
+        }
+        assert_eq!(
+            value.call_method("indexOf", vec![Value::from("f0"), Value::Number(20.0)]),
+            Value::Number(31.0)
+        );
+        assert_eq!(
+            value.call_method("slice", vec![Value::Number(-3.0)]),
+            Value::from("def")
+        );
+        assert_eq!(
+            value.call_method("substr", vec![Value::Number(-2.0)]),
+            Value::from("ef")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        // Long non-ASCII strings keep the UTF-16 path (astral = 2 units).
+        let wide = Value::from("\u{1f600}ab".repeat(100).as_str());
+        assert_eq!(
+            wide.call_method("slice", vec![Value::Number(2.0), Value::Number(4.0)]),
+            Value::from("ab")
+        );
+        assert_eq!(
+            wide.call_method("substr", vec![Value::Number(4.0), Value::Number(2.0)]),
+            Value::from("\u{1f600}")
+        );
+    }
+
+    #[test]
     fn strict_equality() {
         assert!(Value::Number(1.0).strict_eq(&Value::Number(1.0)));
         assert!(!Value::Number(f64::NAN).strict_eq(&Value::Number(f64::NAN)));
@@ -5895,6 +6315,39 @@ mod tests {
             "5th own prop spills FunctionData props to HashMap"
         );
         crate::page_arena::reset();
+    }
+
+    #[test]
+    fn aot_capture_map_keeps_hash_map_semantics_with_exact_small_buffers() {
+        let number = |n: f64| AotCapture::Accessors(Value::Number(n), Value::Undefined);
+        let read = |map: &AotCaptureMap, id: u32| match map.get(&id) {
+            Some(AotCapture::Accessors(getter, _)) => Some(getter.to_number()),
+            _ => None,
+        };
+        let mut map = AotCaptureMap::new();
+        assert!(map.is_empty());
+        assert!(map.insert(9, number(1.0)).is_none());
+        assert_eq!(map.capacity(), 1, "one capture holds one slot");
+        assert!(map.insert(3, number(2.0)).is_none());
+        assert!(map.insert(9, number(3.0)).is_some(), "insert replaces");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.capacity(), 2);
+        assert_eq!(read(&map, 9), Some(3.0));
+        assert_eq!(read(&map, 3), Some(2.0));
+        assert_eq!(read(&map, 4), None);
+        assert!(map.contains_key(&3) && !map.contains_key(&4));
+        let mut ids = map.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 9]);
+        assert!(matches!(map[&3], AotCapture::Accessors(..)));
+        for id in 10..40 {
+            map.insert(id, number(f64::from(id)));
+        }
+        assert_eq!(map.len(), 32);
+        assert_eq!(read(&map, 39), Some(39.0));
+        let literal = AotCaptureMap::from([(1, number(1.0)), (2, number(2.0))]);
+        assert_eq!(literal.capacity(), 2);
+        assert_eq!(read(&literal.clone(), 2), Some(2.0));
     }
 
     #[test]

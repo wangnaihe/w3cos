@@ -1282,10 +1282,15 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
     }
     let object = value.object_ref_raw()?;
     let object = object.borrow();
+    // Strict equality and SameValueZero call this for every pair of objects,
+    // nearly all of which are not DOM wrappers: one failed lookup answers
+    // them, so the generation is only read for an object that has an id.
     let direct = object.get_direct("__node_id");
+    if !direct.is_number() {
+        return None;
+    }
     let generation = object.get_direct("__w3cos_realm_generation");
-    if direct.is_number() && generation.is_number() && bridge_realm_is_current(generation.to_u32())
-    {
+    if generation.is_number() && bridge_realm_is_current(generation.to_u32()) {
         return Some(direct.to_u32());
     }
     None
@@ -14600,7 +14605,44 @@ fn inline_computed_style_fallback(node: u32, property: &str) -> String {
     }
 }
 
+thread_local! {
+    /// `getComputedStyle(el)` declarations, reused per element and realm.
+    /// The declaration is live (every read resolves the current style), so
+    /// layout helpers that call `getComputedStyle` once per measured edge
+    /// (VS Code's `getContentHeight` reads four) stop building a proxy, a
+    /// method table and two closures per read.
+    static COMPUTED_STYLE_DECLS: RefCell<HashMap<u32, (u64, Value)>> =
+        RefCell::new(HashMap::new());
+}
+
+const COMPUTED_STYLE_DECL_CACHE_LIMIT: usize = 4096;
+
 fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
+    if pseudo.is_some() {
+        return build_computed_style_value(node, pseudo);
+    }
+    let generation = realm_generation() as u64;
+    if let Some(value) = COMPUTED_STYLE_DECLS.with(|cache| {
+        cache
+            .borrow()
+            .get(&node)
+            .filter(|(cached_generation, _)| *cached_generation == generation)
+            .map(|(_, value)| value.clone())
+    }) {
+        return value;
+    }
+    let value = build_computed_style_value(node, None);
+    COMPUTED_STYLE_DECLS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= COMPUTED_STYLE_DECL_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(node, (generation, value.clone()));
+    });
+    value
+}
+
+fn build_computed_style_value(node: u32, pseudo: Option<String>) -> Value {
     let generation = realm_generation();
     let getter_pseudo = pseudo.clone();
     let handler = ProxyBuilder::new()
@@ -23763,6 +23805,36 @@ mod tests {
         dom::reset_document();
         reset_bridge();
         crate::history::reset();
+    }
+
+    #[test]
+    fn node_id_of_needs_both_an_id_and_the_current_generation() {
+        setup();
+        let current = realm_generation();
+        let wrapper = |id: Option<f64>, generation: Option<u32>| {
+            let mut properties = HashMap::new();
+            if let Some(id) = id {
+                properties.insert("__node_id".to_string(), Value::Number(id));
+            }
+            if let Some(generation) = generation {
+                properties.insert(
+                    "__w3cos_realm_generation".to_string(),
+                    Value::Number(generation as f64),
+                );
+            }
+            Value::object(properties)
+        };
+        assert_eq!(node_id_of(&wrapper(Some(7.0), Some(current))), Some(7));
+        // A plain object, an id without a generation, a generation without
+        // an id and a stale generation are all not DOM wrappers.
+        assert_eq!(node_id_of(&wrapper(None, None)), None);
+        assert_eq!(node_id_of(&wrapper(Some(7.0), None)), None);
+        assert_eq!(node_id_of(&wrapper(None, Some(current))), None);
+        assert_eq!(
+            node_id_of(&wrapper(Some(7.0), Some(current.wrapping_add(1)))),
+            None
+        );
+        assert_eq!(node_id_of(&Value::Number(3.0)), None);
     }
 
     fn create_in_body(tag: &str) -> Value {
@@ -34231,6 +34303,27 @@ try {
             serialize_computed_style_property("color", "rgba(255, 0, 0, 0.5)"),
             "rgba(255, 0, 0, 0.502)"
         );
+    }
+
+    #[test]
+    fn get_computed_style_reuses_a_live_declaration_per_element() {
+        setup();
+        let win = window_value();
+        let div = create_in_body("div");
+        div.get_property("style")
+            .set_property("width", Value::string("3px"));
+        let first = win.call_method("getComputedStyle", vec![div.clone()]);
+        let second = win.call_method("getComputedStyle", vec![div.clone()]);
+        assert!(first.strict_eq(&second));
+        assert_eq!(first.get_property("width").to_js_string(), "3px");
+        div.get_property("style")
+            .set_property("width", Value::string("7px"));
+        assert_eq!(second.get_property("width").to_js_string(), "7px");
+        let other = create_in_body("div");
+        let third = win.call_method("getComputedStyle", vec![other]);
+        assert!(!third.strict_eq(&first));
+        let before = win.call_method("getComputedStyle", vec![div, Value::string("::before")]);
+        assert!(!before.strict_eq(&first));
     }
 
     #[test]

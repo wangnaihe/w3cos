@@ -7744,7 +7744,9 @@ impl Document {
         let mut remaining = value;
         let mut counters = None;
         let mut quote_depth = None;
-        let quote_pairs = self.quote_pairs_for(id);
+        // Resolving `quotes` walks the ancestor chain and re-matches every
+        // selector, so only pay for it when a quote operator is present.
+        let mut quote_pairs: Option<Vec<(String, String)>> = None;
         while !remaining.trim_start().is_empty() {
             remaining = remaining.trim_start();
             let Some(first) = remaining.chars().next() else {
@@ -7888,8 +7890,9 @@ impl Document {
                     quote_depth.get_or_insert_with(|| self.quote_depth_at(id, pseudo_element));
                 match operator {
                     "open-quote" => {
+                        let pairs = quote_pairs.get_or_insert_with(|| self.quote_pairs_for(id));
                         if let Some((opening, _)) =
-                            quote_pairs.get((*depth).min(quote_pairs.len().saturating_sub(1)))
+                            pairs.get((*depth).min(pairs.len().saturating_sub(1)))
                         {
                             output.push(GeneratedContentItem::Quote(opening.clone()));
                         }
@@ -7898,8 +7901,9 @@ impl Document {
                     "no-open-quote" => *depth += 1,
                     "close-quote" if *depth > 0 => {
                         *depth -= 1;
+                        let pairs = quote_pairs.get_or_insert_with(|| self.quote_pairs_for(id));
                         if let Some((_, closing)) =
-                            quote_pairs.get((*depth).min(quote_pairs.len().saturating_sub(1)))
+                            pairs.get((*depth).min(pairs.len().saturating_sub(1)))
                         {
                             output.push(GeneratedContentItem::Quote(closing.clone()));
                         }
@@ -13771,14 +13775,30 @@ impl Document {
 
 fn css_property_eq(actual: &str, canonical: &str) -> bool {
     // Property names are ASCII. Skip dashes and compare without allocating a
-    // lowercased copy; computed style calls this for every declaration.
-    let mut left = actual.bytes().filter(|byte| *byte != b'-');
-    let mut right = canonical.bytes().filter(|byte| *byte != b'-');
+    // lowercased copy; computed style calls this for every declaration, so it
+    // is a plain index loop (iterator adapters made it the hottest function of
+    // the Code-OSS boot in unoptimised builds) with an exact-match fast path.
+    let (left, right) = (actual.as_bytes(), canonical.as_bytes());
+    if left == right {
+        return true;
+    }
+    let (mut i, mut j) = (0, 0);
     loop {
-        match (left.next(), right.next()) {
-            (Some(actual), Some(canonical))
-                if actual.to_ascii_lowercase() == canonical.to_ascii_lowercase() => {}
-            (None, None) => return true,
+        while i < left.len() && left[i] == b'-' {
+            i += 1;
+        }
+        while j < right.len() && right[j] == b'-' {
+            j += 1;
+        }
+        match (i < left.len(), j < right.len()) {
+            (false, false) => return true,
+            (true, true) => {
+                if left[i].to_ascii_lowercase() != right[j].to_ascii_lowercase() {
+                    return false;
+                }
+                i += 1;
+                j += 1;
+            }
             _ => return false,
         }
     }
@@ -13801,6 +13821,12 @@ mod css_property_eq_tests {
         assert!(!css_property_eq("width", "height"));
         assert!(!css_property_eq("top", "topx"));
         assert!(css_property_eq("background-color", "backgroundColor"));
+        assert!(css_property_eq("color", "color"));
+        assert!(css_property_eq("", ""));
+        assert!(css_property_eq("--", ""));
+        assert!(!css_property_eq("topx", "top"));
+        assert!(!css_property_eq("", "top"));
+        assert!(!css_property_eq("top", ""));
     }
 }
 
@@ -18235,10 +18261,14 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             fragment = text;
         }
         loop {
-            let painted_wrapper_matches_text = fragment.children.first().is_some_and(|child| {
-                equivalent_text_style(&fragment.style, &child.style)
-                    && painted_inline_text_box_can_merge(&fragment.style)
-            });
+            // The style comparison clones both styles, so it runs only once
+            // every cheaper wrapper condition below has already passed.
+            let painted_wrapper_matches_text = || {
+                fragment.children.first().is_some_and(|child| {
+                    equivalent_text_style(&fragment.style, &child.style)
+                        && painted_inline_text_box_can_merge(&fragment.style)
+                })
+            };
             if !matches!(&fragment.kind, ComponentKind::Row | ComponentKind::Box)
                 || !matches!(
                     fragment.style.display,
@@ -18259,7 +18289,7 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
                 // would silently turn `vertical-align: top` into baseline.
                 || fragment.style.align_self != w3cos_std::style::AlignSelf::Auto
                 || !(principal_box_can_merge_generated_inline_text(&fragment.style)
-                    || painted_wrapper_matches_text)
+                    || painted_wrapper_matches_text())
                 || !matches!(&fragment.children[0].kind, ComponentKind::Text { .. })
             {
                 break;
@@ -20457,6 +20487,29 @@ mod image_component_tests {
     use w3cos_std::style::{
         AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing, WhiteSpace,
     };
+
+    #[test]
+    fn equivalent_text_style_ignores_run_identity_and_none_background_only() {
+        let base = w3cos_std::style::Style::default();
+        let mut run = base.clone();
+        let mut properties = w3cos_std::style::CustomProperties::default();
+        properties.insert(
+            w3cos_std::inline_text::SOURCE_RUN.to_string(),
+            "7".to_string(),
+        );
+        run.custom_properties = Some(properties);
+        run.background_image = Some("none".to_string().into());
+        assert!(equivalent_text_style(&base, &run));
+        assert!(equivalent_text_style(&run, &base));
+        let mut painted = base.clone();
+        painted.color = w3cos_std::Color::rgb(1, 2, 3);
+        assert!(!equivalent_text_style(&base, &painted));
+        let mut custom = base.clone();
+        let mut properties = w3cos_std::style::CustomProperties::default();
+        properties.insert("--tone".to_string(), "dark".to_string());
+        custom.custom_properties = Some(properties);
+        assert!(!equivalent_text_style(&base, &custom));
+    }
 
     #[test]
     fn adjacent_decorated_inline_spaces_collapse_to_one_visual_space() {
@@ -25244,6 +25297,31 @@ mod image_component_tests {
         // Chrome155's default quote pairs are typographic, not ASCII (the
         // pinned dynamic002 actual/reference captures both establish this).
         assert_eq!(rendered, "“Foo”<1>0</1>");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn pseudo_quote_operators_use_the_ancestor_quotes_and_plain_strings_ignore_them() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".host", &[("quotes", "'<' '>'")]);
+        crate::stylesheet::register_rule(".plain::before", &[("content", "'p'")]);
+        crate::stylesheet::register_rule(".quoted::before", &[("content", "'a' open-quote 'b'")]);
+        crate::stylesheet::register_rule(".quoted::after", &[("content", "close-quote 'c'")]);
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        host.set_attribute(&mut document, "class", "host");
+        let plain = document.create_element("span");
+        plain.set_attribute(&mut document, "class", "plain");
+        let quoted = document.create_element("span");
+        quoted.set_attribute(&mut document, "class", "quoted");
+        host.append_child(&mut document, plain);
+        host.append_child(&mut document, quoted);
+        document.body().append_child(&mut document, host);
+        let rendered = descendant_text_runs(&document.to_component_tree())
+            .into_iter()
+            .map(|run| run.0)
+            .collect::<String>();
+        assert_eq!(rendered, "pa<b>c");
         crate::stylesheet::clear_rules();
     }
 
