@@ -1301,7 +1301,19 @@ pub(crate) fn sync_column_scroll_marker_counts(
     let nodes: Vec<(&w3cos_std::style::Style, Option<usize>)> =
         flat.iter().map(|node| (node.style, node.parent)).collect();
     let plans = crate::layout::resolve_column_fragment_plans(&nodes, &rects, Some(viewport));
+    let mut target_groups = Vec::new();
     for (index, node) in flat.iter().enumerate() {
+        if let EventAction::NativeHost { id, .. } = node.on_click
+            && node
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key(w3cos_dom::css_style::SCROLL_TARGET_GROUP_PROPERTY)
+                })
+        {
+            target_groups.push(NodeId::from_u32(*id as u32));
+        }
         if node.style.scroll_marker_group == ScrollMarkerGroup::None {
             continue;
         }
@@ -1316,6 +1328,25 @@ pub(crate) fn sync_column_scroll_marker_counts(
         if crate::dom::set_column_pseudo_count(*id as u32, count) {
             changed = true;
         }
+    }
+    if !target_groups.is_empty() || crate::dom::with_document(|d| d.has_target_current()) {
+        // :target-current depends on this pass's geometry (CSS Overflow 5).
+        let mut boxes = HashMap::new();
+        for (index, node) in flat.iter().enumerate() {
+            if let (EventAction::NativeHost { id, .. }, Some(rect)) = (node.on_click, rects[index])
+            {
+                boxes.entry(*id as u32).or_insert(w3cos_dom::DOMRect::new(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                ));
+            }
+        }
+        let rect = |id: NodeId| boxes.get(&id.as_u32()).copied();
+        changed |= crate::dom::with_document_mut(|document| {
+            document.update_target_current(&target_groups, &rect, viewport.1)
+        });
     }
     changed
 }

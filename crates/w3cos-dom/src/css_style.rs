@@ -39,6 +39,8 @@ pub const TAB_SIZE_PROPERTY: &str = "--w3cos-internal-tab-size";
 /// `contain` with a real `size` (or `strict`) token: size containment
 /// (CSS Contain 2 3.1; `inline-size` alone is not). `Contain` folds tokens.
 pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
+/// CSS Overflow 5 `scroll-target-group: auto` (not inherited).
+pub const SCROLL_TARGET_GROUP_PROPERTY: &str = "--w3cos-internal-scroll-target-group";
 /// `contain-intrinsic-size`: "<width> <height>" in px, `none` per axis.
 pub const CONTAIN_INTRINSIC_SIZE_PROPERTY: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width stays auto).
@@ -1154,6 +1156,19 @@ impl CSSStyleDeclaration {
             "break-before" | "breakBefore" | "page-break-before" | "pageBreakBefore" => {
                 if let Some(keyword) = parse_break_before(value) {
                     set_marker(&mut self.inner, BREAK_BEFORE_PROPERTY, Some(keyword));
+                }
+            }
+            "scroll-target-group" | "scrollTargetGroup" => {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "auto" => set_marker(
+                        &mut self.inner,
+                        SCROLL_TARGET_GROUP_PROPERTY,
+                        Some("auto".into()),
+                    ),
+                    "none" | "initial" | "unset" => {
+                        set_marker(&mut self.inner, SCROLL_TARGET_GROUP_PROPERTY, None)
+                    }
+                    _ => {}
                 }
             }
             "scroll-marker-group" | "scrollMarkerGroup" => {
