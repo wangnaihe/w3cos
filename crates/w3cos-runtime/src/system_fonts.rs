@@ -492,7 +492,7 @@ pub(super) fn host_ui_families() -> [fontdb::Family<'static>; 7] {
 }
 
 pub(super) struct PreferredHostFace {
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: super::FontBytes,
     pub index: u32,
     pub family: String,
 }
@@ -695,13 +695,41 @@ fn single_file_host_face(paths: &[std::path::PathBuf]) -> Option<PreferredHostFa
             .0
             .clone();
         let index = face.index;
-        let bytes = database.with_face_data(id, |data, _| Arc::new(data.to_vec()))?;
+        let mapped = match &face.source {
+            fontdb::Source::File(path) => map_font_file(path),
+            _ => None,
+        };
+        let bytes = match mapped {
+            Some(bytes) => bytes,
+            None => database.with_face_data(id, |data, _| -> super::FontBytes {
+                Arc::new(data.to_vec())
+            })?,
+        };
         Some(PreferredHostFace {
             bytes,
             index,
             family,
         })
     }
+}
+
+/// Maps an installed font file read-only. The host UI face is often a whole
+/// CJK collection (~19 MB for Noto Sans CJK); mapped, it stays in the shared
+/// page cache instead of becoming a private heap copy in every process.
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos"
+))]
+fn map_font_file(path: &std::path::Path) -> Option<super::FontBytes> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: installed system font files are read-only to this process and
+    // are not truncated while it runs; fontdb's `memmap` source relies on
+    // the same assumption.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    if map.is_empty() {
+        return None;
+    }
+    Some(Arc::new(map))
 }
 
 fn fontconfig_fallback(character: char) -> Option<LoadedFont> {
@@ -963,14 +991,39 @@ mod tests {
         assert_eq!(family, &fast.family);
         assert_eq!(face.index, fast.index);
         let bytes = database.with_face_data(id, |data, _| data.len()).unwrap();
-        assert_eq!(bytes, fast.bytes.len());
+        assert_eq!(bytes, (*fast.bytes).as_ref().len());
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn preferred_host_face_maps_its_font_file() {
+        let fast = preferred_host_face().expect("fontconfig host face");
+        let start = (*fast.bytes).as_ref().as_ptr() as usize;
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let mapping = maps
+            .lines()
+            .find(|line| {
+                let range = line.split_whitespace().next().unwrap_or("");
+                let Some((low, high)) = range.split_once('-') else {
+                    return false;
+                };
+                let low = usize::from_str_radix(low, 16).unwrap_or(usize::MAX);
+                let high = usize::from_str_radix(high, 16).unwrap_or(0);
+                (low..high).contains(&start)
+            })
+            .expect("host face bytes live in a mapping");
+        let backing = mapping.split_whitespace().nth(5).unwrap_or("");
+        assert!(
+            backing.starts_with('/') && std::path::Path::new(backing).is_file(),
+            "host face bytes should be a file mapping, got: {mapping}"
+        );
     }
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     #[test]
     fn preferred_host_face_is_a_regular_named_family() {
         let fast = preferred_host_face().expect("fontconfig host face");
-        assert!(!fast.bytes.is_empty());
+        assert!(!(*fast.bytes).as_ref().is_empty());
         assert!(
             HOST_UI_NAMED_FAMILIES
                 .iter()
@@ -980,7 +1033,7 @@ mod tests {
         );
         let mut lone = fontdb::Database::new();
         let path = std::env::temp_dir().join("w3cos-preferred-host-face.ttf");
-        std::fs::write(&path, fast.bytes.as_slice()).unwrap();
+        std::fs::write(&path, (*fast.bytes).as_ref()).unwrap();
         lone.load_font_file(&path).unwrap();
         let id = lone
             .query(&fontdb::Query {
@@ -1015,7 +1068,7 @@ mod tests {
             .with_face_data(id, |data, index| (data.to_vec(), index))
             .expect("database face bytes");
         assert_eq!(host.index, index);
-        assert_eq!(host.data.as_slice(), bytes.as_slice());
+        assert_eq!(host.bytes(), bytes.as_slice());
     }
 
     #[test]

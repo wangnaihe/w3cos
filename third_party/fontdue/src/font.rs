@@ -15,6 +15,9 @@ use core::ops::Deref;
 use std::sync::OnceLock;
 use ttf_parser::{Face, FaceParsingError, GlyphId, Tag};
 
+/// Immutable face bytes a [`Font`] can share with its caller.
+pub type FontBytes = std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 /// Defines the bounds for a glyph's outline in subpixels. A glyph's outline is always contained in
 /// its bitmap.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -186,8 +189,9 @@ impl Default for FontSettings {
 pub struct Font {
     name: Option<String>,
     units_per_em: f32,
-    /// Original face bytes. Glyph outlines are rebuilt from these on demand.
-    bytes: Box<[u8]>,
+    /// Original face bytes, shared with the caller when built through
+    /// [`Font::from_shared`]. Glyph outlines are rebuilt from these on demand.
+    bytes: FontBytes,
     glyphs: Vec<OnceLock<Glyph>>,
     char_to_glyph: HashMap<char, NonZeroU16>,
     horizontal_line_metrics: Option<LineMetrics>,
@@ -290,11 +294,20 @@ fn convert_name(face: &Face) -> Option<String> {
 }
 
 impl Font {
-    /// Constructs a font from an array of bytes.
+    /// Constructs a font from an array of bytes. The bytes are copied; use
+    /// [`Font::from_shared`] to keep one copy of a large face.
     pub fn from_bytes<Data: Deref<Target = [u8]>>(
         data: Data,
         settings: FontSettings,
     ) -> FontResult<Font> {
+        let bytes: Box<[u8]> = data.to_vec().into_boxed_slice();
+        Self::from_shared(std::sync::Arc::new(bytes), settings)
+    }
+
+    /// Constructs a font that keeps `bytes` (heap, `mmap`, or static data)
+    /// instead of copying them.
+    pub fn from_shared(bytes: FontBytes, settings: FontSettings) -> FontResult<Font> {
+        let data: &[u8] = (*bytes).as_ref();
         let hash = crate::hash::hash(&data);
 
         let face = match Face::parse(&data, settings.collection_index) {
@@ -336,8 +349,6 @@ impl Font {
         for _ in 0..glyph_count {
             glyphs.push(OnceLock::new());
         }
-        let bytes: Box<[u8]> = data.to_vec().into_boxed_slice();
-
         // New line metrics.
         let horizontal_line_metrics = Some(LineMetrics::new(
             face.ascender(),
@@ -368,10 +379,15 @@ impl Font {
         })
     }
 
+    /// The face bytes this font parses glyphs from.
+    pub fn bytes(&self) -> &[u8] {
+        (*self.bytes).as_ref()
+    }
+
     /// Compile one glyph with the same outline builder an eager load used.
     fn glyph(&self, index: u16) -> &Glyph {
         self.glyphs[index as usize].get_or_init(|| {
-            let face = Face::parse(self.bytes.as_ref(), self.settings.collection_index)
+            let face = Face::parse((*self.bytes).as_ref(), self.settings.collection_index)
                 .expect("font bytes already parsed");
             build_glyph(&face, index, self.settings.scale, self.units_per_em)
                 .expect("glyph index is inside the face")

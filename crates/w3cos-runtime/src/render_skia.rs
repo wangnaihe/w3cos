@@ -204,7 +204,7 @@ fn host_typeface() -> Option<Typeface> {
     let host = crate::font_face::host_ui_font();
     let manager = crate::font_face::pinned_font_mgr();
     manager
-        .new_from_data(host.data.as_slice(), Some(host.index as usize))
+        .new_from_data(host.bytes(), Some(host.index as usize))
         // Some platform font collections cannot be instantiated from copied
         // bytes by the OS-backed manager. Resolve the already-selected family,
         // never substitute an unrelated bundled/default font for its metrics.
