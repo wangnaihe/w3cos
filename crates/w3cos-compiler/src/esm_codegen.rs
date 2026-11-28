@@ -5505,6 +5505,113 @@ fn main() {
     }
 
     #[test]
+    fn generated_bundle_logical_operators_match_js_semantics() {
+        // `&&` / `||` / `??` in value position return the selected operand
+        // (evaluated once); in truthiness-only positions (if/while/do/for
+        // tests, ternary tests, `!` operands) they lower to native bool
+        // short-circuits. Both must keep JS results and side-effect order.
+        // Expected strings are what Node.js prints for the same module.
+        let root = fixture_root("w3cos_esm_codegen_logical_ops");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"let calls = 0;
+function tick(v) { calls = calls + 1; return v; }
+export function valuePos() {
+  calls = 0;
+  let s = "";
+  s = s + (0 || "a") + ",";
+  s = s + ("" || 0) + ",";
+  s = s + (NaN || "n") + ",";
+  s = s + (null && tick(1)) + ",";
+  s = s + (undefined ?? "u") + ",";
+  s = s + (0 ?? "z") + ",";
+  s = s + ("x" && "y") + ",";
+  s = s + (tick("") || tick(0) || tick("last")) + ",";
+  s = s + (tick(1) && tick(2) && tick(3)) + ",";
+  s = s + (tick(null) ?? tick(false)) + ",";
+  s = s + !(0 || "") + "," + !!("k" && 0);
+  return s + ":" + calls;
+}
+export function condPos() {
+  calls = 0;
+  let out = "";
+  if (0 || "" || null || undefined || NaN) { out = out + "T"; } else { out = out + "F"; }
+  if (tick(1) && tick("s")) { out = out + "T"; } else { out = out + "F"; }
+  if (tick(0) && tick(1)) { out = out + "T"; } else { out = out + "F"; }
+  if (tick("x") || tick(1)) { out = out + "T"; } else { out = out + "F"; }
+  if (!(tick(null) || tick(0))) { out = out + "T"; } else { out = out + "F"; }
+  if ((null ?? 0) || (undefined ?? "d")) { out = out + "T"; } else { out = out + "F"; }
+  if (tick(undefined) ?? tick(0)) { out = out + "T"; } else { out = out + "F"; }
+  let i = 0;
+  let n = 0;
+  while (i < 5 && (n = n + 1) && i !== 3) { i = i + 1; }
+  out = out + ":" + i + ":" + n + ":";
+  for (let j = 0; j < 4 && !(j === 2 || j === 3); j = j + 1) { out = out + j; }
+  let k = 0;
+  do { k = k + 1; } while ((k < 10 && k !== 4) || k === 0);
+  out = out + ":" + k + ":";
+  out = out + ((0 || NaN) ? "y" : "n") + (!!(1 && "q") ? "b" : "c");
+  return out + ":" + calls;
+}"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    m0::m0__init();
+    let r = m0::m0_valuePos(vec![]);
+    assert_eq!(r.to_js_string(), "a,0,n,null,u,0,y,last,3,false,true,false:8", "value-position logical operators: {r:?}");
+    let r = m0::m0_condPos(vec![]);
+    assert_eq!(r.to_js_string(), "FTFTTTF:3:4:01:4:nb:8", "condition-position logical operators: {r:?}");
+    println!("W3COS_LOGICAL_OPS_E2E_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+
+        assert!(
+            output.status.success(),
+            "generated logical-operator bundle should build and run.\n--- code ---\n{code}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("W3COS_LOGICAL_OPS_E2E_OK"),
+            "logical-operator assertions should pass: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn generated_bundle_runs_jsdom_globals() {
         let root = fixture_root("w3cos_esm_codegen_globals_jsdom");
         std::fs::create_dir_all(root.join("src")).unwrap();

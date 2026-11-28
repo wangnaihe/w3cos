@@ -590,7 +590,7 @@ impl LowerCtx {
             Stmt::If(if_stmt) => self.lower_if(if_stmt),
             Stmt::For(for_stmt) => self.lower_for(for_stmt),
             Stmt::While(while_stmt) => {
-                let test = self.lower_expr(&while_stmt.test);
+                let test = self.lower_test(&while_stmt.test);
                 let label = if self.dynamic_values {
                     self.take_loop_label()
                 } else {
@@ -600,11 +600,6 @@ impl LowerCtx {
                     self.lower_loop_body(&while_stmt.body, &label.clone(), &label.clone())
                 } else {
                     self.lower_stmt(&while_stmt.body)
-                };
-                let test = if self.dynamic_values {
-                    format!("{test}.to_bool()")
-                } else {
-                    test
                 };
                 let prefix = if label.is_empty() {
                     label
@@ -717,12 +712,7 @@ impl LowerCtx {
                     self.lower_stmt(&do_while.body)
                 };
                 self.indent -= 4;
-                let test = self.lower_expr(&do_while.test);
-                let test = if self.dynamic_values {
-                    format!("{test}.to_bool()")
-                } else {
-                    test
-                };
+                let test = self.lower_test(&do_while.test);
                 let (prefix, break_) = if label.is_empty() {
                     (String::new(), "break;".to_string())
                 } else {
@@ -1231,11 +1221,63 @@ impl LowerCtx {
         }
     }
 
-    fn lower_if(&mut self, if_stmt: &IfStmt) -> String {
-        let mut test = self.lower_expr(&if_stmt.test);
+    /// Lower an expression whose only use is its truthiness (an `if`,
+    /// `while`, `do`/`while` or `for` test, or a ternary test). In dynamic
+    /// mode this yields a Rust `bool` expression; in static mode it is the
+    /// plain lowered expression (already a Rust `bool`).
+    fn lower_test(&self, expr: &Expr) -> String {
         if self.dynamic_values {
-            test = format!("{test}.to_bool()");
+            self.lower_truthy(expr)
+        } else {
+            self.lower_expr(expr)
         }
+    }
+
+    /// ECMAScript `ToBoolean(expr)` as a native Rust `bool` (dynamic mode).
+    ///
+    /// Logical operators in a truthiness-only position never need the value
+    /// of the operand they select, so `a && b` becomes
+    /// `a.to_bool() && b.to_bool()`: Rust's own short-circuit keeps JS
+    /// evaluation order and skips building/moving the selected `Value`
+    /// (and the second `to_bool` the old `{ let __l = a; ... }.to_bool()`
+    /// shape paid). The result is always safe as an operand of `&&`, `||`
+    /// and `!` (compound forms are parenthesized).
+    fn lower_truthy(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Paren(paren) => self.lower_truthy(&paren.expr),
+            Expr::Lit(Lit::Bool(b)) => b.value.to_string(),
+            Expr::Bin(bin) if bin.op == BinaryOp::LogicalAnd || bin.op == BinaryOp::LogicalOr => {
+                let left = self.lower_truthy(&bin.left);
+                let right = self.lower_truthy(&bin.right);
+                let op = if bin.op == BinaryOp::LogicalAnd {
+                    "&&"
+                } else {
+                    "||"
+                };
+                format!("({left} {op} {right})")
+            }
+            Expr::Bin(bin) if bin.op == BinaryOp::NullishCoalescing => {
+                // The nullish test needs the left Value itself; only the
+                // final truthiness is a bool.
+                let left = self.lower_expr(&bin.left);
+                let right = self.lower_truthy(&bin.right);
+                format!(
+                    "{{ let __l = {left}; if __l.is_nullish() {{ {right} }} else {{ __l.to_bool() }} }}"
+                )
+            }
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => {
+                let arg = self.lower_truthy(&unary.arg);
+                format!("(!{arg})")
+            }
+            _ => {
+                let value = self.lower_expr(expr);
+                format!("({value}).to_bool()")
+            }
+        }
+    }
+
+    fn lower_if(&mut self, if_stmt: &IfStmt) -> String {
+        let test = self.lower_test(&if_stmt.test);
         self.indent += 4;
         let cons = self.lower_stmt(&if_stmt.cons);
         self.indent -= 4;
@@ -1264,7 +1306,7 @@ impl LowerCtx {
         let test = for_stmt
             .test
             .as_ref()
-            .map(|e| self.lower_expr(e))
+            .map(|e| self.lower_test(e))
             .unwrap_or_else(|| "true".to_string());
         let update = for_stmt
             .update
@@ -1311,12 +1353,7 @@ impl LowerCtx {
         }
         // Emit break condition
         if test != "true" {
-            let condition = if self.dynamic_values {
-                format!("{test}.to_bool()")
-            } else {
-                test
-            };
-            out.push_str(&format!("{inner_pad}if !({condition}) {{ {break_} }}\n"));
+            out.push_str(&format!("{inner_pad}if !({test}) {{ {break_} }}\n"));
         }
         out.push_str(&body);
         out.push('\n');
@@ -1861,6 +1898,11 @@ impl LowerCtx {
                 let right = self.lower_expr(&bin.right);
                 if self.dynamic_values {
                     lower_dynamic_bin_op(bin.op, &left, &right)
+                } else if bin.op == BinaryOp::NullishCoalescing {
+                    // Static mode represents nullable values as `Option`
+                    // (`null` lowers to `None`): `a ?? b` keeps `a`'s payload
+                    // and evaluates `b` only when `a` is `None`.
+                    format!("({left}).unwrap_or_else(|| {right})")
                 } else {
                     let op = lower_bin_op(bin.op);
                     format!("{left} {op} {right}")
@@ -1903,6 +1945,13 @@ impl LowerCtx {
                             );
                         }
                         return "w3cos_core::Value::Bool(true)".to_string();
+                    }
+                    if unary.op == UnaryOp::Bang && is_truthiness_only_operand(&unary.arg) {
+                        // `!(a && b)` / `!!x` only need the operand's
+                        // truthiness: test it as a native bool instead of
+                        // materializing the selected operand Value first.
+                        let test = self.lower_truthy(&unary.arg);
+                        return format!("w3cos_core::Value::Bool(!({test}))");
                     }
                     let arg = self.lower_expr(&unary.arg);
                     match unary.op {
@@ -2348,10 +2397,7 @@ impl LowerCtx {
                 }
             }
             Expr::Cond(cond) => {
-                let mut test = self.lower_expr(&cond.test);
-                if self.dynamic_values {
-                    test = format!("{test}.to_bool()");
-                }
+                let test = self.lower_test(&cond.test);
                 let cons = self.lower_expr(&cond.cons);
                 let alt = self.lower_expr(&cond.alt);
                 format!("if {test} {{ {cons} }} else {{ {alt} }}")
@@ -4946,6 +4992,21 @@ fn expr_references_ident(expr: &Expr, matches: &dyn Fn(&str) -> bool) -> bool {
     }
 }
 
+/// Whether `!expr` can test `expr` as a native bool (see `lower_truthy`):
+/// the operand is itself a logical operator or another `!`, so lowering it
+/// as a Value would materialize an intermediate that is only tested.
+fn is_truthiness_only_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(paren) => is_truthiness_only_operand(&paren.expr),
+        Expr::Bin(bin) => matches!(
+            bin.op,
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+        ),
+        Expr::Unary(unary) => unary.op == UnaryOp::Bang,
+        _ => false,
+    }
+}
+
 fn lower_bin_op(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
@@ -4967,7 +5028,8 @@ fn lower_bin_op(op: BinaryOp) -> &'static str {
         BinaryOp::LShift => "<<",
         BinaryOp::RShift => ">>",
         BinaryOp::ZeroFillRShift => ">>",
-        BinaryOp::NullishCoalescing => "/* ?? */||",
+        // Lowered structurally (`Option::unwrap_or_else`) by the caller.
+        BinaryOp::NullishCoalescing => "/* ?? */",
         BinaryOp::Exp => "/* ** */",
         BinaryOp::In => "/* in */==",
         BinaryOp::InstanceOf => "/* instanceof */==",
@@ -6484,6 +6546,78 @@ function f(window) { return window.x; }"#,
                 && code.contains("w3cos_core::intrinsics::call_method(")
                 && code.contains("Value::string(\"for\")"),
             "Symbol.for registry facade: {code}"
+        );
+    }
+
+    #[test]
+    fn condition_position_logical_ops_lower_to_native_bool_short_circuit() {
+        let stmts = parse_stmts(
+            "if (a && (b || !c)) { f(); }\nwhile (x || y) { g(); }\nlet t = (p && q) ? 1 : 2;\ndo { h(); } while (m && n);\nfor (; i && j; ) { k(); }",
+        );
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        // No Value is materialized for a logical operator that only feeds a
+        // truthiness test: no `let __l` binding, no outer `.to_bool()` on it.
+        assert!(
+            !code.contains("let __l"),
+            "condition-position logical operators must not bind __l: {code}"
+        );
+        assert!(
+            code.contains(".to_bool() && (") && code.contains(".to_bool() || ("),
+            "native short-circuit over operand truthiness: {code}"
+        );
+        assert!(
+            code.contains("(!(") && code.contains(".to_bool())"),
+            "`!` operand in condition position is a native bool: {code}"
+        );
+        assert!(
+            !code.contains("logical_not"),
+            "`!c` inside a condition does not build a Value: {code}"
+        );
+    }
+
+    #[test]
+    fn value_position_logical_ops_keep_single_evaluation_operand_value() {
+        let stmts = parse_stmts("let v = a || b;\nlet w = a && b;\nlet z = a ?? b;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("if __l.to_bool() { __l } else {"),
+            "value-position || returns the left operand Value: {code}"
+        );
+        assert!(
+            code.contains("else { __l } }"),
+            "value-position && returns the left operand Value when falsy: {code}"
+        );
+        assert!(
+            code.contains("if __l.is_nullish() {"),
+            "value-position ?? tests nullishness: {code}"
+        );
+    }
+
+    #[test]
+    fn bang_over_logical_tests_truthiness_without_intermediate_value() {
+        let stmts = parse_stmts("let v = !(a && b);\nlet w = !!x;\nlet u = !y;");
+        let mut ctx = LowerCtx::new_dynamic(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("w3cos_core::Value::Bool(!((") && !code.contains("let __l"),
+            "`!(a && b)` lowers to a native bool short-circuit: {code}"
+        );
+        assert!(
+            code.contains("w3cos_core::intrinsics::logical_not("),
+            "plain `!y` keeps the logical_not intrinsic: {code}"
+        );
+    }
+
+    #[test]
+    fn static_nullish_coalescing_unwraps_option() {
+        let stmts = parse_stmts("let v = a ?? b;");
+        let mut ctx = LowerCtx::new(vec![]);
+        let code = ctx.lower_stmts(&stmts);
+        assert!(
+            code.contains("(a).unwrap_or_else(|| b)") && !code.contains("/* ?? */"),
+            "static ?? keeps Option payload, evaluates rhs lazily: {code}"
         );
     }
 
