@@ -90,24 +90,18 @@ fn case_width(fixed: bool, change_others: bool) {
         assert_eq!(restoration,"memo");
         assert_eq!(after,normal);
     }
-}
-// Observe legacy engine state after a genuine memo replay, independently
-// of whether the earlier width-snapshot guard passed.
-fn after_replay() {
-    let expected = fresh("120px","140px","130px");
-    let [a,b,c] = setup("120px","100px","100px");
-    dom::set_style_property(a,"width","96px");
-    assert_eq!(flush(),"retained");
-    assert_eq!(read(),[96.0,100.0,100.0,300.0,400.0]);
-    dom::set_style_property(a,"width","120px");
-    assert_eq!(flush(),"memo");
-    assert_eq!(read(),[120.0,100.0,100.0,300.0,400.0]);
-    dom::set_style_property(b,"height","140px");
-    dom::set_style_property(c,"height","130px");
-    let final_route = flush();
-    let observed = read();
-    assert_eq!(final_route,"retained");
-    println!("[memo-after-replay] restored=memo current={final_route} observed={observed:?} expected={expected:?} matches={}",observed == expected);
+    if !change_others {
+        // Extend this exact warm sequence only after proving that restoring A
+        // at 120 px really replayed a memo and published the correct boxes.
+        dom::set_style_property(b,"height","140px");
+        dom::set_style_property(c,"height","130px");
+        let final_route = flush();
+        let observed = read();
+        let expected = fresh("120px","140px","130px");
+        assert_eq!(expected,[120.0,140.0,130.0,370.0,470.0]);
+        println!("[memo-after-replay] restored={restoration} current={final_route} observed={observed:?} expected={expected:?} matches={}",observed == expected);
+        assert_eq!(final_route,"retained");
+    }
 }
 fn main() {
     let fixed = std::env::var("DOT_WIDTH_MEMO_FIX").as_deref() == Ok("1");
@@ -115,7 +109,6 @@ fn main() {
         Some("height") => case_direct(fixed),
         Some("width") => case_width(fixed,false),
         Some("cross") => case_width(fixed,true),
-        Some("after-replay") => after_replay(),
         other => panic!("unsupported scenario: {other:?}"),
     }
 }
