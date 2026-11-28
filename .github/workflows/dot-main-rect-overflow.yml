@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 5
+          fetch-depth: 7
       - name: Install baseline dependencies and pin the test font
         run: |
           git rev-parse HEAD
