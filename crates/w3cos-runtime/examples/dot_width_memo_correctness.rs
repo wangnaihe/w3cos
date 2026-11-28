@@ -62,7 +62,7 @@ fn case_direct(fixed: bool) {
         assert_eq!(after,start);
     }
 }
-fn case_width(fixed: bool, change_others: bool) {
+fn case_width(fixed: bool, change_others: bool, replay_more: bool) {
     let normal = fresh("120px","100px","100px");
     let expected = if change_others { fresh("120px","140px","130px") } else { normal };
     let [a,b,c] = setup("120px","100px","100px");
@@ -90,6 +90,18 @@ fn case_width(fixed: bool, change_others: bool) {
         assert_eq!(restoration,"memo");
         assert_eq!(after,normal);
     }
+    if replay_more {
+        assert!(!change_others);
+        for (next,expected_width) in [("96px",96.0),("120px",120.0)] {
+            dom::set_style_property(a,"width",next);
+            let route = flush();
+            let observed = read();
+            assert_eq!(route,"memo");
+            assert_eq!(observed,[expected_width,100.0,100.0,300.0,400.0]);
+            println!("[memo-repeat] width={expected_width} route={route}");
+        }
+        return;
+    }
     if !change_others {
         // Extend this exact warm sequence only after proving that restoring A
         // at 120 px really replayed a memo and published the correct boxes.
@@ -101,14 +113,20 @@ fn case_width(fixed: bool, change_others: bool) {
         assert_eq!(expected,[120.0,140.0,130.0,370.0,470.0]);
         println!("[memo-after-replay] restored={restoration} current={final_route} observed={observed:?} expected={expected:?} matches={}",observed == expected);
         assert_eq!(final_route,"retained");
+        if fixed {
+            assert_eq!(observed,expected);
+        } else {
+            assert_eq!(observed,[96.0,140.0,130.0,370.0,470.0]);
+        }
     }
 }
 fn main() {
     let fixed = std::env::var("DOT_WIDTH_MEMO_FIX").as_deref() == Ok("1");
     match std::env::args().nth(1).as_deref() {
         Some("height") => case_direct(fixed),
-        Some("width") => case_width(fixed,false),
-        Some("cross") => case_width(fixed,true),
+        Some("width") => case_width(fixed,false,false),
+        Some("cross") => case_width(fixed,true,false),
+        Some("reuse") => case_width(fixed,false,true),
         other => panic!("unsupported scenario: {other:?}"),
     }
 }
