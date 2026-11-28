@@ -15,7 +15,7 @@ fn rect(node: &Value) -> [f64;4] {
     let r = node.call_method("getBoundingClientRect",vec![]);
     ["x","y","width","height"].map(|n| r.get_property(n).to_number())
 }
-fn setup(tall: bool, narrow: bool) -> (u32, Value, Value, Value, Value) {
+fn setup(tall: bool, narrow: bool, percent: bool) -> (u32, Value, Value, Value, Value) {
     dom::reset_document();
     jsdom::reset_bridge();
     incremental_layout::invalidate();
@@ -23,7 +23,7 @@ fn setup(tall: bool, narrow: bool) -> (u32, Value, Value, Value, Value) {
     let body = dom::body_id();
     dom::set_style_property(body,"margin","0px");
     let sc_numeric = element(body,"sc",&[("width","240px"),("height","200px"),("overflow","hidden")]);
-    let lead = element(sc_numeric,"lead",&[("width",if narrow {"100px"} else {"120px"}),("height",if tall {"140px"} else {"100px"})]);
+    let lead = element(sc_numeric,"lead",&[("width",if percent { if narrow {"40%"} else {"50%"} } else { if narrow {"100px"} else {"120px"} }),("height",if tall {"140px"} else {"100px"})]);
     element(sc_numeric,"tail",&[("width","100px"),("height","300px")]);
     // A separate ordinary block with a nonzero horizontal margin rules out
     // the whole-document definite-box shortcut without moving the scroller.
@@ -56,7 +56,7 @@ fn snapshot(sc: &Value, lead: &Value, tail: &Value, control: &Value, height: f64
 // Independent, non-gating CSSOM observation; the layout receipt test does
 // not reinterpret browser-relative getBoundingClientRect semantics.
 fn observe_cssom() {
-    let (_,sc,_,tail,_) = setup(false,false);
+    let (_,sc,_,tail,_) = setup(false,false,false);
     assert!(incremental_layout::flush());
     assert_eq!(incremental_layout::last_flush_stats().kind,"rebuild");
     let before = rect(&tail)[1] - rect(&sc)[1];
@@ -70,22 +70,54 @@ fn observe_cssom() {
     println!("[cssom-ancestor-scroll] scroll={scroll} before={before} expected={expected} observed={observed} matches={}",observed == expected);
 }
 
+fn measure_height(sc: &Value, lead: &Value, tail: &Value) -> [f64;3] {
+    [rect(lead)[3], rect(tail)[1] - rect(sc)[1], sc.get_property("scrollHeight").to_number()]
+}
+
+// Measure stock layout separately in a fresh process, without asserting
+// the suspected mismatch as a condition for candidate qualification.
+fn observe_width_memo() {
+    let expected = std::thread::spawn(|| {
+        let (_,sc,lead,tail,_) = setup(true,false,false);
+        assert_eq!(incremental_layout::last_flush_stats().kind,"none");
+        assert!(incremental_layout::flush());
+        assert_eq!(incremental_layout::last_flush_stats().kind,"rebuild");
+        measure_height(&sc,&lead,&tail)
+    }).join().expect("fresh height oracle");
+    assert_eq!(expected,[140.0,140.0,440.0]);
+    let (id,sc,lead,tail,_) = setup(false,false,false);
+    assert_eq!(incremental_layout::last_flush_stats().kind,"none");
+    assert!(incremental_layout::flush());
+    assert_eq!(incremental_layout::last_flush_stats().kind,"rebuild");
+    let before = measure_height(&sc,&lead,&tail);
+    assert_eq!(before,[100.0,100.0,400.0]);
+    assert_eq!(rect(&lead)[2],120.0);
+    dom::set_style_property(id,"height","140px");
+    assert!(incremental_layout::flush());
+    let route = incremental_layout::last_flush_stats().kind;
+    let observed = measure_height(&sc,&lead,&tail);
+    assert_eq!(rect(&lead)[2],120.0);
+    println!("[width-memo-height] route={route} before={before:?} expected={expected:?} observed={observed:?} matches={}",observed == expected);
+}
+
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--observe-cssom") {
-        observe_cssom();
-        return;
+    match std::env::args().nth(1).as_deref() {
+        Some("--observe-cssom") => { observe_cssom(); return; }
+        Some("--observe-width-memo") => { observe_width_memo(); return; }
+        None => {}
+        other => panic!("unexpected argument: {other:?}"),
     }
     // Each oracle and the measured fixture have independent last-flush slots.
     let oracle = [(false,false), (true,false), (false,true)].map(|(tall,narrow)| {
         std::thread::spawn(move || {
-            let (_,sc,lead,tail,control) = setup(tall,narrow);
+            let (_,sc,lead,tail,control) = setup(tall,narrow,true);
             assert_eq!(incremental_layout::last_flush_stats().kind,"none");
             assert!(incremental_layout::flush());
             assert_eq!(incremental_layout::last_flush_stats().kind,"rebuild");
             snapshot(&sc,&lead,&tail,&control, if tall {140.0} else {100.0})
         }).join().expect("fresh oracle")
     });
-    let (id,sc,lead,tail,control) = setup(false,false);
+    let (id,sc,lead,tail,control) = setup(false,false,true);
     assert_eq!(incremental_layout::last_flush_stats().kind, "none");
     assert!(incremental_layout::flush());
     let stat = incremental_layout::last_flush_stats();
@@ -96,7 +128,7 @@ fn main() {
     for (tag,property,value,state,height,shifted) in [
         ("grow","height","140px",1,140.0,1u32),
         ("shrink","height","100px",0,100.0,1),
-        ("width","width","100px",2,100.0,0),
+        ("width","width","40%",2,100.0,0),
     ] {
         eprintln!("[overflow-phase] {tag}");
         dom::set_style_property(id,property,value);
@@ -106,6 +138,7 @@ fn main() {
         assert_eq!(stat.shifted_nodes, shifted);
         let observed = snapshot(&sc,&lead,&tail,&control,height);
         assert_eq!(observed,oracle[state],"{tag}");
+        assert!((observed.boxes[1][2] - if tag == "width" {96.0} else {120.0}).abs() < 0.01);
         assert_eq!(observed.boxes[3],oracle[0].boxes[3],"{tag} moved unrelated sibling");
         eprintln!("[overflow-result] {tag} shifted={} height={} clamp={}",stat.shifted_nodes,observed.total,observed.clamped);
     }
