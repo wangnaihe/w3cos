@@ -4116,6 +4116,10 @@ impl From<&str> for Value {
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
+        if value.len() >= LONG_STRING_HEAP_BYTES {
+            // Already owned: keep the buffer, free it with the last value.
+            return Value::from_js_string(JsString::heap_owned(value));
+        }
         Value::from_js_string(JsString::from(value))
     }
 }
@@ -4303,6 +4307,12 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
 /// Concatenations up to this many bytes are interned (cheap equality and
 /// property-key reuse); longer ones are plain heap strings.
 const CONCAT_INTERN_LIMIT: usize = 256;
+
+/// Owned `String` values (file contents, decoded buffers, JSON text) at least
+/// this long are heap (`Rc`) strings rather than page-interned ones: interned
+/// strings are never freed before a page reset, which a long-running app never
+/// does. See `From<String> for Value`.
+pub(crate) const LONG_STRING_HEAP_BYTES: usize = 1024;
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
@@ -5249,6 +5259,27 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_owned_strings_are_freed_with_their_values() {
+        let before = crate::page_arena::allocated_bytes();
+        for index in 0..50 {
+            // Like file contents read as UTF-8: distinct, long, short-lived.
+            let text = Value::from(format!("{index:04}{}", "f".repeat(4000)));
+            assert_eq!(text.to_js_string().len(), 4004);
+            assert!(text.is_string());
+        }
+        let retained = crate::page_arena::allocated_bytes() - before;
+        assert!(
+            retained < 4000,
+            "{retained} bytes interned for 50 dropped 4 KB strings"
+        );
+        let short = Value::from("short".to_string());
+        assert!(
+            short.as_immediate().is_some(),
+            "short strings stay interned"
         );
     }
 
