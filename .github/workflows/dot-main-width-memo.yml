@@ -1,0 +1,146 @@
+name: Verify LayoutNG width memo correctness
+
+on:
+  push:
+    branches: [dot/width-memo-current-main-20261128]
+    paths:
+      - '.github/workflows/dot-main-width-memo.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      W3COS_LAYOUT_NG: '1'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Install baseline dependencies
+        run: |
+          git rev-parse HEAD
+          git diff --exit-code 3dd00a81fbdd559adab1719541b2ff8f22db778e HEAD -- . ':!.github/workflows/dot-main-width-memo.yml' ':!crates/w3cos-runtime/examples/dot_width_memo_correctness.rs'
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+          rustup toolchain install --no-self-update
+          mkdir -p "$RUNNER_TEMP/width-memo-evidence"
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+          cp Cargo.lock "$RUNNER_TEMP/width-memo-evidence/"
+          sha256sum Cargo.lock
+      - name: Stage opt-in width memo eligibility and retention guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/w3cos-runtime/src/incremental_layout.rs")
+          s = p.read_text()
+          old = "    let memo_hit = single_px_width(&styles).and_then(|(node, bits)| {"
+          new = """    let guarded = dot_width_memo_fix_enabled();
+              let memo_key = if guarded {
+                  single_px_width(&styles).and_then(|key| {
+                      let old = previous.as_ref()?;
+                      let new = &styles[0].1;
+                      if old.width == new.width {
+                          return None;
+                      }
+                      let mut only_width = old.clone();
+                      only_width.width = new.width;
+                      (only_width == *new).then_some(key)
+                  })
+              } else {
+                  single_px_width(&styles)
+              };
+              // Each memo is a whole-document snapshot. After a width-only
+              // change it can still describe the same host at another width,
+              // but never describes a different host under the new geometry.
+              // Any other geometry or layout change ends that family of memos.
+              if guarded && !paint_only {
+                  if let Some((node, _)) = memo_key {
+                      cache.width_memos.retain(|memo| memo.node == node);
+                  } else {
+                      cache.width_memos.clear();
+                  }
+              }
+              let memo_hit = memo_key.and_then(|(node, bits)| {"""
+          assert s.count(old) == 1
+          s = s.replace(old,new)
+          old = "    if let Some((node, bits)) = single_px_width(&styles) {"
+          assert s.count(old) == 1
+          s = s.replace(old,"    if let Some((node, bits)) = memo_key {")
+          anchor = "fn single_px_width(styles:"
+          assert s.count(anchor) == 1
+          s = s.replace(anchor, """fn dot_width_memo_fix_enabled() -> bool {
+              static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ENABLED.get_or_init(|| std::env::var("DOT_WIDTH_MEMO_FIX").as_deref() == Ok("1"))
+          }
+
+          """ + anchor)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/width-memo-evidence/candidate.diff"
+      - name: Build CPU example and native app oracle
+        id: build
+        run: |
+          cargo build --locked --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --example dot_width_memo_correctness --no-default-features --features cpu-render
+      - name: Verify direct height mutation in LayoutNG and legacy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          result=0
+          for ng in 1 0; do
+            for mode in 0 1; do
+              printf 'direct layout_ng=%s guarded=%s\n' "$ng" "$mode"
+              DOT_WIDTH_MEMO_FIX=$mode W3COS_LAYOUT_NG=$ng W3COS_LAYOUT_NG_VERIFY=0 \
+                target/runtime-bench/examples/dot_width_memo_correctness height \
+                | tee "$RUNNER_TEMP/width-memo-evidence/$ng-$mode-height.log" || result=1
+            done
+          done
+          exit "$result"
+      - name: Verify actual legacy retained fallback and width memo reuse
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          result=0
+          for mode in 0 1; do
+            for scenario in width cross after-replay; do
+              printf 'retained layout_ng=0 guarded=%s case=%s\n' "$mode" "$scenario"
+              DOT_WIDTH_MEMO_FIX=$mode W3COS_LAYOUT_NG=0 W3COS_LAYOUT_NG_VERIFY=0 W3COS_SUBTREE_RELAYOUT=0 \
+                target/runtime-bench/examples/dot_width_memo_correctness "$scenario" \
+                | tee "$RUNNER_TEMP/width-memo-evidence/$mode-$scenario.log" || result=1
+            done
+          done
+          exit "$result"
+      - name: Run the existing CPU application sanity gate in both arms
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in 0 1; do
+            DOT_WIDTH_MEMO_FIX=$mode target/runtime-bench/w3cos-runtime-bench --output "$RUNNER_TEMP/width-memo-evidence/runtime-$mode.json" --samples 3
+            python3 scripts/check-runtime-bench.py --expect-layout-ng on "$RUNNER_TEMP/width-memo-evidence/runtime-$mode.json"
+          done
+          python3 - "$RUNNER_TEMP/width-memo-evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          out=Path(sys.argv[1])
+          a,b=(json.loads((out / f"runtime-{i}.json").read_text()) for i in range(2))
+          for group, child in (("style_layout","layout_checksum"),("paint_scroll","checksum")):
+              print("app", group, child, a[group][child], b[group][child])
+          for key in ("layout_checksum","checksum"):
+              print("app", "startup", key, a["startup"]["child"][key], b["startup"]["child"][key])
+          PY
+      - name: Archive targeted observations and candidate patch
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: current-main-width-memo-evidence
+          path: ${{ runner.temp }}/width-memo-evidence
+          if-no-files-found: ignore
