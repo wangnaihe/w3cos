@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 4
       - name: Install baseline dependencies
         run: |
           git rev-parse HEAD
@@ -84,22 +84,41 @@ jobs:
           git diff --check
           git diff > "$RUNNER_TEMP/width-memo-evidence/candidate.diff"
       - name: Build CPU example and native app oracle
+        id: build
         run: |
           cargo build --locked --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --example dot_width_memo_correctness --no-default-features --features cpu-render
-      - name: Verify direct fix, live width reuse and cross-host retained geometry
+      - name: Verify direct height mutation in LayoutNG and legacy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
-          set -euo pipefail
-          for mode in 0 1; do
-            DOT_WIDTH_MEMO_FIX=$mode target/runtime-bench/examples/dot_width_memo_correctness height | tee "$RUNNER_TEMP/width-memo-evidence/$mode-height.log"
-            for scenario in width cross; do
-              # Select the existing retained fallback. It retains width snapshots,
-              # unlike the style-subtree route that already clears them.
-              DOT_WIDTH_MEMO_FIX=$mode W3COS_SUBTREE_RELAYOUT=0 target/runtime-bench/examples/dot_width_memo_correctness "$scenario" \
-                | tee "$RUNNER_TEMP/width-memo-evidence/$mode-$scenario.log"
+          set -uo pipefail
+          result=0
+          for ng in 1 0; do
+            for mode in 0 1; do
+              printf 'direct layout_ng=%s guarded=%s\n' "$ng" "$mode"
+              DOT_WIDTH_MEMO_FIX=$mode W3COS_LAYOUT_NG=$ng W3COS_LAYOUT_NG_VERIFY=0 \
+                target/runtime-bench/examples/dot_width_memo_correctness height \
+                | tee "$RUNNER_TEMP/width-memo-evidence/$ng-$mode-height.log" || result=1
             done
           done
+          exit "$result"
+      - name: Verify actual legacy retained fallback and width memo reuse
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          result=0
+          for mode in 0 1; do
+            for scenario in width cross; do
+              printf 'retained layout_ng=0 guarded=%s case=%s\n' "$mode" "$scenario"
+              DOT_WIDTH_MEMO_FIX=$mode W3COS_LAYOUT_NG=0 W3COS_LAYOUT_NG_VERIFY=0 W3COS_SUBTREE_RELAYOUT=0 \
+                target/runtime-bench/examples/dot_width_memo_correctness "$scenario" \
+                | tee "$RUNNER_TEMP/width-memo-evidence/$mode-$scenario.log" || result=1
+            done
+          done
+          exit "$result"
       - name: Run the existing CPU application sanity gate in both arms
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -122,6 +141,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: main-width-memo-evidence
+          name: main-width-memo-separated-evidence
           path: ${{ runner.temp }}/width-memo-evidence
           if-no-files-found: ignore
