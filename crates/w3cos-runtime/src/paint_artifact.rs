@@ -881,7 +881,8 @@ pub(crate) fn table_pass_spans_stats() -> (u64, u64) {
     TABLE_PASS_SPANS_STATS.with(std::cell::Cell::get)
 }
 
-/// `W3COS_PAINT_PERSIST_PREFILL_SPANS=1|verify` (off by default; with the
+/// `W3COS_PAINT_PERSIST_PREFILL_SPANS` (on by default, `=0` turns it off; `=verify`
+/// checks it; with the
 /// persistent path in place, spliced nodes and the dirty list): the clean
 /// boxes take last build's style by visiting only the boxes last build did
 /// not keep clean. A box clean in both builds holds the recycled node of the
@@ -899,9 +900,9 @@ fn persist_prefill_spans_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
