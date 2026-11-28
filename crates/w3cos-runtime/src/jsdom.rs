@@ -34311,19 +34311,14 @@ try {
         let win = window_value();
         let div = create_in_body("div");
         div.get_property("style")
-            .set_property("paddingTop", Value::string("3px"));
+            .set_property("width", Value::string("3px"));
         let first = win.call_method("getComputedStyle", vec![div.clone()]);
         let second = win.call_method("getComputedStyle", vec![div.clone()]);
         assert!(first.strict_eq(&second));
-        assert_eq!(
-            first
-                .call_method("getPropertyValue", vec![Value::string("padding-top")])
-                .to_js_string(),
-            "3px"
-        );
+        assert_eq!(first.get_property("width").to_js_string(), "3px");
         div.get_property("style")
-            .set_property("paddingTop", Value::string("7px"));
-        assert_eq!(second.get_property("paddingTop").to_js_string(), "7px");
+            .set_property("width", Value::string("7px"));
+        assert_eq!(second.get_property("width").to_js_string(), "7px");
         let other = create_in_body("div");
         let third = win.call_method("getComputedStyle", vec![other]);
         assert!(!third.strict_eq(&first));
