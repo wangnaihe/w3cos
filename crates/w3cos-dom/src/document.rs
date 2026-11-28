@@ -925,6 +925,9 @@ pub struct Document {
     style_revisions: Vec<u64>,
     focused_node: Option<NodeId>,
     focus_visible: bool,
+    /// Active `<a href="#...">` markers of `scroll-target-group` containers
+    /// (`:target-current`), sorted. Re-chosen after every layout.
+    target_current: Vec<NodeId>,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
     /// `computed_style_for` results keyed by (style clock, stylesheet
     /// generation, style-write epoch). Any style-affecting mutation moves one
@@ -1174,6 +1177,7 @@ impl Document {
             matched_rules_cache: RefCell::new(Vec::new()),
             style_revisions: Vec::new(),
             focused_node: None,
+            target_current: Vec::new(),
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
             style_for_memo: RefCell::new(StyleForMemo::default()),
@@ -2755,6 +2759,244 @@ impl Document {
         // relational selectors. Conservatively invalidate the document scope.
         self.invalidate_style_subtree(NodeId::ROOT);
         self.record_layout_dirty(NodeId::ROOT);
+    }
+
+    pub fn is_target_current(&self, id: NodeId) -> bool {
+        self.target_current
+            .binary_search_by_key(&id.0, |n| n.0)
+            .is_ok()
+    }
+
+    pub fn has_target_current(&self) -> bool {
+        !self.target_current.is_empty()
+    }
+
+    /// CSS Overflow 5 §3.1.8 (Blink `ScrollMarkerGroupData`): after layout,
+    /// choose the active `<a href="#id">` scroll marker of every
+    /// `scroll-target-group: auto` container. `rect` reads this pass's border
+    /// boxes. Returns true when the `:target-current` set changed; the
+    /// affected anchors are restyled and the caller relays out.
+    pub fn update_target_current(
+        &mut self,
+        groups: &[NodeId],
+        rect: &dyn Fn(NodeId) -> Option<DOMRect>,
+        viewport_height: f32,
+    ) -> bool {
+        let mut current: Vec<NodeId> = groups
+            .iter()
+            .filter_map(|&group| self.choose_target_current(group, groups, rect, viewport_height))
+            .collect();
+        current.sort_unstable_by_key(|id| id.0);
+        current.dedup();
+        if current == self.target_current {
+            return false;
+        }
+        let previous = std::mem::replace(&mut self.target_current, current);
+        for id in previous.into_iter().chain(self.target_current.clone()) {
+            if self.nodes.get(id.0 as usize).is_some_and(Option::is_some) {
+                self.invalidate_style_subtree(id);
+                self.record_layout_dirty(id);
+            }
+        }
+        true
+    }
+
+    /// First laid-out element with `id` (the id index may still map a
+    /// detached element, e.g. after `cloneNode` + remove + prepend).
+    fn scroll_target_by_id(
+        &self,
+        id: &str,
+        rect: &dyn Fn(NodeId) -> Option<DOMRect>,
+    ) -> Option<NodeId> {
+        if let Some(element) = self.get_element_by_id(id)
+            && rect(element.id).is_some()
+        {
+            return Some(element.id);
+        }
+        let mut stack = vec![NodeId::ROOT];
+        while let Some(node_id) = stack.pop() {
+            let node = self.get_node(node_id);
+            if node.node_type == NodeType::Element
+                && rect(node_id).is_some()
+                && node
+                    .attributes
+                    .iter()
+                    .any(|(name, value)| *name == Atom::ID && value.as_str() == id)
+            {
+                return Some(node_id);
+            }
+            let mut children = self.children_ids(node_id);
+            children.reverse();
+            stack.extend(children);
+        }
+        None
+    }
+
+    /// Nearest ancestor scroll container; `None` is the viewport.
+    fn scroll_target_scroller(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.get_node(id).parent;
+        while let Some(parent) = current {
+            let node = self.get_node(parent);
+            if node.node_type != NodeType::Element
+                || matches!(node.tag.as_str().as_str(), "html" | "body")
+            {
+                return None;
+            }
+            let style = self.computed_style_for(parent);
+            let scrolls = |axis: Option<w3cos_std::style::Overflow>| {
+                axis.unwrap_or(style.overflow) != w3cos_std::style::Overflow::Visible
+            };
+            if scrolls(style.overflow_x) || scrolls(style.overflow_y) {
+                return Some(parent);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    fn choose_target_current(
+        &self,
+        group: NodeId,
+        groups: &[NodeId],
+        rect: &dyn Fn(NodeId) -> Option<DOMRect>,
+        viewport_height: f32,
+    ) -> Option<NodeId> {
+        // Markers in tree order whose nearest group container is `group`.
+        let mut markers = Vec::new();
+        let mut stack = self.children_ids(group);
+        stack.reverse();
+        while let Some(id) = stack.pop() {
+            let node = self.get_node(id);
+            if node.node_type != NodeType::Element || groups.contains(&id) {
+                continue;
+            }
+            if node.tag.as_str() == "a"
+                && let Some(target) = node
+                    .attributes
+                    .iter()
+                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("href"))
+                    .and_then(|(_, href)| href.trim().strip_prefix('#'))
+                    .filter(|fragment| !fragment.is_empty())
+                    .and_then(|fragment| self.scroll_target_by_id(fragment, rect))
+            {
+                markers.push((id, target, self.scroll_target_scroller(target)));
+            }
+            let mut children = self.children_ids(id);
+            children.reverse();
+            stack.extend(children);
+        }
+        let chain = |mut scroller: Option<NodeId>| {
+            let mut chain = vec![scroller];
+            while let Some(id) = scroller {
+                scroller = self.scroll_target_scroller(id);
+                chain.push(scroller);
+            }
+            chain
+        };
+        let mut scroller = markers.first()?.2;
+        for marker in &markers[1..] {
+            let other = chain(marker.2);
+            scroller = chain(scroller)
+                .into_iter()
+                .find(|candidate| other.contains(candidate))
+                .flatten();
+        }
+        loop {
+            // (measured box, marker) — a nested scroller stands in for its
+            // targets until it is chosen.
+            let mut candidates = Vec::new();
+            for &(marker, target, target_scroller) in &markers {
+                if target_scroller == scroller {
+                    candidates.push((target, Some(marker)));
+                } else if let Some(nested) = target_scroller
+                    && self.scroll_target_scroller(nested) == scroller
+                {
+                    candidates.push((nested, None));
+                }
+            }
+            if candidates.is_empty() {
+                return None;
+            }
+            let chosen = self.choose_scroll_candidate(scroller, &candidates, rect, viewport_height);
+            match candidates[chosen] {
+                (_, Some(marker)) => return Some(marker),
+                (nested, None) => scroller = Some(nested),
+            }
+        }
+    }
+
+    /// Blink `ScrollMarkerChooser` along the block (y) axis.
+    fn choose_scroll_candidate(
+        &self,
+        scroller: Option<NodeId>,
+        candidates: &[(NodeId, Option<NodeId>)],
+        rect: &dyn Fn(NodeId) -> Option<DOMRect>,
+        viewport_height: f32,
+    ) -> usize {
+        let root = scroller.unwrap_or(NodeId::ROOT);
+        let (origin, port, mut extent) = match scroller {
+            Some(id) => {
+                let r = rect(id).unwrap_or_default();
+                (r.y, r.height, r.height)
+            }
+            None => (0.0, viewport_height, viewport_height),
+        };
+        let mut stack = self.children_ids(root);
+        while let Some(id) = stack.pop() {
+            if let Some(r) = rect(id) {
+                extent = extent.max(r.y + r.height - origin);
+            }
+            stack.extend(self.children_ids(id));
+        }
+        let range = (extent - port).max(0.0);
+        if range <= 0.0 {
+            return candidates.len() - 1;
+        }
+        let scroll = match scroller {
+            Some(id) => self.get_scroll(id).1,
+            None => self
+                .children_ids(NodeId::ROOT)
+                .into_iter()
+                .find(|&id| self.get_node(id).node_type == NodeType::Element)
+                .map_or(0.0, |html| self.get_scroll(html).1),
+        }
+        .clamp(0.0, range);
+        let mut positions: Vec<f32> = candidates
+            .iter()
+            .map(|&(id, _)| (rect(id).unwrap_or_default().y - origin).clamp(0.0, range))
+            .collect();
+        let distribute = (port / 8.0).min(range / 2.0);
+        let min = positions.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = positions.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let after_start = range - distribute;
+        for position in &mut positions {
+            if *position < distribute && distribute > min {
+                *position = (*position - min) / (distribute - min) * distribute;
+            } else if *position > after_start && max > after_start {
+                *position =
+                    (*position - after_start) / (max - after_start) * distribute + after_start;
+            }
+        }
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|&a, &b| positions[a].total_cmp(&positions[b]));
+        let mut before = order[0];
+        let mut after: Option<usize> = None;
+        for &index in &order[1..] {
+            let position = positions[index];
+            if position <= scroll {
+                if position > positions[before] {
+                    before = index;
+                }
+            } else if position < scroll + port / 2.0
+                && after.is_none_or(|best| position < positions[best])
+            {
+                after = Some(index);
+            }
+        }
+        match after {
+            Some(after) if positions[after] - scroll < scroll - positions[before] => after,
+            _ => before,
+        }
     }
 
     pub fn is_focused(&self, id: NodeId) -> bool {

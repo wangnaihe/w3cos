@@ -145,6 +145,8 @@ enum PseudoClass {
     Focus,
     FocusVisible,
     FocusWithin,
+    /// CSS Overflow 5 active scroll marker of a `scroll-target-group`.
+    TargetCurrent,
     Dir(String),
     Lang(String),
     Has(String),
@@ -1773,6 +1775,7 @@ fn pseudo_matches_node(
         PseudoClass::Focus => document.is_focused(node),
         PseudoClass::FocusVisible => document.is_focus_visible(node),
         PseudoClass::FocusWithin => document.is_focus_within(node),
+        PseudoClass::TargetCurrent => document.is_target_current(node),
         PseudoClass::Target => target_id.is_some_and(|target_id| {
             dom_node
                 .attributes
@@ -2659,6 +2662,9 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                     }
                     (false, false, "focus-within") => {
                         compound.pseudo_classes.push(PseudoClass::FocusWithin)
+                    }
+                    (false, false, "target-current") => {
+                        compound.pseudo_classes.push(PseudoClass::TargetCurrent)
                     }
                     (false, false, "active" | "hover" | "indeterminate" | "placeholder-shown") => {
                         compound.unsupported = true

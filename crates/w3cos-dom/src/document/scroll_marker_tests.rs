@@ -488,3 +488,122 @@ fn link_styled_scroll_markers_are_non_atomic_inlines() {
 
     crate::stylesheet::clear_rules();
 }
+
+/// `scroll-target-group: auto` turns `<a href="#id">` descendants into scroll
+/// markers; `:target-current` follows the targets' scroller.
+fn target_group_fixture(
+    document: &mut Document,
+) -> (
+    Vec<crate::element::Element>,
+    crate::element::Element,
+    Vec<NodeId>,
+    NodeId,
+) {
+    crate::stylesheet::register_rule(".group", &[("scroll-target-group", "auto")]);
+    crate::stylesheet::register_rule(".scroller", &[("overflow", "auto"), ("height", "130px")]);
+    let wrapper = document.create_element("div");
+    wrapper.set_attribute(document, "class", "group");
+    document.body().append_child(document, wrapper);
+    let scroller = document.create_element("div");
+    scroller.set_attribute(document, "class", "scroller");
+    document.body().append_child(document, scroller);
+    let mut links = Vec::new();
+    let mut targets = Vec::new();
+    for index in 1..=4 {
+        let link = document.create_element("a");
+        link.set_attribute(document, "href", &format!("#target{index}"));
+        wrapper.append_child(document, link);
+        links.push(link);
+        let target = document.create_element("div");
+        target.set_attribute(document, "id", &format!("target{index}"));
+        scroller.append_child(document, target);
+        targets.push(target.id);
+    }
+    (links, scroller, targets, wrapper.id)
+}
+
+fn target_group_rects(
+    scroller: NodeId,
+    targets: &[NodeId],
+) -> impl Fn(NodeId) -> Option<crate::DOMRect> + '_ {
+    move |id| {
+        if id == scroller {
+            return Some(crate::DOMRect::new(0.0, 20.0, 100.0, 130.0));
+        }
+        let index = targets.iter().position(|&target| target == id)?;
+        Some(crate::DOMRect::new(
+            5.0,
+            25.0 + 105.0 * index as f32,
+            100.0,
+            100.0,
+        ))
+    }
+}
+
+#[test]
+fn scroll_target_group_selects_target_current_marker() {
+    crate::stylesheet::clear_rules();
+    crate::stylesheet::register_rule("a", &[("color", "red")]);
+    crate::stylesheet::register_rule("a:target-current", &[("color", "green")]);
+    let mut document = Document::new();
+    let (links, scroller, targets, group) = target_group_fixture(&mut document);
+    assert!(
+        document
+            .computed_style_for(group)
+            .custom_properties
+            .is_some_and(|p| p.contains_key(crate::css_style::SCROLL_TARGET_GROUP_PROPERTY))
+    );
+    let red = document.computed_style_for(links[0].id).color;
+    let rects = target_group_rects(scroller.id, &targets);
+
+    assert!(document.update_target_current(&[group], &rects, 600.0));
+    assert!(document.is_target_current(links[0].id));
+    assert_ne!(document.computed_style_for(links[0].id).color, red);
+    assert_eq!(document.computed_style_for(links[1].id).color, red);
+    // Unchanged geometry keeps the set (no relayout loop).
+    assert!(!document.update_target_current(&[group], &rects, 600.0));
+
+    // Scrolled to the end: the last target is active.
+    document.set_scroll(scroller.id, None, Some(290.0));
+    assert!(document.update_target_current(&[group], &rects, 600.0));
+    assert!(document.is_target_current(links[3].id));
+    assert!(!document.is_target_current(links[0].id));
+    assert_eq!(document.computed_style_for(links[0].id).color, red);
+
+    // A target within half a scrollport ahead wins over a far one behind.
+    document.set_scroll(scroller.id, None, Some(90.0));
+    document.update_target_current(&[group], &rects, 600.0);
+    assert!(document.is_target_current(links[1].id));
+
+    // No group container: nothing matches.
+    assert!(document.update_target_current(&[], &rects, 600.0));
+    assert!(!document.has_target_current());
+}
+
+#[test]
+fn scroll_target_group_ignores_links_without_targets() {
+    crate::stylesheet::clear_rules();
+    let mut document = Document::new();
+    let (links, scroller, targets, group) = target_group_fixture(&mut document);
+    links[0].set_attribute(&mut document, "href", "");
+    links[1].set_attribute(&mut document, "href", "#missing");
+    let rects = target_group_rects(scroller.id, &targets);
+    document.update_target_current(&[group], &rects, 600.0);
+    assert!(document.is_target_current(links[2].id));
+}
+
+#[test]
+fn scroll_target_group_resolves_the_laid_out_element_for_a_reused_id() {
+    crate::stylesheet::clear_rules();
+    let mut document = Document::new();
+    let (links, scroller, mut targets, group) = target_group_fixture(&mut document);
+    // cloneNode + remove + prepend: the detached original keeps the id.
+    let old = targets[0];
+    let clone = document.clone_node(old, false);
+    document.remove_child(scroller.id, old);
+    document.insert_before(scroller.id, clone, targets[1]);
+    targets[0] = clone;
+    let rects = target_group_rects(scroller.id, &targets);
+    document.update_target_current(&[group], &rects, 600.0);
+    assert!(document.is_target_current(links[0].id));
+}
