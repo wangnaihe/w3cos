@@ -1597,11 +1597,11 @@ fn diffs_equal(a: &Option<PaintDiff>, b: &Option<PaintDiff>) -> bool {
     }
 }
 
-/// `W3COS_PAINT_DIFF_SPARSE=1`: with runs, the diff visits inside a copied
-/// run only the clients the artifact build listed as volatile or that have
-/// text fragments, instead of every client of the run. `=verify` also diffs
-/// densely and compares. Off by default; the build records the volatile
-/// list only when this is on.
+/// `W3COS_PAINT_DIFF_SPARSE` (on by default, `=0` turns it off): with runs,
+/// the diff visits inside a copied run only the clients the artifact build
+/// listed as volatile or that have text fragments, instead of every client
+/// of the run. `=verify` also diffs densely and compares. The build records
+/// the volatile list only when this is on.
 pub(crate) fn paint_diff_sparse_mode() -> u8 {
     #[cfg(test)]
     if let Some(mode) = PAINT_DIFF_SPARSE_OVERRIDE.with(std::cell::Cell::get) {
@@ -1610,9 +1610,9 @@ pub(crate) fn paint_diff_sparse_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("W3COS_PAINT_DIFF_SPARSE").ok().as_deref() {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         },
     )
 }
