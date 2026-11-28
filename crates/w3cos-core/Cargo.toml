@@ -23,6 +23,8 @@ chrono-tz = { workspace = true }
 base64 = "0.22"
 # Fast non-DoS-resistant hasher for the interpreter's own key tables.
 rustc-hash = "2"
+# `HashTable<u32>` position index for dictionary-mode property maps.
+hashbrown = { version = "0.15", default-features = false }
 regex = "1"
 fancy-regex = "0.18"
 regex-syntax = "0.8"

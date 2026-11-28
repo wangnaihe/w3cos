@@ -333,11 +333,131 @@ enum PropertyStore {
     Dict(Box<DictStore>),
 }
 
+/// Dictionary-mode storage: entries in insertion order plus, once there
+/// are more than [`DICT_LINEAR`] of them, a hash index of entry positions.
+///
+/// This used to be a `FastMap<JsString, Value>` plus a separate `order`
+/// list, which stored every key twice and sized the 32-byte buckets by
+/// hashbrown's load factor. The index only holds `u32` positions, so a
+/// large dictionary costs about 32 bytes per entry plus about 5 per index
+/// bucket.
 #[derive(Clone)]
 struct DictStore {
-    map: FastMap<JsString, Value>,
-    order: Vec<JsString>,
+    entries: Vec<(JsString, Value)>,
+    /// Positions into `entries`, hashed by key. Empty while
+    /// `entries.len() <= DICT_LINEAR` (lookups scan instead).
+    index: hashbrown::HashTable<u32>,
     has_index_key: bool,
+}
+
+/// Dictionaries with at most this many entries have no hash index.
+const DICT_LINEAR: usize = 8;
+
+#[inline]
+fn key_hash(key: &str) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(key)
+}
+
+impl DictStore {
+    fn from_entries(entries: Vec<(JsString, Value)>, has_index_key: bool) -> Self {
+        let mut dict = Self {
+            entries,
+            index: hashbrown::HashTable::new(),
+            has_index_key,
+        };
+        if dict.entries.len() > DICT_LINEAR {
+            dict.rebuild_index();
+        }
+        dict
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn rebuild_index(&mut self) {
+        let Self { entries, index, .. } = self;
+        index.clear();
+        index.reserve(entries.len(), |&i| key_hash(entries[i as usize].0.as_str()));
+        for (i, (key, _)) in entries.iter().enumerate() {
+            index.insert_unique(key_hash(key.as_str()), i as u32, |&j| {
+                key_hash(entries[j as usize].0.as_str())
+            });
+        }
+    }
+
+    #[inline]
+    fn position(&self, key: &str) -> Option<usize> {
+        if self.index.is_empty() {
+            return self.entries.iter().position(|(k, _)| k.as_str() == key);
+        }
+        self.index
+            .find(key_hash(key), |&i| self.entries[i as usize].0.as_str() == key)
+            .map(|&i| i as usize)
+    }
+
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        let i = self.position(key)?;
+        Some(&self.entries[i].1)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        let i = self.position(key)?;
+        Some(&mut self.entries[i].1)
+    }
+
+    /// Append a key known to be absent.
+    fn push(&mut self, key: JsString, value: Value) {
+        let i = self.entries.len();
+        let hash = key_hash(key.as_str());
+        self.entries.push((key, value));
+        if !self.index.is_empty() {
+            let Self { entries, index, .. } = self;
+            index.insert_unique(hash, i as u32, |&j| key_hash(entries[j as usize].0.as_str()));
+        } else if self.entries.len() > DICT_LINEAR {
+            self.rebuild_index();
+        }
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Value> {
+        let pos = self.position(key)?;
+        let (_, value) = self.entries.remove(pos);
+        if !self.index.is_empty() {
+            if self.entries.len() <= DICT_LINEAR {
+                self.index = hashbrown::HashTable::new();
+            } else {
+                let pos = pos as u32;
+                self.index.retain(|i| {
+                    if *i == pos {
+                        return false;
+                    }
+                    if *i > pos {
+                        *i -= 1;
+                    }
+                    true
+                });
+            }
+        }
+        Some(value)
+    }
+
+    fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(JsString, Value)>()),
+            )
+            .saturating_add(
+                self.index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>() + 1),
+            )
+    }
 }
 
 impl PropertyMap {
@@ -370,18 +490,21 @@ impl PropertyMap {
         }
         // Too wide or out of shape budget: dictionary from the start.
         // `map` still holds the keys the shape walk did not consume.
-        let mut map: FastMap<JsString, Value> = map.into_iter().collect();
-        map.reserve(order.len());
-        for (key, value) in order.iter().zip(slots) {
-            map.insert(key.clone(), value);
+        let has_index_key = order.iter().any(|key| is_index_key(key.as_str()));
+        let consumed = slots.len();
+        let mut entries = Vec::with_capacity(order.len());
+        let mut order = order.into_iter();
+        for value in slots {
+            entries.push((order.next().expect("one key per slot"), value));
         }
-        let map_order: Vec<JsString> = order;
-        let has_index_key = map_order.iter().any(|key| is_index_key(key.as_str()));
-        out.inner = Some(Box::new(PropertyStore::Dict(Box::new(DictStore {
-            map,
-            order: map_order,
-            has_index_key,
-        }))));
+        debug_assert_eq!(entries.len(), consumed);
+        for key in order {
+            let value = map.remove(&key).expect("key from order");
+            entries.push((key, value));
+        }
+        out.inner = Some(Box::new(PropertyStore::Dict(Box::new(
+            DictStore::from_entries(entries, has_index_key),
+        ))));
         out
     }
 
@@ -390,7 +513,7 @@ impl PropertyMap {
         match self.inner.as_deref() {
             None => 0,
             Some(PropertyStore::Shaped { slots, .. }) => slots.len(),
-            Some(PropertyStore::Dict(dict)) => dict.map.len(),
+            Some(PropertyStore::Dict(dict)) => dict.len(),
         }
     }
 
@@ -460,22 +583,7 @@ impl PropertyMap {
                 PropertyStore::Shaped { slots, .. } => slots
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Value>()),
-                PropertyStore::Dict(dict) => std::mem::size_of::<DictStore>()
-                    .saturating_add(
-                        dict.map
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<(JsString, Value)>()),
-                    )
-                    .saturating_add(
-                        dict.map
-                            .len()
-                            .saturating_mul(std::mem::size_of::<JsString>()),
-                    )
-                    .saturating_add(
-                        dict.order
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<JsString>()),
-                    ),
+                PropertyStore::Dict(dict) => dict.heap_bytes(),
             }),
         }
     }
@@ -487,7 +595,7 @@ impl PropertyMap {
             Some(PropertyStore::Shaped { shape, slots }) => {
                 shape.lookup(key).and_then(|i| slots.get(i))
             }
-            Some(PropertyStore::Dict(dict)) => dict.map.get(key),
+            Some(PropertyStore::Dict(dict)) => dict.get(key),
         }
     }
 
@@ -499,7 +607,7 @@ impl PropertyMap {
                 let i = shape.lookup(key)?;
                 slots.get_mut(i)
             }
-            Some(PropertyStore::Dict(dict)) => dict.map.get_mut(key),
+            Some(PropertyStore::Dict(dict)) => dict.get_mut(key),
         }
     }
 
@@ -558,11 +666,9 @@ impl PropertyMap {
                         return;
                     }
                     None => {
-                        self.inner = Some(Box::new(PropertyStore::Dict(Box::new(DictStore {
-                            map: FastMap::default(),
-                            order: Vec::new(),
-                            has_index_key: false,
-                        }))));
+                        self.inner = Some(Box::new(PropertyStore::Dict(Box::new(
+                            DictStore::from_entries(Vec::new(), false),
+                        ))));
                         self.inner.as_deref_mut().expect("just set")
                     }
                 }
@@ -587,8 +693,7 @@ impl PropertyMap {
         };
         let key = interned.unwrap_or_else(|| JsString::intern(key));
         dict.has_index_key |= is_index_key(key.as_str());
-        dict.order.push(key.clone());
-        dict.map.insert(key, value);
+        dict.push(key, value);
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> Option<Value> {
@@ -612,28 +717,28 @@ impl PropertyMap {
         let PropertyStore::Dict(dict) = store else {
             unreachable!("dictionary after make_dictionary");
         };
-        let DictStore { map, order, .. } = &mut **dict;
-        let removed = map.remove(key)?;
-        if let Some(pos) = order.iter().position(|k| k.as_str() == key) {
-            order.remove(pos);
-        }
-        if map.is_empty() {
+        let removed = dict.remove(key)?;
+        if dict.len() == 0 {
             self.inner = None;
         }
         Some(removed)
     }
 
     pub(crate) fn keys(&self) -> PropertyMapKeys<'_> {
-        let (base, has_index): (&[JsString], bool) = match self.inner.as_deref() {
-            None => (&[], false),
-            Some(PropertyStore::Shaped { shape, .. }) => (shape.keys(), shape.has_index_key),
-            Some(PropertyStore::Dict(dict)) => (dict.order.as_slice(), dict.has_index_key),
+        let (base, has_index): (PropertyMapKeys<'_>, bool) = match self.inner.as_deref() {
+            None => (PropertyMapKeys::Plain([].iter()), false),
+            Some(PropertyStore::Shaped { shape, .. }) => {
+                (PropertyMapKeys::Plain(shape.keys().iter()), shape.has_index_key)
+            }
+            Some(PropertyStore::Dict(dict)) => {
+                (PropertyMapKeys::Entries(dict.entries.iter()), dict.has_index_key)
+            }
         };
         if !has_index {
-            return PropertyMapKeys::Plain(base.iter());
+            return base;
         }
         let mut indexed: Vec<(u32, &JsString)> = Vec::new();
-        let mut named: Vec<&JsString> = Vec::with_capacity(base.len());
+        let mut named: Vec<&JsString> = Vec::with_capacity(self.len());
         for key in base {
             match index_key_value(key.as_str()) {
                 Some(index) => indexed.push((index, key)),
@@ -661,7 +766,7 @@ impl PropertyMap {
         match self.inner.as_deref() {
             None => false,
             Some(PropertyStore::Shaped { shape, .. }) => shape.keys().iter().any(&mut f),
-            Some(PropertyStore::Dict(dict)) => dict.order.iter().any(f),
+            Some(PropertyStore::Dict(dict)) => dict.entries.iter().any(|(key, _)| f(key)),
         }
     }
 }
@@ -670,17 +775,14 @@ impl PropertyStore {
     fn make_dictionary(&mut self) {
         if let PropertyStore::Shaped { shape, slots } = self {
             let slots = std::mem::take(slots);
-            let mut map = FastMap::with_capacity_and_hasher(slots.len() + 1, Default::default());
-            let mut order = Vec::with_capacity(slots.len() + 1);
+            let mut entries = Vec::with_capacity(slots.len() + 1);
             for (key, value) in shape.keys().iter().zip(slots) {
-                order.push(key.clone());
-                map.insert(key.clone(), value);
+                entries.push((key.clone(), value));
             }
-            *self = PropertyStore::Dict(Box::new(DictStore {
-                map,
-                order,
-                has_index_key: shape.has_index_key,
-            }));
+            *self = PropertyStore::Dict(Box::new(DictStore::from_entries(
+                entries,
+                shape.has_index_key,
+            )));
         }
     }
 }
@@ -693,6 +795,7 @@ impl Default for PropertyMap {
 
 pub(crate) enum PropertyMapKeys<'a> {
     Plain(std::slice::Iter<'a, JsString>),
+    Entries(std::slice::Iter<'a, (JsString, Value)>),
     Ordered(std::vec::IntoIter<&'a JsString>),
 }
 
@@ -703,6 +806,7 @@ impl<'a> Iterator for PropertyMapKeys<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             PropertyMapKeys::Plain(iter) => iter.next(),
+            PropertyMapKeys::Entries(iter) => iter.next().map(|(key, _)| key),
             PropertyMapKeys::Ordered(iter) => iter.next(),
         }
     }
@@ -999,4 +1103,62 @@ mod tests {
         assert_ne!(here, there);
         assert_ne!(here, Some(ROOT_SHAPE_ID));
     }
+
+    #[test]
+    fn dictionary_index_tracks_inserts_and_removals_past_the_linear_limit() {
+        let names: Vec<String> = (0..40).map(|i| format!("k{i}")).collect();
+        let mut map = PropertyMap::new();
+        for (i, name) in names.iter().enumerate() {
+            map.insert_str(name, Value::Number(i as f64));
+            if i == 3 {
+                // A delete forces dictionary mode while the map is small.
+                map.remove("k0");
+                map.insert_str("k0", Value::Number(0.0));
+            }
+        }
+        assert!(map.is_dictionary());
+        assert_eq!(map.len(), 40);
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(map.get(name).map(Value::to_number), Some(i as f64), "{name}");
+        }
+        // Remove from the middle, the front and the back; positions shift.
+        for gone in ["k20", "k1", "k39"] {
+            assert!(map.remove(gone).is_some());
+            assert!(map.get(gone).is_none());
+        }
+        assert_eq!(map.len(), 37);
+        for (i, name) in names.iter().enumerate() {
+            if ["k20", "k1", "k39"].contains(&name.as_str()) {
+                continue;
+            }
+            assert_eq!(map.get(name).map(Value::to_number), Some(i as f64), "{name}");
+        }
+        let order = keys(&map);
+        assert_eq!(order[0], "k2");
+        assert_eq!(order.iter().position(|k| k == "k0"), Some(2));
+        assert_eq!(order.last().map(String::as_str), Some("k38"));
+        // Shrinking back under the limit drops the index; lookups still work.
+        for name in &names[5..39] {
+            map.remove(name);
+        }
+        assert!(map.get("k2").is_some() && map.get("k0").is_some() && map.get("k30").is_none());
+        assert_eq!(keys(&map), vec!["k2", "k3", "k0", "k4"]);
+    }
+
+    #[test]
+    fn wide_literal_dictionaries_keep_sorted_key_order() {
+        let mut source = HashMap::new();
+        for i in 0..(MAX_SHAPE_KEYS + 10) {
+            source.insert(JsString::intern(&format!("p{i:03}")), Value::Number(i as f64));
+        }
+        let map = PropertyMap::from_interned_hashmap(source);
+        assert!(map.is_dictionary());
+        let order = keys(&map);
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted);
+        assert_eq!(order.len(), MAX_SHAPE_KEYS + 10);
+        assert_eq!(map.get("p070").map(Value::to_number), Some(70.0));
+    }
+
 }
