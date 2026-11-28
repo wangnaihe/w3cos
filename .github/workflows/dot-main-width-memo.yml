@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 5
+          fetch-depth: 7
       - name: Install baseline dependencies
         run: |
           git rev-parse HEAD
@@ -79,6 +79,38 @@ jobs:
           }
 
           """ + anchor)
+          old = "    if let Some((rects, client_rects)) = memo_hit {"
+          assert s.count(old) == 1
+          s = s.replace(old, """    if let Some((rects, client_rects)) = memo_hit {
+                  let audit = dot_width_memo_audit_enabled();
+                  let engine_before = audit && cache.engine.tree_valid();
+                  if guarded {
+                      // Replay publishes a coherent DOM snapshot but does not update
+                      // the legacy tree. Retire that tree without doing layout now.
+                      cache.engine.invalidate();
+                  }
+                  if audit {
+                      eprintln!("[memo-engine-replay] guard={guarded} tree_before={engine_before} tree_after={}", cache.engine.tree_valid());
+                  }""")
+          old = "    let compute_started = std::time::Instant::now();"
+          assert s.count(old) == 1
+          s = s.replace(old, """    let audit = dot_width_memo_audit_enabled();
+              let engine_before = audit && cache.engine.tree_valid();
+              let compute_started = std::time::Instant::now();""")
+          old = '    note_flush("retained", flat.len() as u32, 0);'
+          assert s.count(old) == 1
+          s = s.replace(old, """    if audit {
+                  eprintln!("[memo-engine-retained] guard={guarded} tree_before={engine_before} tree_after={}", cache.engine.tree_valid());
+              }
+          """ + old)
+          anchor = "fn dot_width_memo_fix_enabled()"
+          assert s.count(anchor) == 1
+          s = s.replace(anchor, """fn dot_width_memo_audit_enabled() -> bool {
+              static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              *ENABLED.get_or_init(|| std::env::var_os("DOT_WIDTH_MEMO_AUDIT").is_some())
+          }
+
+          """ + anchor)
           p.write_text(s)
           PY
           git diff --check
@@ -109,10 +141,10 @@ jobs:
           set -uo pipefail
           result=0
           for mode in 0 1; do
-            for scenario in width cross; do
+            for scenario in width cross reuse; do
               printf 'retained layout_ng=0 guarded=%s case=%s\n' "$mode" "$scenario"
-              DOT_WIDTH_MEMO_FIX=$mode W3COS_LAYOUT_NG=0 W3COS_LAYOUT_NG_VERIFY=0 W3COS_SUBTREE_RELAYOUT=0 \
-                target/runtime-bench/examples/dot_width_memo_correctness "$scenario" \
+              DOT_WIDTH_MEMO_FIX=$mode DOT_WIDTH_MEMO_AUDIT=1 W3COS_LAYOUT_NG=0 W3COS_LAYOUT_NG_VERIFY=0 W3COS_SUBTREE_RELAYOUT=0 \
+                target/runtime-bench/examples/dot_width_memo_correctness "$scenario" 2>&1 \
                 | tee "$RUNNER_TEMP/width-memo-evidence/$mode-$scenario.log" || result=1
             done
           done
@@ -141,6 +173,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: current-main-width-memo-replay-evidence
+          name: current-main-width-memo-coherence-evidence
           path: ${{ runner.temp }}/width-memo-evidence
           if-no-files-found: ignore
