@@ -8,12 +8,7 @@ fn video_controls_paint_state_tracks_boolean_attribute_without_inheriting() {
     fn state(tree: &w3cos_std::Component, id: u64) -> Option<&str> {
         if matches!(tree.on_click, w3cos_std::EventAction::NativeHost { id: host, .. } if host == id)
         {
-            return tree
-                .style
-                .custom_properties
-                .as_ref()?
-                .get(MARKER)
-                .map(String::as_str);
+            return tree.style.custom_properties.as_ref()?.get(MARKER);
         }
         tree.children.iter().find_map(|child| state(child, id))
     }
@@ -89,8 +84,7 @@ fn html_control_auto_appearance_yields_to_author_decoration() {
                 style
                     .custom_properties
                     .as_ref()
-                    .and_then(|p| p.get("--w3cos-internal-html-control-appearance"))
-                    .map(String::as_str),
+                    .and_then(|p| p.get("--w3cos-internal-html-control-appearance")),
                 Some(expected),
                 "{tag}: {property}: {value}"
             );

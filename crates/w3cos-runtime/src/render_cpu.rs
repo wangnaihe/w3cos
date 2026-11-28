@@ -1804,7 +1804,6 @@ fn draw_ime_preedit_underline(
         .custom_properties
         .as_ref()
         .and_then(|props| props.get("--w3cos-ime-preedit"))
-        .map(String::as_str)
         .filter(|suffix| !suffix.is_empty())
     else {
         return;
@@ -2027,7 +2026,7 @@ fn text_align_last(style: &Style) -> Option<TextAlign> {
         .custom_properties
         .as_ref()?
         .get("--w3cos-internal-text-align-last")?;
-    Some(match value.as_str() {
+    Some(match value {
         "left" => TextAlign::Left,
         "right" => TextAlign::Right,
         "center" => TextAlign::Center,

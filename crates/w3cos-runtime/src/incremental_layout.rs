@@ -1074,7 +1074,12 @@ fn assign_layout_style(
                     w3cos_std::inline_text::CSSOM_BOX_OWNERS,
                 ]
                 .into_iter()
-                .filter_map(|key| properties.get(key).cloned().map(|value| (key, value)))
+                .filter_map(|key| {
+                    properties
+                        .get(key)
+                        .map(str::to_string)
+                        .map(|value| (key, value))
+                })
                 .collect::<Vec<_>>()
             })
             .unwrap_or_default();

@@ -9,11 +9,7 @@ use w3cos_std::style::{Display, Float, Position, TextDirection};
 use w3cos_std::{ComponentKind, Style};
 
 fn property<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
-    style
-        .custom_properties
-        .as_ref()?
-        .get(key)
-        .map(String::as_str)
+    style.custom_properties.as_ref()?.get(key)
 }
 
 pub(crate) fn inside_kind(style: &Style) -> Option<&str> {

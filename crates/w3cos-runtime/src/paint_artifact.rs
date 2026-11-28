@@ -396,7 +396,6 @@ fn split_positioned_inline_owner(node: &PaintNode) -> Option<&str> {
         .custom_properties
         .as_ref()?
         .get("--w3cos-internal-positioned-inline-owner")
-        .map(String::as_str)
         .filter(|owner| !owner.is_empty())
 }
 
@@ -943,15 +942,12 @@ fn resolve_collapsed_cell_border_conflicts(nodes: &mut [PaintNode]) {
     fn suppress_edge(style: &mut Style, side: usize, width: f32) {
         const NAMES: [&str; 4] = ["top", "right", "bottom", "left"];
         set_edge(style, side, width, Color::TRANSPARENT);
-        style
-            .custom_properties
-            .get_or_insert_with(Default::default)
-            .entry(COLLAPSED_BORDER_SUPPRESSED.to_string())
-            .and_modify(|value| {
-                value.push(' ');
-                value.push_str(NAMES[side]);
-            })
-            .or_insert_with(|| NAMES[side].to_string());
+        let properties = style.custom_properties.get_or_insert_with(Default::default);
+        let value = match properties.get(COLLAPSED_BORDER_SUPPRESSED) {
+            Some(existing) => format!("{existing} {}", NAMES[side]),
+            None => NAMES[side].to_string(),
+        };
+        properties.insert(COLLAPSED_BORDER_SUPPRESSED.to_string(), value);
     }
 
     let rows = nodes

@@ -79,8 +79,8 @@ fn has_internal_marker(style: &Style, allowed: &[&str]) -> bool {
     style.custom_properties.as_ref().is_some_and(|props| {
         props.keys().any(|key| {
             key.starts_with("--w3cos-internal")
-                && !INERT_MARKERS.contains(&key.as_str())
-                && !allowed.contains(&key.as_str())
+                && !INERT_MARKERS.contains(&key)
+                && !allowed.contains(&key)
         })
     })
 }
