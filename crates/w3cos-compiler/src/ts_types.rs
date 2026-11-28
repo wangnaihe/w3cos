@@ -248,8 +248,29 @@ pub fn infer_from_expr(expr: &swc_ecma_ast::Expr) -> RustType {
                 }
                 Sub | Mul | Div | Mod | Exp | BitAnd | BitOr | BitXor | LShift | RShift
                 | ZeroFillRShift => RustType::F64,
-                EqEq | NotEq | EqEqEq | NotEqEq | Lt | LtEq | Gt | GtEq | LogicalAnd
-                | LogicalOr => RustType::Bool,
+                EqEq | NotEq | EqEqEq | NotEqEq | Lt | LtEq | Gt | GtEq => RustType::Bool,
+                // JS `&&` / `||` return one of their operands, not a bool:
+                // the result has a single static type only when both
+                // operands share it (`bool && bool` is `bool`).
+                LogicalAnd | LogicalOr => {
+                    let left = infer_from_expr(&bin.left);
+                    let right = infer_from_expr(&bin.right);
+                    if left == right && !matches!(left, RustType::Dynamic) {
+                        left
+                    } else {
+                        RustType::Inferred
+                    }
+                }
+                // `Option<T> ?? T` unwraps to `T`; `T ?? T` stays `T`.
+                NullishCoalescing => {
+                    let left = infer_from_expr(&bin.left);
+                    let right = infer_from_expr(&bin.right);
+                    match left {
+                        RustType::Option(inner) if *inner == right => right,
+                        _ if left == right && !matches!(left, RustType::Dynamic) => left,
+                        _ => RustType::Inferred,
+                    }
+                }
                 _ => RustType::Inferred,
             }
         }
@@ -302,6 +323,33 @@ mod tests {
     fn hashmap_type_string() {
         let t = RustType::HashMap(Box::new(RustType::String), Box::new(RustType::F64));
         assert_eq!(t.to_rust_str(), "HashMap<String, f64>");
+    }
+
+    fn infer_src(src: &str) -> RustType {
+        use swc_common::{FileName, SourceMap, sync::Lrc};
+        use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
+        let cm: Lrc<SourceMap> = Default::default();
+        let fm = cm.new_source_file(Lrc::new(FileName::Anon), src.to_string());
+        let mut parser = Parser::new(
+            Syntax::Typescript(TsSyntax::default()),
+            StringInput::from(&*fm),
+            None,
+        );
+        let expr = parser.parse_expr().expect("parse");
+        infer_from_expr(&expr)
+    }
+
+    #[test]
+    fn logical_operators_infer_operand_type_not_bool() {
+        assert_eq!(infer_src("true && false"), RustType::Bool);
+        assert_eq!(infer_src("(1 < 2) || false"), RustType::Bool);
+        assert_eq!(infer_src("1 || 2"), RustType::F64);
+        assert_eq!(infer_src("'a' && 'b'"), RustType::String);
+        assert_eq!(infer_src("'' || 0"), RustType::Inferred);
+        assert_eq!(infer_src("x || 'default'"), RustType::Inferred);
+        assert_eq!(infer_src("1 ?? 2"), RustType::F64);
+        assert_eq!(infer_src("null ?? 2"), RustType::Inferred);
+        assert_eq!(infer_src("!(1 || 2)"), RustType::Bool);
     }
 
     #[test]

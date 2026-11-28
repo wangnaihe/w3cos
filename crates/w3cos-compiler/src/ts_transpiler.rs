@@ -715,7 +715,7 @@ impl TranspileContext {
 
     fn transpile_if_inner(&mut self, if_stmt: &IfStmt) -> Result<()> {
         self.push("if ");
-        self.transpile_expr(&if_stmt.test)?;
+        self.transpile_test(&if_stmt.test)?;
         self.push(" {\n");
         self.indent += 1;
         self.transpile_stmt_body(&if_stmt.cons)?;
@@ -781,7 +781,7 @@ impl TranspileContext {
         self.push_indent();
         self.push("while ");
         if let Some(test) = &for_stmt.test {
-            self.transpile_expr(test)?;
+            self.transpile_test(test)?;
         } else {
             self.push("true");
         }
@@ -844,7 +844,7 @@ impl TranspileContext {
     fn transpile_while(&mut self, w: &WhileStmt) -> Result<()> {
         self.push_indent();
         self.push("while ");
-        self.transpile_expr(&w.test)?;
+        self.transpile_test(&w.test)?;
         self.push(" {\n");
         self.indent += 1;
         self.transpile_stmt_body(&w.body)?;
@@ -990,12 +990,183 @@ impl TranspileContext {
             return self.transpile_string_concat(bin);
         }
 
+        if matches!(
+            bin.op,
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+        ) && self.transpile_logical_value(bin)?
+        {
+            return Ok(());
+        }
+
         self.transpile_expr(&bin.left)?;
         self.push(" ");
         self.push(bin_op_to_rust(bin.op));
         self.push(" ");
         self.transpile_expr(&bin.right)?;
         Ok(())
+    }
+
+    /// Transpile `expr` into a string instead of the output buffer.
+    fn expr_string(&mut self, expr: &Expr) -> Result<String> {
+        let start = self.output.len();
+        self.transpile_expr(expr)?;
+        Ok(self.output.split_off(start))
+    }
+
+    /// Best-effort static type of an expression: declared/inferred local
+    /// types for identifiers, otherwise `ts_types::infer_from_expr`.
+    fn static_type(&self, expr: &Expr) -> RustType {
+        match expr {
+            Expr::Ident(ident) => self
+                .vars
+                .get(ident.sym.as_ref())
+                .map(|info| info.rust_type.clone())
+                .unwrap_or(RustType::Inferred),
+            Expr::Paren(paren) => self.static_type(&paren.expr),
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => RustType::Bool,
+            Expr::Bin(bin) => match bin.op {
+                BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
+                    let left = self.static_type(&bin.left);
+                    if left == self.static_type(&bin.right) && is_concrete(&left) {
+                        left
+                    } else {
+                        RustType::Inferred
+                    }
+                }
+                BinaryOp::NullishCoalescing => {
+                    let left = self.static_type(&bin.left);
+                    let right = self.static_type(&bin.right);
+                    match left {
+                        RustType::Option(inner) if *inner == right => right,
+                        _ if left == right && is_concrete(&left) => left,
+                        _ => RustType::Inferred,
+                    }
+                }
+                _ => ts_types::infer_from_expr(expr),
+            },
+            _ => ts_types::infer_from_expr(expr),
+        }
+    }
+
+    /// Emit an expression whose only use is its truthiness (if/while/for
+    /// test, ternary test, `!` operand) as a Rust `bool`.
+    ///
+    /// `bool` operands keep native `&&`/`||` (zero cost, output unchanged).
+    /// Logical operators over other statically known types test each
+    /// operand's JS truthiness natively (`n != 0.0 && !n.is_nan()`,
+    /// `!s.is_empty()`, ...) with Rust short-circuiting, so the selected
+    /// operand value is never materialized. Unknown types fall back to the
+    /// plain expression (previous behavior).
+    fn transpile_test(&mut self, expr: &Expr) -> Result<()> {
+        let code = self.test_string(expr)?;
+        // Source parentheses (`if ((a))`) are kept; only drop the grouping
+        // this lowering added around a typed truthiness test.
+        let code = if matches!(expr, Expr::Paren(_)) {
+            code.as_str()
+        } else {
+            strip_wrapping_parens(&code)
+        };
+        self.push(code);
+        Ok(())
+    }
+
+    fn test_string(&mut self, expr: &Expr) -> Result<String> {
+        if self.static_type(expr) == RustType::Bool {
+            return self.expr_string(expr);
+        }
+        match expr {
+            Expr::Paren(paren) => {
+                let inner = self.test_string(&paren.expr)?;
+                Ok(format!("({inner})"))
+            }
+            Expr::Bin(bin) if matches!(bin.op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) => {
+                let left = self.test_string(&bin.left)?;
+                let right = self.test_string(&bin.right)?;
+                // Source parentheses are kept as `Expr::Paren`, and Rust's
+                // `&&`/`||` precedence matches JS, so no extra grouping.
+                let op = bin_op_to_rust(bin.op);
+                Ok(format!("{left} {op} {right}"))
+            }
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => {
+                let arg = self.test_string(&unary.arg)?;
+                Ok(format!("!{arg}"))
+            }
+            _ => {
+                let ty = self.static_type(expr);
+                let code = self.expr_string(expr)?;
+                Ok(truthy_test(&ty, &code).unwrap_or(code))
+            }
+        }
+    }
+
+    /// Value-position `&&` / `||` / `??` with JS semantics (the result is
+    /// one of the operands, the right side is evaluated at most once and
+    /// only when selected). Returns `false` (nothing emitted) when the
+    /// static types do not allow a typed lowering, so the caller keeps the
+    /// legacy native emission (always the case for `bool && bool`).
+    fn transpile_logical_value(&mut self, bin: &BinExpr) -> Result<bool> {
+        let left_ty = self.static_type(&bin.left);
+        let right_ty = self.static_type(&bin.right);
+        match bin.op {
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
+                if left_ty == RustType::Bool && right_ty == RustType::Bool {
+                    return Ok(false);
+                }
+                if left_ty != right_ty {
+                    return Ok(false);
+                }
+                let Some(test) = truthy_test(&left_ty, "__l") else {
+                    return Ok(false);
+                };
+                let test = strip_wrapping_parens(&test);
+                let mut left = self.expr_string(&bin.left)?;
+                let mut right = self.expr_string(&bin.right)?;
+                if left_ty == RustType::String {
+                    // JS strings are values: selecting a `String` local must
+                    // not move it out of the variable.
+                    for (expr, code) in [(&bin.left, &mut left), (&bin.right, &mut right)] {
+                        if matches!(expr.as_ref(), Expr::Ident(_)) {
+                            code.push_str(".clone()");
+                        }
+                    }
+                }
+                let code = if bin.op == BinaryOp::LogicalOr {
+                    format!("{{ let __l = {left}; if {test} {{ __l }} else {{ {right} }} }}")
+                } else {
+                    format!("{{ let __l = {left}; if {test} {{ {right} }} else {{ __l }} }}")
+                };
+                self.push(&code);
+                Ok(true)
+            }
+            BinaryOp::NullishCoalescing => {
+                let left = self.expr_string(&bin.left)?;
+                match &left_ty {
+                    // A statically non-nullable left side is the result; JS
+                    // never evaluates the right side.
+                    RustType::F64
+                    | RustType::String
+                    | RustType::Bool
+                    | RustType::Vec(_)
+                    | RustType::HashMap(_, _)
+                    | RustType::Struct(_)
+                    | RustType::Tuple(_) => {
+                        self.push(&left);
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+                let right = self.expr_string(&bin.right)?;
+                // Nullable values are `Option`s (`null` is `None`).
+                let code = if matches!(right_ty, RustType::Option(_)) {
+                    format!("({left}).or_else(|| {right})")
+                } else {
+                    format!("({left}).unwrap_or_else(|| {right})")
+                };
+                self.push(&code);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn is_string_context(&self, bin: &BinExpr) -> bool {
@@ -1046,8 +1217,10 @@ impl TranspileContext {
     fn transpile_unary(&mut self, unary: &UnaryExpr) -> Result<()> {
         match unary.op {
             UnaryOp::Bang => {
+                // Operand of `!`: keep the test atomic (no paren stripping).
+                let test = self.test_string(&unary.arg)?;
                 self.push("!");
-                self.transpile_expr(&unary.arg)?;
+                self.push(&test);
             }
             UnaryOp::Minus => {
                 self.push("-");
@@ -2100,7 +2273,7 @@ impl TranspileContext {
 
     fn transpile_cond(&mut self, cond: &CondExpr) -> Result<()> {
         self.push("if ");
-        self.transpile_expr(&cond.test)?;
+        self.transpile_test(&cond.test)?;
         self.push(" { ");
         self.transpile_expr(&cond.cons)?;
         self.push(" } else { ");
@@ -2592,6 +2765,70 @@ fn detect_range_for(for_stmt: &ForStmt) -> Option<RangeFor<'_>> {
         start,
         end,
     })
+}
+
+/// `(x)` → `x` when the outer parentheses wrap the whole expression.
+fn strip_wrapping_parens(code: &str) -> &str {
+    let Some(inner) = code
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return code;
+    };
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return code;
+                }
+            }
+            '"' | '\'' => return code,
+            _ => {}
+        }
+    }
+    if depth == 0 { inner } else { code }
+}
+
+fn is_concrete(ty: &RustType) -> bool {
+    !matches!(ty, RustType::Dynamic | RustType::Inferred)
+}
+
+/// JS `ToBoolean` for a statically typed Rust expression, or `None` when the
+/// type has no cheap native test. `code` is wrapped as needed, so the
+/// result is safe as an operand of `&&`, `||` and `!`.
+fn truthy_test(ty: &RustType, code: &str) -> Option<String> {
+    let simple = !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let atom = if simple {
+        code.to_string()
+    } else {
+        format!("({code})")
+    };
+    match ty {
+        RustType::Bool => Some(atom),
+        RustType::F64 if simple => Some(format!("({code} != 0.0 && !{code}.is_nan())")),
+        RustType::F64 => Some(format!(
+            "({{ let __t: f64 = {code}; __t != 0.0 && !__t.is_nan() }})"
+        )),
+        RustType::String => Some(format!("!{atom}.is_empty()")),
+        RustType::Option(inner) => match inner.as_ref() {
+            RustType::Bool => Some(format!("{atom}.unwrap_or(false)")),
+            RustType::F64 => Some(format!(
+                "{atom}.is_some_and(|__t| __t != 0.0 && !__t.is_nan())"
+            )),
+            RustType::String => Some(format!(
+                "{atom}.as_ref().is_some_and(|__t| !__t.is_empty())"
+            )),
+            // Objects are always truthy: only `None` (null/undefined) is falsy.
+            RustType::Vec(_) | RustType::HashMap(_, _) | RustType::Struct(_) => {
+                Some(format!("{atom}.is_some()"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn bin_op_to_rust(op: BinaryOp) -> &'static str {
@@ -3459,5 +3696,64 @@ mod tests {
             !output.needs_history,
             "needs_history should be false when unused"
         );
+    }
+
+    #[test]
+    fn logical_bool_operands_stay_native() {
+        let rust = transpile_ok(
+            "let a: boolean = true;\nlet b: boolean = false;\nif (a && !b || a) { console.log(\"x\"); }\nlet c = a && b;",
+        );
+        assert!(rust.contains("if a && !b || a {"), "got: {rust}");
+        assert!(rust.contains("let c = a && b;"), "got: {rust}");
+    }
+
+    #[test]
+    fn logical_condition_uses_typed_truthiness() {
+        let rust = transpile_ok(
+            "let n: number = 0;\nlet s: string = \"\";\nif (n || s) { console.log(\"t\"); }\nwhile (!n && s) { n = 1; }",
+        );
+        assert!(
+            rust.contains("if (n != 0.0 && !n.is_nan()) || !s.is_empty() {"),
+            "number/string truthiness in condition position: {rust}"
+        );
+        assert!(
+            rust.contains("while !(n != 0.0 && !n.is_nan()) && !s.is_empty() {"),
+            "`!` operand and && in a while test: {rust}"
+        );
+    }
+
+    #[test]
+    fn logical_value_returns_selected_operand() {
+        let rust = transpile_ok(
+            "let name: string = \"\";\nlet shown = name || \"anon\";\nlet x: number = 2;\nlet y: number = 3;\nlet z = x && y;",
+        );
+        assert!(
+            rust.contains(
+                "let shown = { let __l = name.clone(); if !__l.is_empty() { __l } else { \"anon\".to_string() } };"
+            ),
+            "string || default keeps the operand value and type: {rust}"
+        );
+        assert!(
+            rust.contains(
+                "let z = { let __l = x; if __l != 0.0 && !__l.is_nan() { y } else { __l } };"
+            ),
+            "number && number selects an operand: {rust}"
+        );
+    }
+
+    #[test]
+    fn nullish_coalescing_unwraps_option_lazily() {
+        let rust = transpile_ok(
+            "let maybe: number | null = null;\nlet v = maybe ?? 5;\nlet n: number = 1;\nlet w = n ?? 2;",
+        );
+        assert!(
+            rust.contains("let v = (maybe).unwrap_or_else(|| 5);"),
+            "got: {rust}"
+        );
+        assert!(
+            rust.contains("let w = n;"),
+            "non-nullable left side never evaluates the right side: {rust}"
+        );
+        assert!(!rust.contains("/* unknown op */"), "got: {rust}");
     }
 }

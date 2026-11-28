@@ -2605,16 +2605,10 @@ impl Builder {
     }
 
     fn lower_if_statement(&mut self, statement: &swc_ecma_ast::IfStmt) -> Result<()> {
-        let condition = self.lower_expression(&statement.test)?;
         let then_block = self.allocate_block();
         let else_block = self.allocate_block();
         let merge_block = self.allocate_block();
-        self.terminate(Instruction::Branch {
-            condition,
-            then_block,
-            else_block,
-        });
-        self.seal_current_block();
+        self.lower_condition_branch(&statement.test, then_block, else_block)?;
 
         self.start_block(then_block);
         self.lower_if_branch(&statement.cons)?;
@@ -2662,13 +2656,7 @@ impl Builder {
         self.seal_current_block();
 
         self.start_block(condition_block);
-        let condition = self.lower_expression(&statement.test)?;
-        self.terminate(Instruction::Branch {
-            condition,
-            then_block: body_block,
-            else_block: exit_block,
-        });
-        self.seal_current_block();
+        self.lower_condition_branch(&statement.test, body_block, exit_block)?;
 
         self.start_block(body_block);
         self.control_targets.push(ControlTarget {
@@ -2718,13 +2706,7 @@ impl Builder {
         self.seal_current_block();
 
         self.start_block(condition_block);
-        let condition = self.lower_expression(&statement.test)?;
-        self.terminate(Instruction::Branch {
-            condition,
-            then_block: body_block,
-            else_block: exit_block,
-        });
-        self.seal_current_block();
+        self.lower_condition_branch(&statement.test, body_block, exit_block)?;
         self.start_block(exit_block);
         Ok(())
     }
@@ -2767,17 +2749,17 @@ impl Builder {
             self.seal_current_block();
 
             self.start_block(condition_block);
-            let condition = if let Some(test) = &statement.test {
-                self.lower_expression(test)?
+            if let Some(test) = &statement.test {
+                self.lower_condition_branch(test, body_block, exit_block)?;
             } else {
-                self.constant(Constant::Bool(true))
-            };
-            self.terminate(Instruction::Branch {
-                condition,
-                then_block: body_block,
-                else_block: exit_block,
-            });
-            self.seal_current_block();
+                let condition = self.constant(Constant::Bool(true));
+                self.terminate(Instruction::Branch {
+                    condition,
+                    then_block: body_block,
+                    else_block: exit_block,
+                });
+                self.seal_current_block();
+            }
 
             self.start_block(body_block);
             self.control_targets.push(ControlTarget {
@@ -3175,14 +3157,26 @@ impl Builder {
     ) -> Result<Register> {
         let consequent_block = self.allocate_block();
         let alternate_block = self.allocate_block();
-        let merge_block = self.allocate_block();
-        let result = self.register();
         self.terminate(Instruction::Branch {
             condition,
             then_block: consequent_block,
             else_block: alternate_block,
         });
         self.seal_current_block();
+        self.lower_branch_arms(consequent_block, alternate_block, consequent, alternate)
+    }
+
+    /// The two value arms and merge of a branch whose (already emitted and
+    /// sealed) terminator targets `consequent_block` / `alternate_block`.
+    fn lower_branch_arms(
+        &mut self,
+        consequent_block: BlockId,
+        alternate_block: BlockId,
+        consequent: impl FnOnce(&mut Self) -> Result<Register>,
+        alternate: impl FnOnce(&mut Self) -> Result<Register>,
+    ) -> Result<Register> {
+        let merge_block = self.allocate_block();
+        let result = self.register();
 
         self.start_block(consequent_block);
         let consequent = consequent(self)?;
@@ -3250,12 +3244,67 @@ impl Builder {
         &mut self,
         expression: &swc_ecma_ast::CondExpr,
     ) -> Result<Register> {
-        let condition = self.lower_expression(&expression.test)?;
-        self.lower_branch_value(
-            condition,
+        let consequent_block = self.allocate_block();
+        let alternate_block = self.allocate_block();
+        self.lower_condition_branch(&expression.test, consequent_block, alternate_block)?;
+        self.lower_branch_arms(
+            consequent_block,
+            alternate_block,
             |builder| builder.lower_expression(&expression.cons),
             |builder| builder.lower_expression(&expression.alt),
         )
+    }
+
+    /// Lower a truthiness-only `test` (if/while/do-while/for test, ternary
+    /// test) straight into control flow ("jumping code"): branch to
+    /// `then_block` when it is truthy and `else_block` otherwise, then seal
+    /// the current block.
+    ///
+    /// `a && b` / `a || b` here never need the operand they select, so each
+    /// operand branches directly (with the same short-circuit order) instead
+    /// of `Move`-merging the selected operand into a fresh register and
+    /// branching on that register again. Besides saving the merge block, the
+    /// moves and the second ToBoolean, this keeps each operand's register in
+    /// its own representation (a comparison stays a native bool) instead of
+    /// widening a merged register to a dynamic Value. `!x` just swaps the
+    /// targets (instead of materializing `true`/`false` and branching on
+    /// that again).
+    fn lower_condition_branch(
+        &mut self,
+        test: &Expr,
+        then_block: BlockId,
+        else_block: BlockId,
+    ) -> Result<()> {
+        match test {
+            Expr::Paren(parenthesized) => {
+                self.lower_condition_branch(&parenthesized.expr, then_block, else_block)
+            }
+            Expr::Bin(binary) if binary.op == BinaryOp::LogicalAnd => {
+                let rhs_block = self.allocate_block();
+                self.lower_condition_branch(&binary.left, rhs_block, else_block)?;
+                self.start_block(rhs_block);
+                self.lower_condition_branch(&binary.right, then_block, else_block)
+            }
+            Expr::Bin(binary) if binary.op == BinaryOp::LogicalOr => {
+                let rhs_block = self.allocate_block();
+                self.lower_condition_branch(&binary.left, then_block, rhs_block)?;
+                self.start_block(rhs_block);
+                self.lower_condition_branch(&binary.right, then_block, else_block)
+            }
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => {
+                self.lower_condition_branch(&unary.arg, else_block, then_block)
+            }
+            _ => {
+                let condition = self.lower_expression(test)?;
+                self.terminate(Instruction::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                });
+                self.seal_current_block();
+                Ok(())
+            }
+        }
     }
 
     fn lower_unary_expression(&mut self, expression: &swc_ecma_ast::UnaryExpr) -> Result<Register> {
@@ -3276,13 +3325,21 @@ impl Builder {
             return Ok(self.constant(Constant::Bool(true)));
         }
 
-        let argument = self.lower_expression(&expression.arg)?;
-        match expression.op {
-            UnaryOp::Bang => self.lower_branch_value(
-                argument,
+        if expression.op == UnaryOp::Bang {
+            // `!x` is `x ? false : true`; a logical operand branches per
+            // operand (see `lower_condition_branch`).
+            let false_block = self.allocate_block();
+            let true_block = self.allocate_block();
+            self.lower_condition_branch(&expression.arg, false_block, true_block)?;
+            return self.lower_branch_arms(
+                false_block,
+                true_block,
                 |builder| Ok(builder.constant(Constant::Bool(false))),
                 |builder| Ok(builder.constant(Constant::Bool(true))),
-            ),
+            );
+        }
+        let argument = self.lower_expression(&expression.arg)?;
+        match expression.op {
             UnaryOp::Plus => {
                 let one = self.constant(Constant::Number(1.0));
                 let dst = self.register();
@@ -6300,6 +6357,172 @@ mod tests {
         assert_eq!(
             attributes.borrow().get("data-ready").map(String::as_str),
             Some("yes")
+        );
+    }
+
+    #[test]
+    fn condition_position_logical_operators_lower_to_jumping_code() {
+        // `if (a && (b || !(c && d)))` branches on each operand directly: no
+        // merged result register (no `Move`; `!` swaps targets instead of
+        // materializing true/false), one `Branch` per operand.
+        let module = lower_script(
+            "if (a && (b || !(c && d))) { hit(); }",
+            "https://example.test/jumping-code.js",
+        )
+        .unwrap();
+        let entry = module
+            .functions
+            .iter()
+            .find(|function| function.id == module.entry)
+            .unwrap();
+        let instructions = entry
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .collect::<Vec<_>>();
+        assert!(
+            !instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Move { .. })),
+            "no merged logical result register: {instructions:#?}"
+        );
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::Branch { .. }))
+                .count(),
+            4,
+            "one branch per operand: {instructions:#?}"
+        );
+
+        // Value position keeps the selected operand.
+        let module =
+            lower_script("out = a && b;", "https://example.test/logical-value.js").unwrap();
+        let entry = module
+            .functions
+            .iter()
+            .find(|function| function.id == module.entry)
+            .unwrap();
+        assert!(
+            entry
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+                .any(|instruction| matches!(instruction, Instruction::Move { .. })),
+            "value-position && merges the selected operand"
+        );
+    }
+
+    #[test]
+    #[ignore = "timing only; cargo test --release -p w3cos-compiler --lib bench_w3vm_ -- --ignored --nocapture"]
+    fn bench_w3vm_condition_position_logical_chain() {
+        let n = 1_000_000u32;
+        let source = format!(
+            "function run(n) {{ let hits = 0; for (let i = 0; i < n; i = i + 1) {{ const a = i % 3; const b = i % 5; const c = i % 7; const d = i % 2; if ((a && b) || (c && !d)) {{ hits = hits + 1; }} }} return hits; }}\nout = run({n});"
+        );
+        let expected = (0..n)
+            .filter(|i| (i % 3 != 0 && i % 5 != 0) || (i % 7 != 0 && i % 2 == 0))
+            .count();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let module = lower_script(&source, "https://example.test/logical-bench.js").unwrap();
+            let out_binding = module
+                .imports
+                .iter()
+                .find(|import| import.imported == "out")
+                .unwrap()
+                .local;
+            let window = Value::object(HashMap::new());
+            let limits = Limits {
+                max_instructions: u64::MAX,
+                max_wall_time: None,
+                ..Limits::default()
+            };
+            let vm = Vm::new(module, limits).unwrap();
+            let start = std::time::Instant::now();
+            vm.run_with_cells(HashMap::from([(
+                out_binding,
+                property_binding_cell(window.clone(), "out"),
+            )]))
+            .unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(window.get_property("out").to_number(), expected as f64);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "W3VM_LOGICAL_BENCH n={n} median {:.2} ms (min {:.2}, max {:.2})",
+            samples[2], samples[0], samples[4]
+        );
+    }
+
+    #[test]
+    fn logical_operators_match_js_semantics_in_w3vm() {
+        // Same module the AOT e2e test runs; expected strings are Node.js
+        // output. Covers value position (operand values, single evaluation,
+        // NaN/0/""/null/undefined falsy) and every truthiness-only position.
+        let source = r#"let calls = 0;
+function tick(v) { calls = calls + 1; return v; }
+function valuePos() {
+  calls = 0;
+  let s = "";
+  s = s + (0 || "a") + ",";
+  s = s + ("" || 0) + ",";
+  s = s + (NaN || "n") + ",";
+  s = s + (null && tick(1)) + ",";
+  s = s + (undefined ?? "u") + ",";
+  s = s + (0 ?? "z") + ",";
+  s = s + ("x" && "y") + ",";
+  s = s + (tick("") || tick(0) || tick("last")) + ",";
+  s = s + (tick(1) && tick(2) && tick(3)) + ",";
+  s = s + (tick(null) ?? tick(false)) + ",";
+  s = s + !(0 || "") + "," + !!("k" && 0);
+  return s + ":" + calls;
+}
+function condPos() {
+  calls = 0;
+  let out = "";
+  if (0 || "" || null || undefined || NaN) { out = out + "T"; } else { out = out + "F"; }
+  if (tick(1) && tick("s")) { out = out + "T"; } else { out = out + "F"; }
+  if (tick(0) && tick(1)) { out = out + "T"; } else { out = out + "F"; }
+  if (tick("x") || tick(1)) { out = out + "T"; } else { out = out + "F"; }
+  if (!(tick(null) || tick(0))) { out = out + "T"; } else { out = out + "F"; }
+  if ((null ?? 0) || (undefined ?? "d")) { out = out + "T"; } else { out = out + "F"; }
+  if (tick(undefined) ?? tick(0)) { out = out + "T"; } else { out = out + "F"; }
+  let i = 0;
+  let n = 0;
+  while (i < 5 && (n = n + 1) && i !== 3) { i = i + 1; }
+  out = out + ":" + i + ":" + n + ":";
+  for (let j = 0; j < 4 && !(j === 2 || j === 3); j = j + 1) { out = out + j; }
+  let k = 0;
+  do { k = k + 1; } while ((k < 10 && k !== 4) || k === 0);
+  out = out + ":" + k + ":";
+  out = out + ((0 || NaN) ? "y" : "n") + (!!(1 && "q") ? "b" : "c");
+  return out + ":" + calls;
+}
+out = valuePos() + "|" + condPos();"#;
+        // `NaN` / `undefined` are host globals here; spell them inline so
+        // `out` is the only import the test must bind.
+        let source = source
+            .replace("NaN", "(0 / 0)")
+            .replace("undefined", "(void 0)");
+        let module = lower_script(&source, "https://example.test/logical-ops.js").unwrap();
+        let out_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "out")
+            .unwrap()
+            .local;
+        let window = Value::object(HashMap::new());
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_cells(HashMap::from([(
+                out_binding,
+                property_binding_cell(window.clone(), "out"),
+            )]))
+            .unwrap();
+        assert_eq!(
+            window.get_property("out").to_js_string(),
+            "a,0,n,null,u,0,y,last,3,false,true,false:8|FTFTTTF:3:4:01:4:nb:8"
         );
     }
 
