@@ -3154,8 +3154,7 @@ mod tests {
                 .style
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword")),
             Some("bottom")
         );
         crate::stylesheet::clear_rules();

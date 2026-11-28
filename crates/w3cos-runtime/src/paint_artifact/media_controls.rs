@@ -9,7 +9,6 @@ pub(super) fn append(nodes: &mut Vec<PaintNode>, rects: &mut Vec<Option<LayoutRe
             .custom_properties
             .as_ref()
             .and_then(|p| p.get("--w3cos-internal-video-controls"))
-            .map(String::as_str)
             != Some("no-source")
         {
             continue;

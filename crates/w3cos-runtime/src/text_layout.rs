@@ -1035,11 +1035,10 @@ pub(crate) fn font_render_text_for_style_with_boundaries<'a>(
     text: &'a str,
     style: &w3cos_std::style::Style,
 ) -> (Cow<'a, str>, Vec<usize>) {
-    let language = style.custom_properties.as_ref().and_then(|properties| {
-        properties
-            .get("--w3cos-internal-text-language")
-            .map(String::as_str)
-    });
+    let language = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-text-language"));
     let continues_word = style.custom_properties.as_ref().is_some_and(|properties| {
         properties
             .get("--w3cos-internal-text-transform-continues-word")

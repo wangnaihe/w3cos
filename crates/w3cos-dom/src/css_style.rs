@@ -221,7 +221,6 @@ fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>
         .custom_properties
         .as_ref()
         .and_then(|props| props.get(PERCENT_GAP_PROPERTY))
-        .map(String::as_str)
         .unwrap_or("");
     let mut has_row = current == "row" || current == "both";
     let mut has_column = current == "column" || current == "both";
@@ -302,7 +301,7 @@ fn set_stretch(style: &mut Style, token: &str, on: bool) {
         .custom_properties
         .as_ref()
         .and_then(|props| props.get(STRETCH_PROPERTY))
-        .cloned()
+        .map(str::to_string)
         .unwrap_or_default();
     let mut tokens: Vec<&str> = current
         .split(',')
@@ -697,9 +696,12 @@ impl CSSStyleDeclaration {
             markers: Vec::new(),
         };
         let marker = |properties: &Option<w3cos_std::style::CustomProperties>, key: &str| {
-            properties.as_ref().and_then(|p| p.get(key)).cloned()
+            properties
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .map(str::to_string)
         };
-        let mut keys: Vec<&String> = Vec::new();
+        let mut keys: Vec<&str> = Vec::new();
         for properties in [&a.custom_properties, &b.custom_properties]
             .into_iter()
             .flatten()
@@ -718,7 +720,7 @@ impl CSSStyleDeclaration {
                 marker(&b.custom_properties, key),
             );
             if declared != mapped {
-                overrides.markers.push((key.clone(), mapped));
+                overrides.markers.push((key.to_string(), mapped));
             }
         }
         (overrides != w3cos_std::style::LogicalOverrides::default()).then_some(overrides)
@@ -2743,7 +2745,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(TEXT_DECORATION_COLOR_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| "currentcolor".into()),
             "column-width" | "columnWidth" => dimension_to_css(&self.inner.column_width),
             "column-count" | "columnCount" => self
@@ -2761,7 +2763,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(BREAK_BEFORE_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| "auto".to_string()),
             "scroll-marker-group" | "scrollMarkerGroup" => match self.inner.scroll_marker_group {
                 ScrollMarkerGroup::None => "none",
@@ -2845,7 +2847,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| match self.inner.align_self {
                     w3cos_std::style::AlignSelf::FlexStart => "top".to_string(),
                     w3cos_std::style::AlignSelf::FlexEnd => "bottom".to_string(),
@@ -2887,7 +2889,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(LIST_IMAGE_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| "none".into()),
             "background-size" | "backgroundSize" => self
                 .inner
@@ -2966,7 +2968,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| {
                     match self.inner.flex_wrap {
                         FlexWrap::NoWrap => "nowrap",
@@ -2980,7 +2982,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(FLEX_LINE_COUNT_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| "1".into()),
             "justify-content" | "justifyContent" => {
                 format!("{:?}", self.inner.justify_content).to_lowercase()
@@ -3002,7 +3004,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(RESIZE_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| "none".into()),
             // Computed tab-size: a number, or an absolute length in px.
             "tab-size" | "tabSize" => self
@@ -3010,7 +3012,7 @@ impl CSSStyleDeclaration {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(TAB_SIZE_PROPERTY))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_else(|| "8".into()),
             "clip" => self.inner.clip.map_or_else(
                 || "auto".to_string(),
@@ -5554,7 +5556,7 @@ mod grid_longhand_tests {
                 .custom_properties
                 .as_ref()
                 .and_then(|properties| properties.get(name))
-                .cloned()
+                .map(str::to_string)
         };
         let mut style = CSSStyleDeclaration::new();
         style.set_property("gap", "calc(10% + 25px)");
@@ -5596,7 +5598,7 @@ mod place_content_tests {
             .custom_properties
             .as_ref()
             .and_then(|properties| properties.get(JUSTIFY_CONTENT_PROPERTY))
-            .cloned()
+            .map(str::to_string)
     }
 
     #[test]
@@ -6699,10 +6701,10 @@ mod font_shorthand_tests {
         declaration.set_property("contain-intrinsic-inline-size", "100px");
         declaration.set_property("contain-intrinsic-block-size", "auto 50px");
         let marker = |d: &CSSStyleDeclaration| {
-            d.inner
-                .custom_properties
-                .as_ref()
-                .and_then(|p| p.get(super::CONTAIN_INTRINSIC_SIZE_PROPERTY).cloned())
+            d.inner.custom_properties.as_ref().and_then(|p| {
+                p.get(super::CONTAIN_INTRINSIC_SIZE_PROPERTY)
+                    .map(str::to_string)
+            })
         };
         assert_eq!(marker(&declaration).as_deref(), Some("100 50"));
         declaration.set_property("contain-intrinsic-width", "none");
@@ -7613,14 +7615,10 @@ mod tests {
             assert_eq!(declaration.inner.align_self, expected);
             assert_eq!(declaration.get_property("vertical-align"), value);
             assert_eq!(
-                declaration
-                    .inner
-                    .custom_properties
-                    .as_ref()
-                    .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
-                    .map(String::as_str),
-                matches!(value, "top" | "text-top" | "bottom" | "text-bottom")
-                    .then_some(value),
+                declaration.inner.custom_properties.as_ref().and_then(
+                    |properties| properties.get("--w3cos-internal-vertical-align-keyword")
+                ),
+                matches!(value, "top" | "text-top" | "bottom" | "text-bottom").then_some(value),
             );
         }
     }
@@ -8547,8 +8545,7 @@ mod tests {
                     .inner
                     .custom_properties
                     .as_ref()
-                    .and_then(|properties| properties.get(WIDTH_KEYWORD_PROPERTY))
-                    .map(String::as_str),
+                    .and_then(|properties| properties.get(WIDTH_KEYWORD_PROPERTY)),
                 Some("max-content")
             );
         }
@@ -8669,7 +8666,7 @@ mod tests {
                 .inner
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get(key).cloned())
+                .and_then(|properties| properties.get(key).map(str::to_string))
         };
         assert_eq!(
             marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
@@ -8729,7 +8726,7 @@ mod tests {
                 .inner
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get(STRETCH_PROPERTY).cloned())
+                .and_then(|properties| properties.get(STRETCH_PROPERTY).map(str::to_string))
                 .unwrap_or_default()
         };
         declaration.set_property("width", "stretch");
@@ -8925,8 +8922,7 @@ mod tests {
                 .inner
                 .custom_properties
                 .as_ref()
-                .and_then(|properties| properties.get("--w3cos-internal-text-align-last"))
-                .map(String::as_str),
+                .and_then(|properties| properties.get("--w3cos-internal-text-align-last")),
             Some("right")
         );
     }
@@ -8947,7 +8943,7 @@ fn aspect_ratio_is_stored_as_a_width_over_height_marker() {
             .custom_properties
             .as_ref()
             .and_then(|props| props.get(ASPECT_RATIO_PROPERTY))
-            .cloned()
+            .map(str::to_string)
     };
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("aspect-ratio", "1 / 1");
@@ -9023,8 +9019,7 @@ fn grid_lanes_stays_flex_and_percent_gaps_are_marked() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get(GRID_LANES_PROPERTY))
-            .map(String::as_str),
+            .and_then(|props| props.get(GRID_LANES_PROPERTY)),
         Some("1")
     );
     assert!(
@@ -9049,8 +9044,7 @@ fn grid_lanes_stays_flex_and_percent_gaps_are_marked() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get(PERCENT_GAP_PROPERTY))
-            .map(String::as_str),
+            .and_then(|props| props.get(PERCENT_GAP_PROPERTY)),
         Some("row")
     );
     declaration.set_property("gap", "8px");
@@ -9102,8 +9096,7 @@ fn text_box_trim_and_edge_are_marked() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|properties| properties.get(TEXT_BOX_TRIM_PROPERTY))
-            .map(String::as_str),
+            .and_then(|properties| properties.get(TEXT_BOX_TRIM_PROPERTY)),
         Some("trim-both")
     );
     assert_eq!(
@@ -9111,8 +9104,7 @@ fn text_box_trim_and_edge_are_marked() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|properties| properties.get(TEXT_BOX_EDGE_PROPERTY))
-            .map(String::as_str),
+            .and_then(|properties| properties.get(TEXT_BOX_EDGE_PROPERTY)),
         Some("text")
     );
     declaration.set_property("text-box-trim", "none");
@@ -9121,8 +9113,7 @@ fn text_box_trim_and_edge_are_marked() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|properties| properties.get(TEXT_BOX_TRIM_PROPERTY))
-            .map(String::as_str),
+            .and_then(|properties| properties.get(TEXT_BOX_TRIM_PROPERTY)),
         Some("none")
     );
 }
@@ -9161,7 +9152,7 @@ fn webkit_box_orient_and_line_clamp_keep_markers() {
             .custom_properties
             .as_ref()
             .and_then(|props| props.get(key))
-            .cloned()
+            .map(str::to_string)
     };
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("-webkit-box-orient", "vertical");
@@ -9256,8 +9247,7 @@ fn unrecognized_display_and_flex_wrap_keep_a_marker() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY))
-            .map(String::as_str),
+            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY)),
         Some("-webkit-box")
     );
     declaration.set_property("display", "flex");
@@ -9274,8 +9264,7 @@ fn unrecognized_display_and_flex_wrap_keep_a_marker() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY))
-            .map(String::as_str),
+            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY)),
         Some("inline-grid")
     );
     declaration.set_property("flex-wrap", "balance");
@@ -9285,8 +9274,7 @@ fn unrecognized_display_and_flex_wrap_keep_a_marker() {
             .inner
             .custom_properties
             .as_ref()
-            .and_then(|props| props.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
-            .map(String::as_str),
+            .and_then(|props| props.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY)),
         Some("balance")
     );
     declaration.set_property("flex-wrap", "nowrap");
@@ -9308,7 +9296,7 @@ fn flex_line_count_stores_a_positive_integer_marker() {
             .custom_properties
             .as_ref()
             .and_then(|props| props.get(FLEX_LINE_COUNT_PROPERTY))
-            .cloned()
+            .map(str::to_string)
     };
     declaration.set_property("flex-line-count", "3");
     assert_eq!(marker(&declaration).as_deref(), Some("3"));
