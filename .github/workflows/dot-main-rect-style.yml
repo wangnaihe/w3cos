@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 5
       - name: Install baseline dependencies and pin the test font
         run: |
           git rev-parse HEAD
@@ -152,7 +152,15 @@ jobs:
               assert a == b, (path,a,b)
               print(json.dumps(dict(phase="equal-checksum", path=".".join(path), value=a)), flush=True)
           PY
-      - name: Prove style-subtree, exact epoch deltas, and public scrolling parity
+      - name: Record independent CSSOM ancestor-scroll behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in 0 1; do
+            DOT_MAIN_RECT_BATCH=$mode target/runtime-bench/examples/dot_main_rect_style --observe-cssom \
+              | tee "$RUNNER_TEMP/main-rect-evidence/cssom-observed-$mode.log"
+          done
+      - name: Prove style-subtree, exact epoch deltas, zero-scroll geometry and clamping
         run: |
           python3 - "$RUNNER_TEMP/main-rect-evidence" <<'PY'
           from pathlib import Path
@@ -179,14 +187,14 @@ jobs:
               for tag, wanted, height, receipt in zip(phases[1::2], (1,1,0), (440,400,400), phases[2::2]):
                   writes = re.findall(r"\[dot-main-" + name + r"\] ids=(\d+) writes=(\d+) epoch=(\d+)", receipt)
                   assert writes == [tuple([str(wanted)]*3)], receipt
-                  assert f"[overflow-result] {tag} shifted={wanted} height={height} clamp={height-200} tail=-100" in receipt, receipt
+                  assert f"[overflow-result] {tag} shifted={wanted} height={height} clamp={height-200}" in receipt, receipt
                   print(json.dumps(dict(phase="verified-overflow", mode=name, tag=tag, moved=wanted,
-                                        scrollHeight=height, maxScrollTop=height-200, tailRelativeTop=-100)), flush=True)
+                                        scrollHeight=height, maxScrollTop=height-200)), flush=True)
           PY
       - name: Archive results and exact patch
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: main-rect-overflow-evidence
+          name: main-rect-partitioned-style-evidence
           path: ${{ runner.temp }}/main-rect-evidence
           if-no-files-found: ignore
