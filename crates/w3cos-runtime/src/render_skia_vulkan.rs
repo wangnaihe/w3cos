@@ -69,7 +69,7 @@ impl SkiaVulkanPresenter {
 
     pub fn new_host(window: &winit::window::Window) -> Option<Self> {
         let host = crate::font_face::host_ui_font();
-        unsafe { Self::try_new(window, host.data.as_slice(), Some(host.index as usize)).ok() }
+        unsafe { Self::try_new(window, host.bytes(), Some(host.index as usize)).ok() }
     }
 
     unsafe fn try_new(

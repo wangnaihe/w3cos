@@ -432,9 +432,11 @@ fn render_node_gpu_layer(
     }
 }
 
-pub(crate) fn make_owned_font_data(font_bytes: Arc<Vec<u8>>, index: u32) -> FontData {
-    let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = font_bytes;
-    FontData::new(Blob::new(bytes), index)
+pub(crate) fn make_owned_font_data(
+    font_bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    index: u32,
+) -> FontData {
+    FontData::new(Blob::new(font_bytes), index)
 }
 
 fn make_custom_font_data(font_bytes: Arc<Vec<u8>>) -> FontData {
