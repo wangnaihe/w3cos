@@ -2612,7 +2612,7 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
 }
 
-/// `W3COS_PAINT_DIFF_QUIET_MOVES=1|verify` (off by default; with
+/// `W3COS_PAINT_DIFF_QUIET_MOVES` (on by default, `=0` turns it off; with
 /// `W3COS_PAINT_DIFF_CULLED_SPANS`): a box in the build's culled spans is
 /// left out of the diff altogether instead of being marked dirty when its
 /// rect moved. The build copied it as culled in both frames with its
@@ -2632,9 +2632,9 @@ pub(crate) fn paint_diff_quiet_moves_mode() -> u8 {
             .ok()
             .as_deref()
         {
-            Some("1") => 1,
+            Some("0" | "false") => 0,
             Some("verify") => 2,
-            _ => 0,
+            _ => 1,
         }
     })
 }
